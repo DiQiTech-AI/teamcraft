@@ -1,62 +1,64 @@
-# 团匠 TeamCraft
+# TeamCraft 团匠
 
-> 让 AI 各司其职，协作交付。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-团匠是一个基于 Herdr 的有状态开发团队编排 Skill。它先建立一名总工 CEO，再由 CEO 按任务需要组织 CTO、研发、设计、测试或自定义专家；每名成员在独立 pane 中运行，通过明确的职责、文件范围和验收证据共同完成交付。
+> Specialized AI agents, working as one delivery team.
 
-项目当前的 Skill 技术名为 `herdr-team`。它提供了一套可执行的团队生命周期工具，而不是一个无需监督的全自动交付系统：CEO 负责拆解、派工和复核，最终集成与发布决策仍应由人确认。
+TeamCraft is a stateful software team orchestration skill built on Herdr. It starts with a chief engineer acting as CEO. The CEO can then assemble CTO, developer, designer, tester, or custom specialists as the task requires. Each member runs in an independent pane and works toward delivery with an explicit role, file scope, and acceptance evidence.
 
-## 它解决什么问题
+The skill's technical name is `herdr-team`. It provides executable tools for managing a team's lifecycle rather than an unsupervised, fully autonomous delivery system. The CEO handles decomposition, delegation, and review; a human should still confirm final integration and release decisions.
 
-普通的多 Agent 协作容易遇到重复派工、文件互相覆盖、失败后重复启动，以及无法判断任务是否已经发送等问题。团匠围绕这些问题提供：
+## What it solves
 
-- **按需组队**：默认只启动 CEO，由 CEO 判断是否需要 CTO、研发、设计、测试或其他专家。
-- **Harness 与角色分离**：角色决定职责，`--kind` 选择 Herdr 支持的 Codex、OpenCode 等 harness。
-- **责任范围协调**：编辑任务必须声明项目内的文件或目录范围，活动成员之间的重叠范围会被拒绝。
-- **只读成员**：评审、调研和验收任务可使用 `--read-only`，不占用编辑范围。
-- **状态持久化**：成员、pane 身份、任务、责任范围和执行阶段保存在 `.herdr-team/state.json`。
-- **安全恢复**：`resume` 会核对 terminal 和原生 Agent session；结果不明确时默认只检查，不自动重复发送任务。
-- **真实状态检查**：`status` 展示 `blocked`、`working`、`idle`、`done`、`unknown` 或 `missing`，避免把缓存状态当成实时状态。
-- **并发保护**：状态写入和成员生命周期操作使用文件锁，降低并发创建或恢复造成的冲突。
+Multi-agent development can easily lead to duplicate assignments, overlapping edits, repeated starts after failures, and uncertainty over whether a task was submitted. TeamCraft addresses these issues with:
 
-## 团队结构
+- **On-demand staffing:** Only the CEO starts by default. The CEO decides whether the task needs a CTO, developer, designer, tester, or another specialist.
+- **Separate harness and role choices:** The role defines responsibility, while `--kind` selects a Herdr-supported harness such as Codex or OpenCode.
+- **Ownership coordination:** Every editing task must declare project-relative file or directory scopes. Overlapping scopes among active members are rejected.
+- **Read-only members:** Reviews, research, and acceptance checks can use `--read-only` without reserving an edit scope.
+- **Persistent state:** Members, pane identities, tasks, ownership scopes, and execution phases are stored in `.herdr-team/state.json`.
+- **Safe recovery:** `resume` checks the terminal and native agent session. When the outcome is ambiguous, it inspects by default instead of submitting a task again.
+- **Live status checks:** `status` reports `blocked`, `working`, `idle`, `done`, `unknown`, or `missing` rather than treating cached state as live state.
+- **Concurrency protection:** State writes and member lifecycle operations use file locks to reduce conflicts during concurrent launches or recovery.
+
+## Team structure
 
 ```mermaid
 flowchart TD
-    U[用户目标] --> T[teamctl 启动 CEO]
-    T --> C[CEO：拆解、派工、复核、集成]
-    C --> A[CTO：架构与技术风险]
-    C --> D[Developer：实现与验证]
-    C --> G[Designer：流程与视觉]
-    C --> Q[Tester：验收与证据]
-    C --> X[Custom：自定义职责]
-    A --> R[变更、测试与风险证据]
+    U[User goal] --> T[teamctl starts CEO]
+    T --> C[CEO: plan, delegate, review, integrate]
+    C --> A[CTO: architecture and technical risk]
+    C --> D[Developer: implementation and verification]
+    C --> G[Designer: product flow and visual design]
+    C --> Q[Tester: acceptance and evidence]
+    C --> X[Custom: project-specific responsibility]
+    A --> R[Changes, tests, and risk evidence]
     D --> R
     G --> R
     Q --> R
     X --> R
     R --> C
-    C --> H[人工确认最终交付]
+    C --> H[Human confirms final delivery]
 ```
 
-| 角色 | 主要职责 |
+| Role | Primary responsibility |
 | --- | --- |
-| CEO | 理解需求、规划、组建团队、分配任务、复核证据、集成与交付判断 |
-| CTO | 架构、接口、技术取舍和风险 |
-| Developer | 在已分配范围内实现并验证 |
-| Designer | 产品流程、交互、视觉规范和设计资产 |
-| Tester | 验收覆盖、问题复现和验证证据 |
-| Custom | 通过 `--responsibility` 定义部署、文档、安全等其他职责 |
+| CEO | Understand requirements, plan, staff the team, delegate, review evidence, integrate, and assess delivery |
+| CTO | Architecture, interfaces, technical tradeoffs, and risk |
+| Developer | Implement and verify changes within an assigned scope |
+| Designer | Product flow, interaction, visual rules, and design assets |
+| Tester | Acceptance coverage, issue reproduction, and verification evidence |
+| Custom | Define another responsibility, such as deployment, documentation, or security, with `--responsibility` |
 
-## 环境要求
+## Requirements
 
-- macOS 或 Linux。当前实现使用 Python 的 `fcntl` 文件锁，不支持原生 Windows。
-- Python 3.10 或更高版本。
-- 已安装 Herdr CLI，并从 Herdr pane 内运行；环境中应有 `HERDR_ENV=1` 和 `HERDR_SOCKET_PATH`。
-- 至少一种 Herdr 支持的 Agent harness，其可执行文件需要位于 `PATH` 中。
-- 使用内置 OpenCode 角色时，需要安装 OpenCode，并准备可用的模型 provider。
+- macOS or Linux. The current implementation uses Python's `fcntl` file locking and does not support native Windows.
+- Python 3.10 or later.
+- Herdr CLI installed and commands run from a Herdr pane, with `HERDR_ENV=1` and `HERDR_SOCKET_PATH` available.
+- At least one Herdr-supported agent harness with its executable on `PATH`.
+- OpenCode and a working model provider when using the bundled OpenCode role profiles.
 
-仓库中的示例配置使用本地 oMLX：
+The example configuration in this repository uses a local oMLX service:
 
 ```text
 provider: omlx
@@ -64,54 +66,73 @@ baseURL: http://127.0.0.1:8000/v1
 model: omlx/Qwen3.8-Flash-Next-oQ4e-mtp
 ```
 
-这只是当前开发机器的配置，不是团匠的固定依赖。
+This is an example from the development environment, not a fixed TeamCraft dependency.
 
-## 安装与本机适配
+## Install into a project
+
+Clone TeamCraft, then run the installer from the cloned repository:
 
 ```bash
 git clone https://github.com/DiQiTech-AI/teamcraft.git
 cd teamcraft
+bash scripts/install.sh --target /path/to/project
 ```
 
-首次运行前，请检查并调整以下配置：
-
-1. 从不含个人配置或密钥的示例创建本机配置：
+If `--target` is omitted, the installer uses the current working directory:
 
 ```bash
-cp opencode.example.json opencode.json
+bash scripts/install.sh
 ```
 
-2. 在本地 `opencode.json` 中配置可用的 provider、`baseURL` 和模型。该文件已被 Git 忽略。
-3. 如果不使用示例中的模型，在 `.opencode/agents/herdr-*.md` 中同步修改 `model`。
-4. 从项目根目录确认 OpenCode 能加载配置：
+Preview the changes without writing files:
+
+```bash
+bash scripts/install.sh --target /path/to/project --dry-run
+```
+
+The installer copies the project-local `herdr-team` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.herdr-team/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
+
+By default, an existing managed file with different content causes an error and is not overwritten. Use `--force` only when you intend to replace TeamCraft-managed skill, role, or template files:
+
+```bash
+bash scripts/install.sh --target /path/to/project --force
+```
+
+`--force` never overwrites an existing `opencode.json`. Reinstalling identical content is safe and idempotent. The installer does not install dependencies, access the network, or modify global configuration.
+
+After installation:
+
+1. If the installer created `opencode.json`, edit its provider, `baseURL`, and model for the target machine. If the project already had this file, review it manually; the installer leaves it untouched.
+2. If you use another model, update `model` in the installed `.opencode/agents/herdr-*.md` profiles as well.
+3. From the target project root, confirm that OpenCode can load the configuration:
 
 ```bash
 opencode --standalone
 ```
 
-退出试运行后，在 Herdr 中进入仓库根目录。可用以下命令确认当前环境和本机 Herdr 语义：
+Exit the trial run, open the target project root in Herdr, and check the current environment and local Herdr semantics:
 
 ```bash
 test "$HERDR_ENV" = "1"
 herdr --skill
 ```
 
-## 快速开始：建立一个 OpenCode 团队
+## Quick start: create an OpenCode team
 
-下面的例子让 CEO 负责实现一个纯 HTML 待办页面。`--agent-arg=--standalone` 会原样传给 OpenCode：
+This example asks the CEO to deliver a plain HTML to-do page. `--agent-arg=--standalone` is passed through to OpenCode unchanged:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --role ceo \
   --kind opencode \
   --name ceo \
-  --task "交付一个纯 HTML 待办页面。按需创建研发和只读测试成员，为每项任务写明验收标准，复核结果后汇报。" \
+  --task "Deliver a plain HTML to-do page. Create developer and read-only tester members as needed, define acceptance criteria for every assignment, and report after reviewing their results." \
   --agent-arg=--standalone
 ```
 
-`teamctl` 会在当前 Herdr tab 中创建 sibling pane、加载 `herdr-ceo` OpenCode 角色并提交任务。CEO 随后可以通过同一个 `herdr-team` Skill 创建所需 worker。
+`teamctl` creates a sibling pane in the current Herdr tab, loads the `herdr-ceo` OpenCode profile, and submits the task. The CEO can then use the same `herdr-team` skill to create the workers it needs.
 
-例如，CEO 创建研发成员时可以执行：
+For example, the CEO can create a developer with:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
@@ -119,11 +140,11 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --kind opencode \
   --name web_dev \
   --ownership 'examples/todo/**' \
-  --task "实现无外部依赖的待办页面；验收：可新增、完成和删除事项。" \
+  --task "Implement a dependency-free to-do page. Acceptance: users can add, complete, and delete items." \
   --agent-arg=--standalone
 ```
 
-再创建一名不修改文件的验收成员：
+Then create a tester instructed not to modify files:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
@@ -131,76 +152,76 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --kind opencode \
   --name acceptance \
   --read-only \
-  --task "按需求验收待办页面并报告证据，不修改项目文件。" \
+  --task "Verify the to-do page against the requirements and report evidence without changing project files." \
   --agent-arg=--standalone
 ```
 
-## Ownership 与只读任务
+## Ownership and read-only tasks
 
-每个会编辑文件的非 CEO 成员都必须声明至少一个 `--ownership`：
+Every non-CEO member that edits files must declare at least one `--ownership` scope:
 
 ```bash
 --ownership 'src/api/**'
 --ownership 'tests/api/test_users.py'
 ```
 
-- 路径必须相对于项目根目录。
-- 支持精确文件或以 `/**` 结尾的目录范围。
-- 不支持其他通配符、绝对路径和 `..` 路径穿越。
-- 活动编辑成员的相同、父级或子级范围不能重叠。
-- `--read-only` 成员不能同时声明 `--ownership`。
+- Paths must be relative to the project root.
+- Exact files and directory scopes ending in `/**` are supported.
+- Other wildcards, absolute paths, and `..` traversal are rejected.
+- Equal, parent, or child scopes cannot overlap among active editing members.
+- A `--read-only` member cannot also declare `--ownership`.
 
-Ownership 是协作元数据，用来防止派工范围冲突；它不是操作系统级的文件访问隔离。CEO 和最终审阅者仍需检查成员实际改动。
+Ownership is coordination metadata that prevents conflicting assignments. It is not operating-system-level file isolation. The CEO and final reviewer should still inspect each member's actual changes.
 
-## 查看、恢复和归档
+## Inspect, recover, and archive
 
-查看团队及成员实时状态：
+Inspect the team and each member's live state:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py status
 ```
 
-恢复未完成的创建流程，默认只检查，不重复提交任务：
+Resume an incomplete launch. The default action only inspects state and does not resubmit the task:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev
 ```
 
-检查后确认任务从未执行或确实需要重发时，再明确选择：
+After confirming the task never ran or must be sent again, choose that action explicitly:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action send
 ```
 
-如果任务已经送达，可跳过重发：
+If the task was already delivered, skip resubmission:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action skip
 ```
 
-当 pane split 的结果不明确时，先查看当前布局。只有确认没有创建 pane 后才重试：
+When the result of a pane split is ambiguous, inspect the current layout first. Retry only after confirming that no pane was created:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --split-action retry
 ```
 
-验收完成后归档任务并释放 ownership：
+Archive a task and release its ownership after acceptance:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py complete web_dev
 ```
 
-仅释放责任范围而不标记完成：
+Release the ownership without marking the task complete:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py release web_dev
 ```
 
-`complete` 和 `release` 都不会关闭 pane 或终止 Agent。成员处于 `working`、`blocked` 或 `unknown` 时会拒绝操作；`--force` 只应在人工确认该成员不会继续产生冲突修改后使用。
+Neither `complete` nor `release` closes the pane or terminates the agent. They reject members in `working`, `blocked`, or `unknown` state. Use `--force` only after a human confirms that the member will not make further conflicting changes.
 
-## 使用其他 Harness
+## Use another harness
 
-角色和 harness 是独立的。将 `--kind opencode` 换成当前 Herdr 支持的其他类型即可，例如：
+Roles and harnesses are independent. Replace `--kind opencode` with another type supported by the active Herdr installation. For example:
 
 ```bash
 python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
@@ -208,45 +229,49 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --kind codex \
   --name api_review \
   --read-only \
-  --task "运行 API 验收测试并报告失败证据，不修改文件。"
+  --task "Run the API acceptance tests and report failure evidence without changing files."
 ```
 
-`teamctl` 会先检查 Herdr 的 kind 列表和对应可执行文件。OpenCode 会额外加载项目中的 `.opencode/agents/herdr-*.md` 角色配置；其他 harness 通过任务提示接收角色、职责和 ownership。
+`teamctl` first checks Herdr's supported kind list and the corresponding executable. OpenCode additionally loads the `.opencode/agents/herdr-*.md` profiles in the target project. Other harnesses receive their role, responsibility, and ownership through the task prompt.
 
-## 项目结构
+## Repository layout
 
 ```text
 .
 ├── .agents/skills/herdr-team/
-│   ├── SKILL.md                 # Skill 规则与操作指南
-│   ├── scripts/teamctl.py       # 启动、状态、恢复和归档工具
-│   └── tests/test_teamctl.py    # 回归测试
-├── .opencode/agents/            # CEO、CTO、研发、设计、测试和自定义角色
-├── examples/team-demo/          # 实机协作示例
-├── opencode.example.json        # 可复制的 OpenCode/oMLX 示例配置
-└── PROGRESS.md                  # 实现与实机验证记录
+│   ├── SKILL.md                 # Skill rules and operating guide
+│   ├── scripts/teamctl.py       # Launch, status, recovery, and archival tool
+│   └── tests/test_teamctl.py    # Regression tests
+├── .opencode/agents/            # CEO, CTO, developer, designer, tester, and custom profiles
+├── examples/team-demo/          # Live collaboration example
+├── scripts/install.sh           # Project-local installer
+├── opencode.example.json        # OpenCode/oMLX example configuration
+└── PROGRESS.md                  # Implementation and live verification notes
 ```
 
-`.herdr-team/` 是本地运行目录，保存状态、任务和锁文件，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。
+`.herdr-team/` is a local runtime directory containing state, tasks, and lock files. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session.
 
-## 验证
+## Verification
 
-运行回归测试：
+Run the regression suite with:
 
 ```bash
 python3 -B -m unittest discover -s .agents/skills/herdr-team/tests -v
+python3 -B -m unittest discover -s tests -v
 ```
 
-当前共 20 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并和输入错误等场景。
+The current 20 tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, and invalid input.
 
-项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
+The installer has a separate suite covering first installation, repeated installation, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, and Git ignore rules.
 
-## 当前边界
+The project has also completed one live OpenCode workflow: the CEO created a developer and a read-only tester, the developer generated [`examples/team-demo/index.html`](examples/team-demo/index.html), and the tester completed acceptance. During that run, the CEO's final polling loop did not converge on its own; the controlling agent stopped the loop manually and completed archival. See [`PROGRESS.md`](PROGRESS.md) for the detailed record.
 
-- 已实机验证 CEO、Developer 和 Tester；CTO、Designer、Custom 的配置尚未分别实机启动验证。
-- CEO 能够拆解任务、创建成员和收集结果，但当前仍需要人监督权限请求、异常恢复、最终集成和发布。
-- `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
-- `unknown` 表示无法核实实时状态，不应据此推断任务完成。
-- ownership 只负责团队协调，不提供安全沙箱。
-- 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
-- 把 Skill 用到其他项目时，需要一并部署角色配置，并按目标机器调整 provider、模型和权限路径。
+## Current limits
+
+- CEO, Developer, and Tester have been exercised in a live workflow. CTO, Designer, and Custom have not yet been started and verified individually.
+- The CEO can decompose work, create members, and collect results, but a human still needs to supervise permission requests, exception recovery, final integration, and release.
+- Both `idle` and `done` can indicate a completed, settled task; do not wait only for `done`.
+- `unknown` means the live state could not be verified and must not be treated as completion.
+- Ownership provides team coordination, not a security sandbox.
+- Use a new member name for a new task after completing or releasing a member. Historical task archival and member reuse are not implemented.
+- Installing the skill into another project also requires the role profiles, with provider, model, and permission paths adjusted for the target machine.
