@@ -1,0 +1,7 @@
+/.herdr-team/
+/opencode.json
+.DS_Store
+.env
+.env.*
+__pycache__/
+*.py[cod]
