@@ -1,0 +1,385 @@
+# TeamCraft 2.0 M0 架构审计与实施审查报告
+
+> 状态：待审查，批准后方可进入 M1
+>
+> 审计日期：2026-10-21
+>
+> 基准：`doc/TEAMCRAFT_2_0_PLAN.md` v1.0 规划草案
+>
+> 仓库基线：`main` / `d9d95a6`
+>
+> 本轮范围：架构审计、差距分析、ADR 候选和 M1–M6 实施拆解；未修改产品代码。本会话另有用户授权的 DIQI 创建、命名和 Pane 布局操作；启动 DIQI 前，主 Agent 因原 `state.json` 绑定另一 Herdr Session，手动且可逆地将其移动为归档文件。这些是编排运行变更，不属于产品实现或本报告的验证动作
+
+## 1. 审查结论
+
+当前 TeamCraft 是一个可工作的 Herdr 团队管理 Skill，而不是 PRD 所描述的完整编排服务。真实核心只有一条同步调用链：Skill/用户调用 `teamctl.py`，脚本在 `.herdr-team/state.json` 中预留成员和 Ownership，再直接调用 Herdr CLI 创建 Pane、启动 Harness、提交 Prompt，并通过 Herdr 实时查询完成状态检查和保守恢复。项目还包含六个 OpenCode 角色配置、一个安全安装器和两组回归测试。
+
+现有实现已经形成必须保留的兼容基线：
+
+- 角色与 Harness 分离，支持 CEO、CTO、Developer、Designer、Tester 和 Custom；
+- 写入成员必须声明非重叠 Ownership，只读成员不能占用 Ownership；
+- `status` 将持久化阶段与 Herdr 实时信号分开，无法核实时返回 `unknown`；
+- `resume` 核验 Pane、terminal、Harness、成员名和原生 Agent Session，歧义时默认检查而不重发；
+- JSON 状态使用原子替换、全局状态锁和成员生命周期锁；
+- `complete`/`release` 不终止进程，`working`、`blocked`、`unknown` 默认不能释放；
+- OpenCode 角色通过 Pane 局部配置选择，不覆盖用户已有的全局/项目配置；
+- 安装器先做完整预检，拒绝符号链接目标，保留已有 `opencode.json`，支持幂等和 dry-run。
+
+PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、Web/API/SSE、Approval、Worktree、Verifier、GitHub PR 和成本路由均未实现。M1 不应先启动 Web 或 Worktree；应先把上述现有语义写成兼容契约，然后引入 SQLite Core，并在一次明确的切换中将旧 JSON 从写入真源迁移为只读兼容视图。M2 再把直接 Herdr 调用收口为 Adapter，并增加确定性调度、观察和恢复。由于 FR-011 Verifier 和 FR-012 Approval 都是 P0，M2 还必须在 M3 Web 验收前提供最小程序化验证和持久审批门禁；M4 负责扩展到 Worktree、Diff、Commit 和 PR 证据。在 M4 之前，共享工作树上的验证不能证明普通 ship 产物与某个隔离执行一一对应，因此 M2/M3 的完成验收只适用于 report-only/scout，或在项目写入完全静止时复制、封存并按内容摘要验证的 local-only 快照；普通 ship 必须保持未交付状态，不能宣称已满足完整 P0 闭环。
+
+路径存在一个需显式处理的文档差异：PRD 当前实际位于未跟踪的 `doc/TEAMCRAFT_2_0_PLAN.md`，而目标目录树和开工提示词使用 `docs/TEAMCRAFT_2_0_PLAN.md`（PRD `:615-619`、`:866`）。本轮按要求保留原文件原位置且不移动；进入 M1 前需决定正式路径和迁移方式，避免形成两个内容分叉的 PRD。
+
+## 2. 审计范围与证据
+
+审计覆盖：
+
+- 产品与使用说明：`README.md`、`README.zh-CN.md`、`PROGRESS.md`；
+- Skill 契约：`.agents/skills/herdr-team/SKILL.md`；
+- 运行实现：`.agents/skills/herdr-team/scripts/teamctl.py`；
+- Harness 配置：`.opencode/agents/herdr-*.md`、`opencode.example.json`；
+- 安装：`scripts/install.sh`；
+- 测试：`.agents/skills/herdr-team/tests/test_teamctl.py`、`tests/test_install.py`；
+- 目标基准：`doc/TEAMCRAFT_2_0_PLAN.md`。
+
+仓库当前没有 `pyproject.toml`、Python 包目录、前端工程、CI 工作流或数据库迁移目录。跟踪文件列表与 README 给出的当前目录结构一致（`README.md:237-250`）。`.herdr-team/` 和本地 `opencode.json` 由 `.gitignore:1-2` 排除。基线测试使用临时目录，没有读取或改写项目的实际 `state.json`；但本会话在审计之外按用户授权创建、命名和移动了 DIQI Pane。启动前，主 Agent 发现原 `state.json` 绑定另一 Herdr Session，遂手动且可逆地把它移动到归档文件名，再启动 DIQI；这不是 Herdr 自动归档。因此不能笼统声称运行状态或布局完全未变。架构结论只依据受跟踪实现、PRD、测试和版本探测，不把这次编排操作当作产品能力验收。
+
+## 3. 当前真实架构
+
+### 3.1 组件与边界
+
+```mermaid
+flowchart LR
+    U[用户或 CEO] --> S[herdr-team SKILL.md]
+    S --> CLI[teamctl.py CLI]
+    CLI --> V[输入/Harness/路径预检]
+    CLI --> JS[(.herdr-team/state.json)]
+    CLI --> FL[state.lock + member.NAME.lock]
+    CLI --> H[Herdr CLI JSON 接口]
+    H --> P[Herdr Pane]
+    H --> A[Codex / OpenCode Harness]
+    OC[.opencode/agents/herdr-*.md] --> A
+    CFG[OPENCODE_CONFIG_CONTENT] --> A
+    A --> W[同一项目工作目录]
+    H --> CLI
+```
+
+边界结论：
+
+1. `teamctl.py` 同时承担 CLI、领域校验、状态存储、Herdr Adapter、Pane 布局、成员恢复和输出序列化，尚无独立 Core 或服务层。
+2. `.herdr-team/state.json` 是成员编排记录，但并非完整历史数据库。Task 是成员记录中的文本字段，Member、Task、Attempt、Session 尚未独立建模（`teamctl.py:648-658`）。
+3. Herdr 是运行态观测源。`status` 在锁内取得 JSON 快照，随后逐成员查询 Herdr；查询失败时输出 `unknown` 和 `inspection_error`，不会展示缓存状态冒充实时状态（`teamctl.py:824-863`）。
+4. Worker 共享同一项目目录。Ownership 只做派工冲突协调，Skill 明确声明它不是文件系统权限隔离（`SKILL.md:31-33`；`README.md:168-174`）。
+5. OpenCode 模型选择是静态配置。六个角色配置均指向同一 oMLX 模型；`opencode.example.json:1-18` 给出本地 Provider 示例，尚无运行时 Router、预算或故障升级策略。
+6. 安装器把 Skill、测试、脚本、角色配置和配置模板复制到目标项目；它不是包管理器，也不安装依赖（`scripts/install.sh:50-78`；`README.md:93-101`）。
+
+### 3.2 启动调用路径
+
+`teamctl launch` 的实际顺序如下：
+
+1. 要求在 Herdr 环境中运行，并要求 `HERDR_SOCKET_PATH`（`teamctl.py:102-118`）。
+2. 校验成员名、超时、项目根、任务文本、角色责任和 Ownership；非 CEO 写入成员没有 Ownership 会被拒绝（`teamctl.py:618-635`）。
+3. 从已安装 Herdr 的 kind 列表确认 Harness，并确认可执行文件在 `PATH`（`teamctl.py:335-351`）。
+4. 查询同名实时 Agent、解析调用 Pane、计算当前 Herdr Session 身份（`teamctl.py:364-384`、`:109-118`）。
+5. 在状态锁中检查 Session、成员名和 Ownership 重叠，先把 `reserved` 成员写入 JSON（`teamctl.py:310-332`）。这保证外部布局改变之前先记录意图。
+6. 读取 Pane 几何并选择安全拆分方向；调用 `herdr pane split --no-focus`。OpenCode 额外注入仅覆盖 `default_agent` 的 Pane 局部 JSON（`teamctl.py:401-416`、`:475-496`、`:499-534`）。
+7. 将阶段记为 `start_requested`，调用 `herdr agent start`，再用 `agent get` 记录 Pane、terminal 和原生 Session（`teamctl.py:537-565`）。
+8. 在提交 Prompt 前先设置 `prompt_may_have_been_delivered=true`，再调用 `herdr agent prompt`。超时或失败统一视为结果歧义，禁止自动重发（`teamctl.py:568-601`）。
+9. 输出成员摘要，包括持久化阶段、实时状态、只读标志和 Ownership（`teamctl.py:604-615`）。
+
+### 3.3 状态、锁与恢复路径
+
+- `StateStore` 使用 `fcntl.flock` 串行化 JSON 读写，以同目录临时文件、`fsync` 和 `os.replace` 原子替换状态文件（`teamctl.py:125-169`）。因此当前原生平台是 macOS/Linux，README 声明 Python 3.10+ 且不支持原生 Windows（`README.md:53-59`）。
+- 每个成员另有非阻塞生命周期锁，避免同名成员同时 `launch`、`resume`、`complete` 或 `release`（`teamctl.py:171-189`、`:889-910`）。
+- Session 身份由 Herdr socket 的解析路径、设备号和 inode 组成；状态属于其他 Herdr Session 时拒绝自动接管（`teamctl.py:109-118`、`:203-207`）。
+- `resume` 先验证记录 Pane 的 terminal、成员名、Harness 和原生 Session；Pane 移动后可以用唯一成员名重新定位，但仍需验证身份（`teamctl.py:688-755`）。
+- 对 `split_requested/split_ambiguous`，默认返回检查指令，只有显式 `--split-action retry` 才重试；对可能已经提交的 Prompt，默认 `inspect`，只有显式 `send`/`skip` 才推进（`teamctl.py:758-821`）。
+- `status` 支持 `blocked/working/idle/done/unknown/missing`。Skill 规定 `idle` 和 `done` 都可表示 Agent 已稳定下来，但它们都不应自动推导新的 2.0 Task 已验收完成（`SKILL.md:79-87`）。
+- `complete` 和 `release` 只修改记录并清空 Ownership，不关闭 Pane；实时状态为 `working`、`blocked`、`unknown` 时必须显式 `--force`（`teamctl.py:866-886`）。
+
+### 3.4 安装和角色配置路径
+
+安装器先构造受管文件清单并拒绝源或目标路径中的符号链接（`scripts/install.sh:50-78`、`:81-97`），在任何写入前预检全部冲突（`:170-221`），随后以原子复制/写入执行（`:113-148`、`:223-240`）。已有 `opencode.json` 无论 `--force` 与否都保留（`:204-211`）。
+
+六个 OpenCode Profile 是角色提示和权限模板，不是独立运行服务。Developer 等角色将编辑和 shell 设置为 `ask`，拒绝外部目录、网络搜索和子任务；CEO Profile 可以编辑项目文件，但同样拒绝外部目录和子任务。`teamctl` 在 Pane 层选择 `herdr-<role>`，同时保留既有 `OPENCODE_CONFIG_CONTENT` 其他字段（`teamctl.py:471-496`）。
+
+## 4. 兼容性矩阵
+
+| 兼容面 | 当前真实行为 | 2.0 约束 | M1/M2 兼容验收 |
+|---|---|---|---|
+| Skill 入口 | `.agents/skills/herdr-team/SKILL.md` 指导 `teamctl.py` | 保留原路径和命令示例 | 原 Skill 无需用户改命令即可完成既有流程；新能力另加命令，不静默改义 |
+| CLI 命令 | `launch/status/resume/complete/release`（`teamctl.py:917-966`） | 旧命令至少一个可见版本稳定 | 参数、默认值、stdout JSON 关键字段、错误退出码建立 golden/contract 测试 |
+| 角色/Harness | 六类角色；`--kind` 独立选择 Harness | Core 不直接推理，仍经 Herdr | Adapter 接受现有 role/kind/agent args；未支持 kind 保持预检失败 |
+| Ownership | 精确路径或尾部 `/**`；父子范围冲突；终态释放（`:264-332`） | 保留重叠检测并加入 Task/Attempt | 同一组合法/非法输入与并发预留结果一致；新增 Diff Gate 不削弱原规则 |
+| read-only | 不能带 Ownership；Prompt 明令不编辑（`:264-266`、`:436-458`） | Scout/审计不获得写权限 | 数据库保存 read-only；Scheduler 不分配写租约；现有 CLI 拒绝组合保持一致 |
+| 持久化路径 | `.herdr-team/state.json`，version 1 | SQLite 成为新真源，旧 JSON 不原地覆盖 | 迁移前备份+摘要；切换前 Reconcile；旧 JSON 只读导出或归档，不双主写 |
+| 原子性/锁 | `state.lock` + `member.<name>.lock`；原子替换 | SQLite 事务、条件更新、Leader Lease | 并发 Ownership 和同成员生命周期测试继续通过；跨进程派工最多一次获得租约 |
+| Session 身份 | socket path/device/inode + Pane/terminal/native session | Task/Attempt/Session 分离 | 不允许只凭名字接管；所有恢复仍验证已有身份并保留无法核实时的 UNKNOWN |
+| 状态显示 | 阶段与 `agent_state` 分开；检查失败为 `unknown` | Task/Attempt/Session 三层状态 | 不把 `idle`、`done`、Pane 存活直接映射成 Task DONE；兼容输出继续提供旧字段 |
+| 保守恢复 | split/start/prompt 歧义先记录，默认 inspect | Watcher 只观察；未知结果不盲重试 | 默认恢复不产生第二 Pane/Prompt/外部副作用；新 Attempt 前必须有确定证据或人审 |
+| 完成/释放 | 不关 Pane；危险实时状态需 `--force` | 高风险动作走审批和审计 | 旧命令仍不终止 Agent；新的 cancel/stop 是独立显式 Command |
+| OpenCode 配置 | Pane 局部覆盖 `default_agent`，要求角色文件存在 | Router 可选 Harness/Model | 不覆盖用户 Provider；静态 Profile 仍可运行；Router 决策另行记录 |
+| 安装器 | 项目内复制，预检后写入，保留配置，拒绝 symlink | 需部署 Core/API/Web 资产和迁移工具 | 旧安装场景 10 项测试全过；新增文件仍遵守预检、幂等、dry-run 和配置保留 |
+| 人工权限 | 最终集成/发布由人确认（`README.md:7-9`） | merge/deploy/delete worktree 默认审批 | 未经批准不自动 merge、部署、清理脏 Worktree 或重复高风险命令 |
+
+## 5. 目标能力差距
+
+状态定义：**已有**表示当前实现满足目标的核心语义；**部分**表示可复用但缺少目标领域模型或闭环；**缺失**表示仓库中没有实现证据。
+
+| FR | 状态 | 当前证据与差距 |
+|---|---|---|
+| FR-001 项目注册 | 部分 | `resolve_project_root` 可验证现有目录（`teamctl.py:227-235`），但没有 Project ID、注册表、权限/仓库检查或项目配置 |
+| FR-002 Task CRUD | 部分 | launch 保存不可独立编辑/查询的任务文本；没有 Task ID、验收结构、版本或审计 |
+| FR-003 Task DAG | 缺失 | 没有依赖表、无环校验和 READY 推导 |
+| FR-004 Attempt/Session 独立 | 缺失 | 单个 Member 记录混合角色、任务、Pane、原生 Session 和阶段 |
+| FR-005 SQLite/事件 | 缺失 | 仅 JSON version 1 和文件锁；没有 Schema Migration、事务事件或 Outbox |
+| FR-006 Herdr Adapter | 部分 | `run_herdr`、响应解析和直接调用可提取（`:67-100`），但无稳定 Adapter 接口、日志/停止能力和契约测试层 |
+| FR-007 Watcher/恢复 | 部分 | `status/resume` 已有人工触发的保守恢复；没有后台 Watcher、租约、事件去重或自动 Reconcile |
+| FR-008 Ownership | 已有（协调级） | 路径规范化、重叠拒绝、只读语义和并发测试已存在；没有 OS 沙箱和 Diff Gate |
+| FR-009 Web UI | 缺失 | 没有 HTTP 或前端工程；`examples/team-demo/index.html` 是实机协作产物示例（`README.md:267`），不是 TeamCraft 控制台 |
+| FR-010 CLI/Web 共享命令服务 | 缺失 | CLI 直接调用单文件内部函数 |
+| FR-011 Verifier | 缺失 | Worker 自报证据，Core 不独立执行验证，也不绑定 Commit SHA |
+| FR-012 用户审批 | 缺失 | 有 shell/tool 交互权限和 `--force` 人工决策，但无持久 Approval 实体、审计和统一门禁 |
+| FR-013 Worktree | 缺失 | 当前所有 Pane 使用同一 `cwd`（`teamctl.py:507-510`） |
+| FR-014 SSE | 缺失 | 没有 Event 序号、流和断线补拉 |
+| FR-015 Model Router | 部分 | 用户可选 `--kind`，OpenCode Profile 静态指定 oMLX；没有策略、风险、健康、预算或决策原因 |
+| FR-016 GitHub PR | 缺失 | 没有 `gh` 探测、PR 状态或发布门禁 |
+| FR-017 Workflow DAG 图 | 缺失 | 无 DAG 数据和 Web |
+| FR-018 Token/成本 | 缺失 | 没有 usage 数据；不得把缺失值解释为 0 |
+| FR-019 重试/失败升级 | 部分 | 已有“歧义不自动重试”，但无失败分类、有界尝试、预算和云端升级流程 |
+| FR-020 项目策略 | 部分 | 仅 OpenCode 项目配置和 CLI 参数；无并发、Verifier、审批、路由的统一项目策略 |
+| FR-021 Review 专家 | 部分 | Tester/Custom/CTO 可按需启动；没有基于 Task 的交叉审查策略 |
+| FR-022 远程访问 | 缺失/P2 | 当前仅本地 Herdr；没有 Web 认证、TLS、VPN/SSH 入口设计实现 |
+| FR-023 多机 Worker | 缺失/P2 | 单机实现，符合当前非目标 |
+
+除 FR 清单外，当前已有而目标必须继续支持的能力是项目内安全安装、配置保留、角色模板、Pane 自动布局和焦点保持。这些能力不应在引入 Python 包或服务进程时丢失。
+
+## 6. 可复用组件与改造边界
+
+| 组件 | 复用判断 | 建议动作 |
+|---|---|---|
+| `SKILL.md` | 直接保留，作为外部操作契约 | 先用测试固化，再逐阶段补充 2.0 命令；不要提前写成“已实现” |
+| `teamctl` 参数与 JSON 输出 | 外部兼容面，可复用 | 保留脚本为薄入口；内部逐步转调共享 Command Service/Herdr Adapter |
+| `run_process/run_herdr` 与响应解析 | 可提取 | 移到 `adapters/herdr.py`，定义超时、错误归一化、能力探测、Fake Adapter 契约 |
+| `StateStore` | 仅用于迁移和兼容 | 冻结 version 1 读取器；SQLite 切换后不得与 DB 双主写；保留原文件快照和只读导出 |
+| Ownership 规范化/重叠算法 | 高价值复用 | 移到 Core ownership 模块并保持输入语义；增加大小写策略、symlink/实际 Diff 检查，不改变现有 CLI 合法集合 |
+| Prompt/Brief 构造 | 部分复用 | 将现有角色、责任、Ownership 和只读要求纳入结构化 Brief；Task/Attempt ID、验收和禁止操作由 Core 注入 |
+| Pane 拆分方向和 `--no-focus` | 直接复用 | 留在 Herdr Adapter/Workspace 调用层；契约测试固定 Pane 参数 |
+| Session/occupant 核验 | 高价值复用 | 作为 Reconcile 核心；禁止简化成仅按成员名或 Pane ID 恢复 |
+| 保守恢复状态 | 高价值复用 | 映射为 Command `unknown`、Attempt `UNKNOWN` 和需人工处理事件；默认仍不重发 |
+| OpenCode Profile | 可继续使用 | 保持静态回退；Router 只选择/记录，不在迁移时覆写用户 Provider/Model |
+| 安装器 | 可扩展 | 保留全量预检、原子写、symlink 拒绝、配置保留和幂等；新增依赖安装需单独设计，不能暗中联网 |
+| 现有单元测试 | 必须保留 | 提升为 compatibility suite；Fake Herdr 继续离线运行，另加当前 Herdr 版本的可选实机 contract suite |
+| `teamctl.py` 单文件结构 | 需要拆分 | 只做渐进提取；每次提取都先保持旧入口和回归测试，不整文件重写 |
+| Member 混合模型 | 需要替换内部模型 | 对外提供兼容视图；内部拆为 Task、Attempt、Agent、Session，保留原始 legacy payload 供审计 |
+| 状态阶段 | 需要分层 | 现有 launch phase 保留为 Attempt/Session 兼容字段，不能和 Task 状态或实时 Agent 信号混为一列 |
+
+## 7. 测试与环境基线
+
+README 的正式回归入口位于 `README.md:254-265`。本轮在未修改仓库和 Herdr 运行状态的情况下执行：
+
+| 命令 | 退出码 | 结果 |
+|---|---:|---|
+| `python3 -B -m unittest discover -s .agents/skills/herdr-team/tests -v` | 0 | 20/20 通过，0.024s |
+| `python3 -B -m unittest discover -s tests -v` | 0 | 10/10 通过，0.490s |
+
+合计 30/30 通过。Herdr 测试使用临时目录、模拟 socket 和 Mock Herdr（`test_teamctl.py:52-68`），覆盖状态恢复、Ownership 并发、生命周期锁、Pane 移动、Session 身份、歧义恢复、实时状态和 OpenCode 配置。安装器测试通过临时目标调用真实 `scripts/install.sh`（`tests/test_install.py:10-29`），覆盖首次/重复安装、冲突、配置保留、dry-run、空格路径、符号链接和 Git ignore。
+
+环境探测：
+
+| 工具 | 版本/结果 | 说明 |
+|---|---|---|
+| Python | 3.13.14 | 当前 README 最低要求为 3.10+，PRD 建议 3.11+；最终最低版本尚未用 CI 矩阵验证 |
+| Herdr | 0.9.3 | 版本命令成功；现有单元测试使用 Mock，尚无自动化实机契约套件 |
+| OpenCode | 2.0.25 | 默认 `opencode --version` 因沙箱不能写用户日志目录而退出 1；将 XDG data/cache/config 指向 `/private/tmp` 后退出 0 |
+| Codex CLI | 0.163.0 | 版本命令退出 0；沙箱下出现不能创建 PATH alias 的非致命警告 |
+| Bash | 3.2.57 | 安装器当前可运行 |
+| Git | 2.54.0 (Apple Git-157) | Worktree/PR 能力尚未测试 |
+
+环境问题不能被误写成产品兼容结论：当前只能证明上述本机版本通过现有离线测试。最低 Herdr/OpenCode/Codex 版本、Linux 行为、真实 oMLX 健康检查和当前 Herdr 命令响应兼容性仍需 M1/M2 建立矩阵。
+
+## 8. ADR-001 候选：存储、状态与进程模型
+
+### 8.1 状态
+
+**Proposed**。需用户批准 M1 边界后接受；本报告不实施迁移。
+
+PRD 的建议 DDL 在实施前必须修正两点：
+
+- PRD 要求“同一 Task 同时至多一个活动 Attempt”（`:352-355`），但 `attempts` 表只有 `(task_id, attempt_no)` 唯一约束（`:249-263`），没有数据库级活动唯一约束。M1 应通过可被 SQLite 执行的部分唯一索引、活动槽表或等价事务约束落地，并用双连接竞争测试证明。
+- `verifications.commit_sha` 在建议 DDL 中为 `NOT NULL`（`:303-311`），但 `report-only`/`scout` 可以交付报告而不产生 Git Commit（`:350`、`:429-431`）。M1/M2 的最终 Schema 应允许可空 Commit，并要求另一种受控 artifact/report hash；不同交付类型通过 CHECK 或领域校验保证至少有一种可验证证据。
+
+里程碑也有一处优先级错位：FR-011/FR-012 被列为 P0（`:115-116`），完整 Verifier 却排到 M4（`:733-744`）。本报告将“批准的验证命令、退出码/日志证据、report artifact、持久 Approval”作为 M2 的最小 P0 门禁；Worktree、Diff Gate、Commit 失效、GitHub PR 和安全清理仍在 M4。这个最小门禁足以验收 report-only/scout，或显式封存、按摘要验证的 local-only 快照，但不能把共享工作树中的普通 ship 认定为可靠交付；因此完整 P0 ship 产品闭环实际要等 M4 证据链完成。
+
+### 8.2 决策
+
+1. **持久化真源**：新 Core 使用 `.herdr-team/teamcraft.db`，SQLite 开启 foreign keys、WAL 和 busy timeout。所有领域写入只经 Repository/Command Service，状态变更与 append-only Event 在同一事务提交。
+2. **单写入源迁移**：M1 开发前半段不接管现有 Herdr 成员；旧 `teamctl` 继续是 JSON 唯一写入者，新 Core 只管理隔离测试数据。切换时暂停新派工，持有全局迁移锁，复制 `state.json`、记录 SHA-256、核对 Herdr 实时身份，导入一次并原子记录 cutover。现有 JSON 明确绑定创建它的 Herdr socket Session（`teamctl.py:192-207`）；如果迁移发生在另一个 Session，记录可导入为历史，但关联 Attempt/Session 必须为 UNKNOWN，绝不按成员名自动认领 Pane、自动恢复或重发 Prompt。切换后 DB 是唯一写入源，`state.json` 只保留原始快照或由 DB 生成的只读兼容导出，禁止长期双写。
+3. **领域分层**：Task 表示用户目标和验收；Attempt 表示一次执行；Session 表示 Herdr/Harness 运行实例；Agent 表示能力配置。旧 Member 记录导入时生成稳定 ID，并把原 JSON 保存在受控 legacy payload/迁移审计中，便于核对而不是覆盖原文件。
+4. **三层状态**：Task 状态、Attempt 状态和 Session/Herdr live signal 独立。`idle/done` 只是实时信号；Worker 报告完成只触发 VERIFYING；只有交付策略、Verifier 和审批条件满足，Task 才能进入 DONE。现有 launch phase 作为兼容字段/事件保留。
+5. **并发不变量**：同一 Task 最多一个活动 Attempt；不能照搬当前建议 DDL，而要以数据库可执行的唯一活动约束配合事务条件更新；Scheduler Leader 使用 DB Lease。Lease 到期不等于进程已死，接管前必须核验 Herdr、Git 和外部副作用。
+6. **进程模型**：MVP 使用一个 `teamcraft serve` 本地进程承载 API、Scheduler 和 Watcher；浏览器只是客户端。CLI 和 Web 调用同一个 Command Service。CLI 默认可在进程内打开 DB 执行无需后台的管理命令；需要派工的命令写入幂等 Command，由单 Leader 执行，避免 CLI 与服务同时抢任务。
+7. **Herdr 边界**：所有 Herdr 命令经 Adapter；Adapter 复用现有 terminal/native-session 核验和错误语义。Watcher 只做确定性观察、Reconcile 和事件产生，空闲时不调用 LLM。
+8. **外部副作用**：Command 采用 `pending/running/confirmed/unknown`，通过 idempotency key 去重。系统承诺 at-least-once 检查和幂等处理，不承诺外部操作 exactly-once。`unknown` 不自动产生新 Attempt。
+9. **安全默认**：保留 Ownership/read-only；M4 叠加 Worktree 和 Diff Gate。merge、deploy、删除脏 Worktree、强制释放和不确定重试均进入 Approval/显式人审。
+10. **回滚**：迁移失败不写 cutover 标记，继续使用原 JSON；迁移成功后如需回滚，停止派工并从迁移前快照恢复，不能把较新的 DB 状态无提示地倒灌旧 JSON。Schema 降级不可无损时采用数据库快照恢复。
+
+### 8.3 不采用的方案
+
+- **长期 JSON/SQLite 双写**：两处原子边界不同，崩溃后无法证明一致，会破坏保守恢复。
+- **Web 服务单独写库、CLI 直接改表**：会绕过统一状态机、幂等和审计。
+- **Lease 到期即重派**：可能在原 Worker 或外部副作用仍运行时重复执行。
+- **将 Herdr idle/done 直接映射 Task DONE**：没有验证和交付证据，会产生虚假完成。
+- **M1 直接重写 `teamctl.py`**：缺少兼容夹具和实机契约，回归风险过高。
+
+### 8.4 主要后果
+
+该方案增加 SQLite Schema、迁移和服务生命周期复杂度，但能保留现有 CLI 的本地使用方式，并为 Task 历史、事件、幂等和重启恢复提供确定边界。M1 的关键风险不在建表，而在旧 Member 到 Task/Attempt/Session 的映射和切换窗口；因此迁移必须单独验收，不能与 Scheduler 或 Web 一并发布。
+
+## 9. M1–M6 可执行任务图
+
+```mermaid
+flowchart LR
+    M0[M0 审批] --> M1A[M1 兼容契约与存储]
+    M1A --> M1B[M1 领域/事件/迁移/CLI]
+    M1B --> M2A[M2 Herdr Adapter + Scheduler]
+    M2A --> M2B[M2 Watcher + Recovery]
+    M1B --> M3A[M3 API 安全与查询]
+    M2B --> M3B[M3 Command/SSE/Web]
+    M2B --> M4A[M4 Workspace + Verifier]
+    M3B --> M4B[M4 Approval/PR 交付]
+    M2A --> M5A[M5 能力与 Router]
+    M3B --> M5B[M5 用量 UI]
+    M4B --> M6[M6 体验与后续 RFC]
+    M5B --> M6
+```
+
+以下任务均以一个可独立评审的 PR 为单位。每项必须保留 30 项既有回归，并按 PRD Definition of Done 提供命令、退出码、失败路径和回滚说明。
+
+### 9.1 M1 — Durable Core
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M1-01 兼容契约夹具**；依赖 M0 批准 | 记录五个 CLI 命令的 parser/default、JSON 关键字段、错误码和 Herdr argv；把现有 30 项测试标为 compatibility；增加典型 stdout/error golden 或结构断言 | 不改产品行为；现有 30 项全过；夹具能检测默认 inspect、`--no-focus`、OpenCode 局部配置、complete/release 不关 Pane | 过度锁死非公开文本；应固定语义和结构，不固定无关格式 |
+| **M1-02 包骨架与配置边界**；依赖 M1-01 | 建立 `teamcraft` 包和 `pyproject.toml`；定义 ID、UTC 时间、错误类型、配置加载边界；旧脚本仍是入口 | Python 最低版本在 CI/本地矩阵明确；import 不产生状态写入；旧命令路径和安装器仍可用 | 打包方式改变项目内 Skill 的可移植性；依赖版本过早膨胀 |
+| **M1-03 SQLite Repository/Migration v1**；依赖 M1-02 | 实现连接、WAL/外键、migration 表、事务 API、busy timeout、备份/恢复；先建 Project/Task/Agent/Attempt/Session 基础表；修正 PRD DDL 的活动 Attempt 与可空 Commit/report 证据模型 | 空库初始化、重复 migrate、并发写、事务中断、损坏/版本过新均有测试；失败无半成品；备份可恢复；ship/scout Schema 样例均可表达 | WAL 在不同文件系统语义差异；数据库路径权限；降级不可逆 |
+| **M1-04 领域状态与 DAG**；依赖 M1-03 | 实现 Task/Attempt/Session 状态机、数据库级单活动 Attempt 约束、DAG 循环路径检测、READY 推导、优先级排序和 optimistic version | 合法/非法转换均测试；循环返回具体路径；Session 消失不改变 Task ID；两个独立 DB 连接竞争时只有一个活动 Attempt | 状态枚举与现有 phase/live_state 混淆；SQLite 部分唯一索引兼容 |
+| **M1-05 Event/Command 原子性**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、同键载荷冲突、pending/running/confirmed/unknown | 状态+事件同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键返回冲突 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长 |
+| **M1-06 Legacy JSON 迁移与切换**；依赖 M1-03、M1-04、M1-05 | 冻结 v1 reader；实现备份/摘要、空/只读/多成员/unknown/损坏/中断迁移；仅在当前 Herdr Session 身份一致时 Reconcile；跨 Session 记录导入 UNKNOWN；写 cutover 标记；提供只读导出 | 原 JSON 字节不被覆盖；重复迁移幂等；成员、角色、任务、Ownership、Pane、Session、phase 可核对；跨 Session 不自动 adopt/resume/resend；失败仍能用旧路径；重启后结果一致 | 活跃成员在切换中变化；legacy 记录缺稳定 ID；映射完成语义不明确 |
+| **M1-07 共享 Command Service 与旧 CLI 桥接**；依赖 M1-05、M1-06 | 将状态查询/变更收口到服务层；旧 `teamctl.py` 变为薄兼容入口；为新 Task CRUD/依赖提供 CLI；禁止上层直写表 | 旧 CLI 契约全过；CLI 重复命令不创建重复 Attempt；新旧查询指向同一 DB 真源；无需 Web 也可管理持久 Task | CLI 与后台服务同时执行命令；兼容输出需要额外查询导致竞态 |
+
+**M1 退出门禁**：ADR-001 accepted；新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session 和 Event；迁移不覆盖旧 JSON且可回滚；DB 是切换后的唯一写入源；全部既有回归和新增事务/迁移测试通过。
+
+### 9.2 M2 — Watcher & Safe Recovery
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M2-01 Herdr Adapter 契约**；依赖 M1-07 | 从 teamctl 提取 capability/list/pane split/start/get/prompt/read/stop；统一超时、JSON shape、错误码；提供 Fake 和当前 Herdr 可选实机契约 | 现有 launch/status/resume argv 与身份核验不变；缺字段、非 UTF-8、超时、命令失败均归一化；无 Herdr 可跑离线测试 | Herdr 0.9.3 响应不是稳定协议；stop/read 在版本间差异 |
+| **M2-02 Scheduler 与 Leader Lease**；依赖 M1-05、M2-01 | 事务领取 READY Task；应用优先级、创建顺序、并发配额、Ownership/read-only；实现单 Leader Lease 和续约 | 两进程竞争只派发一次；两个非重叠任务可并行；冲突任务保持 READY/BLOCKED 并解释原因；读查询不触发派工 | Lease 时钟漂移；长事务；跨项目公平性不足 |
+| **M2-03 结构化 Brief 与完成报告**；依赖 M1-04、M2-01 | Brief 包含 Task/Attempt、目标、非目标、Ownership、依赖、验收、命令白名单、预算；定义 Worker result schema 并保留纯文本兼容 | Codex/OpenCode 均收到既有角色/责任/只读限制；缺失/非法结果不会直接完成 Task；报告可关联 Attempt | 本地模型结构化输出不稳定；Prompt 过长；旧 Harness 只支持文本 |
+| **M2-04 Deterministic Watcher**；依赖 M1-05、M2-01 | 周期读取活动 Attempt；查询 Herdr live state/最近活动；比较快照；仅变化时写 Event；维护游标和退避；空闲不调用 LLM | 相同观察不重复事件；重启后从 DB 继续；空闲期网络/LLM 调用为零；检查异常进入 unknown 而非伪健康 | 轮询频率造成负载；日志/状态噪声导致事件风暴 |
+| **M2-05 Reconcile 与 UNKNOWN 决策**；依赖 M2-02、M2-04 | 复用 terminal/native-session 核验；交叉检查 DB、Herdr、Git/结果；为继续等待、确认新 Attempt、取消、人工处理定义 Command | Prompt 回执丢失不重发；Pane 移动可验证恢复；身份不符拒绝接管；UNKNOWN 未审批不能产生新 Attempt | 证据仍不足时用户负担；错误 Git 推断可能误判完成 |
+| **M2-06 最小 P0 Verification/Approval Gate**；依赖 M1-05、M2-03、M2-05 | 建立 Verification/Approval 服务；仅运行项目批准的 argv 验证命令；report-only/scout 记录受控报告 artifact/hash。对明确选择 local-only 的窄化场景，先持有项目级验证租约、等待所有项目写入 Attempt 停止，再将允许范围复制为内容寻址的只读快照，记录 base SHA、manifest/hash 和配置版本，并仅在该快照上运行验证；持久化批准/拒绝。普通 ship 不使用共享树验证作为交付证据，保留 `VERIFYING` 或转 `NEEDS_HUMAN`，原因标记为等待 M4 workspace evidence | Worker 自报完成不能直接 DONE；无验证命令不默认 PASS；report-only/scout 可凭受控 artifact 完成；local-only 只有封存快照 hash 与验证结果一致时才可按窄化策略完成；普通 ship 在 M4 前不能进入 READY_TO_MERGE/DONE；批准/拒绝可审计且重复决定幂等；M3 暴露同一服务 | 项目级串行降低并发；系统外进程可能在封存前修改共享树；快照复制成本；artifact 可信边界；审批对象在决定前变化 |
+| **M2-07 Core/Runtime 故障注入**；依赖 M2-03、M2-05、M2-06 | 覆盖本阶段可观察的启动响应丢失、Agent 进程退出、Session 存活但卡住、重复 completed、Core 重启/事件回放、最小 Verifier 结果写入前后崩溃；把 Worktree/Git 案例留给 M4、浏览器一致性留给 M3 | 每场景记录观察证据、安全动作、人工升级、幂等边界；无重复 Pane/Prompt/Attempt/外部副作用；最小验证/审批崩溃可恢复；事件可回放 | Mock 与实机偏差；故障窗口难以稳定复现；跨阶段场景不能在 M2 伪造完成证据 |
+
+**M2 退出门禁**：后台观察不消耗 LLM Token；同一 Task 最多一个活动 Attempt；Herdr 失联或结果歧义不会盲重派；服务重启能 Reconcile；最小程序化验证和持久审批已可在 CLI 使用，Worker 自述不能完成 Task；report-only/scout 和安全封存的 local-only 快照可按各自策略验收，普通 ship 明确停在等待 M4 证据的非终态；M2-07 的 Core/Runtime 故障通过。PRD 5.6 的八类故障不在此阶段虚报全部完成，浏览器生命周期由 M3-06 验收，脏 Worktree、已提交 Commit 回执丢失和 Worktree Verifier 崩溃由 M4-02/M4-03/M4-04 验收。
+
+### 9.3 M3 — Web UI 最小控制台
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M3-01 API 安全壳**；依赖 M1-07、M2-06 | FastAPI/Uvicorn 默认绑定 `127.0.0.1`；本地随机 Session Token、Origin/CSRF、request ID、统一错误模型；静态资源边界 | 未授权/错误 Origin/CSRF 写请求拒绝；服务默认不对外网；日志不打印 Token；健康接口区分进程与依赖健康 | localhost 被误当完全可信；Token 保存/轮换体验 |
+| **M3-02 Query API 与快照**；依赖 M3-01、M2-04 | 实现 Projects、Tasks、Attempts、Agents、Events、Approvals 查询 DTO；只经 Query Service；分页、过滤、日志截断/脱敏 | API 数据与 CLI 同源；读请求不改变状态或派工；unknown/缺失用量不伪造；长日志受限 | N+1 查询；内部 Schema 泄漏；日志路径越界 |
+| **M3-03 SSE 与断线恢复**；依赖 M1-05、M3-01 | `after`/`Last-Event-ID`、心跳、批量补拉、序号缺口回快照；限制连接和 payload | 断线后无丢失/重复副作用；客户端检测缺口并重拉；SSE 只读；事件序号严格递增 | 慢客户端占资源；代理缓冲；敏感 payload |
+| **M3-04 受控 Command 与 Approval API**；依赖 M3-01、M1-05、M2-05、M2-06 | 将既有 P0 Approval Service 暴露为 API，并增加 pause/resume/cancel/retry-request；所有写请求要求 Idempotency-Key 和版本；异步返回 command ID | CLI/API 对同一审批得到同一转换；重复提交只执行一次；版本冲突 409；外部操作 202；批准前无高风险动作；拒绝有审计且不重试 | 审批 TOCTOU；批准时证据/文件集合已改变 |
+| **M3-05 最小 Web 页面**；依赖 M3-02、M3-03、M3-04 | Overview、Task list/detail、Agents、Events、Approvals；真实 API；离线/空/错误/截断状态；HTML/Markdown 净化 | 展示 Task 与 Agent 状态区别；关闭浏览器任务继续；无 Demo 数据混入真实视图；恶意日志不执行 | 前端状态缓存冒充真源；依赖/bundle 膨胀 |
+| **M3-06 浏览器 E2E 与恢复**；依赖 M3-05、M2-07 | 临时 DB+Fake Herdr；以 report-only/scout 或安全封存 local-only 快照测试创建任务→派工状态→最小验证→待审批→批准/拒绝；另测普通 ship 在缺少 M4 证据时保持非终态；覆盖浏览器断线、后端重启、重复点击、离线、长日志和恶意 HTML | Chromium E2E 可重复；CLI/Web 对同命令产生同一转换；浏览器断开不影响任务；后端重启后快照/SSE 收敛且不重复命令；普通 ship 不被 UI/API 误报完成；刷新后状态来自服务器 | E2E 脆弱；测试未覆盖真实 Herdr 时序；Demo 流程可能掩盖普通 ship 尚未闭环 |
+
+**M3 退出门禁**：API/CLI 共用状态转换；report-only/scout 与安全封存 local-only 快照的最小验证/审批闭环在 Web/CLI 一致；普通 ship 清楚显示“等待 M4 workspace/commit/diff evidence”且不能 READY_TO_MERGE/DONE。本门禁只验收控制台和受限交付类型，不宣称完整 PRD P0 ship 已交付。Web 关闭不影响后台；SSE 可续传或安全重拉；所有写命令幂等和可审计；安全测试覆盖未授权、CSRF、XSS、重复请求和路径边界；浏览器断线/后端重启场景通过。
+
+### 9.4 M4 — Workspace & Verification
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M4-01 Workspace 路径与 Diff Gate**；依赖 M2-02 | 统一真实路径、仓库根、大小写和 symlink 检查；以 NUL 分隔的 Git plumbing/status 组合收集 staged、unstaged、untracked、deleted 和 renamed 的全部路径及 rename 源/目标，不能只用会漏掉 untracked 的 `git diff --name-only -z`；将规范化后的完整变更集与 Ownership 比较并记录 base SHA | `../`、绝对路径、symlink、大小写变体和越权文件均拒绝；新增未跟踪文件、暂存/未暂存修改、删除、rename 源/目标都进入边界检查；现有合法 Ownership 保持通过 | macOS 大小写不敏感与 Linux 不同；Git porcelain/plumbing 版本差异；rename、submodule 和嵌套仓库解析 |
+| **M4-02 Worktree 生命周期**；依赖 M4-01 | 为写 Attempt 创建 `tc/<task>/<attempt>` 分支和独立目录；记录 ALLOCATED→CLEANABLE；资源命名空间；只读策略；注入“任务失败但 Worktree 有未提交改动”场景 | 两 Worker 不共享未提交代码；重启可发现/认领已记录 Worktree；失败状态不掩盖脏现场；脏、未合并、身份不明 Worktree 不自动删除 | Worktree 不是沙箱；磁盘增长；分支名碰撞 |
+| **M4-03 Worktree Verifier 增强**；依赖 M4-02、M2-06 | 在 M4-02 已登记并核验身份的 Attempt Worktree 内运行 P0 Verifier，固定受控 cwd/env/timeout，扩展 lint/test/typecheck/secret scan 和 PASS/FAIL/ERROR/SKIPPED；验证前后调用 M4-01 完整变更集检查；保留 report-only artifact 验证；注入 Verifier 完成前后服务崩溃 | Verifier 拒绝未登记、身份不符或生命周期不允许的 Worktree；UI/Task 不能注入任意 shell；无命令不默认 PASS；并发 Attempt 的验证互不污染；staged、unstaged、untracked、deleted、renamed 越界均不能通过；Verifier 恢复不丢失或重复接受结果；超时和非零码准确；日志路径限制在工件根 | 项目测试本身有副作用；秘密出现在输出；平台命令差异；Worktree 身份或生命周期记录与 Git 事实漂移 |
+| **M4-04 Commit/Diff 证据与审批绑定**；依赖 M4-02、M4-03、M3-04 | ship Verification 绑定 Attempt、Commit SHA、Diff 摘要和配置版本；代码变化使旧 PASS 失效；report-only 保留 artifact/hash；Approval 固定 proposed action；注入“Commit 已存在但完成回执丢失”场景 | 相同 SHA/报告 hash 可查询证据；回执丢失时以 Git+Session+Event 证据 Reconcile 且不重复提交；HEAD/报告改变后不能沿用通过结果；越权 Diff 或失败测试不能 READY_TO_MERGE | amend/rebase 改 SHA；大 Diff 存储成本；报告 artifact 变更检测 |
+| **M4-05 GitHub PR Adapter**；依赖 M4-04 | 探测 `gh` 和认证；显式启用 direct-PR；幂等创建/更新 PR；同步状态；merge 永远走人工批准 | 无 `gh`/未认证时安全 BLOCKED；重试不重复开 PR；创建 PR 不等于合并/DONE；默认不 push 受保护主分支 | 网络/认证失败；重复 PR；远端分支权限 |
+| **M4-06 集成冲突与安全清理**；依赖 M4-02、M4-05 | 检测 base 漂移和冲突；创建显式 integration task；清理前核验脏文件、未交付 commit、审批和路径；审计所有动作 | 冲突不强制覆盖；脏现场保留；仅 CLEANABLE 且证据齐全才可清理；失败可定位恢复 | 自动合并掩盖语义冲突；误删调查证据 |
+
+**M4 退出门禁**：并行写任务使用独立 Worktree；Diff Gate 能拒绝越权；Verifier 结果绑定 Commit 或 report artifact；失败不进入交付成功；不自动 merge，不删除脏或未交付 Worktree；至此普通 ship 才首次具备可独立验收的 workspace/commit/diff 交付证据，完整 P0 ship 闭环才可宣称成立，PRD 5.6 的八类故障也均在其真实组件存在后完成验证。
+
+### 9.5 M5 — Model Routing & Cost
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M5-01 能力注册与健康检查**；依赖 M2-01 | 为 Harness/Provider/Model 记录能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；实际选择记录到 Attempt | 探测本身有费用；版本/模型名不稳定 |
+| **M5-02 确定性 Router**；依赖 M5-01、M2-02 | 配置 local-first、任务风险、能力要求、人工覆盖；输出选择及 reason code；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不能仅因便宜走弱模型；用户覆盖有审计 | 风险分类错误；策略过度复杂 |
+| **M5-03 有界失败升级与预算**；依赖 M5-02、M2-05 | 最大 Attempt、失败分类、云端 Token 预算、升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级 | 不无限重试；UNKNOWN 不计作可自动重试失败；预算不足不调用云端；拒绝升级后不偷跑 | 不同 Provider 用量不可比；失败归因不准确 |
+| **M5-04 Usage 数据与价格来源**；依赖 M1-03、M5-01 | 记录 source、exact/estimated、input/output/cache tokens、响应数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable 而非 0；估算与实数可区分；价格可追溯生效时间 | Harness 不暴露用量；订阅额度无法折算 |
+| **M5-05 用量/成本 UI**；依赖 M3-05、M5-04 | 任务级明细、趋势和筛选；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/来源；NULL 不参与错误求和；权限和脱敏与其他页面一致 | 图表给人虚假精确感；大量明细查询慢 |
+| **M5-06 对照实验**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
+
+**M5 退出门禁**：本地 Worker 完成至少一个真实小任务；oMLX 不可用时有界阻塞或按审批升级；Router 决策可解释；成本数据区分真实、估算、缺失；对照实验可复现且不虚报收益。
+
+### 9.6 M6 — UX Polish / Optional
+
+| ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
+|---|---|---|---|
+| **M6-01 只读 DAG 可视化**；依赖 M3-05、M1-04 | React Flow 展示依赖、状态、角色和阻塞原因；大图筛选/定位；不开放拖拽编辑 | UI 与后端依赖一致；循环不可能由 UI 制造；阻塞路径可解释 | 大图性能；视觉状态与事件延迟 |
+| **M6-02 Diff/验证/时间线页面**；依赖 M4-04、M3-05 | 安全渲染 Diff、Verification、Attempt/Session/Event 时间线；截断和下载受控 | 内容转义；大日志/二进制有明确提示；Commit 与证据关联清楚 | XSS；超大工件；敏感内容 |
+| **M6-03 脱敏诊断包**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
+| **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
+| **M6-05 远程/多机独立 RFC**；依赖 M4/M5 稳定数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
+
+**M6 退出门禁**：P2 项逐项独立发布；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源。
+
+## 10. 全阶段强制门禁
+
+每个阶段除自身退出条件外，还需同时满足：
+
+1. 30 项现有测试保持通过；涉及旧 CLI/Skill 的改动必须增加兼容测试。
+2. 合法与非法状态转换、重复请求、崩溃窗口和回滚路径均有证据。
+3. 未知结果停在 UNKNOWN/NEEDS_HUMAN，不自动重发 Prompt、创建新 Attempt 或执行外部副作用。
+4. Ownership、read-only、锁、Session 身份和保守恢复语义不得以“后续补齐”为由暂时删除。
+5. 数据迁移不得覆盖用户旧 JSON；失败必须可继续使用旧版本或从快照恢复。
+6. Web/CLI 不直写数据库；所有写操作经统一 Command Service、幂等键和审计。
+7. 不把 Herdr `idle/done`、Agent 自述、PR 已创建或测试命令缺失当成 Task DONE。
+8. 不自动 merge、部署、删除脏 Worktree、push 受保护主分支或批准高风险升级。
+9. 文档只描述已验证能力；性能、兼容性、成本节省和成功率必须附实测条件。
+10. 每个 PR 小而可回滚，附变更文件、Schema/迁移、测试命令与退出码、失败场景、回滚和未完成项。
+
+## 11. 未决决策与证据缺口
+
+### 11.1 进入 M1 前需批准
+
+1. **ADR-001**：接受“SQLite 单真源、一次 cutover、不长期双写、单进程 serve + DB Leader Lease”的方向。
+2. **正式文档路径**：当前未跟踪 `doc/TEAMCRAFT_2_0_PLAN.md` 与目标 `docs/` 不一致。建议先将当前文件纳入版本控制，再用单独文档 PR 决定是否迁移；本轮不移动。
+3. **平台矩阵**：当前 README 明确 macOS/Linux，代码依赖 `fcntl`。建议 2.0 继续支持 macOS/Linux，Windows 保持非目标；需要 CI 才能确认 Linux。
+4. **最低 Python**：当前 README 的既有兼容承诺是 3.10+，PRD 只建议 3.11+。在没有依赖或安全证据要求提升前，建议 M1 继续测试并保留 Python 3.10，至少覆盖旧 Skill 和 CLI；若新 Core 必须提升到 3.11，应先提交明确 RFC、版本边界、安装错误和迁移说明，不能在包骨架任务中静默提高下限。
+5. **稳定 ID**：选择 UUIDv7/ULID/UUID4 之一并固定排序和序列化。建议 Task/Attempt 使用可排序 ULID 或 UUIDv7，Event 仍以 SQLite seq 排序。
+6. **交付策略与 DONE**：批准 `local-only`、`direct-PR`、`report-only` 的精确 DONE 条件，尤其明确“PR 已创建”是否只到 READY_TO_MERGE。
+7. **迁移活动成员策略**：建议有活动 Session 时只允许在暂停新派工并完成 Reconcile 后 cutover；无法核实时迁移为 UNKNOWN，而不是拒绝保存或假定完成。
+
+### 11.2 可在对应阶段决定
+
+- FastAPI/React/Vite 的具体版本锁定和前端包管理器；仓库当前没有依赖管理基线。
+- 本地 Session Token 的存储/轮换、浏览器引导和 CSRF 细节。
+- Worktree 根目录、分支命名冲突和磁盘保留期限。
+- Provider 用量能否可靠获取；未知值必须保持未知。
+- `gh` 的认证/远端选择和 fork 场景。
+- Watcher 默认周期和卡住阈值，应以实测而非 PRD 示例值决定。
+
+### 11.3 尚无证据，不应宣称
+
+- Herdr 0.9.3 之外版本的命令/JSON 兼容性；
+- Linux 上的 installer、`fcntl`、SQLite WAL、大小写路径和 Worktree 行为；
+- CTO、Designer、Custom Profile 的实机运行；当前记录只验证 CEO、Developer、Tester（`PROGRESS.md:42-49`、`:77-83`）；
+- oMLX 服务在故障、并发、长任务和结构化输出上的稳定性；
+- Codex/OpenCode 的精确 Token 数据来源和成本；
+- 任一成本节省比例、恢复成功率或并发 SLA；
+- GitHub PR、浏览器安全和远程访问能力。
+
+## 12. M0 退出建议
+
+M0 的代码与测试基线已经明确，现有测试全部通过，核心兼容语义、目标差距、ADR 候选、实施依赖和风险已记录。建议审查者在批准 M1 时只批准 **M1-01 兼容契约夹具**，并同时对 ADR-001、文档正式路径、平台/Python 下限和迁移活动成员策略作出决定。M1-01 完成并通过评审后，再依次启动包骨架和 SQLite Repository；不要把 M1 整体授权解释为可以同步启动 Watcher、Web、Worktree 或模型路由。
