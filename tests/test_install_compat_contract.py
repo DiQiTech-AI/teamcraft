@@ -52,7 +52,7 @@ class InstallerCompatContractTests(unittest.TestCase):
     def build_fake_source_root(self) -> Path:
         """Minimal TeamCraft-shaped source tree owned by this test."""
         root = self.base / "fakeroot"
-        skill = root / ".agents" / "skills" / "herdr-team"
+        skill = root / ".agents" / "skills" / "teamcraft"
         (skill / "scripts").mkdir(parents=True)
         (skill / "tests").mkdir(parents=True)
         (root / ".opencode" / "agents").mkdir(parents=True)
@@ -66,6 +66,25 @@ class InstallerCompatContractTests(unittest.TestCase):
         )
         (root / "opencode.example.json").write_text('{"fake": true}\n', encoding="utf-8")
         return root
+
+    def test_repository_exposes_only_teamcraft_skill_entry(self):
+        skills = REPOSITORY / ".agents" / "skills"
+        entries = sorted(path.name for path in skills.iterdir() if path.is_dir())
+        self.assertEqual(entries, ["teamcraft"])
+        skill_text = (skills / "teamcraft" / "SKILL.md").read_text(encoding="utf-8")
+        frontmatter = skill_text.split("---", 2)[1]
+        self.assertRegex(frontmatter, r"(?m)^name: teamcraft$")
+        self.assertTrue((skills / "teamcraft" / "scripts" / "teamctl.py").is_file())
+
+    def test_installer_uses_teamcraft_entry_and_preserves_runtime_name(self):
+        target = self.base / "project"
+        self.run_installer(target)
+        installed = target / ".agents" / "skills"
+        self.assertTrue((installed / "teamcraft" / "SKILL.md").is_file())
+        self.assertFalse((installed / "herdr-team").exists())
+        ignore_lines = (target / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn("/.herdr-team/", ignore_lines)
+        self.assertNotIn("/.teamcraft/", ignore_lines)
 
     def test_error_prefix_and_non_directory_target(self):
         target = self.base / "blocker"
@@ -107,7 +126,7 @@ class InstallerCompatContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = cwd / "relproj"
-        self.assertTrue(installed.joinpath(".agents/skills/herdr-team/SKILL.md").is_file())
+        self.assertTrue(installed.joinpath(".agents/skills/teamcraft/SKILL.md").is_file())
         self.assertTrue(installed.joinpath("opencode.json").is_file())
 
     def test_force_without_conflict_reports_zero_changes(self):
@@ -135,7 +154,7 @@ class InstallerCompatContractTests(unittest.TestCase):
 
     def test_source_manifest_excludes_pycache_and_junk(self):
         root = self.build_fake_source_root()
-        skill = root / ".agents" / "skills" / "herdr-team"
+        skill = root / ".agents" / "skills" / "teamcraft"
         (skill / "__pycache__").mkdir()
         (skill / "__pycache__" / "teamctl.cpython-313.pyc").write_bytes(b"\x00")
         (skill / ".DS_Store").write_bytes(b"junk")
@@ -145,8 +164,8 @@ class InstallerCompatContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = [path.relative_to(target).as_posix()
                     for path in target.rglob("*") if path.is_file()]
-        self.assertIn(".agents/skills/herdr-team/SKILL.md", installed)
-        self.assertIn(".agents/skills/herdr-team/tests/test_fake.py", installed)
+        self.assertIn(".agents/skills/teamcraft/SKILL.md", installed)
+        self.assertIn(".agents/skills/teamcraft/tests/test_fake.py", installed)
         self.assertIn(".opencode/agents/herdr-ceo.md", installed)
         self.assertIn("opencode.json", installed)
         self.assertFalse([p for p in installed if "__pycache__" in p
@@ -154,7 +173,7 @@ class InstallerCompatContractTests(unittest.TestCase):
 
     def test_source_tree_symlink_rejected(self):
         root = self.build_fake_source_root()
-        link = root / ".agents" / "skills" / "herdr-team" / "evil.txt"
+        link = root / ".agents" / "skills" / "teamcraft" / "evil.txt"
         link.symlink_to(root / "opencode.example.json")
         target = self.base / "project"
         result = self.run_installer(target, installer=root / "scripts" / "install.sh",

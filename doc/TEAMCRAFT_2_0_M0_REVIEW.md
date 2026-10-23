@@ -1,14 +1,16 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 已单独获准开工、交付并通过评审。其他任务未因依赖完成而自动获准开工；正式 cutover 尚未审批（见第 12 节）
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 已通过评审；M1-02 已单独获准开工并形成待验收实现。M1-03 及以后未获开工授权；正式 cutover 尚未审批（见第 12 节）
 >
-> 审计日期：2026-10-21；设计修订：2026-10-22；M1-01 门禁边界补充：2026-10-23
+> 报告版本：v1.2（M1-02 实施记录）
+>
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
-> 仓库基线：原始审计 `main` / `d9d95a6`；文档修订基线 `docs/teamcraft-2-0-planning` / `f841d5b`
+> 仓库基线：原始审计 `main` / `d9d95a6`；当前 M1-02 实施基线 `docs/teamcraft-2-0-planning` / `e9111c8`
 >
-> 本轮范围：架构审计、差距分析、ADR 候选和 M1–M6 实施拆解；未修改产品代码。本会话另有用户授权的 DIQI 创建、命名和 Pane 布局操作；启动 DIQI 前，主 Agent 因原 `state.json` 绑定另一 Herdr Session，手动且可逆地将其移动为归档文件。这些是编排运行变更，不属于产品实现或本报告的验证动作
+> M0 审计轮范围（历史）：架构审计、差距分析、ADR 候选和 M1–M6 实施拆解；当时未修改产品代码。该会话另有用户授权的 DIQI 创建、命名和 Pane 布局操作；启动 DIQI 前，主 Agent 因原 `state.json` 绑定另一 Herdr Session，手动且可逆地将其移动为归档文件。这些是编排运行变更，不属于产品实现或本报告的验证动作。当前 M1-02 只修改获授权的包、Skill、安装器、文档和离线测试，未操作 Herdr 会话
 
 ## 1. 审查结论
 
@@ -27,11 +29,11 @@
 
 PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、Web/API/SSE、Approval、Worktree、Verifier、GitHub PR 和成本路由均未实现。M1 不应先启动 Web 或 Worktree；应先把上述现有语义写成兼容契约，然后引入 SQLite Core，并在一次有冻结、代际栅栏和回滚条件的切换中将旧 JSON 从写入真源迁移为只读兼容视图。M2 再把直接 Herdr 调用收口为 Adapter，并增加确定性调度、观察和恢复。由于 FR-011 Verifier 和 FR-012 Approval 都是 P0，M2 还必须在 M3 Web 验收前提供面向 report-only/scout 的最小程序化验证和持久审批门禁；M4 负责 Worktree、Diff、Commit、local-only 和 direct-PR 的完整证据链。在 M4 之前，共享工作树上的验证不能证明普通 ship 产物与某个隔离执行一一对应，因此普通 ship 必须保持未交付状态，不能宣称已满足完整 P0 闭环。
 
-原始规划草案曾有文档路径不一致：实际文件位于 `doc/TEAMCRAFT_2_0_PLAN.md`，目标目录树和开工提示词却写作 `docs/TEAMCRAFT_2_0_PLAN.md`。本轮已统一为现有 `doc/` 路径，不移动文件或另建第二份 PRD；目标目录树中的其他文件仍只是未来建议。
+规划与审计文档的规范目录是 `doc/`：PRD 位于 `doc/TEAMCRAFT_2_0_PLAN.md`，本报告位于 `doc/TEAMCRAFT_2_0_M0_REVIEW.md`。早期草案中的 `docs/` 写法已修正，不再作为当前路径说明；目标目录树中的其他文档仍只是未来建议。
 
 ## 2. 审计范围与证据
 
-审计覆盖：
+M0-01 原始审计覆盖（下列 Skill 路径是当时基线；M1-02 待验收实现已迁移到 `.agents/skills/teamcraft/`）：
 
 - 产品与使用说明：`README.md`、`README.zh-CN.md`、`PROGRESS.md`；
 - Skill 契约：`.agents/skills/herdr-team/SKILL.md`；
@@ -41,7 +43,7 @@ PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、W
 - 测试：`.agents/skills/herdr-team/tests/test_teamctl.py`、`tests/test_install.py`；
 - 目标基准：`doc/TEAMCRAFT_2_0_PLAN.md`。
 
-仓库当前没有 `pyproject.toml`、Python 包目录、前端工程、CI 工作流或数据库迁移目录。跟踪文件列表与 README 给出的当前目录结构一致（`README.md:237-250`）。`.herdr-team/` 和本地 `opencode.json` 由 `.gitignore:1-2` 排除。基线测试使用临时目录，没有读取或改写项目的实际 `state.json`；但本会话在审计之外按用户授权创建、命名和移动了 DIQI Pane。启动前，主 Agent 发现原 `state.json` 绑定另一 Herdr Session，遂手动且可逆地把它移动到归档文件名，再启动 DIQI；这不是 Herdr 自动归档。因此不能笼统声称运行状态或布局完全未变。架构结论只依据受跟踪实现、PRD、测试和版本探测，不把这次编排操作当作产品能力验收。
+M0-01 原始基线没有 `pyproject.toml`、Python 包目录、前端工程、CI 工作流或数据库迁移目录。M1-02 待验收实现仅新增 `pyproject.toml` 与无副作用的最小 `teamcraft` Python 包边界；前端、CI 和数据库迁移仍不存在。`.herdr-team/` 和本地 `opencode.json` 继续由 `.gitignore:1-2` 排除。基线测试使用临时目录，没有读取或改写项目的实际 `state.json`；但 M0 会话在审计之外曾按用户授权创建、命名和移动 DIQI Pane。启动前，主 Agent 发现原 `state.json` 绑定另一 Herdr Session，遂手动且可逆地把它移动到归档文件名，再启动 DIQI；这不是 Herdr 自动归档。因此不能笼统声称该次运行状态或布局完全未变。架构结论只依据受跟踪实现、PRD、测试和版本探测，不把那次编排操作当作产品能力验收。本次 M1-02 未操作 Herdr 会话。
 
 ## 3. 当前真实架构
 
@@ -49,7 +51,7 @@ PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、W
 
 ```mermaid
 flowchart LR
-    U[用户或 CEO] --> S[herdr-team SKILL.md]
+    U[用户或 CEO] --> S[teamcraft SKILL.md]
     S --> CLI[teamctl.py CLI]
     CLI --> V[输入/Harness/路径预检]
     CLI --> JS[(.herdr-team/state.json)]
@@ -106,7 +108,7 @@ flowchart LR
 
 | 兼容面 | 当前真实行为 | 2.0 约束 | M1/M2 兼容验收 |
 |---|---|---|---|
-| Skill 入口 | `.agents/skills/herdr-team/SKILL.md` 指导 `teamctl.py` | 改名前（现状）保留原路径和命令示例；用户确认旧入口从未对外部署，目标名 `teamcraft` 由 M1-02 直接改名目录与 frontmatter 并同步 installer/README/中英文档/测试引用（决策，**未实现**），实施后只安装一个入口，旧目录路径不保留 | M1-02 前既有流程按现路径通过；M1-02 后由新路径承接相同命令语义（用户需改用新路径，不要求旧文件路径继续可用），参数/默认值/stdout JSON/退出码语义不变；新能力另加命令，不静默改义；新入口可发现/可安装，行为基线经 59 项回归迁移通过 |
+| Skill 入口 | `.agents/skills/teamcraft/SKILL.md` 指导原 `teamctl.py`；M0-01 基线路径为 `.agents/skills/herdr-team/` | M1-02 直接改名目录与 frontmatter 并同步 installer/README/测试；旧入口未对外部署，故不保留旧目录、窗口或别名 | 新路径承接相同命令语义；参数/默认值/stdout JSON/退出码不变；既有 59 项回归迁移通过并增加新入口发现/安装契约；最终状态以 M1-02 验收为准 |
 | CLI 命令 | `launch/status/resume/complete/release`（`teamctl.py:917-966`） | 旧命令至少一个可见版本稳定 | 参数、默认值、stdout JSON 关键字段、错误退出码建立 golden/contract 测试 |
 | 角色/Harness | 六类角色；`--kind` 独立选择 Harness | Core 不直接推理，仍经 Herdr | Adapter 接受现有 role/kind/agent args；未支持 kind 保持预检失败 |
 | Ownership | 精确路径或尾部 `/**`；父子范围冲突；终态释放（`:264-332`） | 保留重叠检测并加入 Task/Attempt | 同一组合法/非法输入与并发预留结果一致；新增 Diff Gate 不削弱原规则 |
@@ -157,7 +159,7 @@ flowchart LR
 
 | 组件 | 复用判断 | 建议动作 |
 |---|---|---|
-| `SKILL.md` | 直接保留，作为外部操作契约 | 先用测试固化，再逐阶段补充 2.0 命令；不要提前写成“已实现”；命名迁移：M1-02 直接 `herdr-team` → `teamcraft` 改名（目录 + frontmatter `name`）并同步 installer、README 与命令路径引用，无需双入口；`.herdr-team/` 状态目录名不随之改动 |
+| `SKILL.md` | 直接保留，作为外部操作契约 | M1-02 待验收实现已将目录与 frontmatter 改为 `teamcraft` 并同步 installer、README 与命令路径引用；不设双入口；`.herdr-team/` 状态目录名保持不变；后续只在对应能力实现后补充 2.0 命令 |
 | `teamctl` 参数与 JSON 输出 | 外部兼容面，可复用 | 保留脚本为薄入口；内部逐步转调共享 Command Service/Herdr Adapter |
 | `run_process/run_herdr` 与响应解析 | 可提取 | 移到 `adapters/herdr.py`，定义超时、错误归一化、能力探测、Fake Adapter 契约 |
 | `StateStore` | 仅用于迁移和兼容 | 冻结 version 1 读取器；SQLite 切换后不得与 DB 双主写；保留原文件快照和只读导出 |
@@ -175,7 +177,7 @@ flowchart LR
 
 ## 7. 测试与环境基线
 
-README 的正式回归入口位于 `README.md:254-265`。本轮在未修改仓库和 Herdr 运行状态的情况下执行：
+以下是 M0-01 原始测试基线；当时 README 的回归入口位于 `README.md:254-265`，并在未修改仓库和 Herdr 运行状态的情况下执行：
 
 | 命令 | 退出码 | 结果 |
 |---|---:|---|
@@ -291,7 +293,7 @@ flowchart LR
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M1-01 兼容契约夹具（已验收）**；依赖 M0 审查/ADR-001 原则接受及单独开工授权 | 记录五个 CLI 命令的 parser/default、JSON 关键字段、错误码和 Herdr argv；把现有 30 项测试标为 compatibility；增加典型 stdout/error golden 或结构断言；为 JSON writer、锁、`version=1`、无 generation fence 的现状建立只读 fixture/威胁用例清单，不在本任务实现迁移 | 不改产品行为；现有 30 项全过；夹具能检测默认 inspect、`--no-focus`、OpenCode 局部配置、complete/release 不关 Pane；明确证明当前旧入口在载入后可继续写 JSON，不能误标成已有 fence；交付与测试证据见第 12 节 | 过度锁死非公开文本；威胁 fixture 被误当 cutover 实现 |
-| **M1-02 包骨架、配置边界与 Skill 命名迁移**；依赖 M1-01 | 建立 `teamcraft` 包和 `pyproject.toml`；定义 ID、UTC 时间、错误类型、配置加载边界；旧脚本仍是入口；用户已确认旧 Skill 入口从未对外部署，故直接改名 `.agents/skills/herdr-team/` → `.agents/skills/teamcraft/`，frontmatter `name` 改 `teamcraft`，不引入双入口、兼容窗口或别名；同步更新 installer、README、中英命令路径与测试引用；`teamcraft/` Python 包与 `.agents/skills/teamcraft/` Skill 目录明确区分；`.herdr-team/` 运行状态目录不动（归 M1-06/M1-07），其备份、冻结、旧进程故障测试与安全门禁继续有效 | Python 最低版本在 CI/本地矩阵明确；import 不产生状态写入；安装器预检/幂等/dry-run/配置保留覆盖新路径；以 M1-01 为行为基线，迁移测试位置与命令引用后 59 项（40 teamctl 契约 + 19 安装器）回归全部通过，不要求保留旧文件/命令路径；新增新入口发现/安装契约测试；Herdr/Ownership/read-only/Session 身份/保守恢复语义不变 | 打包方式改变项目内 Skill 的可移植性；依赖版本过早膨胀；外部私有文档或脚本中的旧路径引用会失效——以仓库内 grep 审计、README 中英文同步与迁移说明缓解 |
+| **M1-02 包骨架、配置边界与 Skill 命名迁移**；依赖 M1-01 | 建立 `teamcraft` 包和 `pyproject.toml`；定义 ID、UTC 时间、错误类型、配置加载边界；旧脚本仍是入口；用户已确认旧 Skill 入口从未对外部署，故直接改名 `.agents/skills/herdr-team/` → `.agents/skills/teamcraft/`，frontmatter `name` 改 `teamcraft`，不引入双入口、兼容窗口或别名；同步更新 installer、README、中英命令路径与测试引用；`teamcraft/` Python 包与 `.agents/skills/teamcraft/` Skill 目录明确区分；`.herdr-team/` 运行状态目录不动（归 M1-06/M1-07），其备份、冻结、旧进程故障测试与安全门禁继续有效 | Python 最低版本在 CI/本地矩阵明确；import 不产生状态写入；安装器预检/幂等/dry-run/配置保留覆盖新路径；以 M1-01 为行为基线，59 项既有回归（40 teamctl + 19 installer）迁移后全部通过；另验收新入口发现/安装契约与最小 Core 边界；不要求保留旧文件/命令路径；Herdr/Ownership/read-only/Session 身份/保守恢复语义不变 | 打包方式改变项目内 Skill 的可移植性；依赖版本过早膨胀；外部私有文档或脚本中的旧路径引用会失效——以仓库内 grep 审计、README 中英文同步与迁移说明缓解 |
 | **M1-03 SQLite Repository/Migration v1**；依赖 M1-02 | 实现连接、WAL/外键、migration 表、事务 API、busy timeout；先建 Project/Task/Agent/Attempt/Session 基础表；修正 PRD DDL 的活动 Attempt 与可空 Commit/report 证据模型；实现 Online Backup API/等价一致性备份、manifest、保留策略入口和恢复检查 | 空库初始化、重复 migrate、并发写、事务中断、损坏、磁盘路径不支持和 schema 版本过新均有测试；版本过新拒绝写；WAL 活跃备份可恢复且通过 integrity check；禁止只复制主 DB；ship/scout Schema 样例均可表达 | WAL/锁在不同文件系统语义差异；误放网络盘；保留策略删掉审计证据；降级不可逆 |
 | **M1-04 领域状态与 DAG**；依赖 M1-03 | 实现 Task/Attempt/Session 状态机、数据库级单活动 Attempt 约束、DAG 循环路径检测、READY 推导、优先级排序和 optimistic version | 合法/非法转换均测试；循环返回具体路径；Session 消失不改变 Task ID；两个独立 DB 连接竞争时只有一个活动 Attempt | 状态枚举与现有 phase/live_state 混淆；SQLite 部分唯一索引兼容 |
 | **M1-05 Event/Command 原子性**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、载荷/evidence version、TTL、同键载荷冲突和 pending/running/confirmed/unknown/expired；定义 Command Service API 和 CAS | 状态+事件+Command 同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键冲突；证据变化使待执行命令失效 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长 |
@@ -410,7 +412,8 @@ flowchart LR
 - 保留现有 Herdr/Skill 行为语义、Ownership/read-only、锁、Session 身份和 inspect-first 恢复语义（M1-02 Skill 目录改名不保留旧路径，但承接相同语义）。
 - SQLite 目标是单机本地磁盘上的单一真源；不长期双写，不能 fence 旧 writer 就不 cutover。
 - 旧 CLI guard 必须先于实际切换发布；M1-06 做只读排练/故障矩阵，M1-07 才允许条件切换。
-- Skill 命名迁移 `herdr-team` → `teamcraft`（2026-10-23 确认）：用户确认旧 Skill 入口从未对外部署，无需双版本迁移或别名；M1-02 直接改名目录与 frontmatter `name`，同步 installer、README、中英命令路径与测试引用，实施后只安装一个入口；`.herdr-team/` 运行状态目录不随之改名（归 M1-06/M1-07），其备份、冻结、旧进程故障测试与安全门禁继续有效。本条为设计决策，尚未实现。
+- Skill 命名迁移 `herdr-team` → `teamcraft`（2026-10-23 确认）：用户确认旧 Skill 入口从未对外部署，无需双版本迁移或别名；M1-02 待验收实现已直接改名目录与 frontmatter `name`，同步 installer、README、中英命令路径与测试引用，只安装一个入口；`.herdr-team/` 运行状态目录未改名。备份、冻结、旧进程故障测试与安全门禁仍归 M1-06/M1-07。
+- Python Core 最低版本保持 3.10，与现有 CLI 支持范围一致；`pyproject.toml` 固定该边界，M1-02 本地回归记录实际解释器版本。Linux CI 验证仍是未完成证据，不据此宣称跨平台通过。
 - CLI/Web 只作适配器；所有写入经 Command Service，所有外部副作用经持久 Command 和唯一 fenced Leader。
 - report-only/scout 在 M2/M3 完整验收；local-only 与 direct-PR 的 Worktree/Commit/Diff/PR 交付集中到 M4，不建设 M2 共享树快照。
 - DONE、Verifier、Approval、PR created 和 PR merged 分开；Approval 绑定 evidence version，变化后失效。
@@ -420,10 +423,9 @@ flowchart LR
 ### 11.3 未解决决策（按最晚决策点）
 
 1. **正式 cutover 审批（M1-07 实际切换前）**：在 M1-06 故障矩阵、备份恢复、旧 writer 静止性证明与 M1-07 Guard 验收后，单独审查切换窗口与恢复方案；ADR-001 的原则接受不能替代该审批。
-2. **平台/Python（M1-02 前）**：当前 README 承诺 macOS/Linux、Python 3.10+，代码依赖 `fcntl`（`README.md:53-59`）。建议保持 3.10 兼容，除非依赖证据要求提升；Linux 仍需 CI。
-3. **稳定 ID（M1-03/04 前）**：在 UUIDv7/ULID/UUID4 中选择并固定排序/序列化；Event 继续以 SQLite seq 排序。
-4. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
-5. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
+2. **稳定 ID（M1-03/04 前）**：在 UUIDv7/ULID/UUID4 中选择并固定排序/序列化；M1-02 仅定义 opaque ID 与注入式生成边界，不提前选择格式；Event 继续以 SQLite seq 排序。
+3. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
+4. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
 
 ### 11.4 推迟解决的决策
 
@@ -457,17 +459,19 @@ flowchart LR
 | M0-01 代码运行语义或真实 Herdr 实机兼容的完整证明 | **未宣称完成** | 第 7 节的 30 项原始离线回归只支持本机/Mock 基线；第 11.5 节列出未验证范围 | 无 |
 | M0-02–M0-05 的逐项独立完成验收 | **未登记为完成** | 本报告含兼容矩阵、30 项测试摘要、环境探测与 ADR，但不以此替代各项独立交付记录；最低 Herdr/OpenCode/Codex 版本及 Linux 行为仍未证实 | 无逐项验收 Commit |
 
-M0-01 的审计结论是文档证据，不等于产品功能实现。`M1-01` 另由 `.agents/skills/herdr-team/tests/test_compat_contract.py`、`tests/test_install_compat_contract.py` 固定 CLI、Herdr、Ownership、恢复和安装器契约，对应 `2087a00c1ee4db77cf199c3212669807c6180e8e`；提交记录给出 40/40 teamctl、19/19 installer 离线测试通过。两项任务不可互换编号或交付证据。
+M0-01 的审计结论是文档证据，不等于产品功能实现。`M1-01` 在提交 `2087a00c1ee4db77cf199c3212669807c6180e8e` 中由当时的 `.agents/skills/herdr-team/tests/test_compat_contract.py` 与 `tests/test_install_compat_contract.py` 固定 CLI、Herdr、Ownership、恢复和安装器契约，给出 40/40 teamctl、19/19 installer 离线测试通过；M1-02 仅把前者迁移到 `.agents/skills/teamcraft/tests/`，不改变其断言语义。两项任务不可互换编号或交付证据。
+
+M1-02 待验收工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/tests` 得到 40/40，通过根目录 `tests` 得到 28/28（21 项安装器与 7 项最小 Core 边界），合计 68/68、退出码均为 0。该结果包含 59 项既有契约、2 项新 Skill 发现/安装契约和 7 项新 Core 边界测试；它是完成验收输入，不在用户评审或最终 Commit 前把 M1-02 标记为已验收。
 
 ### 12.2 分层决策记录
 
 | 决策类型 | 当前状态 | 证据与边界 |
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
-| 任务开工授权 | **M1-01 曾获单独授权；M1-02 及以后未自动授权** | 授权只覆盖兼容契约夹具及其直接文档边界；依赖满足不是开工许可 |
-| 任务完成验收 | **M1-01 已交付并经用户评审验收** | 上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M0-01 的文档交付状态见 12.1；不据此宣称 M1 阶段完成 |
+| 任务开工授权 | **M1-01、M1-02 分别获单独授权；M1-03 及以后未授权** | M1-02 授权只覆盖第 9.1 节的包/配置边界、Skill 改名、相关文档与契约测试；依赖满足不是后续开工许可 |
+| 任务完成验收 | **M1-01 已验收；M1-02 待验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 须以本次完整回归、新入口契约和最终 Commit 为证据，不在提交/用户评审前标记完成 |
 | 正式数据迁移 / cutover 审批 | **尚未批准** | M1-06 仅排练，M1-07 必须先验收 Guard、备份恢复、静止性与故障矩阵，再单独批准实际切换；当前没有旧进程运行的时点确认不代替切换日证明 |
 
 ### 12.3 下一任务边界
 
-依第 9.1 节的依赖图，`M1-02`（包骨架、配置边界与 Skill 技术名改为 `teamcraft`）是下一项具备前置条件的候选任务，**本次文档修订不授权也不启动它**。它只应处理包/配置边界、Skill 目录与 frontmatter、安装器/文档/测试引用，并保持 CLI、Herdr、Ownership、read-only、Session 身份和保守恢复语义及 59 项现有测试；不得顺带做 SQLite 迁移、Watcher、Web、Worktree、模型 Router，亦不得操作正在运行的 Herdr 会话。正式 cutover 继续独立审批。
+当前唯一后续动作是评审并验收 `M1-02` 的待验收实现：核对最小包边界、Skill 新入口、安装器和全部回归证据，并确认 CLI、Herdr、Ownership、read-only、Session 身份及保守恢复语义未变。`M1-03` 虽在依赖图中紧随其后，但尚未获开工授权；不得执行 SQLite 迁移、Watcher、Web、Worktree、模型 Router，亦不得操作正在运行的 Herdr 会话。正式 cutover 继续独立审批。

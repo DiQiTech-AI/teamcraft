@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
-    roots = [source_root / ".agents" / "skills" / "herdr-team"]
+    roots = [source_root / ".agents" / "skills" / "teamcraft"]
     sources: list[Path] = []
     for root in roots:
         if not root.is_dir() or root.is_symlink():

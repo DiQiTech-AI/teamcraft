@@ -1,9 +1,9 @@
 ---
-name: herdr-team
+name: teamcraft
 description: Build and coordinate a stateful software delivery team in the current Herdr tab, with a CEO orchestrator and on-demand built-in or custom specialist agents. Use when the user asks to assemble, recover, inspect, or manage a development team through Herdr; do not use for ordinary single-agent delegation.
 ---
 
-# Herdr Team
+# TeamCraft
 
 Create a task-specific team in sibling panes while preserving the current tab, project directory, and user focus.
 
@@ -37,7 +37,7 @@ The CEO must collect changed-file lists and verification evidence, review result
 Launch a CEO from the project root:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role ceo --kind codex --name ceo \
   --task "Deliver the requested feature and create only needed workers."
 ```
@@ -45,7 +45,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 Launch an OpenCode developer with two separate claims:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role developer --kind opencode --name api_dev \
   --ownership 'src/api/**' \
   --ownership 'tests/api/**' \
@@ -56,7 +56,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 Launch a read-only tester:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role tester --kind codex --name acceptance \
   --read-only --task "Run the acceptance checks and report evidence; do not edit."
 ```
@@ -64,7 +64,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 For another specialty:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role custom --responsibility "Own deployment automation and release evidence." \
   --kind codex --name release_eng --ownership 'deploy/**' \
   --task "Prepare staging; acceptance: the dry run succeeds."
@@ -79,7 +79,7 @@ For OpenCode, project profiles live in `.opencode/agents/herdr-*.md`. The helper
 Inspect recorded phase and actual live state:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py status
+python3 .agents/skills/teamcraft/scripts/teamctl.py status
 ```
 
 `agent_state` reports `blocked`, `working`, `idle`, `done`, `unknown`, or `missing`. When blocked, inspect `herdr agent get` and `herdr agent read`; do not blindly approve, resend, or retry.
@@ -89,14 +89,14 @@ Treat both `idle` and `done` as settled completion states. Do not wait only for 
 Recover a partial launch without creating another pane:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume api_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume api_dev
 ```
 
 Resume verifies the recorded terminal ID and native agent session before adopting a live occupant. It reuses an available recorded shell pane after a failed start. Its default `--prompt-action inspect` never resends a possibly delivered task. After inspection, choose explicitly:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume api_dev --prompt-action send
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume api_dev --prompt-action skip
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume api_dev --prompt-action send
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume api_dev --prompt-action skip
 ```
 
 If a split timed out, inspect the layout first; use `--split-action retry` only when no pane was created. A timeout does not prove failure.
@@ -104,8 +104,8 @@ If a split timed out, inspect the layout first; use `--split-action retry` only 
 Release ownership without closing the pane, or mark the assignment complete:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py release api_dev
-python3 .agents/skills/herdr-team/scripts/teamctl.py complete api_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py release api_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py complete api_dev
 ```
 
 Neither operation closes a pane or terminates an agent. Do not pre-create idle specialists, overlap active edit claims, or infer completion from `unknown`.

@@ -6,7 +6,7 @@
 
 TeamCraft is a stateful software team orchestration skill built on Herdr. It starts with a chief engineer acting as CEO. The CEO can then assemble CTO, developer, designer, tester, or custom specialists as the task requires. Each member runs in an independent pane and works toward delivery with an explicit role, file scope, and acceptance evidence.
 
-The skill's technical name is `herdr-team`. It provides executable tools for managing a team's lifecycle rather than an unsupervised, fully autonomous delivery system. The CEO handles decomposition, delegation, and review; a human should still confirm final integration and release decisions.
+The skill's technical name is `teamcraft`. It provides executable tools for managing a team's lifecycle rather than an unsupervised, fully autonomous delivery system. The CEO handles decomposition, delegation, and review; a human should still confirm final integration and release decisions.
 
 ## What it solves
 
@@ -90,7 +90,7 @@ Preview the changes without writing files:
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-The installer copies the project-local `herdr-team` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.herdr-team/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
+The installer copies the project-local `teamcraft` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.herdr-team/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
 
 By default, an existing managed file with different content causes an error and is not overwritten. Use `--force` only when you intend to replace TeamCraft-managed skill, role, or template files:
 
@@ -122,7 +122,7 @@ herdr --skill
 This example asks the CEO to deliver a plain HTML to-do page. `--agent-arg=--standalone` is passed through to OpenCode unchanged:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role ceo \
   --kind opencode \
   --name ceo \
@@ -130,12 +130,12 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --agent-arg=--standalone
 ```
 
-`teamctl` creates a sibling pane in the current Herdr tab, loads the `herdr-ceo` OpenCode profile, and submits the task. The CEO can then use the same `herdr-team` skill to create the workers it needs.
+`teamctl` creates a sibling pane in the current Herdr tab, loads the `herdr-ceo` OpenCode profile, and submits the task. The CEO can then use the same `teamcraft` skill to create the workers it needs.
 
 For example, the CEO can create a developer with:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role developer \
   --kind opencode \
   --name web_dev \
@@ -147,7 +147,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 Then create a tester instructed not to modify files:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role tester \
   --kind opencode \
   --name acceptance \
@@ -178,43 +178,43 @@ Ownership is coordination metadata that prevents conflicting assignments. It is 
 Inspect the team and each member's live state:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py status
+python3 .agents/skills/teamcraft/scripts/teamctl.py status
 ```
 
 Resume an incomplete launch. The default action only inspects state and does not resubmit the task:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev
 ```
 
 After confirming the task never ran or must be sent again, choose that action explicitly:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action send
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --prompt-action send
 ```
 
 If the task was already delivered, skip resubmission:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action skip
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --prompt-action skip
 ```
 
 When the result of a pane split is ambiguous, inspect the current layout first. Retry only after confirming that no pane was created:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --split-action retry
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --split-action retry
 ```
 
 Archive a task and release its ownership after acceptance:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py complete web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py complete web_dev
 ```
 
 Release the ownership without marking the task complete:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py release web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 ```
 
 Neither `complete` nor `release` closes the pane or terminates the agent. They reject members in `working`, `blocked`, or `unknown` state. Use `--force` only after a human confirms that the member will not make further conflicting changes.
@@ -224,7 +224,7 @@ Neither `complete` nor `release` closes the pane or terminates the agent. They r
 Roles and harnesses are independent. Replace `--kind opencode` with another type supported by the active Herdr installation. For example:
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role tester \
   --kind codex \
   --name api_review \
@@ -238,11 +238,13 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 
 ```text
 .
-├── .agents/skills/herdr-team/
+├── .agents/skills/teamcraft/
 │   ├── SKILL.md                 # Skill rules and operating guide
 │   ├── scripts/teamctl.py       # Launch, status, recovery, and archival tool
 │   └── tests/test_teamctl.py    # Regression tests
 ├── .opencode/agents/            # CEO, CTO, developer, designer, tester, and custom profiles
+├── teamcraft/                    # Side-effect-free Python core boundaries (M1-02)
+├── pyproject.toml                # Package metadata; Python 3.10+ boundary
 ├── examples/team-demo/          # Live collaboration example
 ├── scripts/install.sh           # Project-local installer
 ├── opencode.example.json        # OpenCode/oMLX example configuration
@@ -256,13 +258,13 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 Run the regression suite with:
 
 ```bash
-python3 -B -m unittest discover -s .agents/skills/herdr-team/tests -v
+python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-The current 20 tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, and invalid input.
+The current 40 Skill tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, CLI contracts, and invalid input.
 
-The installer has a separate suite covering first installation, repeated installation, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, and Git ignore rules.
+The repository test suite contains 21 installer tests covering first installation, repeated installation, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, Git ignore rules, and the `teamcraft` Skill entry. It also contains 7 tests for the minimal Python package's ID, UTC clock, error, configuration, and side-effect-free import boundaries.
 
 The project has also completed one live OpenCode workflow: the CEO created a developer and a read-only tester, the developer generated [`examples/team-demo/index.html`](examples/team-demo/index.html), and the tester completed acceptance. During that run, the CEO's final polling loop did not converge on its own; the controlling agent stopped the loop manually and completed archival. See [`PROGRESS.md`](PROGRESS.md) for the detailed record.
 

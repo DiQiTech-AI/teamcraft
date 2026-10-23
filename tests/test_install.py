@@ -34,8 +34,8 @@ class InstallScriptTests(unittest.TestCase):
             self.run_installer(target)
 
             self.assertEqual(
-                (target / ".agents/skills/herdr-team/SKILL.md").read_bytes(),
-                (REPOSITORY / ".agents/skills/herdr-team/SKILL.md").read_bytes(),
+                (target / ".agents/skills/teamcraft/SKILL.md").read_bytes(),
+                (REPOSITORY / ".agents/skills/teamcraft/SKILL.md").read_bytes(),
             )
             self.assertTrue(target.joinpath(".opencode/agents/herdr-ceo.md").is_file())
             self.assertEqual(
@@ -125,7 +125,7 @@ class InstallScriptTests(unittest.TestCase):
 
             self.run_installer(target)
 
-            self.assertTrue(target.joinpath(".agents/skills/herdr-team/SKILL.md").is_file())
+            self.assertTrue(target.joinpath(".agents/skills/teamcraft/SKILL.md").is_file())
 
     def test_symbolic_link_destination_is_rejected_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

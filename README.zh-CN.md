@@ -6,7 +6,7 @@
 
 团匠是一个基于 Herdr 的有状态开发团队编排 Skill。它先建立一名总工 CEO，再由 CEO 按任务需要组织 CTO、研发、设计、测试或自定义专家；每名成员在独立 pane 中运行，通过明确的职责、文件范围和验收证据共同完成交付。
 
-项目当前的 Skill 技术名为 `herdr-team`。它提供了一套可执行的团队生命周期工具，而不是一个无需监督的全自动交付系统：CEO 负责拆解、派工和复核，最终集成与发布决策仍应由人确认。
+项目当前的 Skill 技术名为 `teamcraft`。它提供了一套可执行的团队生命周期工具，而不是一个无需监督的全自动交付系统：CEO 负责拆解、派工和复核，最终集成与发布决策仍应由人确认。
 
 ## 它解决什么问题
 
@@ -90,7 +90,7 @@ bash scripts/install.sh
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-安装脚本会复制项目本地的 `herdr-team` Skill、六个 OpenCode 角色配置和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本还会在保留目标项目 `.gitignore` 原有内容的基础上，加入 `/.herdr-team/` 和 `/opencode.json`。
+安装脚本会复制项目本地的 `teamcraft` Skill、六个 OpenCode 角色配置和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本还会在保留目标项目 `.gitignore` 原有内容的基础上，加入 `/.herdr-team/` 和 `/opencode.json`。
 
 默认情况下，如果已存在的托管文件内容不同，安装会报错且不会覆盖。只有确定要替换团匠管理的 Skill、角色或模板文件时才使用 `--force`：
 
@@ -122,7 +122,7 @@ herdr --skill
 下面的例子让 CEO 负责实现一个纯 HTML 待办页面。`--agent-arg=--standalone` 会原样传给 OpenCode：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role ceo \
   --kind opencode \
   --name ceo \
@@ -130,12 +130,12 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
   --agent-arg=--standalone
 ```
 
-`teamctl` 会在当前 Herdr tab 中创建 sibling pane、加载 `herdr-ceo` OpenCode 角色并提交任务。CEO 随后可以通过同一个 `herdr-team` Skill 创建所需 worker。
+`teamctl` 会在当前 Herdr tab 中创建 sibling pane、加载 `herdr-ceo` OpenCode 角色并提交任务。CEO 随后可以通过同一个 `teamcraft` Skill 创建所需 worker。
 
 例如，CEO 创建研发成员时可以执行：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role developer \
   --kind opencode \
   --name web_dev \
@@ -147,7 +147,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 再创建一名不修改文件的验收成员：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role tester \
   --kind opencode \
   --name acceptance \
@@ -178,43 +178,43 @@ Ownership 是协作元数据，用来防止派工范围冲突；它不是操作�
 查看团队及成员实时状态：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py status
+python3 .agents/skills/teamcraft/scripts/teamctl.py status
 ```
 
 恢复未完成的创建流程，默认只检查，不重复提交任务：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev
 ```
 
 检查后确认任务从未执行或确实需要重发时，再明确选择：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action send
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --prompt-action send
 ```
 
 如果任务已经送达，可跳过重发：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --prompt-action skip
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --prompt-action skip
 ```
 
 当 pane split 的结果不明确时，先查看当前布局。只有确认没有创建 pane 后才重试：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume web_dev --split-action retry
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume web_dev --split-action retry
 ```
 
 验收完成后归档任务并释放 ownership：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py complete web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py complete web_dev
 ```
 
 仅释放责任范围而不标记完成：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py release web_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 ```
 
 `complete` 和 `release` 都不会关闭 pane 或终止 Agent。成员处于 `working`、`blocked` 或 `unknown` 时会拒绝操作；`--force` 只应在人工确认该成员不会继续产生冲突修改后使用。
@@ -224,7 +224,7 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py release web_dev
 角色和 harness 是独立的。将 `--kind opencode` 换成当前 Herdr 支持的其他类型即可，例如：
 
 ```bash
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role tester \
   --kind codex \
   --name api_review \
@@ -238,11 +238,13 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 
 ```text
 .
-├── .agents/skills/herdr-team/
+├── .agents/skills/teamcraft/
 │   ├── SKILL.md                 # Skill 规则与操作指南
 │   ├── scripts/teamctl.py       # 启动、状态、恢复和归档工具
 │   └── tests/test_teamctl.py    # 回归测试
 ├── .opencode/agents/            # CEO、CTO、研发、设计、测试和自定义角色
+├── teamcraft/                    # 无导入副作用的 Python Core 边界（M1-02）
+├── pyproject.toml                # 包元数据与 Python 3.10+ 边界
 ├── examples/team-demo/          # 实机协作示例
 ├── scripts/install.sh           # 项目本地安装脚本
 ├── opencode.example.json        # 可复制的 OpenCode/oMLX 示例配置
@@ -256,13 +258,13 @@ python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
 运行回归测试：
 
 ```bash
-python3 -B -m unittest discover -s .agents/skills/herdr-team/tests -v
+python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-团队编排有 20 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并和输入错误等场景。
+Skill 现有 40 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并、CLI 契约和输入错误等场景。
 
-安装脚本另有独立测试，覆盖首次安装、重复安装、配置保留、冲突、预览模式、含空格路径、符号链接和 Git 忽略规则。
+仓库测试包含 21 项安装器测试，覆盖首次安装、重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则和 `teamcraft` Skill 新入口；另有 7 项最小 Python 包边界测试，覆盖 ID、UTC Clock、错误、配置加载和无导入副作用。
 
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 

@@ -2,11 +2,11 @@
 
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
-> **版本**：v1.0（规划草案）  
-> **日期**：2026-10-21  
+> **版本**：v1.1（M1-02 实施修订）
+> **日期**：2026-10-23
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已交付并通过评审；其余目标能力不得理解为已实现或已获开工授权。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已获开工授权并形成待验收实现。M1-03 及以后未获授权，目标能力不得理解为已实现。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
 ---
 
@@ -14,8 +14,8 @@
 
 如果你是接手本文件的编码 Agent，请依次遵守：
 
-1. **先审计现状，后编写代码。** 阅读 `README.md`、`README.zh-CN.md`、`PROGRESS.md`、`.agents/skills/herdr-team/`、`scripts/`、`tests/` 和现有配置。本文的文件路径、命令和接口是**目标设计**，不得假设已在代码中存在。
-2. **禁止推倒重写。** 必须保持现有 Skill 的 Herdr 会话交互、CEO/CTO/Developer/Designer/Tester 角色、Ownership 校验、read-only 成员、状态查询、文件锁和保守恢复语义。Skill 技术名按已接受设计在 M1-02 从 `herdr-team` 直接改为 `teamcraft`；旧入口未对外部署，无需为目录名建立双版本服务。其他不兼容变更须先审查。
+1. **先审计现状，后编写代码。** 阅读 `README.md`、`README.zh-CN.md`、`PROGRESS.md`、`.agents/skills/teamcraft/`、`scripts/`、`tests/` 和现有配置。本文的文件路径、命令和接口是**目标设计**，不得假设已在代码中存在。
+2. **禁止推倒重写。** 必须保持现有 Skill 的 Herdr 会话交互、CEO/CTO/Developer/Designer/Tester 角色、Ownership 校验、read-only 成员、状态查询、文件锁和保守恢复语义。M1-02 已按已接受设计把未对外部署的 Skill 技术名从 `herdr-team` 直接改为 `teamcraft`，不保留旧目录入口；该目录变化不改变 CLI 或 `.herdr-team/` 运行状态语义。其他不兼容变更须先审查。
 3. **优先交付最小纵向闭环。** 一次实现一个可测的端到端切片，不得同时铺开所有后端、Web UI、模型路由、GitHub 自动化。
 4. **确定性编排。** 状态转换、租约、任务依赖、去重、审批、Worktree 生命周期、校验门禁由代码控制；LLM 只负责规划、生成、诊断和建议。
 5. **安全默认。** 未知任务结果不得自动重复派发；没有人工批准不得合并主分支、部署、删除含未提交修改的 Worktree、触发高风险外部副作用。
@@ -37,9 +37,9 @@ TeamCraft 2.0 是一个 **local-first、single-user、failure-resilient、cost-a
 
 ### 1.1 已有公开能力（待开发时再次逐项核对）
 
-根据 TeamCraft GitHub README（2026-10-21 查阅）：
+M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M1-02 待验收实现只把该入口改名为 `teamcraft`，下列既有能力与运行语义未变。按当前工作树：
 
-- 通过 `herdr-team` Skill 管理团队，默认仅启动 CEO，按需启动 CTO、Developer、Designer、Tester 或自定义专家。
+- 通过 `teamcraft` Skill 管理团队，默认仅启动 CEO，按需启动 CTO、Developer、Designer、Tester 或自定义专家。
 - 角色责任和 Agent Harness 分离：可通过 Herdr 支持的 Codex、OpenCode 等 Harness 运行。
 - 修改代码成员声明项目内相对路径 Ownership；活动成员的重叠范围被拒绝；只读成员可不占用编辑范围。
 - `.herdr-team/state.json` 保存成员、Pane、任务、Ownership、执行阶段等信息。
@@ -160,7 +160,7 @@ flowchart TB
 
 | 层 | 首选 | 说明 |
 |---|---|---|
-| Core | Python 3.11+ 标准库优先 | 保持当前项目生态；版本最终以仓库 CI 为准 |
+| Core | Python 3.10+ 标准库优先 | 与现有 CLI 支持范围一致；最低版本由 `pyproject.toml` 固定，Linux CI 证据仍待补齐 |
 | Storage | SQLite（WAL） | 单机 ACID、外键、迁移、事务事件 |
 | HTTP API | FastAPI + Uvicorn | 单服务即可提供 API/SSE/静态页 |
 | Web | React + TypeScript + Vite | 桌面优先、响应式、无独立生产 Node 服务 |
@@ -605,9 +605,9 @@ GET    /api/v1/usage?project_id=&range=
 
 ## 10. 项目代码组织建议
 
-> 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与现有 Skill 入口路径，采用渐进式迁移。M1-02 之后保留的是 CLI/Skill 行为与语义，而非旧目录路径——Skill 目录将改名为 `.agents/skills/teamcraft/`，旧路径不保留（见下条）。
+> 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与 `.agents/skills/teamcraft/` Skill 入口，采用渐进式迁移。M1-02 只建立最小 Python 包边界并迁移 Skill 技术名，未提前实现存储、调度、Web 或模型路由。
 >
-> Skill 技术名演进方向：`herdr-team` → `teamcraft`（2026-10-23 决策，**尚未实现**）。用户确认旧 Skill 入口从未对外部署，无需双版本迁移、兼容窗口或别名：M1-02 直接把仓库内 `.agents/skills/herdr-team/` 改名为 `.agents/skills/teamcraft/`，Skill frontmatter `name` 改为 `teamcraft`，并同步 installer、README、中英命令路径与测试引用；实施后只安装一个 Skill 入口。`.herdr-team/` 运行状态目录不随此改名，归 M1-06/M1-07 迁移决策。
+> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 待验收实现中落地：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧目录、兼容窗口或别名。`.herdr-team/` 运行状态目录保持原名；JSON→SQLite cutover 仍归 M1-06/M1-07，且未在 M1-02 执行。
 
 ```text
 teamcraft/
@@ -619,7 +619,7 @@ teamcraft/
 │   ├── architecture.md
 │   ├── api.md
 │   └── migration.md
-├── .agents/skills/teamcraft/    # Skill 入口（M1-02 由 herdr-team 改名，尚未实现）
+├── .agents/skills/teamcraft/    # 当前 Skill 入口（M1-02 待验收实现）
 ├── scripts/                    # 兼容现有脚本
 ├── teamcraft/                  # Python 代码包（区别于上面的 Skill 目录）
 │   ├── core/
@@ -667,7 +667,7 @@ teamcraft/
 - 初期 **读取旧 JSON → 建库 → 校验 → 切换单一写入源**。不建议长期 JSON/SQLite 双主写入；必要的兼容导出应为只读派生。
 - 切换前停止新派工或持有全局迁移锁；如果有活动会话，先记录 Session 映射并对恢复状态做显式 Reconcile。
 - 每个版本的 Schema 都要有版本记录、上行迁移、可行时的回滚策略；无法无损回滚时提供快照恢复。
-- 兼容命令执行行为、状态字段语义和错误码。任何弃用命令至少在一个可见版本给出警告。
+- 兼容命令执行行为、状态字段语义和错误码。任何弃用 CLI 命令至少在一个可见版本给出警告。M1-02 的 Skill 目录技术名变更是已批准例外：旧入口从未对外部署，因此直接改名且不保留旧目录；CLI 命令、参数和运行状态目录不适用此例外。
 
 ### 11.2 迁移测试
 

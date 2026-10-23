@@ -2,7 +2,7 @@
 
 > 让 AI 各司其职，协作交付。
 
-更新日期：2026-10-18
+更新日期：2026-10-23
 
 ## 已完成
 
@@ -16,26 +16,33 @@
 - 新增六种 OpenCode 工种配置，使用 `omlx/Qwen3.8-Flash-Next-oQ4e-mtp`；通过 pane 局部配置选择角色，并合并已有 JSON 配置。本机 `opencode.json` 保持私有，仓库提供 `opencode.example.json`。
 - 增加 harness、角色配置文件、任务编码及路径预检、子进程超时处理，以及运行状态和 Python 缓存的 Git 忽略规则。
 
+## M1-02 待验收实现
+
+- Skill 技术名和目录已在工作树中直接改为 `teamcraft`，并同步安装器、中英文 README、测试及角色引用；`.herdr-team/` 运行状态目录和全部 CLI 行为保持不变，待用户验收后才登记任务完成。
+- 已新增 Python 3.10+ 的最小 `teamcraft` 包，只定义 opaque ID、UTC Clock、错误类型和无写入的配置加载边界，未引入数据库、Scheduler、Watcher、Web、Worktree 或模型 Router；本机仅用 Python 3.13.14 验证，3.10 和 Linux 仍待 CI 证据。
+
 ## 关键文件
 
 | 文件 | 用途 |
 | --- | --- |
-| `.agents/skills/herdr-team/SKILL.md` | 使用规则、团队职责及操作示例 |
-| `.agents/skills/herdr-team/scripts/teamctl.py` | 团队启动、状态、恢复和责任范围管理 |
-| `.agents/skills/herdr-team/tests/test_teamctl.py` | 保留的回归测试 |
+| `.agents/skills/teamcraft/SKILL.md` | 使用规则、团队职责及操作示例 |
+| `.agents/skills/teamcraft/scripts/teamctl.py` | 团队启动、状态、恢复和责任范围管理 |
+| `.agents/skills/teamcraft/tests/test_teamctl.py` | 保留的回归测试 |
+| `teamcraft/`、`pyproject.toml` | M1-02 最小 Python 包及版本边界 |
 | `.opencode/agents/herdr-*.md` | 六类 OpenCode 角色配置 |
 | `.gitignore` | 排除本地运行状态和缓存 |
 
 ## 验证结果
 
 ```bash
-python3 -B -m unittest discover -s .agents/skills/herdr-team/tests -v
-python3 -B "${SKILL_CREATOR_DIR}/scripts/quick_validate.py" .agents/skills/herdr-team
+python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
+python3 -B -m unittest discover -s tests -v
+python3 -B "${SKILL_CREATOR_DIR}/scripts/quick_validate.py" .agents/skills/teamcraft
 ```
 
 `SKILL_CREATOR_DIR` 需指向本机已安装的 `skill-creator` Skill 目录；其中的 `quick_validate.py` 是外部校验工具，不属于本仓库依赖。
 
-20 项测试通过；Skill 校验通过。测试使用临时目录和 mock Herdr，覆盖状态恢复、并发责任范围预留、成员操作锁、pane 移动、真实 `pane current` 缺少成员名的响应、失败启动恢复、任务发送歧义、会话身份检查、实时状态、OpenCode 配置合并及输入错误。已通过安装的 `herdr pane --help` 确认 `pane get` 命令存在。
+M1-02 离线回归在 Python 3.13.14 上通过：Skill 40/40，仓库测试 28/28（21 项安装器、7 项最小 Core 边界），退出码均为 0；`quick_validate.py` 对新 Skill 入口校验通过，退出码为 0。测试使用临时目录和 mock Herdr，未连接实际 Herdr 会话；59 项 M1-01 既有契约保持通过，并增加新 Skill 发现/安装与无导入副作用等边界检查。2026-10-18 的 `herdr pane --help` 实机确认仍是历史证据，本轮未重复操作 Herdr。
 
 ### 实机示例
 
@@ -54,22 +61,22 @@ python3 -B "${SKILL_CREATOR_DIR}/scripts/quick_validate.py" .agents/skills/herdr
 
 ```bash
 # 创建 CEO；具体交付目标替换为实际任务
-python3 .agents/skills/herdr-team/scripts/teamctl.py launch \
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --role ceo --kind opencode --name ceo \
   --task "分析项目任务，拆分职责并按需创建研发、设计和测试成员。" \
   --agent-arg=--standalone
 
 # 查看团队与成员实时状态
-python3 .agents/skills/herdr-team/scripts/teamctl.py status
+python3 .agents/skills/teamcraft/scripts/teamctl.py status
 
 # 恢复指定成员，默认不重复发送任务
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume api_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume api_dev
 
 # 核查任务未执行或确定需要重发后，显式提交
-python3 .agents/skills/herdr-team/scripts/teamctl.py resume api_dev --prompt-action send
+python3 .agents/skills/teamcraft/scripts/teamctl.py resume api_dev --prompt-action send
 
 # 验收完成后释放责任范围，不关闭成员 pane
-python3 .agents/skills/herdr-team/scripts/teamctl.py complete api_dev
+python3 .agents/skills/teamcraft/scripts/teamctl.py complete api_dev
 ```
 
 `api_dev` 为示例名称，需替换为实际记录的成员。研发等编辑任务需提供 `--ownership 'src/api/**'` 之类的范围；纯审阅可使用 `--read-only`。
