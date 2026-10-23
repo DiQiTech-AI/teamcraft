@@ -1,10 +1,10 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已于 2026-10-23 获用户**原则接受**；授权范围仅 **M1-01 兼容契约夹具**；后续里程碑是否开工按其依赖与退出门禁判定，正式 cutover 另须通过 8.3 与 M1-06/M1-07 验收（见 8.1、第 12 节）
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 已单独获准开工、交付并通过评审。其他任务未因依赖完成而自动获准开工；正式 cutover 尚未审批（见第 12 节）
 >
 > 审计日期：2026-10-21；设计修订：2026-10-22；M1-01 门禁边界补充：2026-10-23
 >
-> 基准：`doc/TEAMCRAFT_2_0_PLAN.md` v1.0 规划草案
+> 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
 > 仓库基线：原始审计 `main` / `d9d95a6`；文档修订基线 `docs/teamcraft-2-0-planning` / `f841d5b`
 >
@@ -27,7 +27,7 @@
 
 PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、Web/API/SSE、Approval、Worktree、Verifier、GitHub PR 和成本路由均未实现。M1 不应先启动 Web 或 Worktree；应先把上述现有语义写成兼容契约，然后引入 SQLite Core，并在一次有冻结、代际栅栏和回滚条件的切换中将旧 JSON 从写入真源迁移为只读兼容视图。M2 再把直接 Herdr 调用收口为 Adapter，并增加确定性调度、观察和恢复。由于 FR-011 Verifier 和 FR-012 Approval 都是 P0，M2 还必须在 M3 Web 验收前提供面向 report-only/scout 的最小程序化验证和持久审批门禁；M4 负责 Worktree、Diff、Commit、local-only 和 direct-PR 的完整证据链。在 M4 之前，共享工作树上的验证不能证明普通 ship 产物与某个隔离执行一一对应，因此普通 ship 必须保持未交付状态，不能宣称已满足完整 P0 闭环。
 
-路径存在一个需显式处理的文档差异：已跟踪的 PRD 当前实际位于 `doc/TEAMCRAFT_2_0_PLAN.md`，而目标目录树和开工提示词使用 `docs/TEAMCRAFT_2_0_PLAN.md`（PRD `:615-619`、`:866`）。本轮按要求保留原文件原位置且不移动；进入 M1 后、修改引用它的代码或工具前需决定正式路径和迁移方式，避免形成两个内容分叉的 PRD。
+原始规划草案曾有文档路径不一致：实际文件位于 `doc/TEAMCRAFT_2_0_PLAN.md`，目标目录树和开工提示词却写作 `docs/TEAMCRAFT_2_0_PLAN.md`。本轮已统一为现有 `doc/` 路径，不移动文件或另建第二份 PRD；目标目录树中的其他文件仍只是未来建议。
 
 ## 2. 审计范围与证据
 
@@ -201,7 +201,7 @@ README 的正式回归入口位于 `README.md:254-265`。本轮在未修改仓�
 
 ### 8.1 状态
 
-**原则接受（2026-10-23）**；原状态为 Proposed / ready for review，历史记录保留于本节及第 12 节。本节已补齐切换并发、交付状态、Leader 和 SQLite 运维边界，已于 2026-10-23 获用户原则接受；该接受仅批准 **M1-01 兼容契约夹具**。后续里程碑是否开工按其依赖与退出门禁判定，M1-02 待 M1-01 评审和后续授权；正式 cutover 仍须满足 8.3 与 M1-06/M1-07 的门禁。本报告不实施迁移。
+**原则接受（2026-10-23）**。本节是实施设计基线；原则接受不等于后续任务开工授权、任务完成验收或正式数据迁移审批。这四种决策分别记录于第 12 节。M1-01 已单独获准、交付并通过评审；正式 cutover 仍须满足 8.3 与 M1-06/M1-07 的门禁及单独审批。本报告不实施迁移。
 
 PRD 的建议 DDL 在实施前必须修正两点：
 
@@ -284,13 +284,13 @@ flowchart LR
     M5B --> M6
 ```
 
-以下任务以小而可评审的变更为交付单位；同一里程碑内强相关、需共同验收的任务（如夹具与其直接消费方）可合并为一个 PR，不机械地一任务一 PR，也不跨里程碑打包。每项必须保留 30 项既有回归，并按 PRD Definition of Done 提供命令、退出码、失败路径和回滚说明。
+本节是 M1–M6 任务编号、名称、依赖、实施步骤、逐项验收和阶段退出门禁的唯一权威来源；PLAN 第 12 节只保留产品阶段目标与退出原则。以下任务以小而可评审的变更为交付单位；同一里程碑内强相关、需共同验收的任务可合并为一个 PR，不机械地一任务一 PR，也不跨里程碑打包。每项必须保留原有 30 项回归，并在 M1-01 后保留全部新增契约测试，按 PRD Definition of Done 提供命令、退出码、失败路径和回滚说明。
 
 ### 9.1 M1 — Durable Core
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
-| **M1-01 兼容契约夹具**；依赖 M0/ADR-001 批准 | 记录五个 CLI 命令的 parser/default、JSON 关键字段、错误码和 Herdr argv；把现有 30 项测试标为 compatibility；增加典型 stdout/error golden 或结构断言；为 JSON writer、锁、`version=1`、无 generation fence 的现状建立只读 fixture/威胁用例清单，不在本任务实现迁移 | 不改产品行为；现有 30 项全过；夹具能检测默认 inspect、`--no-focus`、OpenCode 局部配置、complete/release 不关 Pane；明确证明当前旧入口在载入后可继续写 JSON，不能误标成已有 fence | 过度锁死非公开文本；威胁 fixture 被误当 cutover 实现 |
+| **M1-01 兼容契约夹具（已验收）**；依赖 M0 审查/ADR-001 原则接受及单独开工授权 | 记录五个 CLI 命令的 parser/default、JSON 关键字段、错误码和 Herdr argv；把现有 30 项测试标为 compatibility；增加典型 stdout/error golden 或结构断言；为 JSON writer、锁、`version=1`、无 generation fence 的现状建立只读 fixture/威胁用例清单，不在本任务实现迁移 | 不改产品行为；现有 30 项全过；夹具能检测默认 inspect、`--no-focus`、OpenCode 局部配置、complete/release 不关 Pane；明确证明当前旧入口在载入后可继续写 JSON，不能误标成已有 fence；交付与测试证据见第 12 节 | 过度锁死非公开文本；威胁 fixture 被误当 cutover 实现 |
 | **M1-02 包骨架、配置边界与 Skill 命名迁移**；依赖 M1-01 | 建立 `teamcraft` 包和 `pyproject.toml`；定义 ID、UTC 时间、错误类型、配置加载边界；旧脚本仍是入口；用户已确认旧 Skill 入口从未对外部署，故直接改名 `.agents/skills/herdr-team/` → `.agents/skills/teamcraft/`，frontmatter `name` 改 `teamcraft`，不引入双入口、兼容窗口或别名；同步更新 installer、README、中英命令路径与测试引用；`teamcraft/` Python 包与 `.agents/skills/teamcraft/` Skill 目录明确区分；`.herdr-team/` 运行状态目录不动（归 M1-06/M1-07），其备份、冻结、旧进程故障测试与安全门禁继续有效 | Python 最低版本在 CI/本地矩阵明确；import 不产生状态写入；安装器预检/幂等/dry-run/配置保留覆盖新路径；以 M1-01 为行为基线，迁移测试位置与命令引用后 59 项（40 teamctl 契约 + 19 安装器）回归全部通过，不要求保留旧文件/命令路径；新增新入口发现/安装契约测试；Herdr/Ownership/read-only/Session 身份/保守恢复语义不变 | 打包方式改变项目内 Skill 的可移植性；依赖版本过早膨胀；外部私有文档或脚本中的旧路径引用会失效——以仓库内 grep 审计、README 中英文同步与迁移说明缓解 |
 | **M1-03 SQLite Repository/Migration v1**；依赖 M1-02 | 实现连接、WAL/外键、migration 表、事务 API、busy timeout；先建 Project/Task/Agent/Attempt/Session 基础表；修正 PRD DDL 的活动 Attempt 与可空 Commit/report 证据模型；实现 Online Backup API/等价一致性备份、manifest、保留策略入口和恢复检查 | 空库初始化、重复 migrate、并发写、事务中断、损坏、磁盘路径不支持和 schema 版本过新均有测试；版本过新拒绝写；WAL 活跃备份可恢复且通过 integrity check；禁止只复制主 DB；ship/scout Schema 样例均可表达 | WAL/锁在不同文件系统语义差异；误放网络盘；保留策略删掉审计证据；降级不可逆 |
 | **M1-04 领域状态与 DAG**；依赖 M1-03 | 实现 Task/Attempt/Session 状态机、数据库级单活动 Attempt 约束、DAG 循环路径检测、READY 推导、优先级排序和 optimistic version | 合法/非法转换均测试；循环返回具体路径；Session 消失不改变 Task ID；两个独立 DB 连接竞争时只有一个活动 Attempt | 状态枚举与现有 phase/live_state 混淆；SQLite 部分唯一索引兼容 |
@@ -298,7 +298,7 @@ flowchart LR
 | **M1-06 Legacy 导入排练与 cutover 故障矩阵**；依赖 M1-03、M1-04、M1-05 | 冻结 v1 reader；实现只读 backup/hash/import rehearsal、generation/freeze/cutover 协议和 guard contract；覆盖空/只读/多成员/unknown/损坏/跨 Session；用双进程故障注入模拟已载入旧 writer 在 hash 检查间、提交前后写入及各边界崩溃。本任务不把生产入口切为 DB | 原 JSON 字节不被覆盖；重复 rehearsal 幂等；字段映射可核对；跨 Session 不 adopt/resume/resend；stale/interleaving writer 必须中止切换或触发切后 pause；若无法 fence，测试证明 JSON 继续唯一 writer、DB shadow 不执行副作用；重启选择唯一权威 generation | 旧进程无法枚举或停止；测试时序假阳性；legacy 记录缺稳定 ID |
 | **M1-07 共享 Command Service、旧 CLI Guard 与原子 cutover**；依赖 M1-06 | 先将旧 `teamctl.py` 改为薄兼容入口并在所有写路径部署 freeze/generation guard；状态查询/变更收口到 Command Service；为新 Task CRUD/依赖提供 CLI；实现只读离线、服务缺席拒绝/显式 TTL queue，以及供旧 CLI 单次操作使用的最小持久 Command executor。该 executor 每次只处理本次命令，必须取得排他 fenced lease，不承担长期调度；最后按 8.3 条件执行可回滚 cutover | guard 在持有 legacy `state.lock` 且紧邻 mutation 前检查 marker/generation；迁移器从最终 JSON hash 检查到 DB_AUTHORITATIVE/marker 持久化持续持有同一锁；guard 契约通过后才允许冻结；已载入旧进程无法可靠 fence 时 cutover 被拒绝；新旧查询最终指向同一 DB 真源；CLI 不能直写表或直调 Herdr，Command Service API 明确约束未来 Web 也只能提交 Command；一次性 executor 失租后不能继续副作用；切后意外 JSON 变化暂停 dispatch；全部 crash matrix 通过 | 替换磁盘入口不能约束已载入旧代码；一次性 executor 与后台服务竞争 lease；兼容输出额外查询竞态 |
 
-**M1 退出门禁**：ADR-001 accepted；新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session、Event 和持久 Command；一致性备份/恢复、schema forward protection 和本地磁盘检查通过；旧入口 guard 先于 cutover 生效；冻结、双进程 interleaving、generation、hash/CAS、崩溃恢复矩阵全部通过后 DB 才成为唯一写入源。若任何旧 writer 不能可靠 fence，门禁不允许 cutover，JSON 保持唯一 writer 且 M1 不得宣称退出。全部既有回归和新增事务/迁移测试通过。
+**M1 退出门禁**：ADR-001 已获原则接受；新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session、Event 和持久 Command；一致性备份/恢复、schema forward protection 和本地磁盘检查通过；旧入口 guard 先于 cutover 生效；冻结、双进程 interleaving、generation、hash/CAS、崩溃恢复矩阵全部通过且实际切换获单独审批后，DB 才成为唯一写入源。若任何旧 writer 不能可靠 fence，门禁不允许 cutover，JSON 保持唯一 writer 且 M1 不得宣称退出。全部既有回归和新增事务/迁移测试通过。
 
 ### 9.2 M2 — Watcher & Safe Recovery
 
@@ -361,7 +361,7 @@ flowchart LR
 | **M6-02 Diff/验证/时间线页面**；依赖 M4-04、M3-05 | 安全渲染 Diff、Verification、Attempt/Session/Event 时间线；截断和下载受控 | 内容转义；大日志/二进制有明确提示；Commit 与证据关联清楚 | XSS；超大工件；敏感内容 |
 | **M6-03 脱敏诊断包**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
 | **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
-| **M6-05 远程/多机独立 RFC**；依赖 M4/M5 稳定数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
+| **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
 
 **M6 退出门禁**：P2 项逐项独立发布；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源。
 
@@ -405,7 +405,7 @@ flowchart LR
 
 ### 11.2 已接受的设计决策
 
-“已接受”表示本次修订已纳入设计基线，不表示功能已实现；ADR-001 仍需用户整体批准（2026-10-23 更新：用户已原则接受，范围仅 M1-01，见第 12 节）。
+“已接受”仅表示设计原则已获认可，不表示功能已实现、后续任务获准开工或正式数据迁移获批；各项决策状态见第 12 节。
 
 - 保留现有 Herdr/Skill 行为语义、Ownership/read-only、锁、Session 身份和 inspect-first 恢复语义（M1-02 Skill 目录改名不保留旧路径，但承接相同语义）。
 - SQLite 目标是单机本地磁盘上的单一真源；不长期双写，不能 fence 旧 writer 就不 cutover。
@@ -419,12 +419,11 @@ flowchart LR
 
 ### 11.3 未解决决策（按最晚决策点）
 
-1. **ADR-001 正式批准（M1-01 前）**：接受本节全部单真源、cutover、Leader、交付和 SQLite 运维边界。
+1. **正式 cutover 审批（M1-07 实际切换前）**：在 M1-06 故障矩阵、备份恢复、旧 writer 静止性证明与 M1-07 Guard 验收后，单独审查切换窗口与恢复方案；ADR-001 的原则接受不能替代该审批。
 2. **平台/Python（M1-02 前）**：当前 README 承诺 macOS/Linux、Python 3.10+，代码依赖 `fcntl`（`README.md:53-59`）。建议保持 3.10 兼容，除非依赖证据要求提升；Linux 仍需 CI。
 3. **稳定 ID（M1-03/04 前）**：在 UUIDv7/ULID/UUID4 中选择并固定排序/序列化；Event 继续以 SQLite seq 排序。
-4. **正式文档路径（首次修改引用前）**：已跟踪 PRD 位于 `doc/`，目标树写 `docs/`；本轮不移动，需用单独文档变更决定并避免双份。
-5. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
-6. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
+4. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
+5. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
 
 ### 11.4 推迟解决的决策
 
@@ -446,10 +445,29 @@ flowchart LR
 - 任一成本节省比例、恢复成功率或并发 SLA；
 - GitHub PR、浏览器安全和远程访问能力。
 
-## 12. M0 退出建议
+## 12. M0/M1 证据与决策登记
 
-**技术准备结论：已达到进入 M1-01 的技术条件。** 真实代码和测试基线已定位，原始 M0 运行的 30 项回归全部通过；M1-01 的范围仅是兼容契约、fixture 和当前 cutover 风险的可执行描述，不需要先选择稳定 ID、Web 技术栈或运行数据库迁移。
+### 12.1 M0-01 架构审计交付
 
-**开工授权结论（历史：原 M0 审查修订稿 2026-10-22 时点结论，已由下方 2026-10-23 授权更新覆盖）：尚未达到实际开始 M1-01 的批准条件。** ADR-001 仍是 Proposed，本轮用户明确只修订设计文档且不进入实现。审查者需先接受修订后的 ADR-001 和 M0 退出门禁；随后只授权 **M1-01 兼容契约夹具**。M1-01 完成并评审后，再进入包骨架和 SQLite Repository；该授权不包含迁移、Watcher、Web、Worktree 或模型路由。
+`M0-01` 的工作是审计已有入口、脚本、Skill 与测试并绘制实际调用路径；它不是 `M1-01` 的兼容契约测试。前者形成对现状的审查证据，后者把既有行为固定为可执行断言。
 
-**授权更新（2026-10-23，覆盖上方历史结论）**：用户已**原则接受**修订后的 ADR-001 与 M0 退出门禁，并**仅批准 M1-01 兼容契约夹具**（范围：契约测试与本文档边界补充，不含迁移、Watcher、Web、Worktree、模型路由）。M1-02 等后续任务是否开工按其依赖与退出门禁判定，待 M1-01 评审后另行授权。8.3 的旧进程时点确认不削弱任何门禁：静止性证明与故障注入仍按 M1-06/M1-07 验收。
+| 项目 | 状态 | 可核对证据 | 对应 Commit |
+|---|---|---|---|
+| M0-01 真实架构、组件边界和 launch/status/resume 路径 | **已交付；随 M0 第二轮审查获原则接受** | 本报告第 2 节审计文件清单、第 3 节调用图与逐步路径，原始审计对照 `.agents/skills/herdr-team/scripts/teamctl.py`、`.agents/skills/herdr-team/SKILL.md`、`scripts/install.sh` 和现有测试 | `f841d5bbf32a62eb5b2750f71736021a9d73402a`（首次交付）；`86cec5fd3be7ba02c0e73c25775eb051b4dff566`（设计修订） |
+| M0-01 代码运行语义或真实 Herdr 实机兼容的完整证明 | **未宣称完成** | 第 7 节的 30 项原始离线回归只支持本机/Mock 基线；第 11.5 节列出未验证范围 | 无 |
+| M0-02–M0-05 的逐项独立完成验收 | **未登记为完成** | 本报告含兼容矩阵、30 项测试摘要、环境探测与 ADR，但不以此替代各项独立交付记录；最低 Herdr/OpenCode/Codex 版本及 Linux 行为仍未证实 | 无逐项验收 Commit |
+
+M0-01 的审计结论是文档证据，不等于产品功能实现。`M1-01` 另由 `.agents/skills/herdr-team/tests/test_compat_contract.py`、`tests/test_install_compat_contract.py` 固定 CLI、Herdr、Ownership、恢复和安装器契约，对应 `2087a00c1ee4db77cf199c3212669807c6180e8e`；提交记录给出 40/40 teamctl、19/19 installer 离线测试通过。两项任务不可互换编号或交付证据。
+
+### 12.2 分层决策记录
+
+| 决策类型 | 当前状态 | 证据与边界 |
+|---|---|---|
+| 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
+| 任务开工授权 | **M1-01 曾获单独授权；M1-02 及以后未自动授权** | 授权只覆盖兼容契约夹具及其直接文档边界；依赖满足不是开工许可 |
+| 任务完成验收 | **M1-01 已交付并经用户评审验收** | 上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M0-01 的文档交付状态见 12.1；不据此宣称 M1 阶段完成 |
+| 正式数据迁移 / cutover 审批 | **尚未批准** | M1-06 仅排练，M1-07 必须先验收 Guard、备份恢复、静止性与故障矩阵，再单独批准实际切换；当前没有旧进程运行的时点确认不代替切换日证明 |
+
+### 12.3 下一任务边界
+
+依第 9.1 节的依赖图，`M1-02`（包骨架、配置边界与 Skill 技术名改为 `teamcraft`）是下一项具备前置条件的候选任务，**本次文档修订不授权也不启动它**。它只应处理包/配置边界、Skill 目录与 frontmatter、安装器/文档/测试引用，并保持 CLI、Herdr、Ownership、read-only、Session 身份和保守恢复语义及 59 项现有测试；不得顺带做 SQLite 迁移、Watcher、Web、Worktree、模型 Router，亦不得操作正在运行的 Herdr 会话。正式 cutover 继续独立审批。
