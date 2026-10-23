@@ -605,7 +605,9 @@ GET    /api/v1/usage?project_id=&range=
 
 ## 10. 项目代码组织建议
 
-> 不要求立即按下列结构重排；保留 `teamctl` 外部 CLI 与现有 Skill 入口，采用渐进式迁移。
+> 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与现有 Skill 入口路径，采用渐进式迁移。M1-02 之后保留的是 CLI/Skill 行为与语义，而非旧目录路径——Skill 目录将改名为 `.agents/skills/teamcraft/`，旧路径不保留（见下条）。
+>
+> Skill 技术名演进方向：`herdr-team` → `teamcraft`（2026-10-23 决策，**尚未实现**）。用户确认旧 Skill 入口从未对外部署，无需双版本迁移、兼容窗口或别名：M1-02 直接把仓库内 `.agents/skills/herdr-team/` 改名为 `.agents/skills/teamcraft/`，Skill frontmatter `name` 改为 `teamcraft`，并同步 installer、README、中英命令路径与测试引用；实施后只安装一个 Skill 入口。`.herdr-team/` 运行状态目录不随此改名，归 M1-06/M1-07 迁移决策。
 
 ```text
 teamcraft/
@@ -617,9 +619,9 @@ teamcraft/
 │   ├── architecture.md
 │   ├── api.md
 │   └── migration.md
-├── .agents/skills/herdr-team/   # 保留现有 Skill
+├── .agents/skills/teamcraft/    # Skill 入口（M1-02 由 herdr-team 改名，尚未实现）
 ├── scripts/                    # 兼容现有脚本
-├── teamcraft/
+├── teamcraft/                  # Python 代码包（区别于上面的 Skill 目录）
 │   ├── core/
 │   │   ├── tasks.py
 │   │   ├── attempts.py
@@ -653,7 +655,7 @@ teamcraft/
 └── pyproject.toml
 ```
 
-建议运行目录：`.herdr-team/` 中保留既有状态与缓存；新数据库可用 `.herdr-team/teamcraft.db`，日志和工件放受控子目录。数据库路径和目录迁移需要兼容旧安装。
+建议运行目录：`.herdr-team/` 中保留既有状态与缓存；新数据库可用 `.herdr-team/teamcraft.db`，日志和工件放受控子目录。数据库路径和目录迁移需要兼容旧安装。`.herdr-team/` 运行状态目录名不因 Skill 改名而变动；JSON→SQLite cutover 与状态目录改名是独立问题，归 M1-06/M1-07 决策。
 
 ---
 
