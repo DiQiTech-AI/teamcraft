@@ -2,11 +2,11 @@
 
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
-> **版本**：v1.1（M1-02 实施修订）
-> **日期**：2026-10-23
+> **版本**：v1.2（M1-02 有条件验收收尾）
+> **日期**：2026-10-24
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已获开工授权并形成待验收实现。M1-03 及以后未获授权，目标能力不得理解为已实现。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。M1-03 及以后未获授权，目标能力不得理解为已实现。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
 ---
 
@@ -37,7 +37,7 @@ TeamCraft 2.0 是一个 **local-first、single-user、failure-resilient、cost-a
 
 ### 1.1 已有公开能力（待开发时再次逐项核对）
 
-M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M1-02 待验收实现只把该入口改名为 `teamcraft`，下列既有能力与运行语义未变。按当前工作树：
+M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M1-02 实现（已条件验收通过）只把该入口改名为 `teamcraft`，下列既有能力与运行语义未变。按当前工作树：
 
 - 通过 `teamcraft` Skill 管理团队，默认仅启动 CEO，按需启动 CTO、Developer、Designer、Tester 或自定义专家。
 - 角色责任和 Agent Harness 分离：可通过 Herdr 支持的 Codex、OpenCode 等 Harness 运行。
@@ -607,7 +607,7 @@ GET    /api/v1/usage?project_id=&range=
 
 > 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与 `.agents/skills/teamcraft/` Skill 入口，采用渐进式迁移。M1-02 只建立最小 Python 包边界并迁移 Skill 技术名，未提前实现存储、调度、Web 或模型路由。
 >
-> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 待验收实现中落地：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧目录、兼容窗口或别名。`.herdr-team/` 运行状态目录保持原名；JSON→SQLite cutover 仍归 M1-06/M1-07，且未在 M1-02 执行。
+> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 实现中落地（已条件验收通过）：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧目录、兼容窗口或别名。`.herdr-team/` 运行状态目录保持原名；JSON→SQLite cutover 仍归 M1-06/M1-07，且未在 M1-02 执行。
 
 ```text
 teamcraft/
@@ -619,7 +619,7 @@ teamcraft/
 │   ├── architecture.md
 │   ├── api.md
 │   └── migration.md
-├── .agents/skills/teamcraft/    # 当前 Skill 入口（M1-02 待验收实现）
+├── .agents/skills/teamcraft/    # 当前 Skill 入口（M1-02 实现，已条件验收）
 ├── scripts/                    # 兼容现有脚本
 ├── teamcraft/                  # Python 代码包（区别于上面的 Skill 目录）
 │   ├── core/
