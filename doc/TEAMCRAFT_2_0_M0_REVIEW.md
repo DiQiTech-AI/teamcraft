@@ -2,13 +2,13 @@
 
 > 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，权威实施 SHA `952b39e`，证据见第 12.2 节；Python 3.10/Linux 与 CI 缺失为未关闭验收限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。M1-03 及以后未获开工授权；正式 cutover 尚未审批（见第 12 节）
 >
-> 报告版本：v1.4（运行目录统一为 `.teamcraft/`）
+> 报告版本：v1.5（CEO Protocol 与跨 Harness 编排规划草案）
 >
-> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一修订：2026-10-27
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
-> 仓库基线：原始审计 `main` / `d9d95a6`；当前 M1-02 实施基线 `docs/teamcraft-2-0-planning` / `e9111c8`
+> 仓库基线：原始审计 `main` / `d9d95a6`；M1-02 开工基线 `docs/teamcraft-2-0-planning` / `e9111c8`；本轮规划修订前运行目录更新提交 `924dfad`
 >
 > M0 审计轮范围（历史）：架构审计、差距分析、ADR 候选和 M1–M6 实施拆解；当时未修改产品代码。该会话另有用户授权的 DIQI 创建、命名和 Pane 布局操作；启动 DIQI 前，主 Agent 因原 `state.json` 绑定另一 Herdr Session，手动且可逆地将其移动为归档文件。这些是编排运行变更，不属于产品实现或本报告的验证动作。当前 M1-02 只修改获授权的包、Skill、安装器、文档和离线测试，未操作 Herdr 会话
 
@@ -28,6 +28,8 @@
 - 安装器先做完整预检，拒绝符号链接目标，保留已有 `opencode.json`，支持幂等和 dry-run。
 
 PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、Web/API/SSE、Approval、Worktree、Verifier、GitHub PR 和成本路由均未实现。M1 不应先启动 Web 或 Worktree；应先把上述现有语义写成兼容契约，然后引入 SQLite Core，并在一次有冻结、代际栅栏和回滚条件的切换中将旧 JSON 从写入真源迁移为只读兼容视图。M2 再把直接 Herdr 调用收口为 Adapter，并增加确定性调度、观察和恢复。由于 FR-011 Verifier 和 FR-012 Approval 都是 P0，M2 还必须在 M3 Web 验收前提供面向 report-only/scout 的最小程序化验证和持久审批门禁；M4 负责 Worktree、Diff、Commit、local-only 和 direct-PR 的完整证据链。在 M4 之前，共享工作树上的验证不能证明普通 ship 产物与某个隔离执行一一对应，因此普通 ship 必须保持未交付状态，不能宣称已满足完整 P0 闭环。
+
+本轮规划复核还确认：当前 CEO 行为只存在于 `teamcraft` Skill、OpenCode 角色配置和 `teamctl.build_prompt()` 的固定文本中；仓库没有独立 `teamcraft-ceo` Skill、权威 `CEO_PROTOCOL.md`、协议版本握手、CEO 初始化状态、Wake Dispatcher 或 Claude Code 入口。`teamctl.prompt_member()` 已保留“提交前记录可能已投递、结果歧义不自动重发”的安全语义，可作为后续持久 Command/Reconcile 的兼容基础，但它尚未区分 Agent 接收、实际执行和 Task 完成。以下新增设计是 ADR-001 的待人工审查扩展，不改写或自动扩大 2026-10-23 的原则接受范围。
 
 规划与审计文档的规范目录是 `doc/`：PRD 位于 `doc/TEAMCRAFT_2_0_PLAN.md`，本报告位于 `doc/TEAMCRAFT_2_0_M0_REVIEW.md`。早期草案中的 `docs/` 写法已修正，不再作为当前路径说明；目标目录树中的其他文档仍只是未来建议。
 
@@ -152,6 +154,8 @@ flowchart LR
 | FR-021 Review 专家 | 部分 | Tester/Custom/CTO 可按需启动；没有基于 Task 的交叉审查策略 |
 | FR-022 远程访问 | 缺失/P2 | 当前仅本地 Herdr；没有 Web 认证、TLS、VPN/SSH 入口设计实现 |
 | FR-023 多机 Worker | 缺失/P2 | 单机实现，符合当前非目标 |
+| FR-024 CEO Protocol/跨 Harness | 缺失 | 当前没有 `teamcraft-ceo` 或协议文件；Codex/OpenCode 的项目发现规则有官方文档依据，但尚无本仓库实现或真实发现测试；Claude CLI 本机不可用 |
+| FR-025 CEO 初始化/Wake | 缺失 | 当前 CEO 与 Worker 均经同步 `herdr agent prompt`；没有初始化握手、持久 Wake、事件合并、Dormant 或自动启动策略 |
 
 除 FR 清单外，当前已有而目标必须继续支持的能力是项目内安全安装、配置保留、角色模板、Pane 自动布局和焦点保持。这些能力不应在引入 Python 包或服务进程时丢失。
 
@@ -164,7 +168,8 @@ flowchart LR
 | `run_process/run_herdr` 与响应解析 | 可提取 | 移到 `adapters/herdr.py`，定义超时、错误归一化、能力探测、Fake Adapter 契约 |
 | `StateStore` | 仅用于迁移和兼容 | 冻结 version 1 读取器；SQLite 切换后不得与 DB 双主写；保留原文件快照和只读导出 |
 | Ownership 规范化/重叠算法 | 高价值复用 | 移到 Core ownership 模块并保持输入语义；增加大小写策略、symlink/实际 Diff 检查，不改变现有 CLI 合法集合 |
-| Prompt/Brief 构造 | 部分复用 | 将现有角色、责任、Ownership 和只读要求纳入结构化 Brief；Task/Attempt ID、验收和禁止操作由 Core 注入 |
+| Prompt/Brief 构造 | 部分复用 | 保留现有角色、责任、Ownership 和只读要求；由 M2-03 分层注入 Task/Attempt、任务文件版本、验收和禁止操作，并在 Herdr prompt 前持久化 Command；不复制完整 CEO Protocol |
+| `teamcraft` 运行 Skill | 直接保留 | 继续负责 Herdr 会话和 Agent 运行；新增 `teamcraft-ceo` 只作协议加载入口，不回退到旧 `herdr-team` 名称，也不复制 Core/Herdr CLI |
 | Pane 拆分方向和 `--no-focus` | 直接复用 | 留在 Herdr Adapter/Workspace 调用层；契约测试固定 Pane 参数 |
 | Session/occupant 核验 | 高价值复用 | 作为 Reconcile 核心；禁止简化成仅按成员名或 Pane ID 恢复 |
 | 保守恢复状态 | 高价值复用 | 映射为 Command `unknown`、Attempt `UNKNOWN` 和需人工处理事件；默认仍不重发 |
@@ -268,6 +273,21 @@ PRD 的建议 DDL 在实施前必须修正两点：
 
 该方案增加 SQLite Schema、迁移、Leader 和服务生命周期复杂度，但能保留现有 CLI 的调用方式，并为 Task 历史、事件、幂等和重启恢复提供确定边界。M1 的关键风险不在建表，而在旧 Member 到 Task/Attempt/Session 的映射、已载入旧代码的进程和切换窗口；因此迁移排练与实际切换必须分开验收，不能与 Scheduler 或 Web 一并发布。显式 queue/TTL 和一次性 Leader 会增加 CLI 交互状态，但避免服务恢复后意外执行陈旧请求。
 
+### 8.7 ADR-001 提议扩展：CEO Protocol、Harness 入口与 Wake（待人工审查）
+
+**状态：Proposed（2026-10-27），未接受。** 本节是对已原则接受 ADR-001 的加法提案；在人工审查前不得把它记为 Accepted，也不授权 M1-03、M1-08、M2 或后续实现。已接受的 8.1–8.6、M0-01 事实和 M1-01/M1-02 验收记录不变。
+
+1. **协议唯一来源**：未来以 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 维护唯一 CEO 业务协议，内容覆盖 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八阶段、责任边界和审批门禁。协议有显式 `protocol_version` 与稳定内容 hash；执行中的 Task/Attempt 记录所用版本。相邻 `teamcraft-ceo/SKILL.md` 是薄加载器，不复制协议正文。现有 `.agents/skills/teamcraft/` 继续负责 Herdr/Agent 运行，不更名、不复制 Core 或 Herdr CLI。
+2. **跨 Harness 薄入口**：Codex/OpenCode 共用 `.agents/skills/teamcraft-ceo/`；`AGENTS.md` 只写必要加载规则，OpenCode 可由 `.opencode/agents/` 的薄 CEO 配置适配。Claude Code 通过 `.claude/skills/` 安装受管副本或经目标版本验证的 symlink，并由精简 `CLAUDE.md` 引导；两种方式都必须指向或验证同一协议 version/hash。安装器先探测目标 Harness/版本和冲突，支持 dry-run/no-op，绝不覆盖已有 `AGENTS.md`、`CLAUDE.md` 或 Agent 配置。不兼容时明确降级/fail closed，不维护不同 CEO 业务协议。
+3. **初始化握手**：CEO 启动 Prompt 只声明身份、协议位置/期望版本、`teamcraft` 运行 Skill 和读取当前项目/任务状态的要求。初始化记录区分 Skill discovered、Protocol read、CEO initialized；Protocol read 需要绑定当前 Session/初始化 nonce 的结构化回执并经 Core 校验 version/hash，不能从 Skill 可见或 Prompt 已投递推断。只有协议 version/hash、运行 Skill 可用性、Harness/Session 身份都确认并持久化后才能派工。缺失、读取失败、无法确认或不兼容产生事件并阻断派工。
+4. **Prompt 分层与投递事实**：M2-03 统一 CEO/CTO/Developer/Tester/custom Prompt：稳定角色规则 + 版本化 Task Brief/任务文件引用 + Ownership/read-only + 验收/交付。Core 在调用既有 Herdr `agent prompt` 前持久化 Command/Attempt/Session/evidence version，投递状态至少区分 pending、sending、submitted、acknowledged；Attempt 另记 executing、execution_finished。`acknowledged` 需要目标会话的可关联回执；不具此能力时保持未确认并 Reconcile，不伪造 ack。Worker 报告、Herdr idle/done 和 execution_finished 均不能直接完成 Task。投递结果 unknown 时按现有 inspect-first 语义 Reconcile，不盲目重发。
+5. **确定性观察**：Watcher 先探测 Herdr 的可靠事件订阅能力；仅在版本化契约验证通过时订阅，否则低频查询。无论来源，统一以 SQLite `events.seq`、稳定 dedupe key 和事务写入为权威；分别维护 process liveness、Agent activity、Task progress。Watcher 不调用 LLM 做日常巡检。
+6. **Wake Dispatcher 边界**：Wake Dispatcher 是唯一 Scheduler Leader 进程内组件，不新增后台服务或消息中间件。它从 SQLite 读取事件，按 key/seq/优先级/合并窗口生成持久 Wake，状态为 `pending/sending/submitted/acknowledged/processed`，另记结果不明或阻塞原因；Prompt 只是信号，SQLite 事件是待办真源。`submitted` 仅表示 Herdr 接受投递；`acknowledged` 需要 CEO 对绑定事件序号的显式确认；`processed` 需要对应决策和处理游标持久化，不能从 `idle/done` 推断。CEO working 时普通 Wake 延后；idle/done 且 Session 身份有效时可发送；unknown/missing 进入隔离/Reconcile，不能盲启新会话。事件在 CEO 明确确认前保留。Dormant 模式允许 CEO 不常驻；自动启动 opt-in 且默认关闭；云端预算不足或未知时保守阻塞/升级。
+7. **外部副作用边界不变**：SQLite 幂等键和 fencing 只保证受控执行准入、状态提交及重复状态处理，不能保证 Herdr/GitHub exactly-once。Leader 在 sending/外部调用期间失租时，旧 Leader 不再提交确认；新 Leader必须从 Herdr/Git/远端事实对账后决定 submitted/unknown，禁止自动再发。
+8. **可观测性**：M3 通过 Query/Command Service 展示 CEO Harness、协议版本、初始化阶段、Agent Session、Task/Attempt、三类进展信号、Event/Wake 状态、Verification、审批、恢复和用量。手动请求 CEO、暂停/恢复调度只创建 Command；Web 不直接发送 Prompt 或改表。
+
+**官方发现依据（2026-10-27 规划复核）**：Codex 项目 Skills 为 [`$REPO_ROOT/.agents/skills`](https://learn.chatgpt.com/docs/build-skills)，项目规则见 [AGENTS.md 文档](https://learn.chatgpt.com/docs/agent-configuration/agents-md)；OpenCode v2 支持 [`.agents/skills` 和按需 skill tool](https://dev.opencode.ai/v2/docs/skills/) 及 [AGENTS.md 指令](https://dev.opencode.ai/v2/docs/instructions/)；Claude Code 项目 Skills 见 [`.claude/skills`](https://code.claude.com/docs/en/skills)，项目规则见 [memory 文档](https://code.claude.com/docs/en/memory)。当前 Claude 文档只对 v2.1.277+ 且项目没有 `CLAUDE.md` 时说明 `AGENTS.md` fallback，不能外推到所有版本。本机探测只有 Codex CLI 0.163.0、OpenCode 2.0.25、Herdr 0.9.3；`claude` 不可用。这些是版本/文档证据，不是 Skill 发现端到端测试。
+
 ## 9. M1–M6 可执行任务图
 
 ```mermaid
@@ -284,9 +304,15 @@ flowchart LR
     M3B --> M5B[M5 用量 UI]
     M4B --> M6[M6 体验与后续 RFC]
     M5B --> M6
+    M1A --> P[M1 CEO Protocol 契约]
+    P --> I[M2 CEO 初始化]
+    M2B --> W[M2 Wake Dispatcher]
+    I --> W
+    W --> M3B
+    W --> M6
 ```
 
-本节是 M1–M6 任务编号、名称、依赖、实施步骤、逐项验收和阶段退出门禁的唯一权威来源；PLAN 第 12 节只保留产品阶段目标与退出原则。以下任务以小而可评审的变更为交付单位；同一里程碑内强相关、需共同验收的任务可合并为一个 PR，不机械地一任务一 PR，也不跨里程碑打包。每项必须保留原有 30 项回归，并在 M1-01 后保留全部新增契约测试，按 PRD Definition of Done 提供命令、退出码、失败路径和回滚说明。
+本节是 M1–M6 任务编号、名称、依赖、实施步骤、逐项验收和阶段退出门禁的唯一权威来源，也承担 Milestone TODO 清单；仓库目前没有独立 TODO 文件，PLAN 第 12 节只保留产品阶段目标与退出原则。任务 ID 保持原有编号，执行顺序由依赖决定，因此新增 M2-08/M2-09 验收后才执行 M2-07 故障矩阵。以下任务以小而可评审的变更为交付单位；同一里程碑内强相关、需共同验收的任务可合并为一个 PR，不机械地一任务一 PR，也不跨里程碑打包。每项必须保留原有 30 项回归，并在 M1-01 后保留全部新增契约测试，按 PRD Definition of Done 提供命令、退出码、失败路径和回滚说明。
 
 ### 9.1 M1 — Durable Core
 
@@ -299,8 +325,9 @@ flowchart LR
 | **M1-05 Event/Command 原子性**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、载荷/evidence version、TTL、同键载荷冲突和 pending/running/confirmed/unknown/expired；定义 Command Service API 和 CAS | 状态+事件+Command 同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键冲突；证据变化使待执行命令失效 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长 |
 | **M1-06 Legacy 导入排练与 cutover 故障矩阵**；依赖 M1-03、M1-04、M1-05 | 冻结 v1 reader；实现只读 backup/hash/import rehearsal、generation/freeze/cutover 协议和 guard contract；覆盖空/只读/多成员/unknown/损坏/跨 Session；用双进程故障注入模拟已载入旧 writer 在 hash 检查间、提交前后写入及各边界崩溃。本任务不把生产入口切为 DB | 原 JSON 字节不被覆盖；重复 rehearsal 幂等；字段映射可核对；跨 Session 不 adopt/resume/resend；stale/interleaving writer 必须中止切换或触发切后 pause；若无法 fence，测试证明 JSON 继续唯一 writer、DB shadow 不执行副作用；重启选择唯一权威 generation | 旧进程无法枚举或停止；测试时序假阳性；legacy 记录缺稳定 ID |
 | **M1-07 共享 Command Service、旧 CLI Guard 与原子 cutover**；依赖 M1-06 | 先将旧 `teamctl.py` 改为薄兼容入口并在所有写路径部署 freeze/generation guard；状态查询/变更收口到 Command Service；为新 Task CRUD/依赖提供 CLI；实现只读离线、服务缺席拒绝/显式 TTL queue，以及供旧 CLI 单次操作使用的最小持久 Command executor。该 executor 每次只处理本次命令，必须取得排他 fenced lease，不承担长期调度；最后按 8.3 条件执行可回滚 cutover | guard 在持有 legacy `state.lock` 且紧邻 mutation 前检查 marker/generation；迁移器从最终 JSON hash 检查到 DB_AUTHORITATIVE/marker 持久化持续持有同一锁；guard 契约通过后才允许冻结；已载入旧进程无法可靠 fence 时 cutover 被拒绝；新旧查询最终指向同一 DB 真源；CLI 不能直写表或直调 Herdr，Command Service API 明确约束未来 Web 也只能提交 Command；一次性 executor 失租后不能继续副作用；切后意外 JSON 变化暂停 dispatch；全部 crash matrix 通过 | 替换磁盘入口不能约束已载入旧代码；一次性 executor 与后台服务竞争 lease；兼容输出额外查询竞态 |
+| **M1-08 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约**；依赖 M1-05、M1-02 | 按 8.7 建立未来 `teamcraft-ceo` 薄 Skill 和唯一 `references/CEO_PROTOCOL.md` 的实现契约；定义 protocol version/hash、八阶段与门禁元数据、Task/Attempt 版本 pin；为 Codex/OpenCode 的 `.agents/skills/`、精简 `AGENTS.md`、OpenCode 薄 CEO Agent 设计预检/安装/no-op/dry-run/冲突策略；保留现有 `teamcraft` 运行 Skill。此任务实现时才创建文件，本轮仅规划 | 同一协议内容只维护一次；Codex/OpenCode Mock 发现、缺失、读取失败、hash/version 不兼容均测试且失败时禁止派工；安装器不覆盖已有规则/Agent 配置；真实 Harness 冒烟按实际版本单列，不能用 Mock 代替；协议升级可识别正在执行的旧版本 Attempt | 官方发现规则随版本变化；symlink/副本漂移；规则文件合并语义；协议过早固化 |
 
-**M1 退出门禁**：ADR-001 已获原则接受；新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session、Event 和持久 Command；一致性备份/恢复、schema forward protection 和本地磁盘检查通过；旧入口 guard 先于 cutover 生效；冻结、双进程 interleaving、generation、hash/CAS、崩溃恢复矩阵全部通过且实际切换获单独审批后，DB 才成为唯一写入源。若任何旧 writer 不能可靠 fence，门禁不允许 cutover，JSON 保持唯一 writer 且 M1 不得宣称退出。全部既有回归和新增事务/迁移测试通过。
+**M1 退出门禁**：ADR-001 已获原则接受；8.7 提议扩展须另行人工接受后 M1-08 才可开工。新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session、Event 和持久 Command；一致性备份/恢复、schema forward protection 和本地磁盘检查通过；CEO Protocol 单一来源、version/hash、Codex/OpenCode 发现及缺失/不兼容 fail-closed 契约通过；旧入口 guard 先于 cutover 生效；冻结、双进程 interleaving、generation、hash/CAS、崩溃恢复矩阵全部通过且实际切换获单独审批后，DB 才成为唯一写入源。若任何旧 writer 不能可靠 fence，门禁不允许 cutover，JSON 保持唯一 writer 且 M1 不得宣称退出。全部既有回归和新增事务/迁移测试通过。
 
 ### 9.2 M2 — Watcher & Safe Recovery
 
@@ -308,26 +335,30 @@ flowchart LR
 |---|---|---|---|
 | **M2-01 Herdr Adapter 契约**；依赖 M1-07 | 从 teamctl 提取 capability/list/pane split/start/get/prompt/read/stop；统一超时、JSON shape、错误码；提供 Fake 和当前 Herdr 可选实机契约 | 现有 launch/status/resume argv 与身份核验不变；缺字段、非 UTF-8、超时、命令失败均归一化；无 Herdr 可跑离线测试 | Herdr 0.9.3 响应不是稳定协议；stop/read 在版本间差异 |
 | **M2-02 Scheduler 与 fenced Leader**；依赖 M1-07、M2-01 | 复用 M1-07 的 durable Command executor、lease schema、epoch/fencing token，将一次性排他执行扩展为长期 Scheduler Leader、续租、READY Task 领取和受配额的并行 dispatch；应用优先级、创建顺序、Ownership/read-only；仍只有当前 Leader 可执行持久外部副作用 Command | 一次性 CLI executor 与长期 Scheduler 竞争时只有一个有效 lease；两 Scheduler 竞争只派发/执行一次；旧 Leader 失租后不能提交状态或继续新副作用；两个非重叠任务可并行；冲突任务保持 READY/BLOCKED 并解释原因；读查询不触发派工 | Lease 时钟漂移；已经发出的不可撤销副作用；长事务；跨项目公平性不足 |
-| **M2-03 结构化 Brief 与完成报告**；依赖 M1-04、M2-01 | Brief 包含 Task/Attempt、目标、非目标、Ownership、依赖、验收、命令白名单、预算；定义 Worker result schema 并保留纯文本兼容 | Codex/OpenCode 均收到既有角色/责任/只读限制；缺失/非法结果不会直接完成 Task；报告可关联 Attempt | 本地模型结构化输出不稳定；Prompt 过长；旧 Harness 只支持文本 |
-| **M2-04 Deterministic Watcher 与进展时钟**；依赖 M1-05、M2-01 | 分别观察 process liveness、Agent activity、progress evidence；仅认可版本化的里程碑/artifact/report digest/verification 为实际进展；维护 `last_observed_at`、`last_activity_at`、`last_progress_at`、task deadline、可配置无进展阈值和退避；未知 Token 保持 NULL | 进程活着但无进展达到阈值时进入 STALLED/NEEDS_HUMAN；日志滚动不重置进展时钟；任务超时产生可审计事件；相同观察不重复事件；未知用量不显示为 0、免费或低成本；空闲不调用 LLM | 不同任务进展信号差异；阈值误报；日志噪声；Token 数据缺失使预算决策更保守 |
+| **M2-03 分层角色 Prompt、版本化 Brief 与完成报告**；依赖 M1-04、M1-05、M2-01 | 统一 CEO/CTO/Developer/Tester/custom Prompt 层：稳定角色规则、Task/Attempt、带 digest/version 的任务文件、Ownership/read-only、依赖、验收、命令白名单和预算；不复制 CEO Protocol；投递前持久化 Command/Attempt/Session/evidence version，并记录 pending/sending/submitted/acknowledged/executing/execution_finished/unknown；定义 Worker result schema 并保留纯文本兼容 | Codex/OpenCode 均收到既有角色/责任/只读限制；Herdr argv 与 API 不被替代；提交、接收、执行结束和 Task 完成可区分；崩溃/回执丢失进入 Reconcile 且不盲重发；缺失/非法结果不会直接完成 Task；报告绑定 Attempt 和任务版本 | 本地模型结构化输出不稳定；Prompt 过长；旧 Harness 只支持文本；ack 信号可能不可得 |
+| **M2-04 Deterministic Watcher 与进展时钟**；依赖 M1-05、M2-01 | 先探测 Herdr 是否存在可验证、可恢复的事件订阅；契约不满足时低频查询；分别观察 process liveness、Agent activity、progress evidence；仅认可版本化里程碑/artifact/report digest/verification 为实际进展；维护 `last_observed_at`、`last_activity_at`、`last_progress_at`、task deadline、可配置无进展阈值和退避；事件以 SQLite seq 和 dedupe key 持久化；未知 Token 保持 NULL | 订阅与 polling 产生相同领域事件语义；进程活着但无进展达到阈值时进入 STALLED/NEEDS_HUMAN；日志滚动不重置进展时钟；任务超时产生可审计事件；相同观察不重复事件；重启后不重复派工；未知用量不显示为 0、免费或低成本；空闲不调用 LLM | Herdr 事件能力可能不存在或版本不稳；阈值误报；日志噪声；Token 数据缺失使预算决策更保守 |
 | **M2-05 Reconcile、超时与有界 Attempt**；依赖 M2-02、M2-04 | 复用 terminal/native-session 核验；交叉检查 DB、Herdr、结果；为等待、取消、人工处理、经批准的新 Attempt 定义 Command；配置 max Attempts 和异常升级路径 | Prompt 回执丢失不重发；Pane 移动可验证恢复；身份不符拒绝接管；达到无进展/任务超时或 max Attempts 时升级，不无限重试；UNKNOWN 不自动重试且未审批不能产生新 Attempt | 证据不足时用户负担；阈值和最大次数设置不当；把活跃误判成进展 |
 | **M2-06 report-only/scout Verification/Approval Gate**；依赖 M1-05、M2-03、M2-05 | 建立 Verification/Approval 服务；仅运行项目批准的 argv 验证命令；记录受控报告 artifact/hash、规则/config version 和人类接受；Approval 按 8.2 绑定 evidence version。普通 ship 保留 `VERIFYING` 或转 `NEEDS_HUMAN`，原因标记为等待 M4 Worktree/Commit/Diff evidence；不实现 local-only 快照 | Worker FINISHED 不能直接 DONE；无验证命令不默认 PASS；report-only/scout 仅在 artifact 验证和相同证据版本的人类接受后 DONE；证据变化使 Approval 失效；local-only/direct-PR 在 M4 前不能 DONE；批准/拒绝可审计且重复决定幂等 | artifact 可信边界；审批 TOCTOU；把 M2 报告门禁误用于代码交付 |
-| **M2-07 Core/Runtime 故障注入**；依赖 M2-03、M2-05、M2-06 | 覆盖启动响应丢失、Agent 进程退出、进程存活但无进展、活动无产物进展、任务超时、max Attempts、重复 completed、Leader 换届、旧 Leader 在外部 Herdr/GitHub 调用执行期间失租（epoch 已推进）、Core 重启/事件回放、report Verifier/Approval 写入前后崩溃；Worktree/Git 留给 M4、浏览器一致性留给 M3 | 每场景记录三类信号、阈值、证据、安全动作、人工升级和幂等边界；无重复 Pane/Prompt/Attempt/外部副作用；未知 Token 维持 NULL；UNKNOWN 不自动重试；外部调用期间失租必须转入 Reconcile：以 Herdr/Git 事实判定副作用是否已发生，禁止盲目重发或自动确认（呼应 8.2 第 7 条，fencing 只保证受控状态提交与准入，不保证外部 exactly-once）；事件可回放 | Mock 与实机偏差；故障窗口难稳定复现；阈值需要真实工作负载校准 |
+| **M2-07 Core/Runtime/Wake 故障注入**；依赖 M2-03、M2-05、M2-06、M2-08、M2-09 | 覆盖启动响应丢失、Agent 进程退出、进程存活但无进展、活动无产物进展、任务超时、max Attempts、重复 completed、Leader 换届、旧 Leader 在外部 Herdr/GitHub 调用执行期间失租、Watcher/Dispatcher 重启、CEO working 时多事件、Wake 各投递阶段崩溃、CEO 确认前崩溃、协议版本不兼容、Core 重启/事件回放、report Verifier/Approval 写入前后崩溃；Worktree/Git 留给 M4、浏览器一致性留给 M3 | 每场景记录三类信号、阈值、证据、安全动作、人工升级和幂等边界；事件/Wake 可回放且未确认事件保留；受控状态不重复提交，歧义期间不盲目再次创建 Pane、投递 Prompt 或派发 Attempt；未知 Token 维持 NULL；UNKNOWN 不自动重试；外部调用期间失租必须转入 Reconcile，以 Herdr/Git 事实判定且禁止盲目重发或自动确认，不能把 Mock 结果解释成外部副作用 exactly-once；Mock 与真实 Herdr/Harness 结果分栏 | Mock 与实机偏差；故障窗口难稳定复现；阈值需要真实工作负载校准 |
+| **M2-08 CEO 初始化 Runtime**；依赖 M1-08、M2-01、M2-03 | Runtime Adapter 启动/恢复 CEO，发送最短 bootstrap Prompt；校验期望 protocol version/hash、`teamcraft` 运行 Skill、项目/Task 状态和 Session 身份；持久化 discovered/read/initialized/failed/incompatible，初始化完成前设置 dispatch gate | Skill 缺失、协议不可读/hash 不符/版本不兼容均阻断派工并产事件；发现不等于读取，读取不等于初始化；恢复不创建重复 CEO；Codex/OpenCode 以 Mock + 可用版本实机分别验收 | Harness 无可靠加载确认；Prompt 注入攻击；恢复时协议升级 |
+| **M2-09 Wake Dispatcher**；依赖 M2-08、M2-02、M2-04、M2-05 | 在 Scheduler Leader 内读取 SQLite Events，按 dedupe key、seq、优先级和窗口合并 Wake；持久化 pending/sending/submitted/acknowledged/processed；CEO working 延后普通 Wake，idle/done 且身份有效时用 Herdr prompt 唤醒，unknown/missing 隔离；CEO 明确确认前保留事件；Dormant 支持，auto-start opt-in 默认关闭；预算保守控制 | 多事件只产生一次合并唤醒且不丢高优先级项；重启从 DB 恢复；sending/submitted 结果不明时 Reconcile 不重发；CEO working 不注入普通 Wake；unknown/missing 不启新会话；处理确认原子绑定事件游标；不引入第二服务/消息系统，不要求常驻 LLM | 合并延迟紧急事件；CEO ack 语义不统一；外部 Prompt 不具 exactly-once；预算未知导致保守阻塞 |
 
-**M2 退出门禁**：所有外部副作用由单一 fenced Leader 执行持久 Command；后台观察不消耗 LLM Token；进程存活、Agent 活跃和实际进展可分别查询；无进展阈值、任务超时、max Attempts 和升级路径通过故障测试；未知 Token 保持 NULL 且不作为低成本依据；Herdr 失联、UNKNOWN 或结果歧义不会盲重派。最小 Verification/Approval 已可在 CLI 验收 report-only/scout，Worker 自述不能完成 Task；local-only、direct-PR 和普通 ship 明确停在等待 M4 证据的非终态。浏览器生命周期由 M3-06 验收，脏 Worktree、Commit 回执丢失和 Worktree Verifier 崩溃由 M4 验收。
+**M2 退出门禁**：所有外部副作用由单一 fenced Leader 执行持久 Command；CEO 只有在协议和运行 Skill 初始化确认后才能派工；Watcher 日常观察不消耗 LLM Token；Wake 可合并、去重、确认、重启恢复，Dormant CEO 不要求常驻且 auto-start 默认关闭。进程存活、Agent 活跃和实际进展可分别查询；无进展阈值、任务超时、max Attempts 和升级路径通过故障测试；未知 Token 保持 NULL 且不作为低成本依据；Herdr 失联、UNKNOWN 或投递歧义不会盲重派/重发。最小 Verification/Approval 已可在 CLI 验收 report-only/scout，Worker 自述不能完成 Task；local-only、direct-PR 和普通 ship 明确停在等待 M4 证据的非终态。浏览器生命周期由 M3-06 验收，脏 Worktree、Commit 回执丢失和 Worktree Verifier 崩溃由 M4 验收。
+
+M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reconcile 边界；真实 GitHub Adapter 尚未出现，须在 M4-05 另行验证，不把 M2 Mock 记作真实 GitHub 集成证据。
 
 ### 9.3 M3 — Web UI 最小控制台
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M3-01 API 安全壳**；依赖 M1-07、M2-06 | FastAPI/Uvicorn 默认绑定 `127.0.0.1`；本地随机 Session Token、Origin/CSRF、request ID、统一错误模型；静态资源边界 | 未授权/错误 Origin/CSRF 写请求拒绝；服务默认不对外网；日志不打印 Token；健康接口区分进程与依赖健康 | localhost 被误当完全可信；Token 保存/轮换体验 |
-| **M3-02 Query API 与快照**；依赖 M3-01、M2-04 | 实现 Projects、Tasks、Attempts、Agents、Events、Approvals 查询 DTO；只经 Query Service；分页、过滤、日志截断/脱敏 | API 数据与 CLI 同源；读请求不改变状态或派工；unknown/缺失用量不伪造；长日志受限 | N+1 查询；内部 Schema 泄漏；日志路径越界 |
+| **M3-02 Query API 与快照**；依赖 M3-01、M2-04、M2-09 | 实现 Projects、Tasks、Attempts、Agents、CEO 初始化/协议、Events、Wakes、Approvals、恢复记录和 Verification 查询 DTO；只经 Query Service；分页、过滤、日志截断/脱敏 | API 数据与 CLI 同源；读请求不改变状态、唤醒或派工；能区分 Session、Attempt、Task、三类进展和 Wake 状态；unknown/缺失用量不伪造；长日志受限 | N+1 查询；内部 Schema 泄漏；日志路径越界 |
 | **M3-03 SSE 与断线恢复**；依赖 M1-05、M3-01 | `after`/`Last-Event-ID`、心跳、批量补拉、序号缺口回快照；限制连接和 payload；顺序权威为 SQLite 持久 `events.seq`（进程内广播不得作为顺序真源），断线后按 seq 补拉缺口，客户端按 seq 去重 | 断线后无丢失/重复副作用；客户端检测缺口并重拉且重复投递不产生重复渲染或重复命令；SSE 只读；事件序号严格递增且与 DB 查询结果一致 | 慢客户端占资源；代理缓冲；敏感 payload |
-| **M3-04 Task 管理、受控 Command 与 Approval API**；依赖 M3-01、M1-04、M1-05、M2-05、M2-06 | 通过 Core Command Service 暴露 Task create/edit/query、依赖增删、优先级调整、执行策略配置，以及 pause/resume/cancel/retry-request/Approval；所有写请求要求 Idempotency-Key、Task/evidence version，外部动作异步返回 command ID | Web 能创建、编辑、查询 Task，管理 DAG、priority 和 delivery/router/verifier/timeout/max-attempt policy；循环依赖拒绝并返回路径；版本冲突 409；运行中 Task 的目标、依赖、Ownership 或策略变更按项目策略拒绝或生成新版本并使旧证据失效；CLI/API 得到同一转换；所有写入可追到 Core Command/Event | 运行中编辑破坏 Brief/证据；循环竞态；策略变更绕过审批；Approval TOCTOU |
-| **M3-05 最小 Web 页面**；依赖 M3-02、M3-03、M3-04 | Overview、Task list/detail/create/edit、依赖管理、priority 和 execution policy 控件、Agents、Events、Approvals；真实 API；离线/空/错误/截断状态；HTML/Markdown 净化 | 页面覆盖 M3-04 的全部 Task 管理能力；展示 Task、Attempt、Agent 和三类进展信号的区别；运行中不可编辑项和版本冲突明确；关闭浏览器任务继续；无 Demo 数据混入真实视图；恶意日志不执行 | 前端缓存冒充真源；复杂策略表单错误默认；依赖/bundle 膨胀 |
-| **M3-06 浏览器 E2E 与恢复**；依赖 M3-05、M2-07 | 临时 DB+Fake Herdr；以 report-only/scout 测试创建→编辑→依赖/优先级/策略→派工状态→报告验证→待审批→接受/拒绝；另测 DAG cycle、stale version、运行中编辑策略、普通 ship 等待 M4；覆盖断线、后端重启、服务缺席、显式 queue/TTL、重复点击、长日志和恶意 HTML | Chromium E2E 可重复；CLI/Web 对同命令产生同一转换；所有写入均经过 Command Service；浏览器断开不影响任务；后端重启后快照/SSE 收敛且不重复命令；过期 queue 不执行；普通 ship 不被 UI/API 误报完成 | E2E 脆弱；测试未覆盖真实 Herdr 时序；复杂状态组合遗漏 |
+| **M3-04 Task/调度/Wake 受控 Command 与 Approval API**；依赖 M3-01、M1-04、M1-05、M2-05、M2-06、M2-09 | 通过 Core Command Service 暴露 Task create/edit/query、依赖增删、优先级调整、执行策略配置，以及 pause/resume/cancel/retry-request/Approval、手动请求 CEO 处理和调度 pause/resume；所有写请求要求 Idempotency-Key、Task/evidence version，外部动作异步返回 command ID | Web 能管理 DAG、priority 和 delivery/router/verifier/timeout/max-attempt policy；手动 Wake 只创建持久 Command，不直接发 Prompt；暂停/恢复不绕过 Leader；循环依赖拒绝并返回路径；版本冲突 409；运行中关键变更拒绝或生成新版本并使旧证据失效；CLI/API 同转换；所有写入可追到 Command/Event | 运行中编辑破坏 Brief/证据；循环竞态；手动 Wake 风暴；策略变更绕过审批 |
+| **M3-05 最小 Web 页面**；依赖 M3-02、M3-03、M3-04 | Overview、Task list/detail/create/edit、依赖/priority/policy、Agents、CEO/Protocol、Events、Wakes、Approvals、Verification；真实 API；支持查看 Wake 失败、有效进展和恢复记录，手动请求 CEO、暂停/恢复调度；离线/空/错误/截断状态；HTML/Markdown 净化 | 页面覆盖 M3-04；显示 CEO Harness、protocol version/hash、初始化阶段、Task/Attempt/Session、三类进展、Wake 历史和实际证据；运行中不可编辑项和版本冲突明确；关闭浏览器任务继续；无 Demo 数据；恶意日志不执行 | 前端缓存冒充真源；复杂策略表单错误默认；敏感 Prompt/Event 展示；依赖/bundle 膨胀 |
+| **M3-06 浏览器 E2E 与恢复**；依赖 M3-05、M2-07 | 临时 DB+Fake Herdr；以 report-only/scout 测试完整管理与验收；另测协议信息、CEO working 多事件、空闲合并唤醒、Wake 失败/手动请求、DAG cycle、stale version、普通 ship 等待 M4；覆盖 SSE 断线补拉/客户端去重、后端重启、服务缺席、显式 queue/TTL、重复点击、长日志和恶意 HTML | Chromium E2E 可重复；CLI/Web 同转换；所有写入经 Command Service；浏览器断开不影响任务；重启后快照/SSE 按 SQLite seq 收敛，不重复命令/Wake；过期 queue 不执行；普通 ship 不被误报完成；Fake 证据不标成真实 Harness E2E | E2E 脆弱；测试未覆盖真实 Herdr 时序；复杂状态组合遗漏 |
 
-**M3 退出门禁**：Web 可通过 Core Command Service 完成 Task 创建、编辑、查询、依赖管理、优先级调整和执行策略配置；循环、stale version 和运行中编辑策略均有测试。API/CLI 共用状态转换；report-only/scout 的验证/审批闭环在 Web/CLI 一致；local-only/direct-PR/普通 ship 清楚显示“等待 M4 workspace/commit/diff evidence”且不能 DONE。本门禁只验收控制台和 report-only/scout，不宣称完整 PRD P0 ship 已交付。Web 关闭不影响后台；SSE 可续传或安全重拉；后台缺席不会静默延迟执行；所有写命令幂等和可审计；安全与浏览器恢复场景通过。
+**M3 退出门禁**：Web 可通过 Core Command Service 完成 Task 管理、手动请求 CEO 和调度 pause/resume；展示真实 CEO/协议/Session/Attempt/Task、进展、Event/Wake、Verification、审批、恢复与用量。API/CLI 共用状态转换；report-only/scout 的验证/审批闭环一致；local-only/direct-PR/普通 ship 清楚显示等待 M4 且不能 DONE。Web 关闭不影响后台；SSE 按 SQLite seq 续传、补拉和客户端去重；后台缺席不会静默延迟执行；所有写命令幂等和可审计；安全与浏览器恢复场景通过。
 
 ### 9.4 M4 — Workspace & Verification
 
@@ -335,8 +366,8 @@ flowchart LR
 |---|---|---|---|
 | **M4-01 Workspace 路径与 Diff Gate**；依赖 M2-02 | 统一真实路径、仓库根、大小写和 symlink 检查；以 NUL 分隔的 Git plumbing/status 组合收集 staged、unstaged、untracked、deleted 和 renamed 的全部路径及 rename 源/目标，不能只用会漏掉 untracked 的 `git diff --name-only -z`；将规范化后的完整变更集与 Ownership 比较并记录 base SHA | `../`、绝对路径、symlink、大小写变体和越权文件均拒绝；新增未跟踪文件、暂存/未暂存修改、删除、rename 源/目标都进入边界检查；现有合法 Ownership 保持通过 | macOS 大小写不敏感与 Linux 不同；Git porcelain/plumbing 版本差异；rename、submodule 和嵌套仓库解析 |
 | **M4-02 Worktree 生命周期**；依赖 M4-01 | 为写 Attempt 创建 `tc/<task>/<attempt>` 分支和独立目录；记录 ALLOCATED→CLEANABLE；资源命名空间；只读策略；注入“任务失败但 Worktree 有未提交改动”场景 | 两 Worker 不共享未提交代码；重启可发现/认领已记录 Worktree；失败状态不掩盖脏现场；脏、未合并、身份不明 Worktree 不自动删除 | Worktree 不是沙箱；磁盘增长；分支名碰撞 |
-| **M4-03 Worktree Verifier 增强**；依赖 M4-02、M2-06 | 在 M4-02 已登记并核验身份的 Attempt Worktree 内运行 P0 Verifier，固定受控 cwd/env/timeout，扩展 lint/test/typecheck/secret scan 和 PASS/FAIL/ERROR/SKIPPED；验证前后调用 M4-01 完整变更集检查；保留 report-only artifact 验证；注入 Verifier 完成前后服务崩溃 | Verifier 拒绝未登记、身份不符或生命周期不允许的 Worktree；UI/Task 不能注入任意 shell；无命令不默认 PASS；并发 Attempt 的验证互不污染；staged、unstaged、untracked、deleted、renamed 越界均不能通过；Verifier 恢复不丢失或重复接受结果；超时和非零码准确；日志路径限制在工件根 | 项目测试本身有副作用；秘密出现在输出；平台命令差异；Worktree 身份或生命周期记录与 Git 事实漂移 |
-| **M4-04 Commit/Diff 证据与 local-only 接受**；依赖 M4-02、M4-03、M3-04 | ship Verification 绑定 Attempt、Commit SHA、完整 Diff 摘要和 verifier/config version；Approval 固定 evidence version 和 proposed action；代码、配置或策略变化使旧 PASS/Approval 失效；实现 local-only 明确接受；注入“Commit 已存在但完成回执丢失” | 回执丢失时以 Git+Session+Event Reconcile 且不重复提交；HEAD/Diff/config 改变后不能沿用证据；越权 Diff 或失败测试不能交付；local-only 只有指定 Commit/分支被人接受后 DONE | amend/rebase 改 SHA；大 Diff 存储成本；接受了错误分支或 base |
+| **M4-03 Worktree Verifier 增强**；依赖 M4-02、M2-06 | 在已登记并核验身份的 Attempt Worktree 内独立运行 P0 Verifier，固定 cwd/env/timeout，扩展 lint/test/typecheck/secret scan 和 PASS/FAIL/ERROR/SKIPPED；记录真实 argv、退出码、日志 digest；验证前后做完整 Diff Gate；保留 report artifact；注入 Worker 表示完成但测试失败及 Verifier 崩溃 | Worker/execution_finished 只触发验证；非零码、超时、ERROR、无命令或越权变更均不能 PASS/DONE；修复创建新有界 Attempt；并发验证不污染；恢复不丢失或重复接受结果；日志路径限制在工件根 | 项目测试有副作用；秘密出现在输出；平台差异；身份记录与 Git 漂移 |
+| **M4-04 Commit/Diff 证据与 local-only 接受**；依赖 M4-02、M4-03、M3-04 | ship Verification 绑定 Task/Attempt/Brief version、Commit SHA、完整 Diff 摘要、artifact 和 verifier/config version；Approval 固定 evidence version 和 proposed action；代码、任务、配置或策略变化使旧 PASS/Approval 失效；实现 local-only 明确接受；注入 Commit 已存在但完成回执丢失 | 回执丢失时以 Git+Session+Event Reconcile 且不重复提交；任一绑定证据改变后不能沿用 PASS/Approval；越权 Diff 或失败测试不能交付；Worker finished、Verifier pass 和 Approval 保持独立；local-only 只有指定 Commit/分支被人接受后 DONE | amend/rebase 改 SHA；大 Diff 存储成本；接受错误分支/base；任务版本漂移 |
 | **M4-05 GitHub PR Adapter**；依赖 M4-04 | 探测 `gh` 和认证；显式启用 direct-PR；幂等创建/更新 PR；同步 head/base、检查和 merge 事实；merge Command 永远绑定人工 Approval 并由 fenced Leader 执行 | 无 `gh`/未认证时安全 BLOCKED；重试不重复开 PR；创建 PR 只到 READY_TO_MERGE；head/base 漂移使 Approval 失效；仅合并到绑定 intended base 后 direct-PR DONE；默认不 push 受保护主分支 | 网络/认证失败；重复 PR；远端分支权限；批准后 head/base 漂移 |
 | **M4-06 集成冲突与安全清理**；依赖 M4-02、M4-05 | 检测 base 漂移和冲突；创建显式 integration task；清理前核验脏文件、未交付 commit、审批、交付事实和路径；审计所有动作 | 冲突不强制覆盖；脏现场保留；仅 CLEANABLE 且对应交付策略已 DONE、证据齐全才可清理；失败可定位恢复 | 自动合并掩盖语义冲突；误删调查证据 |
 
@@ -346,11 +377,11 @@ flowchart LR
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
-| **M5-01 能力注册与健康检查**；依赖 M2-01 | 为 Harness/Provider/Model 记录能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；实际选择记录到 Attempt | 探测本身有费用；版本/模型名不稳定 |
+| **M5-01 Harness/Provider 能力注册与健康检查**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt | 探测有费用；版本/模型名不稳定；文档能力与实机不同 |
 | **M5-02 确定性 Router**；依赖 M5-01、M2-02 | 配置 local-first、任务风险、能力要求、人工覆盖；输出选择及 reason code；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不能仅因便宜走弱模型；用户覆盖有审计 | 风险分类错误；策略过度复杂 |
-| **M5-03 有界失败升级与预算**；依赖 M5-02、M2-05 | 复用 M2 的 max Attempts/超时/失败分类，增加云端 Token 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守预算策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；未知用量不当作 0、免费或仍有完整预算；预算不足不调用云端；拒绝升级后不偷跑 | 不同 Provider 用量不可比；未知用量导致保守阻塞；失败归因不准确 |
-| **M5-04 Usage 数据与价格来源**；依赖 M1-03、M5-01 | 记录 source、exact/estimated、input/output/cache tokens、响应数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable 而非 0；估算与实数可区分；价格可追溯生效时间 | Harness 不暴露用量；订阅额度无法折算 |
-| **M5-05 用量/成本 UI**；依赖 M3-05、M5-04 | 任务级明细、趋势和筛选；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/来源；NULL 不参与错误求和；权限和脱敏与其他页面一致 | 图表给人虚假精确感；大量明细查询慢 |
+| **M5-03 有界失败升级、CEO Wake 与预算**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
+| **M5-04 Usage 数据与价格来源**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
+| **M5-05 用量/成本 UI**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
 | **M5-06 对照实验**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
 
 **M5 退出门禁**：本地 Worker 完成至少一个真实小任务；oMLX 不可用时有界阻塞或按审批升级；Router 决策可解释；成本数据区分真实、估算、缺失；对照实验可复现且不虚报收益。
@@ -364,8 +395,29 @@ flowchart LR
 | **M6-03 脱敏诊断包**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
 | **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
+| **M6-06 Claude 适配与跨 Harness 真实 E2E**；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
-**M6 退出门禁**：P2 项逐项独立发布；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源。
+**M6 退出门禁**：P2 项逐项独立发布；跨 Harness E2E 按实际版本和真实运行证据验收，未安装 Claude 时明确未验证；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源或第二份 CEO 协议。
+
+### 9.7 CEO Protocol / Wake 跨任务测试索引
+
+| 场景 | 负责任务 | 最低证据 |
+|---|---|---|
+| Codex/OpenCode 发现同一 CEO Skill/协议 | M1-08、M2-08 | Mock 契约 + 各自已安装版本真实冒烟，version/hash 一致 |
+| Claude 项目入口与发现 | M6-06 | 目标版本真实测试；本机不可用期间标记 pending |
+| Skill/协议缺失、读取失败、版本不兼容 | M1-08、M2-08 | 离线失败路径；初始化不通过且零派工 |
+| Worker Prompt 成功/失败、投递后崩溃 | M2-03、M2-07 | Fake Adapter 故障注入；可用 Herdr 实机契约另列 |
+| CEO working 多事件、idle 合并 Wake | M2-09、M2-07 | 持久 DB 状态、单次发送、事件未丢失 |
+| Watcher/Dispatcher 重启及 Event/Wake 去重 | M2-04、M2-09、M2-07 | SQLite seq/dedupe 恢复，不重复派工/发送 |
+| CEO 收到 Wake 但处理前崩溃 | M2-09、M2-07 | submitted/acknowledged 保留，重启先 Reconcile |
+| Herdr unknown/missing | M2-05、M2-09 | 隔离/升级，不新建 CEO 或重派 Worker |
+| Worker 自报完成但测试失败 | M2-06、M4-03 | Attempt execution_finished 与 Verification FAIL 分离，Task 非 DONE |
+| 日志持续输出但无有效进展 | M2-04、M2-07 | `last_activity_at` 变化而 `last_progress_at` 不变，达到阈值升级 |
+| 外部调用中 Leader 失租 | M2-02、M2-07 | epoch 阻止旧 Leader 提交，外部事实对账，不宣称 exactly-once |
+| Web 断线事件补拉/客户端去重 | M3-03、M3-06 | SQLite seq 为权威，重复 frame 不产生重复 Command/Wake |
+| Ownership/Resume/Launch/Complete/Release 不回退 | 全阶段兼容门禁，重点 M2-01/M2-03 | M1-01 契约与后续全部回归持续通过 |
+
+Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herdr 的发现、Prompt、Session 和时序验证。每次报告须列出二进制版本、平台、是否真实调用及退出码；未运行的真实测试保持“未验证”。
 
 ## 10. 全阶段强制门禁
 
@@ -385,6 +437,9 @@ flowchart LR
 12. SQLite 只运行在单机本地磁盘；WAL 活跃备份不得只复制主 DB；schema 版本过新必须拒绝写入；恢复后先 Reconcile 再派工。
 13. Approval 绑定 evidence version；artifact、Commit/Diff、Verifier/config 或 PR head/base 变化必须失效并重新审批。
 14. 未知 Token 保持 NULL，不作为零成本、低成本或仍有完整预算的依据。
+15. CEO Protocol 只维护一份权威正文；Harness 入口只适配发现/加载，必须记录 version/hash，初始化未确认不得派工。
+16. Wake Prompt 只是通知；SQLite Event/Wake 是权威待办。unknown/missing 或投递结果不明先 Reconcile，不自动新建会话或重发。
+17. Mock/Fake 与真实 Harness/Herdr 证据分开报告，不得以模拟通过宣称跨 Harness 端到端兼容。
 
 ## 11. M0 新增风险与决策清单
 
@@ -404,6 +459,11 @@ flowchart LR
 | Web Task 写入绕过 Core 或运行中编辑使 Brief/证据失效 | **High** | 当前无 Web/API；`teamctl.py` 单文件直接写 StateStore（`:125-169`、`:310-332`） | M3-04 全部 Task CRUD/依赖/优先级/策略经 Command Service；optimistic version、DAG cycle、运行中策略和证据失效测试 |
 | M2 local-only 快照扩大范围仍不能排除系统外写入 | **Medium** | 当前共享同一 `cwd`（`teamctl.py:507-510`），Ownership 明确不是文件系统隔离（`README.md:168-174`） | 取消 M2 快照；M2/M3 只闭环 report-only/scout；M4 用 Worktree/Commit/完整 Diff 证据 |
 | 迁移或 Core 改造削弱 Ownership、Session 身份和保守恢复 | **High** | 现有 normalize/overlap、session identity、默认 inspect 已有代码和测试（`teamctl.py:109-118`、`:264-332`、`:688-821`；`test_teamctl.py:83-132`、`:218-301`） | 30 项回归保持；M1-01 契约固定语义；各阶段强制门禁 3–4 |
+| CEO Protocol 在 Harness 入口复制或版本漂移 | **High** | 当前没有独立协议或版本字段；CEO 规则散在 Skill、Profile 和 `build_prompt()` | M1-08 单一 `CEO_PROTOCOL.md` + version/hash；入口只加载；M2-08 初始化握手；M6-06 跨 Harness 校验 |
+| Skill 被发现但协议未读取/初始化却开始派工 | **Critical** | 当前 `teamctl` Prompt 提交后只有 `prompt_submitted`，没有协议读取确认或 dispatch gate | M2-08 区分 discovered/read/initialized 并 fail closed；M2-07 缺失/不兼容故障注入 |
+| Wake 投递结果不明导致重复 CEO 决策或重复派工 | **Critical** | 当前 prompt 歧义只存 JSON phase，无持久 Event/Wake/Command 对账 | M1-05/M2-03 持久 Command；M2-09 Wake 状态/合并/ack；M2-07 sending/失租/崩溃测试；禁止盲重发 |
+| Harness 官方发现规则或版本变化 | **High** | 本机只有 Codex 0.163.0、OpenCode 2.0.25；Claude 不可用，官方文档不能替代实测 | M1-08/M5-01 能力矩阵；每版本真实冒烟；Claude 延至 M6-06，未测不宣称支持 |
+| CEO 唤醒过频消耗云端 Token | **High** | 当前无 Wake 合并、预算或用量数据 | M2-09 working 延后、合并窗口、优先级、Dormant；M5-03/04 预算和统计；未知用量保守处理 |
 
 ### 11.2 已接受的设计决策
 
@@ -420,6 +480,12 @@ flowchart LR
 - M3 MVP 包含 Task 创建、编辑、查询、依赖、优先级和执行策略管理。
 - Watcher 区分 process liveness、Agent activity 和 task progress；未知 Token 永不解释为零。
 
+### 11.2.1 待审查的新增设计（未接受）
+
+- 第 8.7 节的 CEO Protocol 唯一来源、跨 Harness 薄入口、初始化握手、Prompt 分层和 Wake Dispatcher 尚为 **Proposed**。
+- 相应的 M1-08、M2-08、M2-09 与 M6-06 已纳入依赖图和验收清单，但在本轮人工审查明确接受前不得开工，也不得改变第 12.3 节的授权状态。
+- Codex/OpenCode 官方文档已复核；真实 Skill 发现尚未执行。Claude 仅完成文档层设计，本机无二进制，因此适配方式和端到端结果均未决。
+
 ### 11.3 未解决决策（按最晚决策点）
 
 1. **正式 cutover 审批（M1-07 实际切换前）**：在 M1-06 故障矩阵、备份恢复、旧 writer 静止性证明与 M1-07 Guard 验收后，单独审查切换窗口与恢复方案；ADR-001 的原则接受不能替代该审批。
@@ -427,6 +493,9 @@ flowchart LR
 3. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
 4. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
 5. **Core 模块在已安装项目中的可用性（旧 CLI 或入口脚本依赖 Python Core 前，最晚 M1-07）**：一旦 `teamcraft/` Python Core 成为 CLI 的运行时依赖，安装器必须让目标项目获得可导入模块——例如在目标环境执行打包安装（`pip install`）、将包随 Skill 分发并由入口脚本显式注入模块路径，或提供其他可回滚的离线安装方式；不得依赖源码仓库根目录的隐式 PYTHONPATH（当前 `teamctl.py` 尚未导入 `teamcraft`，故 M1-02 无此问题，但引入依赖即触发本决策）。
+6. **CEO Protocol 首版与升级规则（M1-08 前）**：确定首个版本号、兼容范围、hash 规范，以及协议升级时进行中的 Task/Attempt 固定旧版还是要求重新初始化；任何选择都必须保留证据版本并避免半途静默切换。
+7. **Harness 入口安装策略（M1-08/M6-06 前）**：`AGENTS.md`/`CLAUDE.md` 的安全合并或旁路说明、Claude 使用受管副本还是经验证 symlink、冲突时 no-op/fail 的具体 UX，须按真实版本与跨平台测试决定，不能覆盖用户文件。
+8. **Wake 默认策略（M2-09 前）**：合并窗口、优先级、ack 超时、事件保留期与云端预算需用真实负载校准；CEO auto-start 继续默认关闭，开启方式须显式且可审计。
 
 ### 11.4 推迟解决的决策
 
@@ -437,6 +506,7 @@ flowchart LR
 - `gh` 的认证/远端选择和 fork 场景。
 - M5 的具体模型能力/价格源和成本对照实验方法。
 - M6 远程与多机能力；在单机 SQLite/Leader 数据稳定前只写 RFC。
+- Claude Code 的真实发现、Prompt/Session 能力和最低支持版本；本机没有 `claude`，在 M6-06 实测前保持未验证。
 
 ### 11.5 尚无证据，不应宣称
 
@@ -447,6 +517,7 @@ flowchart LR
 - Codex/OpenCode 的精确 Token 数据来源和成本；
 - 任一成本节省比例、恢复成功率或并发 SLA；
 - GitHub PR、浏览器安全和远程访问能力。
+- `teamcraft-ceo` Skill、`CEO_PROTOCOL.md`、Codex/OpenCode/Claude 协议发现、CEO 初始化与 Wake Dispatcher；这些目前仅是规划。
 
 ## 12. M0/M1 证据与决策登记
 
@@ -487,10 +558,11 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 | 决策类型 | 当前状态 | 证据与边界 |
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
+| CEO Protocol / 跨 Harness / Wake 提议扩展 | **待人工审查（2026-10-27 Proposed）** | 第 8.7 节与 M1-08/M2-08/M2-09/M6-06 只是规划更新；未扩大既有 ADR 接受范围，也未授权实现 |
 | 任务开工授权 | **M1-01、M1-02 分别获单独授权；M1-03 及以后未授权** | M1-02 授权只覆盖第 9.1 节的包/配置边界、Skill 改名、相关文档与契约测试；依赖满足不是后续开工许可 |
 | 任务完成验收 | **M1-01 已验收；M1-02 有条件验收通过（2026-10-24）** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；条件为 12.2 残余 1（Python 3.10/Linux 与 CI），须在 Python Core 成为 CLI 运行时依赖前补齐；收尾文档提交 SHA 由主 Agent 在最终回复提供，不在文档内补记 |
 | 正式数据迁移 / cutover 审批 | **尚未批准** | M1-06 仅排练，M1-07 必须先验收 Guard、备份恢复、静止性与故障矩阵，再单独批准实际切换；当前没有旧进程运行的时点确认不代替切换日证明 |
 
 ### 12.4 下一任务边界
 
-`M1-02` 已获有条件验收通过（条件见 12.2 残余 1）；收尾文档提交由主 Agent 形成，其 SHA 以最终回复为准，文档不自我补记。`M1-03` 虽在依赖图中紧随其后，但**仍未获开工授权**；不得执行 SQLite 迁移、Watcher、Web、Worktree、模型 Router，亦不得操作正在运行的 Herdr 会话。正式 cutover 继续独立审批。
+`M1-02` 已获有条件验收通过（条件见 12.2 残余 1）；收尾文档提交由主 Agent 形成，其 SHA 以最终回复为准，文档不自我补记。依赖顺序上的下一项仍是 **M1-03 SQLite Repository/Migration v1**，其边界只覆盖隔离测试数据的 Repository/Schema/WAL 一致性备份与保护，不执行正式 JSON→SQLite cutover，不实现 CEO Protocol、Watcher、Wake、Web、Worktree 或 Router。`M1-03` 仍未获开工授权，须另行批准；第 8.7 节提议也须先经人工接受，M1-08/M2-08/M2-09/M6-06 才可在各自依赖满足后开工。不得操作正在运行的 Herdr 会话，正式 cutover 继续独立审批。

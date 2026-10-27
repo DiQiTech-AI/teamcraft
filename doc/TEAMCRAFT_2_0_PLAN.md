@@ -2,11 +2,11 @@
 
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
-> **版本**：v1.3（运行目录统一为 `.teamcraft/`）
+> **版本**：v1.4（CEO Protocol 与跨 Harness 编排规划草案）
 > **日期**：2026-10-27
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。M1-03 及以后未获授权，目标能力不得理解为已实现。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03 及以后未获授权。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
 ---
 
@@ -37,7 +37,7 @@ TeamCraft 2.0 是一个 **local-first、single-user、failure-resilient、cost-a
 
 ### 1.1 已有公开能力（待开发时再次逐项核对）
 
-M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M1-02 实现（已条件验收通过）只把该入口改名为 `teamcraft`，下列既有能力与运行语义未变。按当前工作树：
+M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M1-02 实现（已条件验收通过）将该入口改名为 `teamcraft`。随后 2026-10-27 的独立修订把运行目录统一为 `.teamcraft/`，并在旧状态存在时安全拒绝；除此路径和拒绝边界外，Herdr、Ownership、read-only 与保守恢复语义未改。按当前工作树：
 
 - 通过 `teamcraft` Skill 管理团队，默认仅启动 CEO，按需启动 CTO、Developer、Designer、Tester 或自定义专家。
 - 角色责任和 Agent Harness 分离：可通过 Herdr 支持的 Codex、OpenCode 等 Harness 运行。
@@ -60,6 +60,9 @@ M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M
 | 缺少统一可观测界面 | 本地 Web 控制台，实时事件与安全操作 | 浏览器查看真实数据并可审批 |
 | 缺少严格交付证据 | 固定 Verifier、测试/Commit 绑定、PR 门禁 | 任务不能仅凭 Agent 自称 done 完成 |
 | 本地/云端模型分流不统一 | 规则路由 + 人工覆盖 + 故障升级 | 任务记录实际 Harness/Model 和升级原因 |
+| CEO 管理规则散落在角色 Prompt/Skill | 版本化的唯一 CEO Protocol，入口只负责发现和加载 | 初始化记录协议版本/hash，未加载时禁止派工 |
+| Harness 入口与能力差异没有统一适配 | Codex/OpenCode 共用协议，Claude Code 经能力检测后适配 | Mock 契约与真实 Harness 验证分开记录 |
+| CEO 需常驻或主动轮询事件 | Watcher 写持久事件，Wake Dispatcher 合并并按需唤醒 | CEO 工作中不重复唤醒；未知投递先 Reconcile |
 
 ### 1.3 明确非目标（至少 v2.0 阶段）
 
@@ -125,6 +128,8 @@ M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M
 | FR-021 | Review 专家/交叉审查 | P2 | 仅在有价值时启动额外 Agent |
 | FR-022 | 远程访问 | P2 | 优先 SSH/VPN，需验证授权与 CSRF |
 | FR-023 | 多机 Worker | P2 | 单机稳定后独立设计，不纳入 v2.0 |
+| FR-024 | 统一 CEO Protocol 与跨 Harness 发现 | P0 | 单一版本化协议；Codex/OpenCode 入口加载同一内容；缺失或版本不兼容时 fail closed |
+| FR-025 | CEO 初始化与事件驱动唤醒 | P0 | 区分发现/读取/初始化；持久 Wake 状态、合并去重、未知结果对账；自动启动默认关闭 |
 
 ---
 
@@ -139,7 +144,7 @@ flowchart TB
     API --> Core[TeamCraft Core]
     CEO[CEO / Planner 云端或本地] --> Core
     Core --> DB[(SQLite: Tasks Attempts Events)]
-    Core --> Sch[Scheduler + Router]
+    Core --> Sch[Scheduler + Router + Wake Dispatcher]
     Core --> Watch[Deterministic Watcher]
     Core --> Verify[Verifier + Approval Gate]
     Sch --> Herdr[Herdr Adapter]
@@ -152,6 +157,8 @@ flowchart TB
     Verify --> DB
     DB --> SSE[SSE Event Stream]
     SSE --> UI
+    Protocol[Versioned CEO Protocol] --> CEO
+    DB --> Sch
 ```
 
 原则：Web UI 无业务真相；SQLite 是编排状态真源；Herdr 是**运行状态观测源**；Git 是**代码事实源**；模型日志是**辅助证据**。三者须交叉检查，不能把 `idle` 直接等同 `done`。
@@ -181,6 +188,8 @@ flowchart TB
 - `events`: append-only 事件、Outbox、客户端游标。
 - `scheduler`: READY 检测、并发配额、公平派工、租约。
 - `watcher`: 观察会话/心跳/日志/Git/事件，不直接做高风险决策。
+- `wake`: 在 Scheduler Leader 内合并待处理事件、持久化投递状态并按策略唤醒 CEO；不是新常驻服务。
+- `protocol`: 校验 CEO Protocol 版本/hash、Harness 能力和初始化握手；不复制 Herdr 或 Core 逻辑。
 - `router`: 本地/云端模型与 Harness 的可解释规则。
 - `workspace`: 路径规范化、Ownership、Worktree 生命周期。
 - `verifier`: 程序化检查及证据绑定。
@@ -367,7 +376,7 @@ Attempt 可以是 `CREATED → STARTING → ACTIVE → FINISHED | FAILED | UNKNO
 
 ### 5.5 Watcher 与事件处理
 
-Watcher 以可配置周期（例如 5–15 秒，仅为初始调试建议）执行确定性检查：
+Watcher 启动时先探测 Herdr 是否提供已验证、可恢复的事件订阅；只有能力与版本契约通过时才使用订阅，否则以可配置低频周期（例如 5–15 秒，仅为初始调试建议）执行确定性查询：
 
 1. 读取执行中的 Attempt 与租约。
 2. 查询 Herdr Session 存活与活动状态。
@@ -376,7 +385,21 @@ Watcher 以可配置周期（例如 5–15 秒，仅为初始调试建议）执�
 5. 正常长任务继续观察；阻塞、失败、需要审批时产生可操作的告警。
 6. 不自动调用 LLM；仅策略确认有决策需求时通知 CEO 或用户。
 
-### 5.6 可靠恢复原则
+### 5.6 CEO Protocol、初始化与跨 Harness 入口（规划草案）
+
+未来新增 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 作为 CEO 业务协议的唯一权威来源；其相邻 `SKILL.md` 只负责发现、加载、版本校验和最短启动说明。现有 `.agents/skills/teamcraft/` 继续负责 Herdr 会话与 Agent 运行操作，不改回旧 `herdr-team` 名称，也不在 CEO Skill 中复制 Core 或 Herdr CLI 逻辑。协议按 `protocol_version + content_hash` 标识，至少定义 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八个阶段及其批准门禁。
+
+Harness 入口只提供适配：Codex 和 OpenCode 从项目 `.agents/skills/` 发现共享 Skill；`AGENTS.md` 只保留加载入口与项目级强制规则；OpenCode 可在 `.opencode/agents/` 提供薄 CEO 配置。Claude Code 适配在对应任务中通过能力探测，安全生成 `.claude/skills/` 下指向同一协议内容的受管副本或经验证的链接，并由精简 `CLAUDE.md` 引导。安装前必须预检冲突、支持 dry-run、保留用户已有 `AGENTS.md`、`CLAUDE.md` 和 Agent 配置；不支持的能力明确降级或拒绝，不能静默假装已加载。
+
+CEO 初始化状态至少区分 `SKILL_DISCOVERED`、`PROTOCOL_READ`、`INITIALIZED`、`FAILED/INCOMPATIBLE`。启动 Prompt 只声明 TeamCraft CEO 身份、要求加载指定版本协议、使用 `teamcraft` 执行运行操作并读取当前项目/任务状态；不复制协议正文。`PROTOCOL_READ` 需要绑定当前 Session 和初始化 nonce 的结构化回执，Core 校验协议 version/hash；Prompt 已投递或 Skill 已发现均不构成读取证明。只有协议版本/hash 已确认、运行 Skill 可用且初始化记录持久化后，CEO 才可派工。协议缺失、读取失败、无法确认或版本不兼容时 fail closed，并产生可诊断事件。
+
+### 5.7 Prompt 投递与 Wake 消息协议（规划草案）
+
+角色 Prompt 分为稳定角色规则、版本化 Task Brief、Ownership/只读边界、验收与交付要求四层；任务正文优先引用带 digest/version 的受控任务文件，避免重复注入长协议。Core 必须在调用现有 Herdr `agent prompt` 前持久化 Command、Attempt、目标 Session 和 evidence version；Prompt 投递状态区分 `pending → sending → submitted → acknowledged`，结果不明进入 `unknown/reconcile`，不得盲目重发；Attempt 另以 `executing → execution_finished` 表达实际执行，Task/Verification/Delivery 保持独立。`submitted` 只说明 Herdr 接受调用，`acknowledged` 需要目标会话的可关联回执；Harness 没有可靠回执能力时保持未确认并 Reconcile，不伪造 ack。两者均不代表实际执行或任务完成。
+
+Watcher 把变化写入 SQLite Events；同一 Scheduler Leader 内的 Wake Dispatcher 以事件序号为权威来源，将 Wake 记录持久化为 `pending/sending/submitted/acknowledged/processed`，并另记投递结果不明或阻塞原因。`submitted` 只表示 Herdr 接受投递，`acknowledged` 必须是 CEO 对绑定事件序号的显式确认，`processed` 必须是对应决策和处理游标已持久化；不得从 `idle/done` 推断确认。它按事件 key 去重、在合并窗口内聚合并保留优先级：CEO 为 `working` 时普通事件继续待处理；CEO 为 `idle/done` 且 Session 身份核验有效时发送简短唤醒；`unknown/missing` 时隔离并升级，不自动新建会话。CEO 读取数据库中的待处理事件并显式确认，Prompt 只是信号。Dormant 模式允许 CEO 不常驻；自动启动为可选能力且默认关闭。SQLite fencing 只保护受控执行准入和状态提交，不能使 Herdr/GitHub 外部调用 exactly-once；发送中失租必须按事实 Reconcile。
+
+### 5.8 可靠恢复原则
 
 必须处理以下至少 8 种故障：
 
@@ -506,6 +529,8 @@ safety:
 | Approvals | 待批准操作、风险说明、批准/拒绝 | 多级规则、审批模板 |
 | Settings | 项目路径、并发、Verifier、后端健康 | 路由、Token 预算、备份管理 |
 
+MVP 还须在上述页面显示 CEO 当前状态/Harness、已加载协议版本、Wake 请求及失败原因、最近有效进展、恢复记录和 Verification 证据。手动请求 CEO 处理、暂停/恢复调度等操作必须提交 Core Command，不能由页面直接改 Task、Session、Event 或 Wake 状态。
+
 ### 8.3 UI 交互细则
 
 **Overview**：首次加载显示真实的 `active_tasks/blocked_tasks/pending_approvals/active_sessions`。核心进程离线时显示离线，不冒充健康；没有 Token 数据显示 `--`。
@@ -513,6 +538,8 @@ safety:
 **Tasks**：点击任务进入 Detail；创建需要最少 `title/description/project`，验收标准推荐填写；编辑运行中任务的 Ownership 或关键约束需暂停/新版本而非静默覆盖。
 
 **Agent Detail**：显示执行中的 Attempt、原生 Session/Panes、最近命令摘要、结构化事件、尾部日志；任何“停止”明确区分优雅停止与强制终止，不能把终止进程等同任务完成。
+
+**CEO/Wake**：显示 `Skill discovered / Protocol read / Initialized` 三个不同事实、协议 version/hash、CEO Harness 与 Session 身份；Wake 展示 pending/sending/submitted/acknowledged/processed、关联事件序号和 Reconcile 原因。手动唤醒只创建受审计 Command，不直接发送 Prompt。
 
 **Approvals**：显示 proposed action、目标 Task、Commit SHA、受影响文件、Verifier 结果、后果和撤回路径；批准后发 Command，前端通过事件订阅得知最终状态，不能立刻宣称成功。
 
@@ -539,8 +566,11 @@ GET    /api/v1/tasks/{task_id}/attempts
 GET    /api/v1/tasks/{task_id}/verifications
 GET    /api/v1/agents
 GET    /api/v1/agents/{agent_id}
+GET    /api/v1/ceo
 GET    /api/v1/events?after=&limit=
 GET    /api/v1/events/stream
+GET    /api/v1/wakes?status=&after=
+POST   /api/v1/ceo/commands                  # request-processing; never direct prompt
 GET    /api/v1/approvals?status=pending
 POST   /api/v1/approvals/{approval_id}/decision
 GET    /api/v1/usage?project_id=&range=
@@ -620,6 +650,7 @@ teamcraft/
 │   ├── api.md
 │   └── migration.md
 ├── .agents/skills/teamcraft/    # 当前 Skill 入口（M1-02 实现，已条件验收）
+├── .agents/skills/teamcraft-ceo/ # 未来薄加载入口；协议仅在 references/CEO_PROTOCOL.md 维护
 ├── scripts/                    # 兼容现有脚本
 ├── teamcraft/                  # Python 代码包（区别于上面的 Skill 目录）
 │   ├── core/
@@ -667,7 +698,7 @@ teamcraft/
 - 初期 **读取旧 JSON → 建库 → 校验 → 切换单一写入源**。不建议长期 JSON/SQLite 双主写入；必要的兼容导出应为只读派生。
 - 切换前停止新派工或持有全局迁移锁；如果有活动会话，先记录 Session 映射并对恢复状态做显式 Reconcile。
 - 每个版本的 Schema 都要有版本记录、上行迁移、可行时的回滚策略；无法无损回滚时提供快照恢复。
-- 兼容命令执行行为、状态字段语义和错误码。任何弃用 CLI 命令至少在一个可见版本给出警告。M1-02 的 Skill 目录技术名变更是已批准例外：旧入口从未对外部署，因此直接改名且不保留旧目录；CLI 命令、参数和运行状态目录不适用此例外。
+- 兼容命令执行行为、状态字段语义和错误码。任何弃用 CLI 命令至少在一个可见版本给出警告。M1-02 的 Skill 目录技术名变更是已批准例外：旧入口从未对外部署，因此直接改名且不保留旧目录；CLI 命令和参数不适用此例外。运行状态目录随后已按 2026-10-27 指示独立统一为 `.teamcraft/`，对旧状态采取 fail-closed，事实与证据见 M0 Review 第 12.2 节。
 
 ### 11.2 迁移测试
 
@@ -689,19 +720,19 @@ teamcraft/
 
 ### M1 — Durable Core（P0）
 
-**目标**：在保留旧 CLI、Herdr、Ownership 和保守恢复语义的前提下，使持久化 Task、Attempt、Session、Event 和 Command 可在无 Web 时使用。
+**目标**：在保留旧 CLI、Herdr、Ownership 和保守恢复语义的前提下，使持久化 Task、Attempt、Session、Event 和 Command 可在无 Web 时使用，并定义版本化 CEO Protocol 元数据及 Codex/OpenCode 的共享发现契约。
 
-**退出原则**：一致性备份、Schema 前向版本保护、事务与幂等通过；旧入口 Guard、冻结、代际和双进程故障矩阵通过后，才允许受控 JSON→SQLite 单真源切换。旧 writer 无法可靠阻断时保持 JSON 单写，不能宣称 M1 退出。实际切换仍须单独审批。
+**退出原则**：一致性备份、Schema 前向版本保护、事务与幂等通过；CEO Protocol 的单一来源、版本/hash、缺失/不兼容 fail-closed 和 Codex/OpenCode Mock 发现契约通过；旧入口 Guard、冻结、代际和双进程故障矩阵通过后，才允许受控 JSON→SQLite 单真源切换。旧 writer 无法可靠阻断时保持 JSON 单写，不能宣称 M1 退出。实际切换仍须单独审批。
 
 ### M2 — Watcher & Safe Recovery（P0）
 
-**目标**：用单一 Leader 的确定性调度、观察和恢复减少 CEO 持续轮询，并使 report-only/scout 具备验证与人工接受闭环。
+**目标**：用单一 Leader 的确定性调度、观察、CEO 初始化和合并唤醒减少 CEO 持续轮询，并使 report-only/scout 具备验证与人工接受闭环。
 
-**退出原则**：所有外部副作用经持久 Command 和 fenced Leader；失联、失租、回执丢失及无进展能安全 Reconcile；未知 Token 不当作零。普通编码任务、local-only 和 direct-PR 在 M4 证据链完成前不标记 DONE。
+**退出原则**：所有外部副作用经持久 Command 和 fenced Leader；CEO 未确认协议版本前不得派工；Wake 可合并、去重、确认和恢复，Dormant CEO 不产生持续 LLM 巡检；失联、失租、回执丢失及无进展能安全 Reconcile；未知 Token 不当作零。普通编码任务、local-only 和 direct-PR 在 M4 证据链完成前不标记 DONE。
 
 ### M3 — Web UI 最小控制台（P0）
 
-**目标**：以真实 Core 数据提供任务创建、编辑、查询、依赖、优先级、执行策略、观察与审批。
+**目标**：以真实 Core 数据提供任务创建、编辑、查询、依赖、优先级、执行策略、CEO/协议/Wake 观察与审批。
 
 **退出原则**：CLI 与 Web 共用 Command Service；SSE 以 SQLite 持久事件序号为准，支持补拉与去重；关闭浏览器不影响任务。Web 对 report-only/scout 的验收与 CLI 一致，普通编码任务仍等待 M4。
 
@@ -713,13 +744,13 @@ teamcraft/
 
 ### M5 — Model Routing & Cost（P1）
 
-**目标**：稳定使用本地优先模型路径，记录实际用量、估算与未知，并评估成本和质量。
+**目标**：稳定使用本地优先模型路径，记录 Harness 能力、CEO/Worker 的实际用量、估算与未知，并评估成本和质量。
 
 **退出原则**：本地服务失效时有界阻塞或获批升级；预算不把未知用量视为零；对照实验可复现且不虚报收益。
 
 ### M6 — UX Polish / Optional（P2）
 
-**目标**：按实际需求改善 DAG、证据、诊断和模板体验。
+**目标**：按实际需求改善 DAG、证据、诊断和模板体验，并完成 Claude Code 适配及 Codex/OpenCode/Claude 的真实跨 Harness 端到端验证。
 
 **退出原则**：可选项逐项验收，界面只展示真实 Core 数据；远程或多机只进行单独 RFC，不在当前单机本地优先架构中直接实现。
 
@@ -734,6 +765,7 @@ teamcraft/
 | Unit | 状态转换、DAG、Ownership、路由、事件去重 | 不需要 Herdr/模型服务 |
 | Integration | SQLite 并发、事务、迁移、Watcher、Git Worktree | 使用临时仓库和模拟 Adapter |
 | Contract | Herdr 的命令、参数、错误、会话生命周期 | 有可离线 Fake，实机再验收 |
+| Harness discovery | CEO Skill/协议发现、版本握手、缺失/不兼容降级 | Mock 只证明适配逻辑；Codex/OpenCode/Claude 分别记录真实版本与实测证据 |
 | API | 权限、Idempotency-Key、冲突、字段验证、SSE | 测试 401/403/409/202/断线续传 |
 | Browser E2E | 任务创建、详情、等待审批、恢复确认 | 测试空/错误/离线/长日志场景 |
 | Failure Injection | 异常退出、响应丢失、重启、重复完成、脏工作树 | 外部调用结果不明时先 Reconcile，不盲重发；Leader fencing 不保证外部接口 exactly-once |
@@ -754,6 +786,12 @@ teamcraft/
 **AT-06 Read-only audit**：Scout/Tester 不声明写入 Ownership，能生成报告，不得写入仓库。
 
 **AT-07 Security**：模拟 CSRF、越权文件路径、恶意日志 HTML、重复写请求、非法测试命令，全部被拒绝或安全转义。
+
+**AT-08 CEO bootstrap**：Codex/OpenCode 从各自项目入口发现同一 `teamcraft-ceo` 协议，记录一致 version/hash；缺失、读取失败或版本不兼容时不派工。Claude Code 只有在对应版本和项目发现机制实机验证后才计入通过。
+
+**AT-09 Wake recovery**：CEO 工作中产生多个事件时只形成合并待办；CEO 空闲且身份有效后唤醒一次；Watcher/Dispatcher 或 CEO 在 sending、submitted、acknowledged 后崩溃均可从 SQLite 恢复，结果未知时不重复发送。
+
+**AT-10 Completion separation**：Worker 自报完成、Herdr idle/done 和 Attempt execution finished 均只触发验证；测试非零、Diff 越权或证据版本变化时不能进入 DONE，并受 max Attempts 限制。
 
 ### 13.3 Definition of Done（任何阶段统一要求）
 
@@ -781,6 +819,9 @@ teamcraft/
 | 测试覆盖不足 | 错误代码被合并 | 必需 Verifier 门禁 + 人审 |
 | 成本数据不完整 | 节省率误导 | 区分真实/估计/缺失数据 |
 | 持续扩张架构 | 项目变得难以维护 | 严格 P0/P1/P2、ADR、阶段门禁 |
+| Harness 发现规则随版本变化 | CEO 协议未加载或加载错版本 | 版本能力矩阵、薄入口、真实 Harness 冒烟与 fail-closed |
+| Wake 发送回执不明 | 重复唤醒或重复决策 | 持久状态、事件游标、合并去重、Session 核验和 Reconcile |
+| 协议在多个入口复制后漂移 | 不同 CEO 执行不兼容流程 | 单一 `CEO_PROTOCOL.md`、version/hash 握手；适配器不复制正文 |
 
 待 M0 决定：
 
@@ -790,6 +831,9 @@ teamcraft/
 4. 第一版是否直接启用 Worktree？如时间有限可以先以现有 Ownership 保证旧功能，Worktree 延后到 M4；但不能宣称已实现强隔离。
 5. `DONE` 的精确定义对 local-only/PR/report-only 是否需要项目可配置？建议先按交付策略定义。
 6. 现有模型用量是否可从 Harness 稳定获取？不能获取时只显示缺失。
+7. CEO Protocol 首个版本号与兼容范围、协议升级时进行中的 Task 使用旧版还是要求重新初始化？
+8. Claude Code 安装采用受管副本还是经验证的 symlink？须以目标版本的真实发现行为、跨平台路径和冲突测试决定。
+9. Wake 合并窗口、优先级和云端预算默认值是多少？实施前以真实任务数据校准，自动启动继续默认关闭。
 
 ---
 
@@ -838,6 +882,12 @@ teamcraft/
 - CrewAI：https://github.com/crewAIInc/crewAI — 角色协作、Flows 与流程划分。
 - Oh My OpenAgent：https://github.com/code-yeongyu/oh-my-openagent — Agent specialization 与多模型路由思路。
 
+Harness 发现设计的官方依据（2026-10-27 复核；实现时仍须按实际安装版本重新验证）：
+
+- Codex Skills：https://learn.chatgpt.com/docs/build-skills — 项目级 `.agents/skills/`；Codex `AGENTS.md`：https://learn.chatgpt.com/docs/agent-configuration/agents-md 。
+- OpenCode v2 Skills：https://dev.opencode.ai/v2/docs/skills/ — `.agents/skills/` 与按需 skill tool；项目指令：https://dev.opencode.ai/v2/docs/instructions/ 。
+- Claude Code Skills：https://code.claude.com/docs/en/skills — 项目级 `.claude/skills/`；项目规则与 memory：https://code.claude.com/docs/en/memory 。当前文档仅对 Claude Code v2.1.277+ 且项目没有 `CLAUDE.md` 时描述 `AGENTS.md` fallback，不能推定早期或所有版本都支持。本机没有 `claude` 可执行文件，真实发现仍未验证。
+
 ---
 
 ## 17. 最小可发布版本（MVP）验收清单
@@ -848,6 +898,7 @@ teamcraft/
 - [ ] 新任务有持久化 Task、Attempt、Session、Event 和合法状态转换。
 - [ ] Scheduler 能调度至少两个互不冲突任务，未知状态不盲目重发。
 - [ ] Watcher 在无事件时不请求云端 LLM，故障可以安全恢复/升级。
+- [ ] CEO 从唯一版本化协议初始化；缺失/不兼容时不派工；事件唤醒可合并、对账且无需 CEO 常驻。
 - [ ] Web UI 展示**真实**任务、Agent、事件、审批；支持受控取消/恢复/审批。
 - [ ] 自动 Verifier 至少检查配置的测试命令与交付证据，不信任模型自述。
 - [ ] 所有写操作有幂等键与审计记录；无用户批准不执行高风险发布动作。
