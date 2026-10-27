@@ -387,17 +387,17 @@ Watcher 启动时先探测 Herdr 是否提供已验证、可恢复的事件订�
 
 ### 5.6 CEO Protocol、初始化与跨 Harness 入口（规划草案）
 
-未来新增 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 作为 CEO 业务协议的唯一权威来源；其相邻 `SKILL.md` 只负责发现、加载、版本校验和最短启动说明。现有 `.agents/skills/teamcraft/` 继续负责 Herdr 会话与 Agent 运行操作，不改回旧 `herdr-team` 名称，也不在 CEO Skill 中复制 Core 或 Herdr CLI 逻辑。协议按 `protocol_version + content_hash` 标识，至少定义 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八个阶段及其批准门禁。
+未来新增 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 作为 CEO 业务协议的唯一权威来源；其相邻 `SKILL.md` 只负责发现、加载、版本校验和最短启动说明。现有 `.agents/skills/teamcraft/` 继续负责 Herdr 会话与 Agent 运行操作，不改回旧 `herdr-team` 名称，也不在 CEO Skill 中复制 Core 或 Herdr CLI 逻辑。协议按 `protocol_version + content_hash` 标识；每个 Attempt 在创建时固定该版本/hash，运行中不自动切换，旧协议无法恢复时进入 NEEDS_HUMAN；不兼容版本升级须重新初始化并留下审计记录。协议至少定义 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八个阶段及其批准门禁。
 
 Harness 入口只提供适配：Codex 和 OpenCode 从项目 `.agents/skills/` 发现共享 Skill；`AGENTS.md` 只保留加载入口与项目级强制规则；OpenCode 可在 `.opencode/agents/` 提供薄 CEO 配置。Claude Code 适配在对应任务中通过能力探测，安全生成 `.claude/skills/` 下指向同一协议内容的受管副本或经验证的链接，并由精简 `CLAUDE.md` 引导。安装前必须预检冲突、支持 dry-run、保留用户已有 `AGENTS.md`、`CLAUDE.md` 和 Agent 配置；不支持的能力明确降级或拒绝，不能静默假装已加载。
 
-CEO 初始化状态至少区分 `SKILL_DISCOVERED`、`PROTOCOL_READ`、`INITIALIZED`、`FAILED/INCOMPATIBLE`。启动 Prompt 只声明 TeamCraft CEO 身份、要求加载指定版本协议、使用 `teamcraft` 执行运行操作并读取当前项目/任务状态；不复制协议正文。`PROTOCOL_READ` 需要绑定当前 Session 和初始化 nonce 的结构化回执，Core 校验协议 version/hash；Prompt 已投递或 Skill 已发现均不构成读取证明。只有协议版本/hash 已确认、运行 Skill 可用且初始化记录持久化后，CEO 才可派工。协议缺失、读取失败、无法确认或版本不兼容时 fail closed，并产生可诊断事件。
+CEO 初始化状态至少区分 `SKILL_DISCOVERED`、`PROTOCOL_READ`、`INITIALIZED`、`FAILED/INCOMPATIBLE`。启动 Prompt 只声明 TeamCraft CEO 身份、要求加载指定版本协议、使用 `teamcraft` 执行运行操作并读取当前项目/任务状态；不复制协议正文。Core 从实际协议文件独立计算 hash 并校验文件中声明的版本；`PROTOCOL_READ` 需要结构化回执绑定 nonce、Session ID、protocol version/hash，Core 对照本地计算结果及当前 Session 校验。Agent 自述仅是回执证据，不能证明其实际遵循协议，也不能代替 Core 的派工、Ownership、审批和证据版本安全门禁；Prompt 已投递或 Skill 已发现均不构成读取证明。只有协议版本/hash 已确认、运行 Skill 可用且初始化记录持久化后，CEO 才可派工。协议缺失、读取失败、无法确认或版本不兼容时 fail closed，并产生可诊断事件。
 
 ### 5.7 Prompt 投递与 Wake 消息协议（规划草案）
 
 角色 Prompt 分为稳定角色规则、版本化 Task Brief、Ownership/只读边界、验收与交付要求四层；任务正文优先引用带 digest/version 的受控任务文件，避免重复注入长协议。Core 必须在调用现有 Herdr `agent prompt` 前持久化 Command、Attempt、目标 Session 和 evidence version；Prompt 投递状态区分 `pending → sending → submitted → acknowledged`，结果不明进入 `unknown/reconcile`，不得盲目重发；Attempt 另以 `executing → execution_finished` 表达实际执行，Task/Verification/Delivery 保持独立。`submitted` 只说明 Herdr 接受调用，`acknowledged` 需要目标会话的可关联回执；Harness 没有可靠回执能力时保持未确认并 Reconcile，不伪造 ack。两者均不代表实际执行或任务完成。
 
-Watcher 把变化写入 SQLite Events；同一 Scheduler Leader 内的 Wake Dispatcher 以事件序号为权威来源，将 Wake 记录持久化为 `pending/sending/submitted/acknowledged/processed`，并另记投递结果不明或阻塞原因。`submitted` 只表示 Herdr 接受投递，`acknowledged` 必须是 CEO 对绑定事件序号的显式确认，`processed` 必须是对应决策和处理游标已持久化；不得从 `idle/done` 推断确认。它按事件 key 去重、在合并窗口内聚合并保留优先级：CEO 为 `working` 时普通事件继续待处理；CEO 为 `idle/done` 且 Session 身份核验有效时发送简短唤醒；`unknown/missing` 时隔离并升级，不自动新建会话。CEO 读取数据库中的待处理事件并显式确认，Prompt 只是信号。Dormant 模式允许 CEO 不常驻；自动启动为可选能力且默认关闭。SQLite fencing 只保护受控执行准入和状态提交，不能使 Herdr/GitHub 外部调用 exactly-once；发送中失租必须按事实 Reconcile。
+Watcher 把变化写入 SQLite Events；同一 Scheduler Leader 内的 Wake Dispatcher 以事件序号为权威来源，将 Wake 记录持久化为 `pending/sending/submitted/acknowledged/processed`，并另记投递结果不明或阻塞原因。`submitted` 只表示 Herdr 接受投递，`acknowledged` 必须是 CEO 对绑定事件序号的显式确认，`processed` 必须是对应决策和处理游标已持久化；不得从 `idle/done` 推断确认。它按事件 key 去重、在合并窗口内聚合并保留优先级：CEO 为 `working` 时普通事件继续待处理；CEO 为 `idle/done` 且 Session 身份核验有效时发送简短唤醒；`unknown/missing` 时隔离并升级，不自动新建会话。CEO 读取数据库中的待处理事件并显式确认，Prompt 只是信号。Wake 确认游标必须单调递增；同一事件对同一目标和动作重复产生 CEO Command 时经 Core 幂等处理，同一 Task/Attempt 的重复派工不得产生额外执行，事件重放仍须检查审批和 evidence version。Dormant 模式允许 CEO 不常驻；自动启动为可选能力且默认关闭。SQLite fencing 只保护受控执行准入和状态提交，不能使 Herdr/GitHub 外部调用 exactly-once；发送中失租必须按事实 Reconcile。
 
 ### 5.8 可靠恢复原则
 
@@ -831,7 +831,7 @@ teamcraft/
 4. 第一版是否直接启用 Worktree？如时间有限可以先以现有 Ownership 保证旧功能，Worktree 延后到 M4；但不能宣称已实现强隔离。
 5. `DONE` 的精确定义对 local-only/PR/report-only 是否需要项目可配置？建议先按交付策略定义。
 6. 现有模型用量是否可从 Harness 稳定获取？不能获取时只显示缺失。
-7. CEO Protocol 首个版本号与兼容范围、协议升级时进行中的 Task 使用旧版还是要求重新初始化？
+7. CEO Protocol 首个版本号、兼容范围、hash 规范及旧版本协议的安全保留方式如何确定？Attempt 固定创建时版本/hash，不兼容升级须重新初始化并审计。
 8. Claude Code 安装采用受管副本还是经验证的 symlink？须以目标版本的真实发现行为、跨平台路径和冲突测试决定。
 9. Wake 合并窗口、优先级和云端预算默认值是多少？实施前以真实任务数据校准，自动启动继续默认关闭。
 
