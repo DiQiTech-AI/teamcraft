@@ -76,15 +76,15 @@ class InstallerCompatContractTests(unittest.TestCase):
         self.assertRegex(frontmatter, r"(?m)^name: teamcraft$")
         self.assertTrue((skills / "teamcraft" / "scripts" / "teamctl.py").is_file())
 
-    def test_installer_uses_teamcraft_entry_and_preserves_runtime_name(self):
+    def test_installer_uses_teamcraft_entry_and_runtime_name(self):
         target = self.base / "project"
         self.run_installer(target)
         installed = target / ".agents" / "skills"
         self.assertTrue((installed / "teamcraft" / "SKILL.md").is_file())
         self.assertFalse((installed / "herdr-team").exists())
         ignore_lines = (target / ".gitignore").read_text(encoding="utf-8").splitlines()
-        self.assertIn("/.herdr-team/", ignore_lines)
-        self.assertNotIn("/.teamcraft/", ignore_lines)
+        self.assertIn("/.teamcraft/", ignore_lines)
+        self.assertNotIn("/.herdr-team/", ignore_lines)
 
     def test_error_prefix_and_non_directory_target(self):
         target = self.base / "blocker"
@@ -149,8 +149,8 @@ class InstallerCompatContractTests(unittest.TestCase):
         self.assertEqual(foreign.read_text(encoding="utf-8"), "user code\n")
         ignore_lines = ignore.read_text(encoding="utf-8").splitlines()
         self.assertIn("build/", ignore_lines)
-        self.assertIn("/.herdr-team/", ignore_lines)  # no duplicate rule appended
-        self.assertEqual(ignore_lines.count("/.herdr-team/"), 1)
+        self.assertIn("/.teamcraft/", ignore_lines)  # no duplicate rule appended
+        self.assertEqual(ignore_lines.count("/.teamcraft/"), 1)
 
     def test_source_manifest_excludes_pycache_and_junk(self):
         root = self.build_fake_source_root()

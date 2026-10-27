@@ -20,6 +20,8 @@ import uuid
 
 
 STATE_VERSION = 1
+RUNTIME_DIRECTORY_NAME = ".teamcraft"
+LEGACY_RUNTIME_DIRECTORY_NAME = ".herdr-team"
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 ROLES = ("ceo", "cto", "developer", "designer", "tester", "custom")
 TERMINAL_PHASES = {"completed", "released"}
@@ -125,7 +127,23 @@ def now_epoch() -> int:
 class StateStore:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
-        self.directory = project_root / ".herdr-team"
+        legacy_directory = project_root / LEGACY_RUNTIME_DIRECTORY_NAME
+        legacy_state = legacy_directory / "state.json"
+        if (
+            legacy_directory.is_symlink()
+            or legacy_state.exists()
+            or legacy_state.is_symlink()
+        ):
+            raise TeamctlError(
+                f"legacy team state detected at {legacy_state}; stop legacy teamctl "
+                f"processes and resolve that state before using "
+                f"{project_root / RUNTIME_DIRECTORY_NAME}; no files were changed"
+            )
+        self.directory = project_root / RUNTIME_DIRECTORY_NAME
+        if self.directory.is_symlink():
+            raise TeamctlError(
+                f"runtime directory must not be a symbolic link: {self.directory}"
+            )
         self.path = self.directory / "state.json"
         self.lock_path = self.directory / "state.lock"
 
@@ -911,7 +929,7 @@ def finish_member(args: argparse.Namespace) -> int:
 
 
 def add_cwd(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--cwd", help="project root containing .herdr-team")
+    parser.add_argument("--cwd", help="project root containing .teamcraft")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -8,13 +8,17 @@ blindness to an externally planted cutover marker, foreign-session
 behaviour, OpenCode pane-local config, and the guarantee that
 ``complete``/``release`` never close a pane or stop an agent.
 
-Rules honoured here (M0 review section 9.1 / M1-01):
+The M1-01 fixtures originally honoured these rules:
 - offline only: every Herdr call is intercepted by a local double;
 - no product-code change, no SQLite, no migration, no cutover;
 - assertions target stable shapes (keys, argv, exit codes), not prose;
-- ``test_legacy_write_path_ignores_external_cutover_marker`` documents a
+- ``test_json_write_path_ignores_external_cutover_marker`` documents a
   read-only threat (see M0 review 8.3 / 11.1) and does NOT implement any
   fence, guard, or claim that a stale pre-cutover process exists.
+
+The 2026-10-27 runtime-directory follow-up intentionally updates path
+assertions and adds fail-closed coverage for legacy state and symlinks. It
+still performs no migration, cutover, network access, or real Herdr call.
 """
 
 from __future__ import annotations
@@ -302,7 +306,7 @@ class CompatContractTests(unittest.TestCase):
         self.assertEqual(payload["ownership"], ["src/api/**"])
         self.assertEqual(payload["pane_id"], CHILD_PANE_ID)
         self.assertNotIn("pane_closed", payload)
-        recorded = json.loads((self.root_resolved / ".herdr-team" / "state.json")
+        recorded = json.loads((self.root_resolved / ".teamcraft" / "state.json")
                              .read_text(encoding="utf-8"))
         self.assertEqual(recorded["members"]["dev"]["phase"], "prompt_submitted")
         # Current implementation flags possible delivery before submitting and
@@ -358,7 +362,7 @@ class CompatContractTests(unittest.TestCase):
     def test_state_v1_artifacts_and_version_gate(self):
         teamctl.reserve_member(self.store, self.session,
                               make_member("dev", ["src/**"]))
-        runtime = self.root_resolved / ".herdr-team"
+        runtime = self.root_resolved / ".teamcraft"
         state_path = runtime / "state.json"
         mode = runtime.stat().st_mode & 0o777
         self.assertEqual(mode, 0o700)
@@ -383,17 +387,17 @@ class CompatContractTests(unittest.TestCase):
                                  make_member("late", ["docs/**"]))
         self.assertEqual(state_path.read_bytes(), snapshot)  # refusal is read-only
 
-    def test_legacy_write_path_ignores_external_cutover_marker(self):
+    def test_json_write_path_ignores_external_cutover_marker(self):
         """Read-only threat fixture (M0 review 8.3 / 11.1; M1-07 guard gap).
 
         A post-cutover environment is *simulated externally* inside this
         temp project only: a ``cutover.json`` marker declaring DB authority
         with a generation, plus the imported snapshot it references by
-        SHA-256.  The real legacy write path (``update_member`` /
+        SHA-256.  The current JSON write path (``update_member`` /
         ``reserve_member``, each taking the normal ``state.lock``) is then
         exercised after that marker exists.
 
-        Frozen current behaviour: legacy code never reads the marker or
+        Frozen current behaviour: the JSON writer never reads the marker or
         generation, so JSON keeps being rewritten post-cutover.  This pins
         the detection gap M1-07 must close with an explicit guard.  It does
         NOT prove a stale pre-cutover process was ever running (the
@@ -402,7 +406,7 @@ class CompatContractTests(unittest.TestCase):
         """
         teamctl.reserve_member(self.store, self.session,
                              make_member("alpha", ["src/a/**"]))
-        runtime = self.root_resolved / ".herdr-team"
+        runtime = self.root_resolved / ".teamcraft"
         state_path = runtime / "state.json"
         snapshot = state_path.read_bytes()
         snapshot_path = runtime / "imported-snapshot.json"
@@ -415,7 +419,7 @@ class CompatContractTests(unittest.TestCase):
         }, sort_keys=True), encoding="utf-8")
         marker_before = marker_path.read_bytes()
 
-        # Real legacy write path, normal locking, after the simulated cutover:
+        # Real JSON write path, normal locking, after the simulated cutover:
         teamctl.update_member(self.store, self.session, "alpha",
                              phase="released", ownership=[])
         teamctl.reserve_member(self.store, self.session,
@@ -444,12 +448,55 @@ class CompatContractTests(unittest.TestCase):
         self.assertIsNone(payload["team"])
         self.assertEqual(payload["members"], [])
 
+    def test_legacy_state_fails_closed_before_any_herdr_call_or_new_write(self):
+        legacy_runtime = self.root_resolved / ".herdr-team"
+        legacy_runtime.mkdir()
+        legacy_state = legacy_runtime / "state.json"
+        legacy_bytes = b'{"legacy": true}\n'
+        legacy_state.write_bytes(legacy_bytes)
+        commands = (
+            ["status", "--cwd", str(self.root_resolved)],
+            ["launch", "--role", "developer", "--kind", "codex", "--name",
+             "dev", "--task", "t", "--ownership", "src/**", "--cwd",
+             str(self.root_resolved)],
+            ["resume", "dev", "--cwd", str(self.root_resolved)],
+            ["complete", "dev", "--cwd", str(self.root_resolved)],
+            ["release", "dev", "--cwd", str(self.root_resolved)],
+        )
+        with mock.patch.object(teamctl, "run_herdr") as herdr, \
+                mock.patch.object(teamctl, "preflight_kind"):
+            for argv in commands:
+                with self.subTest(command=argv[0]):
+                    code, out, err = self.run_main(argv)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    self.assertIn("legacy team state detected", err)
+                    self.assertIn("no files were changed", err)
+        herdr.assert_not_called()
+        self.assertEqual(legacy_state.read_bytes(), legacy_bytes)
+        self.assertFalse((self.root_resolved / ".teamcraft").exists())
+
+    def test_runtime_symlinks_fail_closed(self):
+        outside = self.root_resolved / "outside"
+        outside.mkdir()
+        for name, message in (
+            (".herdr-team", "legacy team state detected"),
+            (".teamcraft", "runtime directory must not be a symbolic link"),
+        ):
+            with self.subTest(name=name):
+                link = self.root_resolved / name
+                link.symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(teamctl.TeamctlError, message):
+                    teamctl.StateStore(self.root_resolved)
+                link.unlink()
+        self.assertEqual(list(outside.iterdir()), [])
+
     # --------------------------------------------------- session identity
 
     def test_foreign_session_status_is_unknown_and_mutation_refused(self):
         teamctl.reserve_member(self.store, self.session,
                              make_member("dev", ["src/**"]))
-        snapshot = (self.root_resolved / ".herdr-team" / "state.json").read_bytes()
+        snapshot = (self.root_resolved / ".teamcraft" / "state.json").read_bytes()
         other_socket = self.root / "other-herdr.sock"
         other_socket.touch()
         double = HerdrDouble()
@@ -470,7 +517,7 @@ class CompatContractTests(unittest.TestCase):
             teamctl.reserve_member(self.store, other_session,
                                  make_member("invader", ["docs/**"]))
         self.assertEqual(
-            (self.root_resolved / ".herdr-team" / "state.json").read_bytes(),
+            (self.root_resolved / ".teamcraft" / "state.json").read_bytes(),
             snapshot,
         )
 
@@ -557,7 +604,7 @@ class CompatContractTests(unittest.TestCase):
                 self.assertFalse(any(call[:2] == ["pane", "split"] for call in
                                    double.calls))
                 recorded = json.loads(
-                    (self.root_resolved / ".herdr-team" / "state.json")
+                    (self.root_resolved / ".teamcraft" / "state.json")
                     .read_text(encoding="utf-8"))
                 self.assertEqual(recorded["members"]["dev"]["phase"],
                                expected_phase)
@@ -593,7 +640,7 @@ class CompatContractTests(unittest.TestCase):
                 self.assertFalse(forbidden & {tuple(call[:2]) for call in
                                             double.calls})
                 recorded = json.loads(
-                    (self.root_resolved / ".herdr-team" / "state.json")
+                    (self.root_resolved / ".teamcraft" / "state.json")
                     .read_text(encoding="utf-8"))
                 member = recorded["members"]["dev"]
                 self.assertEqual(member["phase"], expected_phase)
@@ -601,7 +648,7 @@ class CompatContractTests(unittest.TestCase):
 
     def temp_reset(self):
         """Remove state between subtests without recreating the temp dir."""
-        state_path = self.root_resolved / ".herdr-team" / "state.json"
+        state_path = self.root_resolved / ".teamcraft" / "state.json"
         if state_path.exists():
             state_path.unlink()
 

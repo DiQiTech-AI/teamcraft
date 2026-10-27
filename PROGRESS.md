@@ -8,7 +8,7 @@
 
 - 支持 CEO、CTO、研发、设计、测试及自定义角色；角色职责与 harness 类型独立选择，按任务需要创建成员。
 - 在当前 Herdr tab 中创建同项目目录的 sibling pane，保持焦点；先解析当前有效 pane ID，避免 pane 移动后布局匹配失败。
-- 将成员、任务、责任路径、pane 身份及执行阶段持久化到 `.herdr-team/state.json`；使用原子写入、状态锁和成员生命周期锁。
+- 将成员、任务、责任路径、pane 身份及执行阶段持久化到 `.teamcraft/state.json`；使用原子写入、状态锁和成员生命周期锁。
 - 编辑任务必须声明文件或目录范围；拒绝活动任务间的相同或父子路径冲突，支持只读任务及中文、空格路径。
 - 提供 `status`、`resume`、`complete`、`release`。恢复时核验 terminal ID 和已有原生 Agent session，复用已记录的 pane。
 - 对 split 结果不明、任务可能已发送等情况要求显式选择，默认恢复不会重复发送任务；无法核实实时状态时报告 unknown，不展示旧缓存为当前状态。
@@ -16,9 +16,9 @@
 - 新增六种 OpenCode 工种配置，使用 `omlx/Qwen3.8-Flash-Next-oQ4e-mtp`；通过 pane 局部配置选择角色，并合并已有 JSON 配置。本机 `opencode.json` 保持私有，仓库提供 `opencode.example.json`。
 - 增加 harness、角色配置文件、任务编码及路径预检、子进程超时处理，以及运行状态和 Python 缓存的 Git 忽略规则。
 
-## M1-02 待验收实现
+## M1-02 条件验收及后续修订
 
-- Skill 技术名和目录已在工作树中直接改为 `teamcraft`，并同步安装器、中英文 README、测试及角色引用；`.herdr-team/` 运行状态目录和全部 CLI 行为保持不变，待用户验收后才登记任务完成。
+- Skill 技术名和目录已改为 `teamcraft`；运行状态目录随后按用户指示改为 `.teamcraft/`。检测到旧 `.herdr-team/state.json` 时会在 Herdr 调用和新状态写入前安全拒绝，不做自动迁移或双状态写入。
 - 已新增 Python 3.10+ 的最小 `teamcraft` 包，只定义 opaque ID、UTC Clock、错误类型和无写入的配置加载边界，未引入数据库、Scheduler、Watcher、Web、Worktree 或模型 Router；本机仅用 Python 3.13.14 验证，3.10 和 Linux 仍待 CI 证据。
 
 ## 关键文件
@@ -42,7 +42,7 @@ python3 -B "${SKILL_CREATOR_DIR}/scripts/quick_validate.py" .agents/skills/teamc
 
 `SKILL_CREATOR_DIR` 需指向本机已安装的 `skill-creator` Skill 目录；其中的 `quick_validate.py` 是外部校验工具，不属于本仓库依赖。
 
-M1-02 离线回归在 Python 3.13.14 上通过：Skill 40/40，仓库测试 28/28（21 项安装器、7 项最小 Core 边界），退出码均为 0；`quick_validate.py` 对新 Skill 入口校验通过，退出码为 0。测试使用临时目录和 mock Herdr，未连接实际 Herdr 会话；59 项 M1-01 既有契约保持通过，并增加新 Skill 发现/安装与无导入副作用等边界检查。2026-10-18 的 `herdr pane --help` 实机确认仍是历史证据，本轮未重复操作 Herdr。
+M1-02 离线回归在 Python 3.13.14 上通过：Skill 40/40，仓库测试 28/28（21 项安装器、7 项最小 Core 边界），退出码均为 0；`quick_validate.py` 对新 Skill 入口校验通过，退出码为 0。测试使用临时目录和 mock Herdr，未连接实际 Herdr 会话；59 项 M1-01 既有契约保持通过，并增加新 Skill 发现/安装与无导入副作用等边界检查。2026-10-27 运行目录统一后，同一环境重新得到 Skill 42/42、仓库 28/28，退出码均为 0；新增用例覆盖五个 CLI 的旧状态 fail-closed 与新旧运行目录 symlink。干净临时目录安装和已安装 CLI `--help` 均退出 0，目标 `.gitignore` 只写入 `/.teamcraft/` 与 `/opencode.json`。2026-10-18 的 `herdr pane --help` 实机确认仍是历史证据，本轮未重复操作 Herdr。
 
 ### 实机示例
 

@@ -43,7 +43,7 @@ class InstallScriptTests(unittest.TestCase):
                 REPOSITORY.joinpath("opencode.example.json").read_bytes(),
             )
             ignore_lines = target.joinpath(".gitignore").read_text().splitlines()
-            self.assertIn("/.herdr-team/", ignore_lines)
+            self.assertIn("/.teamcraft/", ignore_lines)
             self.assertIn("/opencode.json", ignore_lines)
 
     def test_repeated_install_is_idempotent(self) -> None:
@@ -147,13 +147,13 @@ class InstallScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "project"
             target.mkdir()
-            original = "/opencode.json\n/.herdr-team/\n!opencode.json\n!.herdr-team/\n"
+            original = "/opencode.json\n/.teamcraft/\n!opencode.json\n!.teamcraft/\n"
             ignore = target / ".gitignore"
             ignore.write_text(original)
             self.run_installer(target)
             updated = ignore.read_text()
             self.assertTrue(updated.startswith(original))
-            self.assertTrue(updated.endswith("/.herdr-team/\n/opencode.json\n"))
+            self.assertTrue(updated.endswith("/.teamcraft/\n/opencode.json\n"))
             self.run_installer(target)
             self.assertEqual(ignore.read_text(), updated)
 

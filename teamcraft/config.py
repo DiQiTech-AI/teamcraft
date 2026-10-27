@@ -11,7 +11,7 @@ from .errors import ConfigurationError
 
 
 PROJECT_ROOT_ENV = "TEAMCRAFT_PROJECT_ROOT"
-RUNTIME_DIRECTORY_NAME = ".herdr-team"
+RUNTIME_DIRECTORY_NAME = ".teamcraft"
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class TeamCraftConfig:
 
     @property
     def runtime_directory(self) -> Path:
-        """Keep the established runtime path stable across the Skill rename."""
+        """Return the project-local TeamCraft runtime path."""
 
         return self.project_root / RUNTIME_DIRECTORY_NAME
 

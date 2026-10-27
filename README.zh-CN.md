@@ -16,7 +16,7 @@
 - **Harness 与角色分离**：角色决定职责，`--kind` 选择 Herdr 支持的 Codex、OpenCode 等 harness。
 - **责任范围协调**：编辑任务必须声明项目内的文件或目录范围，活动成员之间的重叠范围会被拒绝。
 - **只读成员**：评审、调研和验收任务可使用 `--read-only`，不占用编辑范围。
-- **状态持久化**：成员、pane 身份、任务、责任范围和执行阶段保存在 `.herdr-team/state.json`。
+- **状态持久化**：成员、pane 身份、任务、责任范围和执行阶段保存在 `.teamcraft/state.json`。
 - **安全恢复**：`resume` 会核对 terminal 和原生 Agent session；结果不明确时默认只检查，不自动重复发送任务。
 - **真实状态检查**：`status` 展示 `blocked`、`working`、`idle`、`done`、`unknown` 或 `missing`，避免把缓存状态当成实时状态。
 - **并发保护**：状态写入和成员生命周期操作使用文件锁，降低并发创建或恢复造成的冲突。
@@ -90,7 +90,7 @@ bash scripts/install.sh
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-安装脚本会复制项目本地的 `teamcraft` Skill、六个 OpenCode 角色配置和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本还会在保留目标项目 `.gitignore` 原有内容的基础上，加入 `/.herdr-team/` 和 `/opencode.json`。
+安装脚本会复制项目本地的 `teamcraft` Skill、六个 OpenCode 角色配置和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本还会在保留目标项目 `.gitignore` 原有内容的基础上，加入 `/.teamcraft/` 和 `/opencode.json`。
 
 默认情况下，如果已存在的托管文件内容不同，安装会报错且不会覆盖。只有确定要替换团匠管理的 Skill、角色或模板文件时才使用 `--force`：
 
@@ -251,7 +251,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 └── PROGRESS.md                  # 实现与实机验证记录
 ```
 
-`.herdr-team/` 是本地运行目录，保存状态、任务和锁文件，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。
+`.teamcraft/` 是本地运行目录，保存状态、任务和锁文件，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。若存在 `.herdr-team/state.json`，CLI 会在任何 Herdr 调用或新状态写入前停止，不会自动迁移，也不会创建第二份状态。
 
 ## 验证
 
@@ -262,7 +262,7 @@ python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-Skill 现有 40 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并、CLI 契约和输入错误等场景。
+Skill 现有 42 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并、CLI 契约、输入错误、旧状态安全拒绝和运行目录 symlink 安全等场景。
 
 仓库测试包含 21 项安装器测试，覆盖首次安装、重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则和 `teamcraft` Skill 新入口；另有 7 项最小 Python 包边界测试，覆盖 ID、UTC Clock、错误、配置加载和无导入副作用。
 

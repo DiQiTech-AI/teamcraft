@@ -16,7 +16,7 @@ Multi-agent development can easily lead to duplicate assignments, overlapping ed
 - **Separate harness and role choices:** The role defines responsibility, while `--kind` selects a Herdr-supported harness such as Codex or OpenCode.
 - **Ownership coordination:** Every editing task must declare project-relative file or directory scopes. Overlapping scopes among active members are rejected.
 - **Read-only members:** Reviews, research, and acceptance checks can use `--read-only` without reserving an edit scope.
-- **Persistent state:** Members, pane identities, tasks, ownership scopes, and execution phases are stored in `.herdr-team/state.json`.
+- **Persistent state:** Members, pane identities, tasks, ownership scopes, and execution phases are stored in `.teamcraft/state.json`.
 - **Safe recovery:** `resume` checks the terminal and native agent session. When the outcome is ambiguous, it inspects by default instead of submitting a task again.
 - **Live status checks:** `status` reports `blocked`, `working`, `idle`, `done`, `unknown`, or `missing` rather than treating cached state as live state.
 - **Concurrency protection:** State writes and member lifecycle operations use file locks to reduce conflicts during concurrent launches or recovery.
@@ -90,7 +90,7 @@ Preview the changes without writing files:
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-The installer copies the project-local `teamcraft` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.herdr-team/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
+The installer copies the project-local `teamcraft` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.teamcraft/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
 
 By default, an existing managed file with different content causes an error and is not overwritten. Use `--force` only when you intend to replace TeamCraft-managed skill, role, or template files:
 
@@ -251,7 +251,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 └── PROGRESS.md                  # Implementation and live verification notes
 ```
 
-`.herdr-team/` is a local runtime directory containing state, tasks, and lock files. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session.
+`.teamcraft/` is a local runtime directory containing state, tasks, and lock files. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session. If `.herdr-team/state.json` is present, the CLI stops before any Herdr call or new state write; it never migrates or creates a second state automatically.
 
 ## Verification
 
@@ -262,7 +262,7 @@ python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-The current 40 Skill tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, CLI contracts, and invalid input.
+The current 42 Skill tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, CLI contracts, invalid input, legacy-state refusal, and runtime symlink safety.
 
 The repository test suite contains 21 installer tests covering first installation, repeated installation, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, Git ignore rules, and the `teamcraft` Skill entry. It also contains 7 tests for the minimal Python package's ID, UTC clock, error, configuration, and side-effect-free import boundaries.
 

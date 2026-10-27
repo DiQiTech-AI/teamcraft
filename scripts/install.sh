@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 
-IGNORE_RULES = ("/.herdr-team/", "/opencode.json")
+IGNORE_RULES = ("/.teamcraft/", "/opencode.json")
 
 
 class InstallError(RuntimeError):

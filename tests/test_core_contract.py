@@ -48,7 +48,7 @@ class CoreBoundaryTests(unittest.TestCase):
             self.assertEqual(configured.project_root, explicit.resolve())
             self.assertEqual(
                 configured.runtime_directory,
-                explicit.resolve() / ".herdr-team",
+                explicit.resolve() / ".teamcraft",
             )
             self.assertFalse(explicit.exists())
 
@@ -62,9 +62,9 @@ class CoreBoundaryTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             load_config(environ={"TEAMCRAFT_PROJECT_ROOT": "  "})
 
-    def test_runtime_directory_keeps_legacy_state_name(self) -> None:
+    def test_runtime_directory_uses_teamcraft_name(self) -> None:
         config = TeamCraftConfig(Path("/project"))
-        self.assertEqual(config.runtime_directory, Path("/project/.herdr-team"))
+        self.assertEqual(config.runtime_directory, Path("/project/.teamcraft"))
 
     def test_entity_ids_are_opaque_non_empty_strings(self) -> None:
         self.assertEqual(require_entity_id("task_01"), "task_01")

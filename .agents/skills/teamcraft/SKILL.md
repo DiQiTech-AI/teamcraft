@@ -11,9 +11,9 @@ Create a task-specific team in sibling panes while preserving the current tab, p
 
 Before Herdr control, require `HERDR_ENV=1`, then run `herdr --skill` and follow the installed binary's semantics. Do not inspect or control a focused Herdr session from outside Herdr. Do not create a workspace, tab, or worktree unless the user requests that topology.
 
-Use `scripts/teamctl.py` for managed team members. It reserves ownership and intent in `<project>/.herdr-team/state.json` before layout mutation, records every later phase, and scopes the state to the current Herdr socket session. Do not edit this state by hand while a team operation is running.
+Use `scripts/teamctl.py` for managed team members. It reserves ownership and intent in `<project>/.teamcraft/state.json` before layout mutation, records every later phase, and scopes the state to the current Herdr socket session. Do not edit this state by hand while a team operation is running.
 
-The `.herdr-team/` runtime directory contains tasks, state, and locks and is ignored by version control.
+The `.teamcraft/` runtime directory contains tasks, state, and locks and is ignored by version control. If the CLI detects legacy `.herdr-team/state.json`, it fails closed without calling Herdr or creating new state; resolve that state explicitly before continuing.
 
 ## Team model
 
@@ -112,4 +112,4 @@ Neither operation closes a pane or terminates an agent. Do not pre-create idle s
 
 Release and completion refuse an agent in `working`, `blocked`, or `unknown` state. Use `--force` only after explicitly deciding that its ownership may be reassigned despite that state. Identity verification still applies.
 
-Member lifecycle operations use an exclusive lock. State and locks in `.herdr-team/` are local runtime files excluded from version control. OpenCode launches require the selected role profile in the target project and preserve existing JSON `OPENCODE_CONFIG_CONTENT` settings while overriding only `default_agent`.
+Member lifecycle operations use an exclusive lock. State and locks in `.teamcraft/` are local runtime files excluded from version control. OpenCode launches require the selected role profile in the target project and preserve existing JSON `OPENCODE_CONFIG_CONTENT` settings while overriding only `default_agent`.

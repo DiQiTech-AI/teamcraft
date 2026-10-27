@@ -2,8 +2,8 @@
 
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
-> **版本**：v1.2（M1-02 有条件验收收尾）
-> **日期**：2026-10-24
+> **版本**：v1.3（运行目录统一为 `.teamcraft/`）
+> **日期**：2026-10-27
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
 > **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。M1-03 及以后未获授权，目标能力不得理解为已实现。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
@@ -15,7 +15,7 @@
 如果你是接手本文件的编码 Agent，请依次遵守：
 
 1. **先审计现状，后编写代码。** 阅读 `README.md`、`README.zh-CN.md`、`PROGRESS.md`、`.agents/skills/teamcraft/`、`scripts/`、`tests/` 和现有配置。本文的文件路径、命令和接口是**目标设计**，不得假设已在代码中存在。
-2. **禁止推倒重写。** 必须保持现有 Skill 的 Herdr 会话交互、CEO/CTO/Developer/Designer/Tester 角色、Ownership 校验、read-only 成员、状态查询、文件锁和保守恢复语义。M1-02 已按已接受设计把未对外部署的 Skill 技术名从 `herdr-team` 直接改为 `teamcraft`，不保留旧目录入口；该目录变化不改变 CLI 或 `.herdr-team/` 运行状态语义。其他不兼容变更须先审查。
+2. **禁止推倒重写。** 必须保持现有 Skill 的 Herdr 会话交互、CEO/CTO/Developer/Designer/Tester 角色、Ownership 校验、read-only 成员、状态查询、文件锁和保守恢复语义。M1-02 已按已接受设计把未对外部署的 Skill 技术名从 `herdr-team` 直接改为 `teamcraft`，不保留旧 Skill 目录入口；2026-10-27 后续指示又将项目运行目录统一为 `.teamcraft/`。发现旧 `.herdr-team/state.json` 时必须在外部副作用和新状态写入前 fail closed，不得自动搬移或形成双状态。其他不兼容变更须先审查。
 3. **优先交付最小纵向闭环。** 一次实现一个可测的端到端切片，不得同时铺开所有后端、Web UI、模型路由、GitHub 自动化。
 4. **确定性编排。** 状态转换、租约、任务依赖、去重、审批、Worktree 生命周期、校验门禁由代码控制；LLM 只负责规划、生成、诊断和建议。
 5. **安全默认。** 未知任务结果不得自动重复派发；没有人工批准不得合并主分支、部署、删除含未提交修改的 Worktree、触发高风险外部副作用。
@@ -42,7 +42,7 @@ M0 在 2026-10-21 查阅 README 时记录的 Skill 技术名是 `herdr-team`；M
 - 通过 `teamcraft` Skill 管理团队，默认仅启动 CEO，按需启动 CTO、Developer、Designer、Tester 或自定义专家。
 - 角色责任和 Agent Harness 分离：可通过 Herdr 支持的 Codex、OpenCode 等 Harness 运行。
 - 修改代码成员声明项目内相对路径 Ownership；活动成员的重叠范围被拒绝；只读成员可不占用编辑范围。
-- `.herdr-team/state.json` 保存成员、Pane、任务、Ownership、执行阶段等信息。
+- `.teamcraft/state.json` 保存成员、Pane、任务、Ownership、执行阶段等信息。
 - `resume` 验证终端与原生会话；不确定提交结果时采用 **inspect first**，不自动重发。
 - `status` 具有 `blocked/working/idle/done/unknown/missing` 等实时信号；生命周期写操作使用文件锁。
 - 公开仓库已有 `scripts/`、`tests/`、示例和进度记录。
@@ -607,7 +607,7 @@ GET    /api/v1/usage?project_id=&range=
 
 > 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与 `.agents/skills/teamcraft/` Skill 入口，采用渐进式迁移。M1-02 只建立最小 Python 包边界并迁移 Skill 技术名，未提前实现存储、调度、Web 或模型路由。
 >
-> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 实现中落地（已条件验收通过）：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧目录、兼容窗口或别名。`.herdr-team/` 运行状态目录保持原名；JSON→SQLite cutover 仍归 M1-06/M1-07，且未在 M1-02 执行。
+> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 实现中落地（已条件验收通过）：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧 Skill 目录、兼容窗口或别名。M1-02 当时保留的 `.herdr-team/` 运行目录决定已被 2026-10-27 的后续指示取代，当前运行目录为 `.teamcraft/`；旧状态只触发安全拒绝，不自动迁移。JSON→SQLite cutover 仍归 M1-06/M1-07，且本次目录统一不执行该 cutover。
 
 ```text
 teamcraft/
@@ -655,7 +655,7 @@ teamcraft/
 └── pyproject.toml
 ```
 
-建议运行目录：`.herdr-team/` 中保留既有状态与缓存；新数据库可用 `.herdr-team/teamcraft.db`，日志和工件放受控子目录。数据库路径和目录迁移需要兼容旧安装。`.herdr-team/` 运行状态目录名不因 Skill 改名而变动；JSON→SQLite cutover 与状态目录改名是独立问题，归 M1-06/M1-07 决策。
+建议运行目录：`.teamcraft/` 中保存状态与缓存；新数据库可用 `.teamcraft/teamcraft.db`，日志和工件放受控子目录。若发现旧 `.herdr-team/state.json`，当前 CLI 先安全拒绝并要求显式处置，不自动搬移。JSON→SQLite cutover 仍是独立问题，归 M1-06/M1-07 决策。
 
 ---
 
