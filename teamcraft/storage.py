@@ -947,15 +947,18 @@ class TeamCraftConnection:
             self._ro.row_factory = value
 
 
-def _inner_connection(conn: Any) -> sqlite3.Connection:
+def _inner_connection(conn: TeamCraftConnection) -> sqlite3.Connection:
     """The underlying writable sqlite connection, first-party internals only.
 
     Public code receives :class:`TeamCraftConnection`; this accessor exists
-    for ``transaction``/``migrate_to_head`` internals.  Reaching for it from
-    anywhere else breaks the facade on purpose and is review-rejectable.
+    only for first-party migration/transaction internals.  Accepting a raw
+    ``sqlite3.Connection`` here would silently bypass the facade's authorizer
+    and write gate.
     """
 
-    return conn._rw if isinstance(conn, TeamCraftConnection) else conn
+    if not isinstance(conn, TeamCraftConnection):
+        raise TypeError("expected TeamCraftConnection")
+    return conn._rw
 
 
 def connect(
@@ -1074,41 +1077,37 @@ def connect(
 
 @contextlib.contextmanager
 def transaction(
-    conn: TeamCraftConnection | sqlite3.Connection, *, immediate: bool = True
-) -> Iterator[Any]:
+    conn: TeamCraftConnection, *, immediate: bool = True
+) -> Iterator[TeamCraftConnection]:
     """The module's write gate: lock, version re-check, then open the gate.
 
-    Ordering is the security contract: ``BEGIN IMMEDIATE`` first takes the
-    exclusive lock, ``user_version`` is re-read under that lock (a bump
+    Ordering is the security contract: by default ``BEGIN IMMEDIATE`` first
+    takes the write lock, ``user_version`` is re-read under that lock (a bump
     committed by another process *after* :func:`connect` aborts here with
     :class:`SchemaTooNewError`), and only then is the facade's writable
-    channel opened for the body of the block.  On exit the gate closes
-    before the commit primitive runs.  Raw ``sqlite3.Connection`` inputs
-    (first-party internals) keep the version gate but have no facade to
-    open.  A prepared statement compiled inside the gate does not smuggle a
-    later write through: identical text re-prepared outside the gate is
-    refused by the read channel and by the authorizer (pinned by regression
-    test).
+    channel opened for the body of the block.  ``immediate=False`` deliberately
+    uses SQLite's deferred ``BEGIN`` semantics; callers must treat ``BUSY`` as
+    a failed whole transaction and retry from the beginning.  On exit the gate
+    closes before the commit primitive runs.  The public API accepts only
+    :class:`TeamCraftConnection`; migration code uses its own private,
+    privileged transaction boundary.  A prepared statement compiled inside
+    the gate does not smuggle a later write through: identical text
+    re-prepared outside the gate is refused by the read channel and by the
+    authorizer (pinned by regression test).
     """
 
     inner = _inner_connection(conn)
-    gated = conn if isinstance(conn, TeamCraftConnection) else None
-    if gated is None:
-        inner.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-        try:
-            _assert_writable_version(inner, "re-checked under the write lock")
-            yield conn
-            inner.execute("COMMIT")
-        except BaseException:
-            with contextlib.suppress(sqlite3.Error):
-                inner.execute("ROLLBACK")
-            raise
-        return
+    gated = conn
     with gated._privileged():
         inner.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         with gated._privileged():
-            _assert_writable_version(inner, "re-checked under the write lock")
+            stage = (
+                "re-checked under the write lock"
+                if immediate
+                else "re-checked inside the deferred transaction before first write"
+            )
+            _assert_writable_version(inner, stage)
         gated._open_write_gate()
         try:
             yield conn
@@ -1332,6 +1331,28 @@ _REQUIRED_MANIFEST_FIELDS = (
 )
 
 
+def _manifest_integer(
+    manifest: dict[str, Any], field: str, *, minimum: int = 0
+) -> int:
+    """Return a strictly typed manifest integer or fail as backup metadata.
+
+    JSON booleans are Python integers, and ``int()`` also accepts numeric
+    strings and truncates floats.  None of those are valid for a persisted
+    backup manifest: accepting them would make the on-disk schema ambiguous.
+    """
+
+    value = manifest.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BackupError(
+            f"manifest {field} must be a JSON integer, got {value!r}"
+        )
+    if value < minimum:
+        raise BackupError(
+            f"manifest {field} must be at least {minimum}, got {value}"
+        )
+    return value
+
+
 def backup_database(
     source_path: str | os.PathLike[str],
     dest_dir: str | os.PathLike[str],
@@ -1488,6 +1509,8 @@ def restore_backup(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise BackupError(f"manifest unreadable: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise BackupError("manifest root must be a JSON object")
     elif require_manifest:
         raise BackupError(f"manifest missing next to backup: {manifest_path.name}")
 
@@ -1502,8 +1525,8 @@ def restore_backup(
                 f"manifest backup_file {manifest.get('backup_file')!r} does not "
                 f"match backup {backup.name!r}"
             )
-        expected_size = manifest.get("backup_size_bytes")
-        if expected_size is not None and int(expected_size) != backup.stat().st_size:
+        expected_size = _manifest_integer(manifest, "backup_size_bytes")
+        if expected_size != backup.stat().st_size:
             raise BackupError("manifest size does not match backup file")
         if _sha256(backup) != manifest.get("backup_sha256"):
             raise BackupError("manifest digest does not match backup file")
@@ -1523,8 +1546,13 @@ def restore_backup(
         subject="backup snapshot",
     )
     if manifest is not None:
-        manifest_version = manifest.get("schema_version")
-        if manifest_version is None or int(manifest_version) != snapshot_user_version:
+        manifest_version = _manifest_integer(manifest, "schema_version")
+        if manifest_version > SCHEMA_VERSION:
+            raise BackupError(
+                f"manifest schema_version {manifest_version} is newer than this "
+                f"build supports ({SCHEMA_VERSION})"
+            )
+        if manifest_version != snapshot_user_version:
             raise BackupError(
                 f"manifest schema_version {manifest_version!r} does not match the "
                 f"backup snapshot user_version {snapshot_user_version}"

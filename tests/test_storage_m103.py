@@ -685,6 +685,46 @@ class StorageM103Tests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_transaction_rejects_raw_sqlite_connection(self) -> None:
+        """The public write gate must never accept an authorizer-free handle."""
+        migrate_to_head(self.db)
+        raw = sqlite3.connect(str(self.db), isolation_level=None)
+        try:
+            with self.assertRaisesRegex(TypeError, "TeamCraftConnection"):
+                with transaction(raw):  # type: ignore[arg-type]
+                    self.fail("raw connection entered the public write gate")
+            self.assertFalse(raw.in_transaction)
+            self.assertEqual(
+                raw.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0
+            )
+        finally:
+            raw.close()
+
+    def test_deferred_transaction_rolls_back_and_refuses_too_new_schema(self) -> None:
+        """immediate=False keeps rollback and version gates, but is deferred."""
+        migrate_to_head(self.db)
+        conn = connect(self.db)
+        try:
+            with self.assertRaises(RuntimeError):
+                with transaction(conn, immediate=False):
+                    _seed(conn, "p-deferred")
+                    raise RuntimeError("rollback deferred transaction")
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0
+            )
+
+            attacker = sqlite3.connect(str(self.db))
+            try:
+                attacker.execute("PRAGMA user_version=99")
+                attacker.commit()
+            finally:
+                attacker.close()
+            with self.assertRaises(SchemaTooNewError):
+                with transaction(conn, immediate=False):
+                    self.fail("too-new deferred transaction entered write body")
+        finally:
+            conn.close()
+
     def test_subprocess_crash_rolls_back_uncommitted_transaction(self) -> None:
         migrate_to_head(self.db)
         script = (
@@ -945,6 +985,66 @@ class StorageM103Tests(unittest.TestCase):
                 with self.assertRaises(StorageError):
                     restore_backup(backup_copy, dest)
                 self.assertFalse(dest.exists())
+
+    def test_restore_rejects_non_integer_manifest_fields_before_create(self) -> None:
+        """Bad manifest scalars are BackupError, never conversion leaks."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-invalid-scalars"
+        backup_dir.mkdir()
+        result = backup_database(self.db, backup_dir, generation="gen-1")
+        base_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+        invalid_values = (None, True, False, -1, 1.5, "1", "not-a-number", [], {})
+        for field in ("backup_size_bytes", "schema_version"):
+            for index, value in enumerate(invalid_values):
+                with self.subTest(field=field, value=value):
+                    case_dir = self.base / f"invalid-{field}-{index}"
+                    case_dir.mkdir()
+                    backup_copy = case_dir / result.backup_path.name
+                    shutil.copyfile(result.backup_path, backup_copy)
+                    manifest = dict(base_manifest)
+                    manifest[field] = value
+                    backup_copy.with_name(backup_copy.name + ".manifest.json").write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
+                    dest = case_dir / "restored.db"
+                    with self.assertRaises(BackupError):
+                        restore_backup(backup_copy, dest)
+                    self.assertFalse(dest.exists())
+
+        # A syntactically valid integer still must fit this build's schema.
+        too_new_dir = self.base / "invalid-schema-too-new"
+        too_new_dir.mkdir()
+        too_new_backup = too_new_dir / result.backup_path.name
+        shutil.copyfile(result.backup_path, too_new_backup)
+        too_new_manifest = dict(base_manifest)
+        too_new_manifest["schema_version"] = SCHEMA_VERSION + 1
+        too_new_backup.with_name(too_new_backup.name + ".manifest.json").write_text(
+            json.dumps(too_new_manifest), encoding="utf-8"
+        )
+        too_new_dest = too_new_dir / "restored.db"
+        with self.assertRaises(BackupError):
+            restore_backup(too_new_backup, too_new_dest)
+        self.assertFalse(too_new_dest.exists())
+
+    def test_restore_rejects_non_object_manifest_without_touching_target(self) -> None:
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-non-object"
+        backup_dir.mkdir()
+        result = backup_database(self.db, backup_dir, generation="gen-1")
+        result.manifest_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+
+        dest = self.base / "non-object-target.db"
+        with self.assertRaises(BackupError):
+            restore_backup(result.backup_path, dest)
+        self.assertFalse(dest.exists())
+
+        existing = self.base / "existing-target.db"
+        existing.write_bytes(b"owned by another operation")
+        before = existing.read_bytes()
+        with self.assertRaises(BackupError):
+            restore_backup(result.backup_path, existing)
+        self.assertEqual(existing.read_bytes(), before)
 
     def test_restore_validates_snapshot_itself_not_only_manifest(self) -> None:
         """A self-consistent manifest must still be refused when the *snapshot*
