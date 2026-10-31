@@ -1,5 +1,7 @@
 # TeamCraft 团匠
 
+<img src="assets/teamcraft-logo.png" alt="TeamCraft logo" width="176" />
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 > Specialized AI agents, working as one delivery team.

@@ -1,5 +1,7 @@
 # 团匠 TeamCraft
 
+<img src="assets/teamcraft-logo.png" alt="团匠 TeamCraft 标识" width="176" />
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 > 让 AI 各司其职，协作交付。
