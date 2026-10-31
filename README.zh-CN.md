@@ -1,6 +1,6 @@
 <p align="right"><a href="README.md">English</a></p>
 
-<h1 align="center"><img src="assets/teamcraft-logo.png" alt="团匠 TeamCraft" width="56" align="absmiddle"> 团匠 TeamCraft</h1>
+<h1 align="center"><img src="assets/TeamCraftLogo.png" alt="团匠 TeamCraft" width="56" align="absmiddle"> 团匠 TeamCraft</h1>
 
 <p align="center">
   <strong>让 AI 各司其职，协作交付。</strong>
