@@ -60,12 +60,77 @@ Beyond the baseline contract, this suite pins the M1-03 review findings:
   inode token proves ownership of the main file alone, so an unprovable
   sidecar — e.g. one planted at target-wal during a failing copy by another
   process — is always kept, while the operation's own main artefact still
-  passes its inode check before removal (round 9).
+  passes its inode check before removal (round 9);
+* final acceptance P-fixes, each pinned below: the mode=ro read channel now
+  carries its own authorizer (ATTACH/DETACH denied on BOTH channels even
+  inside an open transaction, closing the ATTACH + bare-COMMIT persistent
+  write bypass); restore binds the verified manifest digest to the bytes
+  ACTUALLY copied (source replaced after verification aborts instead of
+  false success); plan_retention rejects negative/bool knobs and re-proves
+  inode, manifest-text and digest stability at delete time, keeping anything
+  unverifiable (fail closed); connect failure cleanup never unlinks a file
+  it created if that inode may have been adopted (non-blank or WAL sibling
+  present -> keep); ordinary transactions require a coherent audited schema
+  (missing/divergent schema_migrations refused), and verify_database reports
+  SQLite integrity (ok) separately from TeamCraft schema usability
+  (schema_usable);
+* P-fixes 6 closes the LAST check-then-unlink windows with the only sound
+  primitives: a database-initialisation failure on an exposed path now
+  RETAINS the file unconditionally (no unlink at all — under a Path.unlink
+  injection, including adoption-at-the-unlink-moment, no unlink may even be
+  attempted), and plan_retention(delete=True) is refused outright while
+  dry-run stays available, because no inode/digest re-check can be atomic
+  against cross-process replacement before the unlink;
+* P-fixes 7 extends the same ruling to EVERY remaining failure cleanup:
+  backup, restore and manifest artefacts on public (even randomly named)
+  paths are retained, never check-then-unlinked — _still_ours and
+  _discard_if_still_ours are gone, replaced by the single unconditional
+  retention primitive _retain_created_file.  Retained leftovers are
+  failure evidence only: the failing call returns no BackupResult/
+  RestoreResult, unmanifested strays are invisible to plan_retention, and
+  humans (or a future provably-atomic M1-06 mechanism) handle cleanup;
+* P-fixes 8 plugs two more holes found in independent review: the public
+  transaction gate now REFUSES uninitialised v0 databases (only the private
+  migrate_to_head boundary may publish v1 — the old pass-through let
+  CREATE TABLE + COMMIT create unversioned junk), and the copy digest no
+  longer pretends to bind a connection — this SQLite build has no
+  pragma_page TVF, so the old fallback silently digested the re-opened
+  path (fooled by replacement); the digest is now taken over the
+  creation-time file descriptor of our own inode, and normal WAL
+  backup/restore round-trips are pinned to stay intact.
+* P-fixes 9 was a STATUS CORRECTION (public backup/restore disabled); the
+  user then authorized the local P10 model (restored by P-fixes 14):
+  copies run ONLY into a private 0700 staging directory (files created
+  O_EXCL inside it) beside the public target, are FULLY verified while
+  still private (integrity_check + v1 completeness + exact version
+  agreement), and the public name appears ONLY via os.link — atomic and
+  EEXIST-refused — so a pre-existing public file can never be overwritten
+  and a crash before the link leaves NO final name at all.  WAL sources
+  are supported WITHOUT any header rewriting: the page-level copy lands as
+  a self-consistent WAL-marked file (committed frames embedded) that
+  SQLite verifies and restores natively — the module ships no marker
+  patching (pinned structurally in test_destructive_primitives_are_gone).
+  Nothing is ever unlinked or truncated: staging dirs are RETAINED on
+  success AND on failure (the published hard link shares the staged
+  inode, so success retention costs zero extra data blocks — pinned by
+  test_copy_targets_staging_only_and_publish_is_hardlink), and
+  plan_retention(delete=True) stays refused (dry-run only).
+  TRUST MODEL (user-accepted 2026-10-31, explicit in docs, constant and
+  tests): this local single-machine library declares OTHER SAME-UID
+  PROCESSES TRUSTED.  Same-uid path games (renaming/pivoting names
+  around private staging, mutating bytes we verified, replacing public
+  names after publish) are OUT OF SCOPE by declaration and are not
+  claimed defended; cheap identity/adoption checks and the post-publish
+  inode+digest proof remain as fail-closed ACCIDENT detection
+  (post-publish tampering stays detectable later via the manifest digest
+  chain).
 """
 
 from __future__ import annotations
 
 import inspect
+import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -75,6 +140,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -100,7 +166,33 @@ from teamcraft import (
     verify_database,
 )
 
+# P-fixes 10: backup_database/restore_backup are live public API again —
+# copies happen in a private 0700 staging file, are verified there, and the
+# verified inode is published via os.link (EEXIST = never overwrite).  The
+# public directory listing therefore contains retained .tc-staging-* dirs
+# alongside published artefacts; _public_entries filters them out for
+# assertions about what was actually SHIPPED.
+public_backup_database = backup_database
+public_restore_backup = restore_backup
+
+# P-fixes 14 (user-authorized P10 model): backup/restore publish natively
+# via private-staging + os.link on macOS and Linux with Python 3.10/3.13 —
+# no capability gating and no test-side publisher stand-ins.  The declared
+# same-uid trust model, the retention policy and native WAL support are
+# pinned by TrustAndRetentionContractTests.
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _public_entries(directory: Path) -> list[Path]:
+    """Listings excluding retained private staging directories."""
+    return sorted(
+        p for p in directory.iterdir() if not p.name.startswith(".tc-staging-")
+    )
+
+
+def _staging_dirs(directory: Path) -> list[Path]:
+    return sorted(p for p in directory.iterdir() if p.name.startswith(".tc-staging-"))
 EXPECTED_TABLES = {
     "schema_migrations",
     "projects",
@@ -586,8 +678,10 @@ class StorageM103Tests(unittest.TestCase):
             conn.close()
 
     def test_failed_connect_removes_only_files_it_created(self) -> None:
-        """Review R4: cleanup must not delete files another process created;
-        ownership comes from O_EXCL, not from a pre-check boolean."""
+        """Review R4 + P-fixes 6: cleanup must never delete files another
+        process created; since P-fixes 6 even OUR OWN fresh file is RETAINED
+        on failure (check-then-unlink cannot exclude same-inode adoption),
+        so connect-failure cleanup deletes nothing at all."""
         real_connect = sqlite3.connect
 
         def selective(database, *args, **kwargs):
@@ -608,7 +702,12 @@ class StorageM103Tests(unittest.TestCase):
         with mock.patch.object(storage.sqlite3, "connect", side_effect=selective):
             with self.assertRaises(StorageError):
                 connect(fresh)
-        self.assertFalse(fresh.exists())  # ours: cleaned up after the failure
+        # P-fixes 6: retained (not deleted); an empty leftover is inert and
+        # a later connect reuses it cleanly.
+        self.assertTrue(fresh.exists())
+        self.assertEqual(fresh.stat().st_size, 0)
+        retry = connect(fresh)
+        retry.close()
 
     def test_connect_failure_cleanup_respects_concurrent_replacement(self) -> None:
         """R7 ownership tokens also guard connect(): if another process swaps
@@ -639,7 +738,12 @@ class StorageM103Tests(unittest.TestCase):
         ):
             with self.assertRaises(SchemaTooNewError):
                 connect(fresh2)
-        self.assertFalse(fresh2.exists())
+        # P-fixes 6: our own fresh file is now RETAINED (blank, inert)
+        # instead of unlinked, closing the same-inode adoption window.
+        self.assertTrue(fresh2.exists())
+        self.assertEqual(fresh2.stat().st_size, 0)
+        retry = connect(fresh2)
+        retry.close()
 
     def test_corrupted_database_is_refused_and_left_untouched(self) -> None:
         migrate_to_head(self.db)
@@ -1282,9 +1386,16 @@ class StorageM103Tests(unittest.TestCase):
         finally:
             probe.close()
 
-    def test_backup_targets_race_and_failure_cleanup_own_files_only(self) -> None:
-        """A foreign destination is refused untouched; a copy that fails after
-        this call exclusively created its target removes only its own file."""
+    def test_backup_targets_race_refusal_and_failure_retention(self) -> None:
+        """Review R7 + P-fixes 10: a foreign destination is refused
+        untouched — publish is os.link, which cannot displace an existing
+        file, so the winner\'s bytes survive at the public name with no
+        manifest of ours.  A copy that fails mid-flight (P-fixes 7
+        retention + P-fixes 10 staging): nothing reaches the public
+        namespace (publish never ran), the half-written copies live only in
+        RETAINED private staging directories, and the raised error means no
+        result object ever binds them.
+        """
         migrate_to_head(self.db)
         backup_dir = self.base / "backups"
         backup_dir.mkdir()
@@ -1299,25 +1410,30 @@ class StorageM103Tests(unittest.TestCase):
         self.assertEqual(foreign.read_bytes(), foreign_bytes)
 
         # Simulated page-copy failure via the auditable test seam: the
-        # exclusively-created destination must be cleaned up by the failing
-        # call itself and surface as BackupError, leaving no half artefacts.
+        # destination is NEVER published (P-fixes 10) and the staging dir
+        # holding the zero-byte inert copy is RETAINED (P-fixes 7).
         def _fail_copy(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection) -> None:
             raise sqlite3.OperationalError("simulated page-copy failure")
 
         half = self.base / "half-restore.db"
+        staging_before = len(_staging_dirs(self.base))
         with mock.patch.object(storage, "BACKUP_COPY_HOOK", _fail_copy):
             with self.assertRaises(BackupError):
                 restore_backup(result.backup_path, half)
-            self.assertFalse(half.exists())
-            # backup_database too: no half artefacts in the directory.
-            before = set(p.name for p in backup_dir.iterdir())
+            self.assertFalse(half.exists())  # never published -> never existed
+            self.assertGreater(len(_staging_dirs(self.base)), staging_before)
+            # backup_database too: a failed copy adds NO public .db and no
+            # manifest (the attempt happened inside private staging), and
+            # plan_retention still sees nothing deletable.
+            before = {p.name for p in backup_dir.iterdir() if p.name.endswith(".db")}
             with self.assertRaises(BackupError):
                 backup_database(self.db, backup_dir)
+            after = {p.name for p in backup_dir.iterdir() if p.name.endswith(".db")}
+            self.assertEqual(after, before)  # public .db set unchanged
+            self.assertGreaterEqual(len(_staging_dirs(backup_dir)), 1)
             self.assertEqual(
-                {n for n in (p.name for p in backup_dir.iterdir()) if n.endswith(".db")}
-                - {n for n in before if n.endswith(".db")},
-                set(),
-            )
+                plan_retention(backup_dir, keep_last=0), []
+            )  # staging dirs are never scanned or deletable
 
     # ------------------------------------------- concurrent cleanup ownership (R7)
     @staticmethod
@@ -1329,9 +1445,9 @@ class StorageM103Tests(unittest.TestCase):
         return name, name + ".manifest.json"
 
     def test_foreign_target_installed_after_check_survives_cleanup(self) -> None:
-        """Review R7 repro: another process creates the target between the
-        exists() pre-check and the O_EXCL creation; the refusal must not then
-        delete the winner's file."""
+        """Review R7 repro (P-fixes 10 shape): another process creates the
+        target between the exists() pre-check and our hardlink publish; the
+        EEXIST refusal must leave the winner's file exactly as it is."""
         migrate_to_head(self.db)
         backup_dir = self.base / "backups"
         backup_dir.mkdir()
@@ -1347,13 +1463,16 @@ class StorageM103Tests(unittest.TestCase):
 
         def racing_snapshot(path):
             result = real_snapshot(path)
-            # "Another process" wins the name right after our exists() check.
-            other = storage.sqlite3.connect(str(target))
-            try:
-                other.execute("CREATE TABLE foreign_marker(x)")
-                other.commit()
-            finally:
-                other.close()
+            # "Another process" wins the public name right after our
+            # exists() pre-check (only the first snapshot call matters; the
+            # staged-copy verification below must see the world unchanged).
+            if not target.exists():
+                other = storage.sqlite3.connect(str(target))
+                try:
+                    other.execute("CREATE TABLE foreign_marker(x)")
+                    other.commit()
+                finally:
+                    other.close()
             return result
 
         with mock.patch.object(storage, "datetime", FrozenDateTime), mock.patch.object(
@@ -1379,8 +1498,11 @@ class StorageM103Tests(unittest.TestCase):
 
     def test_manifest_race_preserves_foreign_manifest(self) -> None:
         """A manifest appearing mid-flight (between copy and manifest write)
-        belongs to the other process: it is neither overwritten nor deleted,
-        while our own unfinished backup is cleaned up."""
+        belongs to the other process: it is neither overwritten nor deleted.
+        Our own completed-but-unmanifested copy is now RETAINED as inert
+        failure evidence (review P-fixes 7) — it has no manifest, so it is
+        unknown provenance for retention and can never be shipped as a
+        successful backup (the call raised, no BackupResult)."""
         migrate_to_head(self.db)
         backup_dir = self.base / "backups"
         backup_dir.mkdir()
@@ -1406,12 +1528,17 @@ class StorageM103Tests(unittest.TestCase):
                 backup_database(self.db, backup_dir)
 
         self.assertEqual(foreign_manifest.read_bytes(), marker)  # never touched
-        self.assertFalse(target.exists())  # our own artefact is cleaned up
+        # P-fixes 7: our own completed copy is RETAINED (inert: the only
+        # manifest at that name is the foreign marker, which never binds it
+        # as one of ours; the BackupError means nothing was reported).
+        self.assertTrue(target.exists())
 
     def test_restore_concurrent_replacement_survives_cleanup(self) -> None:
-        """If the restore destination is replaced mid-copy by another process,
-        the later verification failure must leave the replacement (and its
-        planted sidecars) exactly as they are."""
+        """If a foreign database appears at the destination path mid-restore
+        (and our verification then fails), the refusal leaves the replacement
+        and its planted sidecars exactly as they are — since P-fixes 10 the
+        public destination is only ever created by our own verified hardlink
+        publish, so here the foreign process was first and we never touch it."""
         migrate_to_head(self.db)
         backup_dir = self.base / "backups"
         backup_dir.mkdir()
@@ -1421,12 +1548,14 @@ class StorageM103Tests(unittest.TestCase):
         captured: dict[str, bytes] = {}
         real_verify = storage.verify_database
 
-        def racing_verify(path):
-            # Our copy has just finished and its handles are closed; another
-            # process now replaces the destination and installs its sidecar.
+        def racing_verify(path: Any) -> dict[str, Any]:
+            # Our staged copy verified fine while private; the public
+            # destination does not exist yet (publish happens only after
+            # verification).  A foreign database now appears at the public
+            # name before our link publish...
             report = real_verify(path)
-            assert report["ok"]
-            dest.unlink()
+            assert report["ok"] and report["schema_usable"]
+            assert not dest.exists(), "public dest must not predate publish"
             other = storage.sqlite3.connect(str(dest))
             try:
                 other.execute("CREATE TABLE other(x)")  # fresh foreign db, v0
@@ -1435,10 +1564,11 @@ class StorageM103Tests(unittest.TestCase):
                 other.close()
             foreign_wal.write_bytes(b"FOREIGN-WAL-MARKER")
             captured["dest"] = dest.read_bytes()
-            # Our verification then observes a foreign database -> refuse.
-            return {**report, "ok": False, "integrity": "foreign replacement"}
-
-        with mock.patch.object(storage, "verify_database", side_effect=racing_verify):
+            # ...our publish then loses the name (EEXIST) and refuses.
+            return report
+        with mock.patch.object(
+            storage, "verify_database", side_effect=racing_verify
+        ):
             with self.assertRaises(BackupError):
                 restore_backup(result.backup_path, dest)
 
@@ -1453,7 +1583,15 @@ class StorageM103Tests(unittest.TestCase):
         self.assertTrue(result.backup_path.exists())
 
     def test_cleanup_token_semantics(self) -> None:
-        """Direct pinning of the ownership helpers used by all cleanup paths."""
+        """Direct pinning of the shared failure-cleanup primitive.
+
+        Review P-fixes 7: :func:`storage._retain_created_file` retains
+        everything — databases, manifests, WAL/SHM sidecars — regardless of
+        whether the creation token matches.  A token is only a
+        creation-decision record now; no publicly visible path may be
+        check-then-unlinked, because adoption or replacement in the window
+        before the unlink cannot be excluded by any prior check.
+        """
         owned = self.base / "owned.db"
         fd = storage._exclusive_create(owned)
         self.assertIsNotNone(fd)
@@ -1470,9 +1608,9 @@ class StorageM103Tests(unittest.TestCase):
         replaced.unlink()  # foreign process replaces at the same name
         replaced.write_bytes(b"foreign content")
 
-        storage._discard_if_still_ours(owned, None)
-        self.assertTrue(owned.exists())  # no token: never delete
-        storage._discard_if_still_ours(replaced, token2)
+        storage._retain_created_file(owned, None)
+        self.assertTrue(owned.exists())  # no token: retained
+        storage._retain_created_file(replaced, token2)
         self.assertTrue(replaced.exists())  # different inode: foreign, keep
         self.assertEqual(replaced.read_bytes(), b"foreign content")
 
@@ -1480,10 +1618,13 @@ class StorageM103Tests(unittest.TestCase):
         shm = Path(str(owned) + "-shm")
         wal.write_bytes(b"wal")
         shm.write_bytes(b"shm")
-        storage._discard_if_still_ours(owned, token)
-        self.assertFalse(owned.exists())  # ours (inode-matched): removed
-        # R9: sidecar ownership can never be proven by the main-file token,
-        # so sidecars are kept even when the main artefact is deleted.
+        # The decisive change (P-fixes 7): even a perfectly inode-matched
+        # file this call created is RETAINED — another process could have
+        # adopted this exact inode since creation, and no check made before
+        # an unlink can prove it did not.
+        storage._retain_created_file(owned, token)
+        self.assertTrue(owned.exists())
+        self.assertEqual(owned.read_bytes(), b"ours")
         self.assertTrue(wal.exists())
         self.assertTrue(shm.exists())
 
@@ -1527,44 +1668,1302 @@ class StorageM103Tests(unittest.TestCase):
         self.assertEqual(restore_result.integrity, "ok")
 
     # ------------------------------------------- foreign sidecar survival (R9)
-    @staticmethod
-    def _plant_wal_and_fail(src_conn, dst_conn) -> None:
-        row = dst_conn.execute("PRAGMA database_list").fetchone()
-        dst_file = str(row[2])
-        with open(dst_file + "-wal", "wb") as handle:
-            handle.write(b"FOREIGN-WAL-BYTES")
-        raise sqlite3.OperationalError("simulated copy abort after foreign sidecar")
-
     def test_foreign_sidecar_planted_during_failed_copy_is_never_deleted(self) -> None:
-        """Review R9 repro: another process creates target-wal mid-copy and
-        the copy then fails; cleanup must remove our own half-written
-        database (inode-matched) but leave the foreign sidecar alone — at
-        both the backup and restore levels."""
+        """Review R9 + P-fixes 7/11 repro: another process creates a wal
+        sidecar next to the in-flight staged copy and the copy then fails;
+        cleanup deletes NOTHING — not the foreign sidecar (unprovable
+        ownership), not our own half-written database.  Both live in the
+        RETAINED private staging directory; the public namespace stays free
+        of half-artefacts at both levels."""
         migrate_to_head(self.db)
         backup_dir = self.base / "backups"
         backup_dir.mkdir()
+        box: dict[str, Path] = {}
 
-        with mock.patch.object(storage, "BACKUP_COPY_HOOK", self._plant_wal_and_fail):
+        def plant_and_fail(source: Any, target: Any, **kwargs: Any) -> str:
+            box["staged"] = Path(str(target))
+            Path(str(target) + "-wal").write_bytes(b"FOREIGN-WAL-BYTES")
+            raise BackupError("simulated copy abort after foreign sidecar")
+
+        with mock.patch.object(storage, "_exclusive_online_copy", plant_and_fail):
             with self.assertRaises(BackupError):
                 backup_database(self.db, backup_dir)
 
-        leftovers = sorted(p.name for p in backup_dir.iterdir())
-        self.assertEqual([n for n in leftovers if n.endswith(".db")], [])
-        self.assertEqual([n for n in leftovers if n.endswith(".manifest.json")], [])
-        wals = [n for n in leftovers if n.endswith("-wal")]
-        self.assertEqual(len(wals), 1)  # only the foreign sidecar remains
-        self.assertEqual((backup_dir / wals[0]).read_bytes(), b"FOREIGN-WAL-BYTES")
+        public = [p.name for p in _public_entries(backup_dir)]
+        self.assertEqual([n for n in public if n.endswith(".db")], [])
+        self.assertEqual([n for n in public if n.endswith(".manifest.json")], [])
+        self.assertEqual([n for n in public if n.endswith("-wal")], [])
+        staged_dir = box["staged"].parent
+        self.assertEqual(staged_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(len(_staging_dirs(backup_dir)), 1)
+        staged_files = sorted(p.name for p in staged_dir.iterdir())
+        self.assertEqual(len(staged_files), 2)  # <name>.db + <name>.db-wal
+        self.assertEqual(box["staged"].stat().st_size, 0)  # inert, retained
+        self.assertEqual(
+            Path(str(box["staged"]) + "-wal").read_bytes(), b"FOREIGN-WAL-BYTES"
+        )
 
-        # Restore level: same guarantee for the destination's sidecars.
-        result = backup_database(self.db, backup_dir)
+        # Restore level: same guarantee for the destination and sidecars.
+        result = backup_database(self.db, backup_dir)  # real copy resumes
         dest = self.base / "restore-sidecar.db"
-        foreign_wal = Path(str(dest) + "-wal")
-        with mock.patch.object(storage, "BACKUP_COPY_HOOK", self._plant_wal_and_fail):
+        with mock.patch.object(storage, "_exclusive_online_copy", plant_and_fail):
             with self.assertRaises(BackupError):
                 restore_backup(result.backup_path, dest)
-        self.assertFalse(dest.exists())  # our own dest, inode-matched: removed
-        self.assertTrue(foreign_wal.exists())  # unprovable ownership: kept
-        self.assertEqual(foreign_wal.read_bytes(), b"FOREIGN-WAL-BYTES")
+        self.assertFalse(dest.exists())  # never published
+        self.assertFalse(Path(str(dest) + "-wal").exists())
+        staged_dir = box["staged"].parent
+        staged_files = sorted(p.name for p in staged_dir.iterdir())
+        self.assertEqual(len(staged_files), 2)  # inert dest + foreign wal
+        self.assertEqual(
+            Path(str(box["staged"]) + "-wal").read_bytes(), b"FOREIGN-WAL-BYTES"
+        )
+
+    def test_wal_sidecars_stay_private_and_publish_ships_verified_bytes(self) -> None:
+        """Native WAL behaviour (P-fixes 14, superseding P-fixes 12's
+        blanket sidecar refusal, which existed only because the abandoned
+        fd-channel could not host sidecars at all): copying a WAL source
+        may leave SQLite's own transient sidecars in the PRIVATE staging
+        directory; publication ships ONLY the verified main inode and
+        sidecars never travel to the public namespace.  The backup
+        SUCCEEDS because the bytes we publish are exactly the bytes our
+        copy wrote and our digest bound — sidecars beside the staged file
+        are neither published nor trusted.  The published file carries
+        NATIVE WAL markers (no header rewriting anywhere) and every
+        committed row — including un-checkpointed WAL frames embedded by
+        the page copy — reads back through the public name."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p14w"
+        backup_dir.mkdir()
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)",
+            ("p14w", "proj-p14w", "/repos/p14w", "2026-10-31T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)",
+            ("p14x", "proj-p14x", "/repos/p14x", "2026-10-31T00:00:00+00:00"),
+        )
+        conn.commit()
+        try:
+            result = backup_database(self.db, backup_dir, generation="g-p14w")
+        finally:
+            conn.close()
+        published = result.backup_path
+        self.assertEqual(storage._sha256(published), result.sha256)
+        # native markers survive verbatim: the library patches no bytes
+        self.assertEqual(published.read_bytes()[18:20], b"\x02\x02")
+        # nothing sidecar-ish beside the PUBLIC name
+        self.assertFalse(Path(str(published) + "-wal").exists())
+        self.assertFalse(Path(str(published) + "-shm").exists())
+        probe = sqlite3.connect(f"file:{published}?mode=ro", uri=True)
+        try:
+            self.assertEqual(
+                probe.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+            )
+            self.assertEqual(
+                sorted(
+                    r[0] for r in probe.execute(
+                        "SELECT id FROM projects WHERE id LIKE 'p14%'"
+                    )
+                ),
+                ["p14w", "p14x"],
+            )
+        finally:
+            probe.close()
+        # transient sidecars (if any) stayed inside the retained private
+        # staging directory — never published, never deleted
+        staging_sidecars = [
+            item
+            for d in _staging_dirs(backup_dir)
+            for item in d.iterdir()
+            if item.name.endswith(("-wal", "-shm"))
+        ]
+        self.assertTrue(staging_sidecars)  # transient WAL really was private
+        for q in staging_sidecars:
+            self.assertIn(".tc-staging-", str(q.parent))
+
+    def test_facade_read_channel_is_authorizer_guarded(self) -> None:
+        """P1-fix 1: mode=ro binds main only; the ro channel must carry its
+        own authorizer so ATTACH (the write hole into foreign databases) is
+        refused at SQLite's execution boundary, while genuine read pragmas
+        keep working."""
+        migrate_to_head(self.db)
+        victim = self.base / "p1-victim.db"
+        raw = sqlite3.connect(str(victim))
+        raw.execute("CREATE TABLE v(x)")
+        raw.commit()
+        raw.close()
+
+        conn = connect(self.db)
+        try:
+            conn.execute("SELECT 1").fetchone()  # force lazy ro channel open
+            # mechanism pin (first-party peek): the CHANNEL itself refuses
+            # ATTACH, independent of the facade's routing/mapping.
+            with self.assertRaises(sqlite3.DatabaseError):
+                conn._ro.execute("ATTACH DATABASE ? AS v", (str(victim),))
+            with self.assertRaises(WriteOutsideTransactionError):
+                conn.execute("ATTACH DATABASE ? AS v", (str(victim),))
+            with self.assertRaises(WriteOutsideTransactionError):
+                conn.execute(f"ATTACH DATABASE '{victim}' AS v2")
+            # never attached -> the dependent statement has no path either
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO v.x VALUES (1)")
+            with self.assertRaises(WriteOutsideTransactionError):
+                conn.execute("DETACH v")
+            with self.assertRaises(WriteOutsideTransactionError):
+                conn.execute("VACUUM")
+            # read-capable pragmas still flow (they were never write paths)
+            self.assertEqual(
+                str(conn.execute("PRAGMA integrity_check").fetchone()[0]).lower(), "ok"
+            )
+            self.assertEqual(
+                str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower(), "wal"
+            )
+            # persistent PRAGMA assignment remains physically refused and mapped
+            with self.assertRaises(WriteOutsideTransactionError):
+                conn.execute("PRAGMA user_version=99")
+        finally:
+            conn.close()
+        check = sqlite3.connect(f"file:{victim}?mode=ro", uri=True)
+        self.assertEqual(check.execute("SELECT COUNT(*) FROM v").fetchone()[0], 0)
+        check.close()
+
+    def test_attach_denied_inside_open_transaction(self) -> None:
+        """P1-fix 1: a schema-blessed gate is no licence to mutate attached
+        foreign databases; ATTACH is denied on the gated channel too."""
+        migrate_to_head(self.db)
+        victim = self.base / "p1-victim-txn.db"
+        raw = sqlite3.connect(str(victim))
+        raw.execute("CREATE TABLE v(x)")
+        raw.commit()
+        raw.close()
+
+        conn = connect(self.db)
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                with transaction(conn):
+                    conn.execute("ATTACH DATABASE ? AS v", (str(victim),))
+                    self.fail("ATTACH inside the gate must not reach execution")
+        finally:
+            conn.close()
+        check = sqlite3.connect(f"file:{victim}?mode=ro", uri=True)
+        self.assertEqual(check.execute("SELECT COUNT(*) FROM v").fetchone()[0], 0)
+        check.close()
+        # the main database is unharmed and still accepts legal writes
+        conn = connect(self.db)
+        try:
+            with transaction(conn):
+                _seed(conn, "p1-after-attach-refusal")
+        finally:
+            conn.close()
+
+    def test_restore_refuses_source_replaced_between_verification_and_copy(self) -> None:
+        """P1-fix 2: when the backup file behind the verified path is swapped
+        AFTER manifest/snapshot verification and BEFORE the copy runs, the
+        copy itself must detect the identity change (digest bound through the
+        live connections) and refuse, never report success."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p2"
+        backup_dir.mkdir()
+        genuine = backup_database(self.db, backup_dir, generation="gen-g")
+        seed_conn = connect(self.db)
+        try:
+            with transaction(seed_conn):
+                _seed(seed_conn, "p2-divergence")
+        finally:
+            seed_conn.close()
+        other = backup_database(self.db, backup_dir, generation="gen-o")
+        self.assertNotEqual(genuine.sha256, other.sha256)
+
+        case_dir = self.base / "p2-race"
+        case_dir.mkdir()
+        tampered = case_dir / genuine.backup_path.name
+        shutil.copyfile(genuine.backup_path, tampered)
+        tampered.with_name(tampered.name + ".manifest.json").write_text(
+            genuine.manifest_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+        original = storage._assert_restorable_snapshot
+
+        def replace_after_verification(
+            version: int, recorded: "int | None", missing: "frozenset[str]", *, subject: str
+        ) -> None:
+            original(version, recorded, missing, subject=subject)
+            if subject == "backup snapshot":
+                # simulate the loser-of-verification swap right after the
+                # last acceptance predicate ran, before copying starts
+                shutil.copyfile(other.backup_path, tampered)
+
+        dest = case_dir / "restored.db"
+        with mock.patch.object(
+            storage, "_assert_restorable_snapshot", new=replace_after_verification
+        ):
+            with self.assertRaises(BackupError):
+                restore_backup(tampered, dest)
+        # P-fixes 7/10: the digest binding caught the swap BEFORE publish,
+        # so nothing reached the public namespace — dest never existed, no
+        # RestoreResult, and the mismatched copy survives only inside the
+        # retained private staging directory as inert failure evidence.
+        self.assertFalse(dest.exists())
+        self.assertGreaterEqual(len(_staging_dirs(case_dir)), 1)
+
+        # positive control: untouched genuine backup restores cleanly
+        ok_dest = case_dir / "restored-ok.db"
+        result = restore_backup(genuine.backup_path, ok_dest)
+        self.assertEqual(result.schema_version, SCHEMA_VERSION)
+        self.assertEqual(result.integrity, "ok")
+
+    def test_retention_rejects_negative_and_boolean_parameters(self) -> None:
+        """P1-fix 3: keep_last=-1 would select EVERY entry; nonsense knobs
+        must fail loudly before any scanning."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p3"
+        backup_dir.mkdir()
+        keep_cases: list = [-1, True, False]
+        age_cases: list = [-1, -30, True]
+        for bad in keep_cases:
+            with self.subTest(keep_last=bad):
+                with self.assertRaises(ValueError):
+                    plan_retention(backup_dir, keep_last=bad)
+                with self.assertRaises(ValueError):
+                    plan_retention(backup_dir, keep_last=bad, delete=True)
+        for bad in age_cases:
+            with self.subTest(older_than_days=bad):
+                with self.assertRaises(ValueError):
+                    plan_retention(backup_dir, older_than_days=bad)
+
+    def test_retention_fails_closed_when_selected_backup_content_changes(self) -> None:
+        """P-fixes 3 + 6: selection may list stale or replaced candidates,
+        but deletion is REFUSED outright (fail closed) — replaced, rewritten,
+        and even perfectly authentic files all survive until the protocol
+        can prove ownership atomically at removal time."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p3b"
+        backup_dir.mkdir()
+        times = iter(
+            [
+                "2026-01-01T00:00:01+00:00",
+                "2026-01-01T00:00:02+00:00",
+                "2026-01-01T00:00:03+00:00",
+            ]
+        )
+        with mock.patch.object(storage, "_utc_now_iso", lambda: next(times)):
+            victim = backup_database(self.db, backup_dir, generation="gen-v")
+            genuine = backup_database(self.db, backup_dir, generation="gen-g")
+            newest = backup_database(self.db, backup_dir, generation="gen-n")
+        foreign = b"ANOTHER-PROCESS-DATABASE-BYTES" * 200
+        victim.backup_path.write_bytes(foreign)
+
+        with self.assertRaises(BackupError):
+            plan_retention(backup_dir, keep_last=1, delete=True)
+        # Nothing deleted: foreign content, authentic backups, newest, and
+        # every manifest all survive a refused deletion call.
+        self.assertTrue(victim.backup_path.exists())
+        self.assertEqual(victim.backup_path.read_bytes(), foreign)
+        self.assertTrue(victim.manifest_path.exists())
+        self.assertTrue(genuine.backup_path.exists())
+        self.assertTrue(genuine.manifest_path.exists())
+        self.assertTrue(newest.backup_path.exists())
+        self.assertTrue(newest.manifest_path.exists())
+        # dry-run selection is unaffected: it still lists both oldest
+        # candidates (keep_last=1 over three entries), deletion notwithstanding.
+        self.assertEqual(
+            plan_retention(backup_dir, keep_last=1),
+            [victim.backup_path, genuine.backup_path],
+        )
+
+    def test_retention_delete_refusal_never_attempts_unlink_even_injected(
+        self,
+    ) -> None:
+        """P-fixes 6 last-window regression: with ``Path.unlink`` patched to
+        a spy that would also adopt-and-commit at the unlink moment (the CEO
+        reproduction), plan_retention(delete=True) must raise BEFORE any
+        unlink is attempted — zero unlink calls, every file intact."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p6r"
+        backup_dir.mkdir()
+        r = backup_database(self.db, backup_dir, generation="gen-w")
+
+        unlinks: list[str] = []
+        real_connect = sqlite3.connect
+        real_unlink = Path.unlink
+
+        def spy_unlink(self: Path, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append(str(self))
+            if self.suffix == ".db":
+                # adopt-and-commit exactly at the unlink moment: the old
+                # check-then-delete code would destroy this committed data
+                adopter = real_connect(str(self), isolation_level=None)
+                adopter.execute("CREATE TABLE external_committed(x)")
+                adopter.execute("INSERT INTO external_committed VALUES (7)")
+                adopter.close()
+            return real_unlink(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", spy_unlink):
+            with self.assertRaises(BackupError):
+                plan_retention(backup_dir, keep_last=0, delete=True)
+        self.assertEqual(unlinks, [])  # not even an ATTEMPT was made
+        self.assertTrue(r.backup_path.exists())
+        self.assertTrue(r.manifest_path.exists())
+
+    def test_connect_init_failure_last_window_adoption_injection(self) -> None:
+        """P-fixes 6 last-window regression: patch ``Path.unlink`` so that
+        if the cleanup path ever tries to unlink our freshly created file,
+        another process adopts that same inode and commits first (the exact
+        CEO reproduction).  connect() must retain the file unconditionally:
+        zero unlink attempts, and any committed data would remain readable."""
+        real_unlink = Path.unlink
+        real_connect = sqlite3.connect
+        unlinks: list[str] = []
+        fresh = self.base / "lastwindow.db"
+
+        def spy_unlink(self: Path, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append(str(self))
+            if str(self) == str(fresh):
+                adopter = real_connect(str(self), isolation_level=None)
+                adopter.execute("CREATE TABLE injected(x)")
+                adopter.execute("INSERT INTO injected VALUES (1)")
+                adopter.close()
+            return real_unlink(self, *args, **kwargs)
+
+        def boom(inner: sqlite3.Connection, stage: str) -> None:
+            raise storage.StorageError("injected initialisation failure")
+
+        with mock.patch.object(Path, "unlink", spy_unlink), mock.patch.object(
+            storage, "_assert_writable_version", boom
+        ):
+            with self.assertRaises(storage.StorageError):
+                connect(fresh)
+        self.assertEqual(unlinks, [])  # no unlink attempt may happen at all
+        self.assertTrue(fresh.exists())  # retained in place
+        self.assertEqual(fresh.stat().st_size, 0)  # blank because never unlinked
+        reader = sqlite3.connect(f"file:{fresh}?mode=ro", uri=True)
+        try:
+            # the inert empty leftover exposes no tables and stays readable
+            self.assertEqual(
+                reader.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            reader.close()
+        # and a retry simply adopts the retained empty file
+        retry = connect(fresh)
+        retry.close()
+
+    def test_backup_failure_last_window_never_unlinks_even_injected(self) -> None:
+        """P-fixes 7/10 last-window regression (backup): with ``Path.unlink``
+        patched to a spy that adopt-and-commits real data into the in-flight
+        database at the exact unlink moment (CEO reproduction — random names
+        are no protection, any local process can open them), a failing
+        backup must raise with ZERO unlink attempts.  Because the copy lived
+        in private staging and publish never ran, the public backup
+        directory gains no stray .db and no manifest; plan_retention stays
+        empty and the staging directory is retained."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p7b"
+        backup_dir.mkdir()
+
+        def _fail_copy(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection) -> None:
+            raise sqlite3.OperationalError("simulated page-copy failure")
+
+        unlinks: list[str] = []
+        real_unlink = Path.unlink
+        real_connect = sqlite3.connect
+
+        def spy_unlink(self: Path, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append(str(self))
+            if self.suffix == ".db":
+                adopter = real_connect(str(self), isolation_level=None)
+                adopter.execute("CREATE TABLE external_committed(x)")
+                adopter.execute("INSERT INTO external_committed VALUES (5)")
+                adopter.commit()
+                adopter.close()
+            return real_unlink(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", spy_unlink), mock.patch.object(
+            storage, "BACKUP_COPY_HOOK", _fail_copy
+        ):
+            with self.assertRaises(BackupError):
+                backup_database(self.db, backup_dir)
+        self.assertEqual(unlinks, [])  # no unlink attempt may happen at all
+        self.assertEqual(
+            [p for p in _public_entries(backup_dir) if p.suffix == ".db"], []
+        )  # nothing published; the inert copy lives in staging only
+        self.assertGreaterEqual(len(_staging_dirs(backup_dir)), 1)  # retained
+        self.assertEqual(plan_retention(backup_dir, keep_last=0), [])
+
+    def test_restore_failure_last_window_never_unlinks_even_injected(self) -> None:
+        """P-fixes 7/10 last-window regression (restore): same unlink spy
+        with adopt-and-commit at the unlink moment; a mid-copy restore
+        failure must raise BackupError with ZERO unlink attempts; the public
+        destination is never created (publish never ran) and the inert copy
+        survives only inside the retained staging directory."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p7r"
+        backup_dir.mkdir()
+        result = backup_database(self.db, backup_dir, generation="gen-p7r")
+        dest = self.base / "restore-p7r.db"
+
+        unlinks: list[str] = []
+        real_unlink = Path.unlink
+        real_connect = sqlite3.connect
+
+        def spy_unlink(self: Path, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append(str(self))
+            if self.suffix == ".db":
+                adopter = real_connect(str(self), isolation_level=None)
+                adopter.execute("CREATE TABLE external_committed(x)")
+                adopter.execute("INSERT INTO external_committed VALUES (6)")
+                adopter.commit()
+                adopter.close()
+            return real_unlink(self, *args, **kwargs)
+
+        def _fail_copy(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection) -> None:
+            raise sqlite3.OperationalError("simulated page-copy failure")
+
+        with mock.patch.object(Path, "unlink", spy_unlink), mock.patch.object(
+            storage, "BACKUP_COPY_HOOK", _fail_copy
+        ):
+            with self.assertRaises(BackupError):
+                restore_backup(result.backup_path, dest)
+        self.assertEqual(unlinks, [])  # no unlink attempt may happen at all
+        self.assertFalse(dest.exists())  # never published -> never existed
+        self.assertGreaterEqual(len(_staging_dirs(self.base)), 1)  # retained
+
+    # ------------------------------------------- final acceptance P-fixes (P8)
+    def test_transaction_refuses_uninitialized_v0_database(self) -> None:
+        """P-fixes 8 (CEO reproduction): the public write gate must refuse
+        v0.  CREATE TABLE + COMMIT inside transaction() on an uninitialised
+        file previously SUCCEEDED, turning it into unversioned junk that
+        migrate_to_head must then refuse; now the re-check under the write
+        lock refuses before any statement runs — nothing persists, the file
+        stays pristine v0, and migrate_to_head still publishes v1 cleanly
+        (both immediate and deferred modes)."""
+        for immediate in (True, False):
+            with self.subTest(immediate=immediate):
+                fresh = self.base / f"v0-public-write-{immediate}.db"
+                seed = sqlite3.connect(str(fresh))
+                seed.close()  # plain v0 database
+                conn = connect(fresh)
+                try:
+                    with self.assertRaises(StorageError):
+                        with transaction(conn, immediate=immediate):
+                            conn.execute("CREATE TABLE smuggled(x)")
+                            conn.execute("INSERT INTO smuggled VALUES (1)")
+                finally:
+                    conn.close()
+                probe = sqlite3.connect(str(fresh))
+                try:
+                    self.assertEqual(
+                        probe.execute("PRAGMA user_version").fetchone()[0], 0
+                    )
+                    self.assertEqual(
+                        probe.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall(),
+                        [],
+                    )
+                finally:
+                    probe.close()
+                report = migrate_to_head(fresh)  # refused attempt left no junk
+                self.assertTrue(report.fresh)
+                self.assertEqual(report.to_version, SCHEMA_VERSION)
+
+    def test_transaction_refuses_v0_even_with_foreign_tables(self) -> None:
+        """P-fixes 8: a v0 file that already carries another application's
+        tables is equally unwritable through the public gate — the refusal
+        keeps the foreign data intact, and migrate_to_head still (correctly)
+        refuses to adopt unversioned junk."""
+        foreign = self.base / "v0-foreign.db"
+        seed = sqlite3.connect(str(foreign))
+        seed.execute("CREATE TABLE foreign_app(x)")
+        seed.execute("INSERT INTO foreign_app VALUES (42)")
+        seed.commit()
+        seed.close()
+        conn = connect(foreign)  # connecting to inspect stays allowed
+        try:
+            with self.assertRaises(StorageError):
+                with transaction(conn):
+                    conn.execute("CREATE TABLE smuggled2(x)")
+        finally:
+            conn.close()
+        probe = sqlite3.connect(str(foreign))
+        try:
+            self.assertEqual(
+                probe.execute("SELECT x FROM foreign_app").fetchall(), [(42,)]
+            )
+            self.assertEqual(probe.execute("PRAGMA user_version").fetchone()[0], 0)
+        finally:
+            probe.close()
+        with self.assertRaises(MigrationError):
+            migrate_to_head(foreign)  # junk remains unadoptable
+
+    def test_exclusive_copy_hash_binds_inode_under_path_swap(self) -> None:
+        """P-fixes 8: with BACKUP_COPY_HOOK renaming our target away and
+        installing foreign bytes at the path mid-copy, the returned digest
+        must still be of OUR inode (descriptor binding), while a path-based
+        digest — exactly what the removed fallback produced — would have
+        been fooled by the replacement."""
+        migrate_to_head(self.db)
+        target = self.base / "bound-snap.db"
+        hidden = self.base / "hidden-real.db"
+
+        def swap_mid(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection) -> None:
+            target.rename(hidden)
+            target.write_bytes(b"EVIL-REPLACEMENT-DATABASE" * 64)
+
+        fd = os.open(
+            str(target), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+        )
+        try:
+            with mock.patch.object(storage, "BACKUP_COPY_HOOK", swap_mid):
+                copied_sha = storage._exclusive_online_copy(
+                    self.db, target, creation_fd=fd
+                )
+        finally:
+            os.close(fd)
+        self.assertEqual(copied_sha, storage._sha256(hidden))  # our inode
+        self.assertNotEqual(copied_sha, storage._sha256(target))  # path lied
+
+    def test_copy_binding_never_hashes_through_the_path(self) -> None:
+        """P-fixes 8: the copy binding must not consult path-based hashing
+        at all — _sha256 spied to explode if called during
+        _exclusive_online_copy; the fd digest still matches the file."""
+        migrate_to_head(self.db)
+        target = self.base / "nopathhash.db"
+        fd = os.open(
+            str(target), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+        )
+        try:
+            with mock.patch.object(
+                storage,
+                "_sha256",
+                side_effect=AssertionError("path hashing must not run during copy"),
+            ):
+                sha = storage._exclusive_online_copy(
+                    self.db, target, creation_fd=fd
+                )
+        finally:
+            os.close(fd)
+        self.assertEqual(sha, storage._sha256(target))  # real comparison now
+
+    def test_wal_backup_restore_roundtrip_binds_copied_bytes(self) -> None:
+        """P-fixes 8 compatibility: normal WAL behaviour is intact — a live
+        WAL source with uncheckpointed frames backs up consistently, the
+        manifest digest equals the on-disk backup bytes equals what restore
+        re-delivers, and the restored database reads the new rows back."""
+        migrate_to_head(self.db)
+        conn = connect(self.db)
+        try:
+            _seed(conn, "wal-roundtrip")
+            n_src = conn.execute(
+                "SELECT COUNT(*) FROM projects WHERE id = 'wal-roundtrip'"
+            ).fetchone()[0]
+            backup_dir = self.base / "backups-w8"
+            backup_dir.mkdir()
+            res = backup_database(self.db, backup_dir, generation="gen-w8")
+        finally:
+            conn.close()
+        manifest = json.loads(res.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["backup_sha256"], res.sha256)
+        self.assertEqual(res.sha256, storage._sha256(res.backup_path))
+        dest = self.base / "restored-w8.db"
+        rr = restore_backup(res.backup_path, dest)
+        self.assertEqual(rr.schema_version, SCHEMA_VERSION)
+        self.assertEqual(rr.integrity, "ok")
+        reader = connect(dest)
+        try:
+            self.assertEqual(
+                reader.execute(
+                    "SELECT COUNT(*) FROM projects WHERE id = 'wal-roundtrip'"
+                ).fetchone()[0],
+                n_src,
+            )
+        finally:
+            reader.close()
+
+    # --------------------------------- final acceptance P-fixes (P10/P11/P12)
+    def test_backup_publish_never_overwrites_pivoted_victim_ceo_injection(
+        self,
+    ) -> None:
+        """P-fixes 10 (CEO requirement: external existing files are never
+        overwritten): the victim database is renamed onto the PUBLIC backup
+        name at the last possible moment while our copy is still writing in
+        private staging.  Publication is os.link, which fails atomically
+        with EEXIST: the victim survives byte- and row-intact at the public
+        name, no manifest is published, no BackupResult exists, and the
+        staging directory is retained.  Our writes never touched the public
+        name — the P-fixes 9 clobber is structurally impossible."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p10b"
+        backup_dir.mkdir()
+        victim = self.base / "victim-p10b.db"
+        migrate_to_head(victim)
+        ev = sqlite3.connect(str(victim))
+        ev.execute("CREATE TABLE foreign_evidence(x)")
+        ev.execute("INSERT INTO foreign_evidence VALUES (\'must-survive\')")
+        ev.commit()
+        ev.close()
+        victim_bytes = victim.read_bytes()
+
+        class FrozenDateTime(storage.datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: ANN001 - mirror stdlib signature
+                return cls(2026, 10, 29, 12, 0, 0)
+
+        expected = backup_dir / self._frozen_names(self.db.stem)[0]
+
+        def pivot_victim(src_conn: Any, dst_conn: Any) -> None:
+            os.replace(str(victim), str(expected))
+
+        with mock.patch.object(storage, "datetime", FrozenDateTime), mock.patch.object(
+            os, "urandom", lambda n: b"\x01\x02\x03"
+        ), mock.patch.object(storage, "BACKUP_COPY_HOOK", pivot_victim):
+            with self.assertRaises(BackupError) as caught:
+                backup_database(self.db, backup_dir)
+        message = str(caught.exception)
+        self.assertIn("already exists", message)
+        self.assertIn("refusing to overwrite", message)
+        self.assertFalse(victim.exists())  # the pivot really happened...
+        self.assertEqual(expected.read_bytes(), victim_bytes)  # ...victim intact
+        probe = sqlite3.connect(str(expected))
+        try:
+            self.assertEqual(
+                probe.execute("SELECT x FROM foreign_evidence").fetchall(),
+                [("must-survive",)],
+            )
+        finally:
+            probe.close()
+        self.assertEqual(_public_entries(backup_dir), [expected])  # ours absent
+        self.assertEqual(len(_staging_dirs(backup_dir)), 1)  # evidence retained
+
+    def test_restore_publish_never_overwrites_pivoted_victim_ceo_injection(
+        self,
+    ) -> None:
+        """P-fixes 10 restore level: the victim is renamed onto the public
+        destination mid-copy; os.link refuses with EEXIST, the victim (and
+        its rows) survive untouched at dest, nothing else is published and
+        the staging copy is retained."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p10r"
+        backup_dir.mkdir()
+        snap = backup_database(self.db, backup_dir, generation="gen-p10r")
+        victim = self.base / "victim-p10r.db"
+        migrate_to_head(victim)
+        ev = sqlite3.connect(str(victim))
+        ev.execute("CREATE TABLE foreign_evidence(x)")
+        ev.execute("INSERT INTO foreign_evidence VALUES (\'must-survive\')")
+        ev.commit()
+        ev.close()
+        victim_bytes = victim.read_bytes()
+        dest = self.base / "dest-p10r.db"
+
+        def pivot_victim(src_conn: Any, dst_conn: Any) -> None:
+            os.replace(str(victim), str(dest))
+
+        with mock.patch.object(storage, "BACKUP_COPY_HOOK", pivot_victim):
+            with self.assertRaises(BackupError) as caught:
+                restore_backup(snap.backup_path, dest)
+        message = str(caught.exception)
+        self.assertIn("already exists", message)
+        self.assertIn("refusing to overwrite", message)
+        self.assertEqual(dest.read_bytes(), victim_bytes)  # victim, untouched
+        probe = sqlite3.connect(str(dest))
+        try:
+            self.assertEqual(
+                probe.execute("SELECT x FROM foreign_evidence").fetchall(),
+                [("must-survive",)],
+            )
+        finally:
+            probe.close()
+        self.assertGreaterEqual(len(_staging_dirs(self.base)), 1)
+
+    def test_copy_targets_staging_only_and_publish_is_hardlink(self) -> None:
+        """Structural proof (P-fixes 14/P10): DURING the copy, SQLite's own
+        view of the destination (PRAGMA database_list) is the private
+        staged path inside a 0700 .tc-staging-* directory (public targets
+        are never opened for writing), and the public target name does not
+        exist yet; afterwards the public file carries exactly the verified
+        bytes (digest equality), the staged copy is retained WHOLE on the
+        very inode the public name links to (nlink == 2 = zero-copy
+        retention), and the staging directory remains (never unlinked,
+        never truncated)."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p14s"
+        backup_dir.mkdir()
+
+        class FrozenDateTime(storage.datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: ANN001 - mirror stdlib signature
+                return cls(2026, 10, 29, 12, 0, 0)
+
+        expected = backup_dir / self._frozen_names(self.db.stem)[0]
+        seen: dict[str, object] = {}
+
+        def inspect_dst(src_conn: Any, dst_conn: Any) -> None:
+            row = dst_conn.execute("PRAGMA database_list").fetchone()
+            dst_file = str(row[2])
+            seen["staging_only"] = ".tc-staging-" in dst_file and dst_file.endswith(
+                "/" + expected.name
+            )
+            seen["journal"] = str(
+                dst_conn.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
+            seen["public_before"] = expected.exists()
+
+        with mock.patch.object(storage, "datetime", FrozenDateTime), mock.patch.object(
+            os, "urandom", lambda n: b"\x01\x02\x03"
+        ), mock.patch.object(storage, "BACKUP_COPY_HOOK", inspect_dst):
+            result = backup_database(self.db, backup_dir)
+        self.assertTrue(seen["staging_only"])
+        self.assertEqual(seen["journal"], "delete")
+        self.assertFalse(seen["public_before"])
+        self.assertEqual(result.backup_path, expected)
+        # published bytes == the verified digest
+        self.assertEqual(storage._sha256(expected), result.sha256)
+        staged = _staging_dirs(backup_dir)
+        self.assertEqual(len(staged), 1)  # dir retained, never unlinked
+        self.assertEqual(oct(os.stat(str(staged[0])).st_mode & 0o777), "0o700")
+        staged_copy = staged[0] / expected.name
+        # retain-never-delete: the staged copy is kept WHOLE, and because
+        # publication is a hard link of that same inode, retention costs
+        # zero extra data blocks (nlink 2 on the shared inode proves both).
+        self.assertTrue(staged_copy.exists())
+        self.assertGreater(staged_copy.stat().st_size, 0)
+        self.assertEqual(os.stat(str(staged_copy)).st_nlink, 2)
+        self.assertEqual(os.stat(str(staged_copy)).st_ino, os.stat(str(expected)).st_ino)
+        self.assertEqual(staged_copy.read_bytes(), expected.read_bytes())
+
+    def test_publish_last_window_foreign_winner_survives(self) -> None:
+        """Last-window injection at the publish boundary itself: a foreign
+        database appears at the public target AFTER our verified copy,
+        immediately before our exclusive create; the EEXIST refusal leaves
+        the winner untouched, publishes nothing of ours, and retains the
+        staged evidence (no BackupResult)."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p11w"
+        backup_dir.mkdir()
+        real_publish = storage._publish_atomically
+        planted: dict[str, bytes] = {}
+
+        def publish_with_competitor(
+            staging_file: Path, directory: Path, name: str, **kwargs: Any
+        ) -> None:
+            victim = Path(str(directory)) / name
+            if not victim.exists():
+                foreign = sqlite3.connect(str(victim))
+                foreign.execute("CREATE TABLE competitor(x)")
+                foreign.execute("INSERT INTO competitor VALUES ('wins')")
+                foreign.commit()
+                foreign.close()
+                planted["bytes"] = victim.read_bytes()
+            real_publish(staging_file, directory, name, **kwargs)
+
+        with mock.patch.object(storage, "_publish_atomically", publish_with_competitor):
+            with self.assertRaises(BackupError):
+                backup_database(self.db, backup_dir)
+        # the competitor owns the public name now; we refused and backed off
+        winner = [p for p in _public_entries(backup_dir) if p.suffix == ".db"]
+        self.assertEqual(len(winner), 1)
+        self.assertEqual(winner[0].read_bytes(), planted["bytes"])
+        probe = sqlite3.connect(str(winner[0]))
+        try:
+            self.assertEqual(
+                probe.execute("SELECT x FROM competitor").fetchall(), [("wins",)]
+            )
+        finally:
+            probe.close()
+        self.assertEqual(
+            [
+                p.name
+                for p in _public_entries(backup_dir)
+                if p.name.endswith(".manifest.json")
+            ],
+            [],
+        )
+        self.assertGreaterEqual(len(_staging_dirs(backup_dir)), 1)
+
+    def test_same_uid_trust_boundary_is_declared_not_defended(self) -> None:
+        """P-fixes 14: the same-uid world is handled by DECLARATION, not by
+        a fake defence.  Same-uid name games (e.g. renaming a foreign
+        database onto our abandoned staging PATH before SQLite opens it)
+        can neither be reliably defended against nor reliably detected
+        from userspace, so the user-accepted trust model must be stated
+        explicitly instead of papered over: the mechanism constant and both
+        public function docstrings declare it, and no docs anywhere claim
+        to defend against it."""
+        mech = storage.TARGET_PUBLICATION_MECHANISM
+        self.assertIn("same-uid", mech)
+        self.assertIn("trusted", mech)
+        self.assertIn("out of scope", mech)
+        for func in (storage.backup_database, storage.restore_backup):
+            doc = (inspect.getdoc(func) or "").lower()
+            self.assertIn("same-uid", doc, func.__name__)
+            self.assertIn("trusted", doc, func.__name__)
+        # and the honest corollary: post-publish replacement of public
+        # content stays a DETECTABLE residual (digest chain), not a claimed
+        # defence
+        self.assertIn("after", mech.lower() + " ".join(
+            (inspect.getdoc(f) or "").lower() for f in (storage.backup_database, storage.restore_backup)
+        ))
+
+    def _seed_named(self, project_id: str = "p1") -> None:
+        """Schema + one project row, so every retained staged copy is
+        independently meaningful recovery evidence."""
+
+        raw = sqlite3.connect(str(self.db))
+        raw.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)",
+            (project_id, f"proj-{project_id}", f"/repos/{project_id}", "2026-10-27T00:00:00+00:00"),
+        )
+        raw.commit()
+        raw.close()
+
+    def _assert_valid_evidence(self, path: Path, project_id: str = "p1") -> None:
+        """A staged database kept as crash-recovery evidence must itself be
+        a complete, valid, queryable snapshot."""
+
+        self.assertGreater(path.stat().st_size, 0)
+        probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            self.assertEqual(probe.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(
+                probe.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchall(),
+                [(f"proj-{project_id}",)],
+            )
+        finally:
+            probe.close()
+
+    def test_crash_after_copy_before_link_never_exposes_final_name(self) -> None:
+        """P-fixes 12 (review P1-1): any crash between the completed copy
+        and the atomic link — here injected at the verification step —
+        leaves NO final public name at all (not even a 0-byte or partial
+        one), while the private staged database remains whole and valid as
+        explicit recovery evidence."""
+        migrate_to_head(self.db)
+        self._seed_named("p12a")
+        backup_dir = self.base / "backups-p12a"
+        backup_dir.mkdir()
+        box: dict[str, Path] = {}
+        real_copy = storage._exclusive_online_copy
+
+        def record_copy(source: Any, target: Any, **kwargs: Any) -> str:
+            box["staged"] = Path(str(target))
+            return real_copy(source, target, **kwargs)
+
+        def crash_verify(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise OSError("simulated crash after copy, before publish")
+
+        with mock.patch.object(storage, "_exclusive_online_copy", record_copy), \
+            mock.patch.object(storage, "verify_database", crash_verify):
+            with self.assertRaises(OSError):
+                backup_database(self.db, backup_dir)
+        public = [p.name for p in _public_entries(backup_dir)]
+        self.assertEqual([n for n in public if n.endswith(".db")], [])
+        self.assertEqual([n for n in public if n.endswith(".manifest.json")], [])
+        self._assert_valid_evidence(box["staged"], "p12a")
+
+    def test_link_failure_leaves_no_final_name(self) -> None:
+        """P-fixes 12: failure AT the publish instant (link refused by the
+        OS — e.g. EPERM/EROFS mid-crash) still creates no public name;
+        staged evidence stays whole."""
+        migrate_to_head(self.db)
+        self._seed_named("p12b")
+        backup_dir = self.base / "backups-p12b"
+        backup_dir.mkdir()
+        box: dict[str, Path] = {}
+        real_copy = storage._exclusive_online_copy
+
+        def record_copy(source: Any, target: Any, **kwargs: Any) -> str:
+            box["staged"] = Path(str(target))
+            return real_copy(source, target, **kwargs)
+
+        def broken_publish(staged: Path, directory: Path, name: str, **kwargs: Any) -> None:
+            raise BackupError(f"simulated publish failure for {kwargs.get('what')}")
+
+        with mock.patch.object(storage, "_exclusive_online_copy", record_copy), \
+            mock.patch.object(storage, "_publish_atomically", broken_publish):
+            with self.assertRaises(BackupError):
+                backup_database(self.db, backup_dir)
+        public = [p.name for p in _public_entries(backup_dir)]
+        self.assertEqual([n for n in public if n.endswith(".db")], [])
+        self.assertEqual([n for n in public if n.endswith(".manifest.json")], [])
+        self._assert_valid_evidence(box["staged"], "p12b")
+
+    def test_manifest_write_failure_exposes_no_partial_manifest(self) -> None:
+        """P-fixes 12 (review P1-1 exact repro class): the payload write
+        dies mid-bytes.  Because payloads are written to PRIVATE staging
+        first, the incomplete bytes never appear under the final name: the
+        public manifest name simply does not exist, the already-link-published
+        database is complete and valid, and the partial staged manifest is
+        retained as evidence."""
+        migrate_to_head(self.db)
+        self._seed_named("p12c")
+        backup_dir = self.base / "backups-p12c"
+        backup_dir.mkdir()
+        real_write_all = storage._write_all
+        box: dict[str, Path] = {}
+
+        def write_then_die(fd: int, payload: bytes) -> None:
+            if b"backup_sha256" in payload:  # manifest payload
+                box["partial_len"] = len(payload)
+                os.write(fd, payload[:1])
+                raise OSError("simulated partial manifest write")
+            real_write_all(fd, payload)
+
+        with mock.patch.object(storage, "_write_all", write_then_die):
+            with self.assertRaises(OSError):
+                backup_database(self.db, backup_dir)
+        public = [p.name for p in _public_entries(backup_dir)]
+        dbs = [n for n in public if n.endswith(".db")]
+        self.assertEqual(len(dbs), 1)  # db was link-published, complete
+        db_path = backup_dir / dbs[0]
+        probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            self.assertEqual(probe.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            probe.close()
+        self.assertEqual([n for n in public if n.endswith(".manifest.json")], [])
+        # the partial manifest never reached a final name; the staged copy
+        # (1 byte of a much larger payload) is retained as evidence
+        staged_manifests = [
+            p
+            for d in _staging_dirs(backup_dir)
+            for p in d.iterdir()
+            if p.name.endswith(".manifest.json")
+        ]
+        self.assertEqual(len(staged_manifests), 1)
+        self.assertEqual(staged_manifests[0].stat().st_size, 1)
+        self.assertGreater(box["partial_len"], 1)
+
+    def test_post_publish_swap_fails_closed_and_retains(self) -> None:
+        """The post-publish identity proof: immediately after the atomic
+        link a foreign file replaces the public name; the inode check fails
+        closed — no BackupResult, no manifest, the intruder's file is kept
+        (we never delete what we did not create) and our staged evidence
+        stays whole and valid."""
+        migrate_to_head(self.db)
+        self._seed_named("p12d")
+        backup_dir = self.base / "backups-p12d"
+        backup_dir.mkdir()
+        real_link = storage._link_publish
+
+        def link_then_swap(staged: Path, dest: Path, *, what: str) -> None:
+            real_link(staged, dest, what=what)
+            evil = Path(str(dest) + "-intruder.db")
+            raw = sqlite3.connect(str(evil))
+            raw.execute("CREATE TABLE intruder(x)")
+            raw.commit()
+            raw.close()
+            os.replace(str(evil), str(dest))  # public name -> foreign inode
+
+        with mock.patch.object(storage, "_link_publish", link_then_swap):
+            with self.assertRaises(BackupError) as caught:
+                backup_database(self.db, backup_dir)
+        self.assertIn("not the verified inode", str(caught.exception))
+        public = [p.name for p in _public_entries(backup_dir)]
+        self.assertEqual([n for n in public if n.endswith(".manifest.json")], [])
+        winner = [backup_dir / n for n in public if n.endswith(".db")]
+        self.assertEqual(len(winner), 1)
+        probe = sqlite3.connect(f"file:{winner[0]}?mode=ro", uri=True)
+        try:
+            self.assertEqual(probe.execute("SELECT x FROM intruder").fetchall(), [])
+        finally:
+            probe.close()
+        staged_copy = [p for d in _staging_dirs(backup_dir) for p in d.iterdir() if p.suffix == ".db"]
+        self.assertEqual(len(staged_copy), 1)
+        self._assert_valid_evidence(staged_copy[0], "p12d")
+
+    def test_hardlink_adoption_refused_and_other_name_survives(self) -> None:
+        """P-fixes 12 (review P1-2): another process adopts our staged
+        inode by hard-linking it elsewhere before publish — st_nlink != 1
+        is a visible adoption sign; publishing is refused (we would ship
+        content whose namespace position someone else shares), and the
+        adopter's name survives untouched (we destroy nothing they made)."""
+        migrate_to_head(self.db)
+        self._seed_named("p12e")
+        backup_dir = self.base / "backups-p12e"
+        backup_dir.mkdir()
+        real_copy = storage._exclusive_online_copy
+        box: dict[str, Path] = {}
+
+        def adopt_after_copy(source: Any, target: Any, **kwargs: Any) -> str:
+            sha = real_copy(source, target, **kwargs)
+            os.link(str(target), str(self.base / "adopted-elsewhere.db"))
+            box["staged"] = Path(str(target))
+            return sha
+
+        with mock.patch.object(storage, "_exclusive_online_copy", adopt_after_copy):
+            with self.assertRaises(BackupError) as caught:
+                backup_database(self.db, backup_dir)
+        self.assertIn("adopted", str(caught.exception))
+        public = [p.name for p in _public_entries(backup_dir)]
+        self.assertEqual([n for n in public if n.endswith(".db")], [])
+        survivor = self.base / "adopted-elsewhere.db"
+        self.assertTrue(survivor.exists())  # never destroyed
+        self.assertEqual(survivor.read_bytes(), box["staged"].read_bytes())
+        self._assert_valid_evidence(box["staged"], "p12e")
+
+    def test_destructive_primitives_are_gone(self) -> None:
+        """Structural guarantee (P-fixes 12): the reclaim/ftruncate helper
+        and the old exclusive-write publish are gone from the module, and
+        the module source contains no ftruncate call site at all — the
+        adoption-unsafe primitives cannot be re-entered by accident."""
+        import inspect
+
+        self.assertFalse(hasattr(storage, "_reclaim_staged_contents"))
+        self.assertFalse(hasattr(storage, "_publish_excl"))
+        self.assertFalse(hasattr(storage, "_publish_hardlink"))
+        # P-fixes 13's capability-gated publish is gone: the public API is
+        # live on every supported platform again (P-fixes 14).
+        self.assertFalse(hasattr(storage, "_fd_publish_from_fd"))
+        self.assertFalse(hasattr(storage, "fd_publish_supported"))
+        # manual WAL-header rewriting can never come back (review 14)
+        self.assertFalse(hasattr(storage, "_clear_wal_journal_markers"))
+        self.assertTrue(hasattr(storage, "_link_publish"))
+        self.assertTrue(hasattr(storage, "_publish_atomically"))
+        source = inspect.getsource(storage)
+        self.assertNotIn("ftruncate", source)
+        self.assertNotIn("os.pwrite", source)
+        self.assertNotIn("journal_mode=OFF", source)
+
+    def test_never_unlinks_across_public_backup_and_restore_flows(self) -> None:
+        """Retention policy (P-fixes 7/10/12) across SUCCESS and FAILURE:
+        with Path.unlink, os.unlink, os.remove, os.ftruncate and os.truncate
+        all spied, successful backups, successful restores and hook-injected
+        failures must make ZERO removal or truncation calls; staging and
+        published names alike are never removed, and no retained staged
+        inode's contents are ever zeroed (adoption-safety)."""
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p10u"
+        backup_dir.mkdir()
+        unlinks: list[str] = []
+        real_path_unlink = Path.unlink
+        real_os_unlink = os.unlink
+        real_os_remove = os.remove
+        real_os_ftruncate = os.ftruncate
+        real_os_truncate = os.truncate
+
+        def spy_path(self: Path, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append("Path.unlink:" + str(self))
+            return real_path_unlink(self, *args, **kwargs)
+
+        def spy_os_unlink(path: Any, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append("os.unlink:" + str(path))
+            return real_os_unlink(path, *args, **kwargs)
+
+        def spy_os_remove(path: Any, *args: Any, **kwargs: Any) -> Any:
+            unlinks.append("os.remove:" + str(path))
+            return real_os_remove(path, *args, **kwargs)
+
+        def spy_os_ftruncate(fd: int, length: int) -> Any:
+            unlinks.append(f"os.ftruncate:{fd}:{length}")
+            return real_os_ftruncate(fd, length)
+
+        def spy_os_truncate(path: Any, length: int) -> Any:
+            unlinks.append("os.truncate:" + str(path))
+            return real_os_truncate(path, length)
+
+        def _fail_copy(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection) -> None:
+            raise sqlite3.OperationalError("simulated page-copy failure")
+
+        with mock.patch.object(Path, "unlink", spy_path), mock.patch.object(
+            os, "unlink", spy_os_unlink
+        ), mock.patch.object(os, "remove", spy_os_remove), mock.patch.object(
+            os, "ftruncate", spy_os_ftruncate
+        ), mock.patch.object(os, "truncate", spy_os_truncate):
+            snap = backup_database(self.db, backup_dir, generation="gen-p10u")
+            dest = self.base / "dest-p10u.db"
+            rr = restore_backup(snap.backup_path, dest)
+            self.assertEqual(rr.integrity, "ok")
+            with self.assertRaises(BackupError):
+                with mock.patch.object(storage, "BACKUP_COPY_HOOK", _fail_copy):
+                    backup_database(self.db, backup_dir)
+            with self.assertRaises(BackupError):
+                with mock.patch.object(storage, "BACKUP_COPY_HOOK", _fail_copy):
+                    restore_backup(
+                        snap.backup_path, self.base / "dest-p10u-fail.db"
+                    )
+        self.assertEqual(
+            unlinks, []
+        )  # zero removal AND zero truncation attempts, ever
+        self.assertTrue(snap.backup_path.exists())
+        self.assertTrue(snap.manifest_path.exists())
+        self.assertTrue(dest.exists())
+
+    def test_mechanism_constant_public_api_live_and_surface_intact(self) -> None:
+        """P-fixes 10 bookkeeping: the blunt P9 disable is gone (no
+        SAFE_TARGET_PUBLICATION_SUPPORTED), the mechanism constant names the
+        hardlink publication, and both public operations are LIVE end-to-end
+        alongside the surrounding surface (verify, retention dry-run with
+        delete refused, transactional writes)."""
+        self.assertFalse(hasattr(storage, "SAFE_TARGET_PUBLICATION_SUPPORTED"))
+        self.assertIn("os.link", storage.TARGET_PUBLICATION_MECHANISM)
+        self.assertIn("non-overwriting", storage.TARGET_PUBLICATION_MECHANISM)
+        self.assertIn("verify-before-publish", storage.TARGET_PUBLICATION_MECHANISM)
+        self.assertIn("retain-never-delete", storage.TARGET_PUBLICATION_MECHANISM)
+        migrate_to_head(self.db)
+        backup_dir = self.base / "backups-p10flag"
+        backup_dir.mkdir()
+        result = backup_database(self.db, backup_dir, generation="gen-p10flag")
+        dest = self.base / "dest-p10flag.db"
+        rr = restore_backup(result.backup_path, dest)
+        self.assertEqual(rr.schema_version, SCHEMA_VERSION)
+        report = verify_database(dest)
+        self.assertTrue(report["ok"] and report["schema_usable"])
+        self.assertEqual(
+            plan_retention(backup_dir, keep_last=0), [result.backup_path]
+        )
+        with self.assertRaises(BackupError):
+            plan_retention(backup_dir, keep_last=0, delete=True)
+        conn = connect(dest)
+        try:
+            with transaction(conn):
+                conn.execute(
+                    "INSERT INTO projects (id, name, repo_path, created_at)"
+                    " VALUES (\'p10-flag\', \'flag\', \'/flag\', \'now\')"
+                )
+        finally:
+            conn.close()
+
+    def test_connect_failure_keeps_inode_adopted_by_another_connection(self) -> None:
+        """P1-fix 4: our O_EXCL creation may be opened and committed into by
+        another process before our failure; inode equality does NOT prove
+        nobody adopted it, so cleanup must keep a non-blank file.  A provably
+        blank file is still removed so a retry is clean."""
+        fresh = self.base / "handoff.db"
+        reached = threading.Event()
+        proceed = threading.Event()
+        box: list = []
+
+        def delayed_boom(inner: sqlite3.Connection, stage: str) -> None:
+            reached.set()
+            self.assertTrue(proceed.wait(10.0), "adopter never finished")
+            raise storage.StorageError("post-creation failure after adoption")
+
+        def worker() -> None:
+            try:
+                connect(fresh)
+            except BaseException as exc:  # noqa: BLE001 - captured for assertions
+                box.append(exc)
+
+        original = storage._assert_writable_version
+        storage._assert_writable_version = delayed_boom
+        thread = threading.Thread(target=worker)
+        try:
+            thread.start()
+            self.assertTrue(reached.wait(10.0), "creator never reached gate")
+            adopter = sqlite3.connect(str(fresh))
+            adopter.execute("CREATE TABLE adopted(x)")
+            adopter.execute("INSERT INTO adopted VALUES (42)")
+            adopter.commit()
+            adopter.close()
+            proceed.set()
+            thread.join(10.0)
+        finally:
+            storage._assert_writable_version = original
+            with contextlib.suppress(Exception):
+                proceed.set()
+            thread.join(5.0)
+
+        self.assertEqual(len(box), 1)
+        self.assertIsInstance(box[0], storage.StorageError)
+        # the adopted inode MUST survive the creator's failure
+        self.assertTrue(fresh.exists())
+        reader = sqlite3.connect(f"file:{fresh}?mode=ro", uri=True)
+        try:
+            self.assertEqual(reader.execute("SELECT x FROM adopted").fetchone()[0], 42)
+        finally:
+            reader.close()
+
+        # P-fixes 6: even a blank, provably-untouched leftover is now KEPT
+        # (the check-then-unlink window is closed by not unlinking at all);
+        # a retry simply adopts the inert empty file.
+        fresh2 = self.base / "handoff2.db"
+
+        def plain_boom(inner: sqlite3.Connection, stage: str) -> None:
+            raise storage.StorageError("immediate post-creation failure")
+
+        with mock.patch.object(storage, "_assert_writable_version", plain_boom):
+            with self.assertRaises(storage.StorageError):
+                connect(fresh2)
+        self.assertTrue(fresh2.exists())
+        self.assertEqual(fresh2.stat().st_size, 0)
+        retry = connect(fresh2)
+        retry.close()
+        self.assertTrue(fresh2.exists())
+
+    def test_transaction_refuses_schema_without_migration_record(self) -> None:
+        """P1-fix 5: user_version alone can be a lie; with schema_migrations
+        emptied the schema is unaudited and ordinary writes must be refused,
+        while verify_database keeps integrity and schema usability distinct."""
+        migrate_to_head(self.db)
+        raw = sqlite3.connect(str(self.db))
+        raw.execute("DELETE FROM schema_migrations")
+        raw.commit()
+        raw.close()
+
+        conn = connect(self.db)  # version gate is range-only by design
+        try:
+            with self.assertRaises(StorageError):
+                with transaction(conn):
+                    self.fail("unaudited schema must not open the write gate")
+        finally:
+            conn.close()
+        report = verify_database(self.db)
+        self.assertTrue(report["ok"])  # the FILE is structurally fine
+        self.assertFalse(report["schema_usable"])  # the SCHEMA is not auditable
+        self.assertIsNone(report["schema_migrations_recorded"])
+        self.assertEqual(report["missing_tables"], [])
+
+    def test_transaction_refuses_incomplete_schema(self) -> None:
+        """P1-fix 5: dropped v1 tables make the schema incomplete; the gate
+        must refuse and diagnostics must name the missing tables."""
+        migrate_to_head(self.db)
+        raw = sqlite3.connect(str(self.db))
+        raw.execute("DROP TABLE tasks")
+        raw.commit()
+        raw.close()
+
+        conn = connect(self.db)
+        try:
+            with self.assertRaises(StorageError):
+                with transaction(conn):
+                    self.fail("incomplete schema must not open the write gate")
+        finally:
+            conn.close()
+        report = verify_database(self.db)
+        self.assertTrue(report["ok"])
+        self.assertFalse(report["schema_usable"])
+        self.assertEqual(report["missing_tables"], ["tasks"])
+
+    def test_verify_database_separates_integrity_from_schema_usability(self) -> None:
+        """P1-fix 5: an empty sqlite3-created database is integrity-ok but
+        not TeamCraft-usable; a migrated v1 database is both."""
+        empty = self.base / "plain-empty.db"
+        sqlite3.connect(str(empty)).close()
+        report = verify_database(empty)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["integrity"], "ok")
+        self.assertEqual(report["user_version"], 0)
+        self.assertFalse(report["schema_usable"])
+        self.assertEqual(
+            report["missing_tables"],
+            ["agents", "attempts", "projects", "schema_migrations", "sessions", "tasks"],
+        )
+        self.assertIsNone(report["schema_migrations_recorded"])
+
+        migrate_to_head(self.db)
+        healthy = verify_database(self.db)
+        self.assertTrue(healthy["ok"])
+        self.assertTrue(healthy["schema_usable"])
+        self.assertEqual(healthy["schema_migrations_recorded"], SCHEMA_VERSION)
+        self.assertEqual(healthy["missing_tables"], [])
 
     # ------------------------------------------------------- URI targeting
     def test_uri_special_characters_target_exact_files(self) -> None:
@@ -1894,14 +3293,14 @@ class StorageM103Tests(unittest.TestCase):
         self.assertTrue(plan[0].exists())  # dry run deleted nothing
         self.assertTrue(protected.exists() and mystery.exists())
 
-        deleted = plan_retention(backup_dir, keep_last=2, delete=True)
-        self.assertEqual(len(deleted), 1)
-        self.assertFalse(deleted[0].exists())
-        self.assertFalse(
-            deleted[0].with_name(deleted[0].name + ".manifest.json").exists()
-        )
+        # P-fixes 6: actual deletion is refused outright (fail closed);
+        # dry-run selection remains available and nothing is ever deleted.
+        with self.assertRaises(BackupError):
+            plan_retention(backup_dir, keep_last=2, delete=True)
+        self.assertTrue(plan[0].exists())
         self.assertTrue(protected.exists() and mystery.exists())
         self.assertTrue(unbound.backup_path.exists())  # generation-unbound: kept
+        self.assertEqual(plan_retention(backup_dir, keep_last=2), plan)  # stable plan
 
     def test_retention_never_deletes_generation_unknown(self) -> None:
         migrate_to_head(self.db)
@@ -1914,8 +3313,9 @@ class StorageM103Tests(unittest.TestCase):
         # here is generation-unbound, so nothing is even eligible.
         plan = plan_retention(backup_dir, keep_last=1)
         self.assertEqual(plan, [])
-        deleted = plan_retention(backup_dir, keep_last=1, delete=True)
-        self.assertEqual(deleted, [])
+        # P-fixes 6: deletion is refused universally before any policy runs
+        with self.assertRaises(BackupError):
+            plan_retention(backup_dir, keep_last=1, delete=True)
         for result in unbound:
             self.assertTrue(result.backup_path.exists())
             self.assertTrue(result.manifest_path.exists())
@@ -2152,6 +3552,130 @@ class StorageM103Tests(unittest.TestCase):
         self.assertEqual(report["integrity"], "ok")
         self.assertEqual(report["user_version"], SCHEMA_VERSION)
         self.assertEqual(set(report["tables"]), EXPECTED_TABLES)
+
+
+class TrustAndRetentionContractTests(unittest.TestCase):
+    """P-fixes 14 contract (user-accepted model).
+
+    * the same-uid-trusted declaration is EXPLICIT in the mechanism
+      constant, the module docs and both public function docstrings;
+    * the retention policy is pinned: successful staging dirs are RETAINED
+      (zero-copy via the published hard link) and plan_retention stays
+      dry-run — delete=True is refused;
+    * WAL works through the PUBLIC API natively: live un-checkpointed
+      frames are backed up, the published file keeps SQLite-native WAL
+      markers (no header rewriting), verifies, and restores back to
+      readable rows; occupied public names are never overwritten.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.db = self.base / "teamcraft.db"
+        migrate_to_head(self.db)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_trust_boundary_and_policy_are_declared(self) -> None:
+        mech = storage.TARGET_PUBLICATION_MECHANISM
+        for token in (
+            "same-uid",
+            "trusted",
+            "non-overwriting",
+            "retain-never-delete",
+            "delete=True",
+        ):
+            self.assertIn(token, mech)
+        for func in (storage.backup_database, storage.restore_backup):
+            doc = (inspect.getdoc(func) or "").lower()
+            self.assertIn("same-uid", doc, func.__name__)
+            self.assertIn("trusted", doc, func.__name__)
+        retention_doc = (inspect.getdoc(storage.plan_retention) or "").lower()
+        self.assertIn("delete=true", retention_doc)
+        self.assertIn("refus", retention_doc)
+
+    def test_live_public_wal_roundtrip_native_markers(self) -> None:
+        backup_dir = self.base / "backups-t14"
+        backup_dir.mkdir()
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)",
+            ("t14", "proj-t14", "/repos/t14", "2026-10-31T00:00:00+00:00"),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)",
+            ("t14b", "proj-t14b", "/repos/t14b", "2026-10-31T00:00:00+00:00"),
+        )
+        conn.commit()
+        try:
+            result = backup_database(self.db, backup_dir, generation="g-t14")
+        finally:
+            conn.close()
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["backup_sha256"], result.sha256)
+        self.assertEqual(storage._sha256(result.backup_path), result.sha256)
+        self.assertEqual(result.backup_path.read_bytes()[18:20], b"\x02\x02")
+        probe = sqlite3.connect(f"file:{result.backup_path}?mode=ro", uri=True)
+        try:
+            self.assertEqual(
+                probe.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+            )
+            self.assertEqual(
+                sorted(
+                    r[0] for r in probe.execute(
+                        "SELECT id FROM projects WHERE id LIKE 't14%'"
+                    )
+                ),
+                ["t14", "t14b"],
+            )
+        finally:
+            probe.close()
+        dest = self.base / "restored-t14.db"
+        rr = restore_backup(result.backup_path, dest)
+        self.assertEqual(rr.schema_version, SCHEMA_VERSION)
+        self.assertEqual(rr.integrity, "ok")
+        reader = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+        try:
+            self.assertEqual(
+                sorted(
+                    r[0] for r in reader.execute(
+                        "SELECT id FROM projects WHERE id LIKE 't14%'"
+                    )
+                ),
+                ["t14", "t14b"],
+            )
+        finally:
+            reader.close()
+        # occupied destination is never overwritten
+        with self.assertRaises(BackupError):
+            restore_backup(result.backup_path, dest)
+        self.assertTrue(dest.exists())
+
+    def test_successful_staging_is_retained_zero_copy_and_delete_stays_refused(
+        self,
+    ) -> None:
+        backup_dir = self.base / "backups-t14r"
+        backup_dir.mkdir()
+        result = backup_database(self.db, backup_dir, generation="g-ret")
+        staged = _staging_dirs(backup_dir)
+        self.assertEqual(len(staged), 1)
+        self.assertEqual(oct(os.stat(str(staged[0])).st_mode & 0o777), "0o700")
+        copy = staged[0] / result.backup_path.name
+        self.assertTrue(copy.exists())
+        self.assertTrue((staged[0] / (result.backup_path.name + ".manifest.json")).exists())
+        st = os.stat(str(copy))
+        self.assertEqual(st.st_nlink, 2)  # inode shared with the published name
+        self.assertEqual(st.st_ino, os.stat(str(result.backup_path)).st_ino)
+        plan = plan_retention(backup_dir, keep_last=0)
+        self.assertEqual(len(plan), 1)  # dry-run still plans the removal...
+        with self.assertRaises(BackupError):  # ...but real deletion is refused
+            plan_retention(backup_dir, keep_last=0, delete=True)
+        self.assertTrue(result.backup_path.exists())
+        self.assertTrue(result.manifest_path.exists())
 
 
 if __name__ == "__main__":
