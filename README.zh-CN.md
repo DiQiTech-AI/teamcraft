@@ -1,10 +1,14 @@
-# 团匠 TeamCraft
+<p align="right"><a href="README.md">English</a></p>
 
-<img src="assets/teamcraft-logo.png" alt="团匠 TeamCraft 标识" width="176" />
+<p align="center">
+  <img src="assets/teamcraft-logo.png" alt="团匠 TeamCraft" width="240">
+</p>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+<h1 align="center">团匠 TeamCraft</h1>
 
-> 让 AI 各司其职，协作交付。
+<p align="center">
+  <strong>让 AI 各司其职，协作交付。</strong>
+</p>
 
 团匠是一个基于 Herdr 的有状态开发团队编排 Skill。它先建立一名总工 CEO，再由 CEO 按任务需要组织 CTO、研发、设计、测试或自定义专家；每名成员在独立 pane 中运行，通过明确的职责、文件范围和验收证据共同完成交付。
 

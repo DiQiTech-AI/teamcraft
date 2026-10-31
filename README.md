@@ -1,10 +1,14 @@
-# TeamCraft 团匠
+<p align="right"><a href="README.zh-CN.md">简体中文</a></p>
 
-<img src="assets/teamcraft-logo.png" alt="TeamCraft logo" width="176" />
+<p align="center">
+  <img src="assets/teamcraft-logo.png" alt="TeamCraft" width="240">
+</p>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+<h1 align="center">TeamCraft 团匠</h1>
 
-> Specialized AI agents, working as one delivery team.
+<p align="center">
+  <strong>Specialized AI agents, working as one delivery team.</strong>
+</p>
 
 TeamCraft is a stateful software team orchestration skill built on Herdr. It starts with a chief engineer acting as CEO. The CEO can then assemble CTO, developer, designer, tester, or custom specialists as the task requires. Each member runs in an independent pane and works toward delivery with an explicit role, file scope, and acceptance evidence.
 
