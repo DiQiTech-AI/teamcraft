@@ -1,6 +1,6 @@
 <p align="right"><a href="README.zh-CN.md">简体中文</a></p>
 
-<h1 align="center"><img src="assets/TeamCraftLogo.png" alt="TeamCraft" width="56" align="absmiddle"> TeamCraft 团匠</h1>
+<h1 align="center"><img src="assets/TeamCraftLogo.png" alt="TeamCraft 团匠" width="360"></h1>
 
 <p align="center">
   <strong>Specialized AI agents, working as one delivery team.</strong>
