@@ -55,3 +55,98 @@ class WriteOutsideTransactionError(StorageError):
     silently writing through an ungated ``execute``/``executemany``/``cursor``
     or an implicit-committing ``executescript``/``commit``.
     """
+
+
+class DomainError(TeamCraftError):
+    """Base class for M1-04 domain state-machine violations."""
+
+
+class SchemaOutOfDateError(DomainError):
+    """The database schema is valid but behind this build's head version.
+
+    M1-04 domain services refuse to run against a lagging (e.g. v1) schema
+    instead of failing deep inside an operation with an opaque SQL error.
+    The database itself stays fully usable for storage-level contracts
+    (connect/query/backup/restore); run ``teamcraft.migrate_to_head()`` to
+    apply the forward-only v1 -> v2 migration first.
+    """
+
+
+class NotFoundError(DomainError):
+    """A referenced entity (project, task, attempt, session) does not exist."""
+
+
+class ConflictError(DomainError):
+    """A uniqueness rule at the storage boundary was violated.
+
+    Distinct from optimistic-locking conflicts (:class:`VersionConflictError`):
+    this signals that a row with the same unique key already exists.
+    """
+
+
+class IllegalTransitionError(DomainError):
+    """A state-machine transition is not part of the transition table.
+
+    Carries the structured refusal (entity kind, current state, event,
+    reason code) so callers never have to parse exception messages.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        entity: str,
+        current: str,
+        event: str,
+        reason_code: str = "ILLEGAL_TRANSITION",
+    ) -> None:
+        super().__init__(message)
+        self.entity = entity
+        self.current = current
+        self.event = event
+        self.reason_code = reason_code
+
+
+class DependencyCycleError(DomainError):
+    """A task dependency edge would create (or already forms) a cycle.
+
+    ``cycle`` is the concrete closed path, e.g. ``["A", "B", "C", "A"]``:
+    consecutive entries are edges of the graph and the last entry repeats
+    the first.  Self-dependencies are reported as ``["A", "A"]``.
+    """
+
+    def __init__(self, message: str, *, cycle: list[str]) -> None:
+        super().__init__(message)
+        self.cycle = list(cycle)
+
+
+class VersionConflictError(DomainError):
+    """An optimistic-locking (compare-and-swap) update found a newer version.
+
+    Raised when a caller-supplied ``expected_version`` no longer matches the
+    row's current ``version`` under the write lock; nothing was written.
+    """
+
+    def __init__(
+        self, message: str, *, entity_id: str, expected: int, found: int
+    ) -> None:
+        super().__init__(message)
+        self.entity_id = entity_id
+        self.expected = expected
+        self.found = found
+
+
+class AttemptSlotOccupiedError(DomainError):
+    """The task's single occupying-attempt slot is taken (DB-enforced).
+
+    ``created``/``starting``/``active``/``unknown`` attempts all hold the
+    slot — an unresolved (UNKNOWN) attempt must never allow parallel
+    re-dispatch (M0 review 8.2-7, 8.2-11).  The backing constraint is the
+    partial unique index ``ux_attempts_single_occupying``; this error is the
+    domain-level mapping of violating it.
+    """
+
+    def __init__(self, message: str, *, task_id: str, occupying_id: str) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.occupying_id = occupying_id

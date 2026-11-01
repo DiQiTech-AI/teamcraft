@@ -26,10 +26,15 @@ Scope is deliberately narrow (M0 review 9.1 M1-03 / 8.2-1, 7, 13, 14):
   reach staging writes); durable writes run inside
   ``transaction()`` (deliberate reflection into private attributes
   is trusted-first-party scope, not claimed defended);
-* base tables only: ``schema_migrations``, ``projects``, ``tasks``,
-  ``agents``, ``attempts``, ``sessions``.  Task dependencies, events and
-  commands (M1-04/M1-05), the full state machine, Watcher, Web, Worktree and
-  Router are NOT part of this module;
+* base tables: ``schema_migrations``, ``projects``, ``tasks``, ``agents``,
+  ``attempts``, ``sessions`` (v1), plus ``task_dependencies`` added by the
+  forward-only v2 migration (M1-04 DAG storage).  The v1 -> v2 upgrade runs
+  inside one exclusive transaction and never rewrites a v1 table; an
+  un-upgraded v1 database remains fully usable for this module's contracts
+  and is refused only by the *domain* layer (M1-04 services demand head).
+  The full state machine, events and
+  commands (M1-04/M1-05), the Watcher, Web, Worktree and Router are NOT part
+  of this module;
 * corrected PRD DDL points: a database-enforced single *occupying* attempt per
   task (created/starting/active/unknown all hold the slot — an unresolved
   attempt must never allow parallel re-dispatch) and nullable Commit/report
@@ -99,7 +104,12 @@ from .errors import (
 )
 
 #: Highest schema version this build understands.
-SCHEMA_VERSION = 1
+#: v2 (M1-04) is a strictly ADDITIVE forward migration: it creates the
+#: ``task_dependencies`` table only and never rewrites a v1 table, so v1
+#: databases keep satisfying every M1-03 contract (connect/query/verify/
+#: backup/restore) whether or not they have been upgraded, and any schema
+#: newer than this build still fails closed read-only (8.2-13).
+SCHEMA_VERSION = 2
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -109,9 +119,9 @@ DEFAULT_DATABASE_FILENAME = "teamcraft.db"
 
 #: Attempt statuses that occupy the task's single concurrent-attempt slot.
 #: An UNKNOWN attempt keeps the slot: unknown must not be treated as zero and
-#: must not permit re-dispatch (M0 review 8.2-11).  M1-04 owns the full state
-#: machine and must keep or consciously replace this set together with
-#: ``ux_attempts_single_occupying``.
+#: must not permit re-dispatch (M0 review 8.2-11).  M1-04 keeps this set and
+#: ``ux_attempts_single_occupying`` unchanged; the domain layer canonicalises
+#: attempt status to these exact lowercase values on every write.
 OCCUPYING_ATTEMPT_STATUSES: tuple[str, ...] = (
     "created",
     "starting",
@@ -129,9 +139,14 @@ TASK_KINDS = ("ship", "scout")
 #: raised by the hook rolls the migration back like any other failure.
 MIGRATION_STATEMENT_HOOK: Callable[[int, str], None] | None = None
 
+#: Tables introduced by v1 (the M1-03 baseline; also the completeness floor
+#: for ordinary write gates, which every historical schema satisfies).
 _V1_TABLES = frozenset(
     {"schema_migrations", "projects", "tasks", "agents", "attempts", "sessions"}
 )
+
+#: Tables added by the forward-only v2 migration (M1-04 DAG storage).
+_V2_TABLES = frozenset({"task_dependencies"})
 
 _V1_STATEMENTS = (
     """
@@ -205,6 +220,63 @@ CREATE TABLE sessions (
   created_at TEXT NOT NULL
 )""",
 )
+
+#: Forward-only v2 step (M1-04): the DAG edge table.  It references only v1
+#: tables and adds no constraint to any pre-existing column, so upgrading a
+#: populated v1 database cannot fail on legacy rows and cannot change the
+#: meaning of anything v1 stored.  Self-dependency is refused twice over:
+#: by the CHECK below and by the domain's cycle detector (which additionally
+#: reports the concrete cycle path).
+_V2_STATEMENTS = (
+    """
+CREATE TABLE task_dependencies (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, depends_on_id),
+  CHECK (task_id <> depends_on_id)
+)""",
+)
+
+#: Ordered migration ladder: version -> DDL statements executed to reach it
+#: from the immediately preceding version.  New entries are appended by
+#: later milestones; entries are never edited or removed (forward-only).
+_MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (1, _V1_STATEMENTS),
+    (2, _V2_STATEMENTS),
+)
+
+#: Tables each step introduces; the audit floor for an incremental upgrade
+#: from version ``v`` is the union over steps ``1..v`` (an audited database
+#: at ``v`` must carry all of them before further steps run).
+_TABLES_BY_VERSION: dict[int, frozenset[str]] = {1: _V1_TABLES, 2: _V2_TABLES}
+
+
+def _head_tables() -> frozenset[str]:
+    """All tables that must exist for a schema to be complete at head."""
+
+    return _V1_TABLES | _V2_TABLES
+
+
+def _required_tables_for(version: int) -> frozenset[str]:
+    """Tables a database at ``version`` MUST already contain.
+
+    Version-aware completeness (CEO review M1-04 fix 1): the required set is
+    the union of every migration step up to the recorded version, so an
+    intact v1 database legitimately requires (and has) only the v1 floor,
+    while a v2 database that lost ``task_dependencies`` is inconsistent and
+    must be refused by every gate.  A version above this build's ladder maps
+    to the highest known requirement (the too-new case itself is refused by
+    the version-range gates in their own order).
+    """
+
+    if version <= 0:
+        return frozenset()
+    required: frozenset[str] = frozenset()
+    for step, step_tables in sorted(_TABLES_BY_VERSION.items()):
+        if step <= version:
+            required = required | step_tables
+    return required
 
 _REMOTE_FSTYPES = frozenset(
     {
@@ -714,7 +786,7 @@ def _migration_record(conn: sqlite3.Connection) -> int | None:
 
 
 def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
-    """Ordinary transactions require a coherent, audited v1 schema.
+    """Ordinary transactions require a coherent, audited schema.
 
     Version-range alone let a database through whose ``user_version`` says v1
     while ``schema_migrations`` is missing, empty, or disagrees (review
@@ -723,12 +795,21 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
     (review P-fixes 8): the public write gate has no legitimate v0 write —
     the old v0 pass-through let ``transaction()`` CREATE TABLE and COMMIT on
     a virgin file, producing unversioned junk that ``migrate_to_head`` must
-    then refuse to adopt.  Publishing v1 is exclusively the job of the
-    private, privileged migration transaction inside
+    then refuse to adopt.  Publishing schema versions is exclusively the job
+    of the private, privileged migration transaction inside
     :func:`migrate_to_head`, which runs its own BEGIN IMMEDIATE boundary
     and never calls this function.  Mirrors
     :func:`_assert_restorable_snapshot` for live databases; the too-new case
     keeps :class:`SchemaTooNewError`.
+
+    Completeness is checked against the tables REQUIRED BY THE RECORDED
+    VERSION (CEO review M1-04 fix 1): an audited, un-upgraded v1 database
+    requires exactly the v1 floor and keeps satisfying the M1-03 storage
+    contracts (plain gated writes, backup, restore) until its owner chooses
+    the forward migration; a database whose recorded version claims v2 must
+    actually carry v2's tables, or it is inconsistent and refused.  Requiring
+    HEAD regardless of the recorded version remains the *domain* layer's job
+    (:class:`teamcraft.errors.SchemaOutOfDateError`), not this gate's.
     """
 
     _assert_writable_version(conn, stage)
@@ -743,11 +824,12 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
         tables = _existing_tables(conn)
     except sqlite3.Error as exc:
         raise StorageError(f"schema catalog unreadable on live connection: {exc}") from exc
-    missing = _V1_TABLES - tables
+    missing = _required_tables_for(version) - tables
     if missing:
         raise StorageError(
-            f"schema is incomplete for ordinary writes, missing tables: "
-            f"{sorted(missing)}; run teamcraft.migrate_to_head() ({stage})"
+            f"schema is incomplete for ordinary writes at version {version}, "
+            f"missing tables: {sorted(missing)}; run "
+            f"teamcraft.migrate_to_head() ({stage})"
         )
     recorded = _migration_record(conn)
     if recorded is None:
@@ -761,7 +843,6 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
             f"record {recorded}; refusing to write against an inconsistent "
             f"schema ({stage})"
         )
-
 
 #: SQLite authorizer action codes that never mutate database contents.  The
 #: authorizer callback runs inside SQLite's own prepare/step machinery, so the
@@ -1350,10 +1431,17 @@ def migrate_to_head(
 
     Version judgement and DDL live inside ONE ``BEGIN IMMEDIATE`` transaction
     with a fresh re-read under the exclusive write lock: two migrators racing
-    on an empty database converge (winner creates, loser observes v1 and
+    on an empty database converge (winner creates, loser observes head and
     no-ops) instead of hitting "table already exists".  Repeated runs are
     idempotent; newer schemas and unversioned junk are refused without any
     modification.
+
+    M1-04 added the forward-only v1 -> v2 step (adds ``task_dependencies``
+    only).  An audited v1 database upgrades in place: its rows are untouched,
+    no v1 table is rewritten, and every migration step is recorded in
+    ``schema_migrations`` (1, then 2) inside the same transaction, so an
+    interrupted upgrade leaves the database exactly at v1 (SQLite rollback),
+    never half-at-head.
     """
 
     conn = connect(
@@ -1375,8 +1463,15 @@ def migrate_to_head(
                 )
                 user_version = int(inner.execute("PRAGMA user_version").fetchone()[0])
                 tables = _existing_tables_safe(inner)
+                if user_version > SCHEMA_VERSION:
+                    # Defensive: ``connect`` already gates this before any
+                    # write-capable open; re-asserted under the write lock.
+                    raise SchemaTooNewError(
+                        f"database schema version {user_version} is newer than "
+                        f"this build supports ({SCHEMA_VERSION})"
+                    )
                 if user_version == SCHEMA_VERSION:
-                    missing = _V1_TABLES - tables
+                    missing = _head_tables() - tables
                     if missing:
                         raise MigrationError(
                             f"user_version={SCHEMA_VERSION} but tables are missing: "
@@ -1398,28 +1493,93 @@ def migrate_to_head(
                         applied=(),
                     )
                 if user_version != 0:
-                    raise MigrationError(
-                        f"no known upgrade path from schema version {user_version} "
-                        f"to {SCHEMA_VERSION}"
+                    # Forward-only incremental upgrade (M1-04: audited v1 ->
+                    # v2).  Preconditions, all under the exclusive write lock:
+                    # the audit record must agree with user_version (an audited
+                    # v1 database carries exactly its floor table set plus a
+                    # matching schema_migrations row), and no half-applied
+                    # artifacts of a later step may pre-exist.  Every step's
+                    # DDL is additive, so legacy rows are never rewritten and
+                    # an interrupted upgrade rolls back to exactly v1.
+                    recorded = inner.execute(
+                        "SELECT MAX(version) FROM schema_migrations"
+                    ).fetchone()
+                    if recorded is None or int(recorded[0]) != user_version:
+                        raise MigrationError(
+                            f"user_version={user_version} disagrees with "
+                            f"schema_migrations record {recorded!r}; refusing to "
+                            "upgrade an unaudited database"
+                        )
+                    floor: frozenset[str] = frozenset()
+                    for step, step_tables in sorted(_TABLES_BY_VERSION.items()):
+                        if step <= user_version:
+                            floor = floor | step_tables
+                    missing_floor = floor - tables
+                    if missing_floor:
+                        raise MigrationError(
+                            f"cannot upgrade from schema version {user_version}: "
+                            f"tables are missing: {sorted(missing_floor)}"
+                        )
+                    # (too-new schemas were already refused under the write
+                    # lock above, so here 0 < user_version < SCHEMA_VERSION.)
+                    pending: frozenset[str] = frozenset()
+                    for step, step_tables in _TABLES_BY_VERSION.items():
+                        if user_version < step <= SCHEMA_VERSION:
+                            pending = pending | step_tables
+                    overlap = pending & tables
+                    if overlap:
+                        raise MigrationError(
+                            f"cannot upgrade from schema version {user_version}: "
+                            f"later-step tables already present: {sorted(overlap)}; "
+                            "refusing to continue"
+                        )
+                    applied_upgrade: tuple[int, ...] = ()
+                    for version, statements in _MIGRATION_STEPS:
+                        if version <= user_version:
+                            continue
+                        for index, statement in enumerate(statements):
+                            inner.execute(statement)
+                            hook = MIGRATION_STATEMENT_HOOK
+                            if hook is not None:
+                                hook(index, statement)
+                        inner.execute(
+                            "INSERT INTO schema_migrations (version, applied_at)"
+                            " VALUES (?, ?)",
+                            (version, _utc_now_iso()),
+                        )
+                        applied_upgrade = applied_upgrade + (version,)
+                    inner.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    inner.execute("COMMIT")
+                    return MigrationReport(
+                        fresh=False,
+                        from_version=user_version,
+                        to_version=SCHEMA_VERSION,
+                        applied=applied_upgrade,
                     )
                 if tables:
                     raise MigrationError(
                         "file already contains unversioned tables; refusing to adopt "
                         "an unknown database as v1"
                     )
-                for index, statement in enumerate(_V1_STATEMENTS):
-                    inner.execute(statement)
-                    hook = MIGRATION_STATEMENT_HOOK
-                    if hook is not None:
-                        hook(index, statement)
-                inner.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (1, _utc_now_iso()),
-                )
+                applied: tuple[int, ...] = ()
+                for version, statements in _MIGRATION_STEPS:
+                    for index, statement in enumerate(statements):
+                        inner.execute(statement)
+                        hook = MIGRATION_STATEMENT_HOOK
+                        if hook is not None:
+                            hook(index, statement)
+                    inner.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                        (version, _utc_now_iso()),
+                    )
+                    applied = applied + (version,)
                 inner.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 inner.execute("COMMIT")
                 return MigrationReport(
-                    fresh=True, from_version=0, to_version=SCHEMA_VERSION, applied=(1,)
+                    fresh=True,
+                    from_version=0,
+                    to_version=SCHEMA_VERSION,
+                    applied=applied,
                 )
             except BaseException:
                 with contextlib.suppress(sqlite3.Error):
@@ -1438,9 +1598,11 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
       ``PRAGMA integrity_check`` plus the version range — is the FILE a
       structurally sound SQLite database this build can talk to (an empty
       v0 file is legitimately ``ok`` and re-migratable);
-    * ``schema_usable``: is it a usable, audited TeamCraft schema — all v1
-      tables present, ``schema_migrations`` carries a record, and that record
-      agrees with ``user_version``.  A pristine empty ``sqlite3`` database is
+    * ``schema_usable``: is it a usable, audited TeamCraft schema — all
+      tables REQUIRED BY THE RECORDED VERSION are present (v1 floor for v1;
+      plus ``task_dependencies`` once the version claims v2),
+      ``schema_migrations`` carries a record, and that record agrees with
+      ``user_version``.  A pristine empty ``sqlite3`` database is
       integrity-``ok`` but NOT schema-usable.
 
     Write-side callers gate on BOTH (an intact file is not yet a usable
@@ -1460,19 +1622,38 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
             raise CorruptDatabaseError(f"integrity check failed to run: {exc}") from exc
         recorded = _migration_record(conn)
     missing = sorted(_V1_TABLES - tables)
+    # CEO review M1-04 fix 1: usability is judged against the tables the
+    # RECORDED version requires — an intact v1 database stays usable
+    # (M1-03 support), but user_version=2 without task_dependencies is
+    # inconsistent and must not be reported usable.
+    missing_for_version = sorted(_required_tables_for(version) - tables)
     schema_usable = (
-        not missing
+        not missing_for_version
         and recorded is not None
         and recorded == version
         and 0 <= version <= SCHEMA_VERSION
     )
     ok = integrity == "ok" and 0 <= version <= SCHEMA_VERSION
+    # ``at_head`` distinguishes "audited and usable at some historical schema"
+    # from "up to date with this build": an un-upgraded v1 database is
+    # usable (storage contracts hold) but lags the domain layer, which needs
+    # head for M1-04 features.  Diagnostics only; never weakens the checks
+    # above.
+    missing_head = sorted(_head_tables() - tables)
+    at_head = (
+        version == SCHEMA_VERSION
+        and recorded == SCHEMA_VERSION
+        and not missing_head
+    )
     return {
         "ok": ok,
         "integrity": integrity,
         "user_version": version,
         "tables": sorted(tables),
         "missing_tables": missing,
+        "missing_version_tables": missing_for_version,
+        "missing_head_tables": missing_head,
+        "at_head": at_head,
         "schema_migrations_recorded": recorded,
         "schema_usable": schema_usable,
     }
@@ -1514,7 +1695,12 @@ def _hash_fd(fd: int) -> str:
 
 
 def _snapshot_versions(path: Path) -> tuple[int, int | None, frozenset[str]]:
-    """(user_version, schema_migrations_max, missing_v1_tables) from the snapshot itself."""
+    """(user_version, schema_migrations_max, missing_version_required_tables).
+
+    The missing set is version-aware (CEO review M1-04 fix 1): a snapshot at
+    v1 requires only the v1 floor; a snapshot whose recorded version claims
+    v2 must also carry ``task_dependencies``.
+    """
 
     with _open_read_connection(path) as conn:
         user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -1523,15 +1709,16 @@ def _snapshot_versions(path: Path) -> tuple[int, int | None, frozenset[str]]:
         if "schema_migrations" in tables:
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
             recorded = int(row[0]) if row and row[0] is not None else None
-        # Completeness of a v1 snapshot is a hard consistency requirement.
-        missing = _V1_TABLES - tables
+        # Completeness for the recorded schema version is a hard consistency
+        # requirement for any snapshot we would copy or restore.
+        missing = _required_tables_for(user_version) - tables
     return user_version, recorded, missing
 
 
 def _assert_restorable_snapshot(
     version: int, recorded: int | None, missing: frozenset[str], *, subject: str
 ) -> None:
-    """Single source of truth for what counts as a restorable v1 snapshot.
+    """Single source of truth for what counts as a restorable snapshot.
 
     ``backup_database`` applies this to the live source before copying and to
     the freshly copied snapshot after copying; ``restore_backup`` applies the
@@ -1539,11 +1726,15 @@ def _assert_restorable_snapshot(
     reported successful when restoring it would pass the same schema/version
     acceptance (review R8: an empty ``sqlite3``-created database must not be
     ``success``-backed up only to be refused at restore for lacking
-    ``schema_migrations`` and the v1 tables).
+    ``schema_migrations`` and the v1 tables).  ``missing`` is the set of
+    tables required by the snapshot's own recorded version.
     """
 
     if missing:
-        raise BackupError(f"{subject} is incomplete, missing tables: {sorted(missing)}")
+        raise BackupError(
+            f"{subject} is incomplete for schema version {version}, missing "
+            f"tables: {sorted(missing)}"
+        )
     if recorded is None:
         raise BackupError(
             f"{subject} has no schema_migrations record; refusing to use an "

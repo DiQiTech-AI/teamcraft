@@ -193,6 +193,9 @@ def _public_entries(directory: Path) -> list[Path]:
 
 def _staging_dirs(directory: Path) -> list[Path]:
     return sorted(p for p in directory.iterdir() if p.name.startswith(".tc-staging-"))
+# M1-04 schema v2 (mechanical version bump, semantics unchanged): v2 is a
+# strictly additive forward migration; the v1 six-table set above remains the
+# documented M1-03 floor and every other assertion in this suite is untouched.
 EXPECTED_TABLES = {
     "schema_migrations",
     "projects",
@@ -200,6 +203,7 @@ EXPECTED_TABLES = {
     "agents",
     "attempts",
     "sessions",
+    "task_dependencies",
 }
 
 
@@ -245,7 +249,8 @@ class StorageM103Tests(unittest.TestCase):
         report = migrate_to_head(self.db)
         self.assertTrue(report.fresh)
         self.assertEqual((report.from_version, report.to_version), (0, SCHEMA_VERSION))
-        self.assertEqual(report.applied, (1,))
+        # v2 ladder: a fresh database applies (1, 2) in one transaction.
+        self.assertEqual(report.applied, (1, 2))
 
         conn = connect(self.db)
         self.assertIsInstance(conn, TeamCraftConnection)
@@ -261,7 +266,7 @@ class StorageM103Tests(unittest.TestCase):
             }
             self.assertEqual(tables, EXPECTED_TABLES)
             rows = conn.execute("SELECT version, applied_at FROM schema_migrations").fetchall()
-            self.assertEqual([r[0] for r in rows], [1])
+            self.assertEqual([r[0] for r in rows], [1, 2])
             self.assertIn("+00:00", rows[0][1])  # UTC ISO-8601
             # Foreign keys are actually enforced, not just declared.
             with self.assertRaises(sqlite3.IntegrityError):
@@ -288,7 +293,7 @@ class StorageM103Tests(unittest.TestCase):
         conn = connect(self.db)
         try:
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
             )
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
@@ -559,14 +564,17 @@ class StorageM103Tests(unittest.TestCase):
             self.assertEqual(
                 conn.cursor().execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            # M1-04 bump: head is SCHEMA_VERSION (was literal v1).
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
             probe0 = sqlite3.connect(str(self.db))
             try:
                 self.assertEqual(
                     probe0.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0
                 )
-                self.assertEqual(probe0.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(
+                    probe0.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
+                )
             finally:
                 probe0.close()
 
@@ -660,7 +668,9 @@ class StorageM103Tests(unittest.TestCase):
                 self.assertEqual(
                     probe.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
                 )
-                self.assertEqual(probe.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(
+                    probe.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
+                )
             finally:
                 probe.close()
             # ...only after the gate released could an upgrade land, and then
@@ -3116,9 +3126,11 @@ class StorageM103Tests(unittest.TestCase):
         self.assertEqual(set(report["tables"]), EXPECTED_TABLES)
         conn = sqlite3.connect(storage._sqlite_uri(self.db, "mode=ro"), uri=True)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1
+                conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
             )
         finally:
             conn.close()
@@ -3178,7 +3190,7 @@ class StorageM103Tests(unittest.TestCase):
         conn = connect(self.db)
         try:
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
             )
         finally:
             conn.close()
@@ -3676,6 +3688,163 @@ class TrustAndRetentionContractTests(unittest.TestCase):
             plan_retention(backup_dir, keep_last=0, delete=True)
         self.assertTrue(result.backup_path.exists())
         self.assertTrue(result.manifest_path.exists())
+
+
+class VersionedCompletenessGateTests(unittest.TestCase):
+    """CEO review M1-04 fix 1: completeness gates follow the RECORDED version.
+
+    A database whose ``user_version`` claims v2 but has lost
+    ``task_dependencies`` is inconsistent and must be refused by the public
+    transaction gate, the verify_database usability flag, and both sides of
+    backup/restore.  An intact v1 database keeps passing everything (M1-03
+    support unchanged).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="tc-m104-completeness-")
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.db = self.base / "teamcraft.db"
+        report = migrate_to_head(self.db)
+        self.assertTrue(report.fresh)
+
+    def _drop_v2_table(self, *, back_to_v1: bool = False) -> None:
+        """Fixture construction via RAW sqlite: after fix 1 the public
+        transaction gate correctly refuses to open against an inconsistent
+        v2-claim, so constructing that state must bypass the public API
+        (same pattern as the corrupt-snapshot fixtures above)."""
+        raw = sqlite3.connect(str(self.db))
+        try:
+            raw.execute("PRAGMA busy_timeout=5000")
+            raw.execute("DROP TABLE IF EXISTS task_dependencies")
+            if back_to_v1:
+                raw.execute("DELETE FROM schema_migrations WHERE version = 2")
+                raw.execute("PRAGMA user_version=1")
+            raw.commit()
+        finally:
+            raw.close()
+
+    def test_public_transaction_refuses_inconsistent_v2_but_not_v1(self) -> None:
+        self._drop_v2_table()  # user_version stays 2, audit stays {1,2}
+        conn = connect(self.db)
+        self.addCleanup(conn.close)
+        with self.assertRaises(StorageError) as ctx:
+            with transaction(conn):
+                conn.execute(
+                    "INSERT INTO projects (id, name, repo_path, created_at)"
+                    " VALUES ('p-x', 'x', '/x', '2026-11-01T00:00:00+00:00')"
+                )
+        self.assertIn("task_dependencies", str(ctx.exception))
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0
+        )
+        # the same database honest about being v1 is writable again (M1-03)
+        self._drop_v2_table(back_to_v1=True)
+        conn2 = connect(self.db)
+        self.addCleanup(conn2.close)
+        with transaction(conn2):
+            conn2.execute(
+                "INSERT INTO projects (id, name, repo_path, created_at)"
+                " VALUES ('p-ok', 'ok', '/ok', '2026-11-01T00:00:00+00:00')"
+            )
+        self.assertEqual(
+            conn2.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
+        )
+
+    def test_verify_database_usability_is_version_aware(self) -> None:
+        healthy = verify_database(self.db)
+        self.assertTrue(healthy["schema_usable"])
+        self.assertTrue(healthy["at_head"])
+        self.assertEqual(healthy["missing_version_tables"], [])
+
+        self._drop_v2_table()
+        broken = verify_database(self.db)
+        self.assertFalse(broken["schema_usable"])  # refused as inconsistent
+        self.assertEqual(broken["missing_version_tables"], ["task_dependencies"])
+        self.assertFalse(broken["at_head"])
+        # M1-03 separation preserved: ok classifies file integrity only.
+        self.assertTrue(broken["ok"])
+        self.assertEqual(broken["integrity"], "ok")
+
+        self._drop_v2_table(back_to_v1=True)
+        lagging = verify_database(self.db)
+        self.assertTrue(lagging["ok"])
+        self.assertTrue(lagging["schema_usable"])  # v1 stays fully usable
+        self.assertFalse(lagging["at_head"])
+        self.assertEqual(lagging["missing_version_tables"], [])
+        self.assertEqual(lagging["missing_head_tables"], ["task_dependencies"])
+
+    def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
+        self._drop_v2_table()
+        with self.assertRaises(MigrationError):
+            migrate_to_head(self.db)
+        info = verify_database(self.db)
+        self.assertEqual(info["user_version"], 2)
+        self.assertEqual(info["missing_version_tables"], ["task_dependencies"])
+
+    def test_backup_refuses_inconsistent_v2_source(self) -> None:
+        self._drop_v2_table()
+        backups = self.base / "backups"
+        backups.mkdir()
+        with self.assertRaises(BackupError):
+            backup_database(self.db, backups, generation="gen-x")
+        self.assertEqual(_public_entries(backups), [])
+
+    def test_backup_and_restore_round_trip_v1_stays_supported(self) -> None:
+        self._drop_v2_table(back_to_v1=True)
+        conn = connect(self.db)
+        with transaction(conn):
+            conn.execute(
+                "INSERT INTO projects (id, name, repo_path, created_at)"
+                " VALUES ('p-v1', 'v1', '/v1', '2026-11-01T00:00:00+00:00')"
+            )
+        conn.close()
+        backups = self.base / "backups"
+        backups.mkdir()
+        result = backup_database(self.db, backups, generation="gen-v1")
+        self.assertEqual(result.schema_version, 1)
+        dest = self.base / "restored-v1.db"
+        restore_result = restore_backup(result.backup_path, dest)
+        self.assertEqual(restore_result.integrity, "ok")
+        probe = connect(dest)
+        try:
+            self.assertEqual(
+                probe.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
+            )
+        finally:
+            probe.close()
+        report = migrate_to_head(dest)  # restored v1 can still upgrade
+        self.assertEqual((report.from_version, report.to_version), (1, 2))
+
+    def test_restore_refuses_snapshot_claiming_v2_without_task_dependencies(self) -> None:
+        backups = self.base / "backups"
+        backups.mkdir()
+        result = backup_database(self.db, backups, generation="gen-1")
+        # Forge a copy that still claims v2 (audit intact) but lost the v2
+        # table — the exact half-state this gate exists to catch.
+        rogue = self.base / "rogue.db"
+        shutil.copyfile(result.backup_path, rogue)
+        raw = sqlite3.connect(str(rogue))
+        raw.execute("DROP TABLE task_dependencies")
+        raw.commit()
+        raw.close()
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "backup_file": rogue.name,
+                "backup_sha256": storage._sha256(rogue),
+                "backup_size_bytes": rogue.stat().st_size,
+                "schema_version": 2,
+            }
+        )
+        rogue.with_name(rogue.name + ".manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        dest = self.base / "dest-rogue.db"
+        with self.assertRaises(BackupError) as ctx:
+            restore_backup(rogue, dest)
+        self.assertIn("task_dependencies", str(ctx.exception))
+        self.assertFalse(dest.exists())
 
 
 if __name__ == "__main__":
