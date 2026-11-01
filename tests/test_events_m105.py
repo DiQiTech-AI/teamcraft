@@ -16,10 +16,14 @@ commands only):
   ``commands``;
 * payload hygiene: valid JSON, bounded size, lowercase kind identifiers —
   refusals write nothing;
-* idempotency: same key + identical (kind, payload, evidence) REUSES the
-  stored command (including a confirmed command's ``result_json``) and
-  appends no duplicate event; same key with different content raises
-  ``IdempotencyConflictError`` with zero side effects;
+* idempotency: same key + identical request identity (kind, payload,
+  evidence, TTL) REUSES the stored command (including a confirmed command's
+  ``result_json``) and appends no duplicate event; same key with different
+  content — TTL included, in both the add and drop direction — raises
+  ``IdempotencyConflictError`` with zero side effects.  TTL is compared as
+  relative seconds derived from the stored row's immutable
+  ``requested_at``/``expires_at`` pair (no schema bump), never as a retry's
+  freshly computed absolute deadline; an expired row still arbitrates its key;
 * command state machine pending/running/confirmed/unknown/expired as
   compare-and-swap: illegal edges refused with structured reason codes
   (``TERMINAL_FROZEN``, ``ILLEGAL_TRANSITION``), CAS losers get
@@ -46,6 +50,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +62,7 @@ from teamcraft.errors import (
     IllegalTransitionError,
     NotFoundError,
     SchemaOutOfDateError,
+    StorageError,
     ValidationError,
 )
 
@@ -586,6 +592,383 @@ class CommandServiceM105Tests(unittest.TestCase):
                          [])  # in flight: reconcile, never silent expiry
         self.assertEqual(commands.get_command(self.conn, sub.command.id).state,
                          "running")
+
+    # -- TTL as normalized request identity ----------------------------------------
+    # Design decision (M1-05): TTL is part of the normalized request identity
+    # and is compared as RELATIVE seconds recovered from the stored row's
+    # immutable (requested_at, expires_at) pair — never against the absolute
+    # deadline a retry computes from its own wall clock.
+
+    def test_identical_request_with_same_ttl_reuses_and_derives_original_ttl(
+        self,
+    ) -> None:
+        """Same key + same kind/payload/evidence/TTL is a REPLAY.
+
+        The replay is issued at a later wall clock, so the retry's freshly
+        computed absolute deadline differs from the stored one; reuse here is
+        the proof that identity is judged on relative TTL, not on
+        ``expires_at``.
+        """
+        task = self.ready_task("ttl-reuse")
+        sub = self.submit(task=task, ttl=300)
+        stored = sub.command
+        self.assertIsNotNone(stored.expires_at)
+        # durable representation: TTL recovered from the original timestamp pair
+        self.assertEqual(commands._stored_ttl_seconds(stored), 300)
+        commands.claim_command(self.conn, stored.id, clock=self.clock)
+        commands.confirm_command(self.conn, stored.id, result_json='{"n": 1}',
+                                clock=self.clock)
+        self.clock.advance(120)  # different "now" => different absolute deadline
+        replay = self.submit(task=task, ttl=300)
+        self.assertFalse(replay.created)
+        self.assertTrue(replay.reused)
+        self.assertEqual(replay.command.id, stored.id)
+        self.assertEqual(replay.command.state, "confirmed")
+        self.assertEqual(replay.command.result_json, '{"n": 1}')
+        # the reused row still carries the ORIGINAL deadline, never the retry's
+        self.assertEqual(replay.command.expires_at, stored.expires_at)
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+        self.assertEqual(self._kind_count("command.claimed"), 1)
+        self.assertEqual(self._kind_count("command.confirmed"), 1)
+
+    def test_differing_ttl_same_key_conflicts_without_side_effects(self) -> None:
+        """Any TTL difference under an existing key is a conflict, not a
+        re-parameterisation of the stored command."""
+        task = self.ready_task("ttl-drift")
+        sub = self.submit(task=task, ttl=300)
+        for variant in (60, 301, 1, commands.MAX_TTL_SECONDS):
+            with self.assertRaises(IdempotencyConflictError) as ctx:
+                self.submit(task=task, ttl=variant)
+            self.assertEqual(ctx.exception.idempotency_key, "k1")
+            self.assertEqual(ctx.exception.existing_command_id, sub.command.id)
+        # zero side effects: no new row, no new event, stored row untouched
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 1
+        )
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+        row = self.conn.execute(
+            "SELECT state, expires_at, result_json, note FROM commands"
+            " WHERE idempotency_key = 'k1'"
+        ).fetchone()
+        self.assertEqual((row[0], row[1], row[2], row[3]),
+                         ("pending", sub.command.expires_at, None, None))
+
+    def test_absent_ttl_replays_absent_ttl(self) -> None:
+        """``None`` is an identity member of its own: None + None reuses."""
+        task = self.ready_task("ttl-none")
+        sub = self.submit(task=task)
+        self.assertIsNone(sub.command.expires_at)
+        self.assertIsNone(commands._stored_ttl_seconds(sub.command))
+        self.clock.advance(3600)
+        replay = self.submit(task=task)
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.command.id, sub.command.id)
+        self.assertIsNone(replay.command.expires_at)
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+
+    def test_none_versus_explicit_ttl_conflicts_in_both_directions(self) -> None:
+        """No-deadline vs deadline conflicts whether the gap is added or
+        dropped, in either order of submission."""
+        task = self.ready_task("ttl-mixed")
+        sub_none = self.submit(task=task)  # stored with NO deadline
+        with self.assertRaises(IdempotencyConflictError) as ctx:
+            self.submit(task=task, ttl=300)  # retry ADDS a deadline
+        self.assertEqual(ctx.exception.existing_command_id, sub_none.command.id)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 1
+        )
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+        # mirror: stored WITH deadline, retry drops it
+        task2 = self.ready_task("ttl-mixed-2")
+        sub_ttl = self.submit(key="k-ttl", task=task2, ttl=300)
+        with self.assertRaises(IdempotencyConflictError) as ctx:
+            self.submit(key="k-ttl", task=task2)
+        self.assertEqual(ctx.exception.existing_command_id, sub_ttl.command.id)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 2
+        )
+        self.assertEqual(self._kind_count("command.submitted"), 2)  # only originals
+
+    def test_same_ttl_replay_after_expiry_reuses_expired_row(self) -> None:
+        """Expiry does not erase identity: an identical request (same TTL)
+        replays onto the already-expired row and revives nothing."""
+        task = self.ready_task("ttl-expired-reuse")
+        sub = self.submit(task=task, ttl=60)
+        self.clock.advance(61)
+        self.assertEqual(
+            commands.sweep_stale_commands(self.conn, clock=self.clock),
+            [(sub.command.id, "TTL_EXPIRED")],
+        )
+        seq_before = events.current_seq(self.conn)
+        submitted_before = self._kind_count("command.submitted")
+        self.clock.advance(60)
+        replay = self.submit(task=task, ttl=60)
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.command.id, sub.command.id)
+        self.assertEqual(replay.command.state, "expired")
+        # no resurrection and no new events of any kind
+        self.assertEqual(events.current_seq(self.conn), seq_before)
+        self.assertEqual(self._kind_count("command.submitted"), submitted_before)
+        self.assertEqual(self._kind_count("command.expired"), 1)
+        self.assertEqual(commands.get_command(self.conn, sub.command.id).state,
+                         "expired")
+
+    def test_different_ttl_replay_after_expiry_still_conflicts(self) -> None:
+        """A swept, expired row still arbitrates its key: TTL drift conflicts
+        and leaves the terminal row exactly as it was."""
+        task = self.ready_task("ttl-expired-conflict")
+        sub = self.submit(task=task, ttl=60)
+        self.clock.advance(61)
+        commands.sweep_stale_commands(self.conn, clock=self.clock)
+        seq_before = events.current_seq(self.conn)
+        with self.assertRaises(IdempotencyConflictError) as ctx:
+            self.submit(task=task, ttl=120)
+        self.assertEqual(ctx.exception.existing_command_id, sub.command.id)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 1
+        )
+        self.assertEqual(events.current_seq(self.conn), seq_before)
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+        row = commands.get_command(self.conn, sub.command.id)
+        self.assertEqual((row.state, row.note), ("expired", "TTL_EXPIRED"))
+        self.assertEqual(row.expires_at, sub.command.expires_at)
+
+    def test_concurrent_identical_ttl_converges_on_one_row_and_event(
+        self,
+    ) -> None:
+        """Two connections replaying the same request (same TTL) converge onto
+        the winner's row: one command, one ``command.submitted`` event."""
+        task = self.ready_task("ttl-race-same")
+        evidence = self.evidence(task)
+        barrier = threading.Barrier(3)
+        results: list[commands.Submission] = []
+        failures: list[BaseException] = []
+        result_lock = threading.Lock()
+
+        def submit() -> None:
+            conn = storage.connect(self.db)
+            try:
+                barrier.wait()
+                result = commands.submit_command(
+                    conn, idempotency_key="k-race", kind="task.pause",
+                    payload_json='{"a": 1}', evidence_json=evidence,
+                    ttl_seconds=300, clock=self.clock,
+                )
+                with result_lock:
+                    results.append(result)
+            except BaseException as exc:
+                with result_lock:
+                    failures.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(result.created for result in results), [False, True])
+        self.assertEqual(results[0].command.id, results[1].command.id)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM commands WHERE idempotency_key = 'k-race'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+
+    def test_concurrent_differing_ttl_yields_one_winner_one_conflict(
+        self,
+    ) -> None:
+        """The loser of a TTL race gets ``IdempotencyConflictError`` and writes
+        nothing: still exactly one row and one submitted event."""
+        task = self.ready_task("ttl-race-diff")
+        evidence = self.evidence(task)
+        barrier = threading.Barrier(3)
+        results: list[commands.Submission] = []
+        conflicts: list[IdempotencyConflictError] = []
+        failures: list[BaseException] = []
+        result_lock = threading.Lock()
+
+        def submit(ttl_seconds: int) -> None:
+            conn = storage.connect(self.db)
+            try:
+                barrier.wait()
+                result = commands.submit_command(
+                    conn, idempotency_key="k-race2", kind="task.pause",
+                    payload_json='{"a": 1}', evidence_json=evidence,
+                    ttl_seconds=ttl_seconds, clock=self.clock,
+                )
+                with result_lock:
+                    results.append(result)
+            except IdempotencyConflictError as exc:
+                with result_lock:
+                    conflicts.append(exc)
+            except BaseException as exc:
+                with result_lock:
+                    failures.append(exc)
+            finally:
+                conn.close()
+
+        threads = [
+            threading.Thread(target=submit, args=(300,)),
+            threading.Thread(target=submit, args=(600,)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(conflicts), 1)
+        winner = results[0]
+        self.assertTrue(winner.created)
+        self.assertEqual(
+            conflicts[0].existing_command_id,
+            winner.command.id,
+        )
+        rows = self.conn.execute(
+            "SELECT id FROM commands WHERE idempotency_key = 'k-race2'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self._kind_count("command.submitted"), 1)
+        # the surviving row keeps the WINNER's TTL
+        survivor = commands.get_command(self.conn, rows[0][0])
+        self.assertIn(commands._stored_ttl_seconds(survivor), (300, 600))
+
+    def test_stored_ttl_is_durable_across_reopen_and_fails_closed_on_damage(
+        self,
+    ) -> None:
+        """The (requested_at, expires_at) pair is the durable TTL carrier: it
+        survives a reopen, and when tampering breaks the invariant the identity
+        check refuses to guess rather than silently reusing or conflicting."""
+        task = self.ready_task("ttl-durable")
+        sub = self.submit(task=task, ttl=900)
+        self.conn.close()
+        reopened = storage.connect(self.db)
+        self.addCleanup(reopened.close)
+        self.assertEqual(
+            commands._stored_ttl_seconds(
+                commands.get_command(reopened, sub.command.id)
+            ),
+            900,
+        )
+        self.assertFalse(
+            commands.submit_command(
+                reopened, idempotency_key="k1", kind="task.pause",
+                payload_json='{"a": 1}', evidence_json=self.evidence(task),
+                ttl_seconds=900, clock=self.clock,
+            ).created
+        )
+        # damage the immutable pair out of band (no DB trigger guards this pair)
+        raw = sqlite3.connect(str(self.db))
+        self.addCleanup(raw.close)
+        raw.execute(
+            "UPDATE commands SET expires_at = 'nonsense' WHERE id = ?",
+            (sub.command.id,),
+        )
+        raw.commit()
+        raw.close()
+        damaged = storage.connect(self.db)
+        self.addCleanup(damaged.close)
+        with self.assertRaises(StorageError):
+            commands.submit_command(
+                damaged, idempotency_key="k1", kind="task.pause",
+                payload_json='{"a": 1}', evidence_json=self.evidence(task),
+                ttl_seconds=900, clock=self.clock,
+            )
+        # fail-closed means fail-clean: the refusal wrote nothing
+        self.assertEqual(
+            damaged.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 1
+        )
+        self.assertEqual(self._kind_count_on(damaged, "command.submitted"), 1)
+
+    def _kind_count_on(self, conn, kind: str) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = ?", (kind,)
+        ).fetchone()[0]
+
+    def test_stored_ttl_derivation_fails_closed_on_every_malformed_pair(
+        self,
+    ) -> None:
+        """Every documented way the derived TTL can be insane is refused.
+
+        ``_stored_ttl_seconds`` must raise :class:`StorageError` for an
+        unparseable, timezone-naive, non-integral, or out-of-window pair
+        instead of guessing that the request matches (silent reuse of a
+        different side-effect promise) or differs (silent conflict on a
+        legitimate replay).  Each refusal is also checked end to end through
+        :func:`submit_command`, and must leave no row and no event behind.
+        """
+        task = self.ready_task("ttl-malformed")
+        sub = self.submit(task=task, ttl=900)
+        original = tuple(
+            str(value) for value in self.conn.execute(
+                "SELECT requested_at, expires_at FROM commands WHERE id = ?",
+                (sub.command.id,),
+            ).fetchone()
+        )
+        requested = datetime.fromisoformat(original[0])
+
+        def damage(requested_at: str, expires_at: str) -> None:
+            raw = sqlite3.connect(str(self.db))
+            try:
+                raw.execute(
+                    "UPDATE commands SET requested_at = ?, expires_at = ?"
+                    " WHERE id = ?",
+                    (requested_at, expires_at, sub.command.id),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+        variants = {
+            "naive": (
+                requested.replace(tzinfo=None).isoformat(),
+                (requested.replace(tzinfo=None)
+                 + timedelta(seconds=900)).isoformat(),
+            ),
+            "non-integral": (
+                original[0],
+                (requested + timedelta(milliseconds=500)).isoformat(),
+            ),
+            "zero": (original[0], original[0]),
+            "too-large": (
+                original[0],
+                (requested
+                 + timedelta(seconds=commands.MAX_TTL_SECONDS + 1)).isoformat(),
+            ),
+        }
+        for label, pair in variants.items():
+            with self.subTest(pair=label):
+                damage(*pair)
+                damaged = storage.connect(self.db)
+                self.addCleanup(damaged.close)
+                snapshot = commands.get_command(damaged, sub.command.id)
+                with self.assertRaises(StorageError):
+                    commands._stored_ttl_seconds(snapshot)
+                with self.assertRaises(StorageError):
+                    commands.submit_command(
+                        damaged, idempotency_key="k1", kind="task.pause",
+                        payload_json='{"a": 1}',
+                        evidence_json=self.evidence(task),
+                        ttl_seconds=900, clock=self.clock,
+                    )
+                # fail-closed also means fail-clean: nothing was written
+                self.assertEqual(
+                    damaged.execute("SELECT COUNT(*) FROM commands").fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    self._kind_count_on(damaged, "command.submitted"), 1
+                )
+                damage(original[0], original[1])  # restore for next round
 
     # -- evidence version invalidation ----------------------------------------------
 

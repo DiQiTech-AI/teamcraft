@@ -3,10 +3,20 @@
 Contract pinned by this module and ``tests/test_events_m105.py``:
 
 * every command row carries a UNIQUE ``idempotency_key``; same key +
-  identical (kind, payload_json, evidence_json) REUSES the stored outcome
-  (including the ``result_json`` of a confirmed command) and writes nothing;
-  same key with different content raises
+  identical request identity — ``(kind, payload_json, evidence_json,
+  ttl_seconds)`` — REUSES the stored outcome (including the ``result_json``
+  of a confirmed command) and writes nothing; same key with any difference
+  (including a TTL difference) raises
   :class:`teamcraft.errors.IdempotencyConflictError` without side effects;
+* TTL is part of that normalized identity and is compared as *relative*
+  seconds, never as an absolute deadline.  A retry computes its own
+  ``expires_at`` from its own wall clock, so absolute deadlines of two
+  identical requests always differ; comparing them would turn every retry
+  into a spurious conflict.  v3 already persists the immutable
+  ``requested_at``/``expires_at`` pair written by the single INSERT, so the
+  originally requested TTL is recovered durably as
+  ``expires_at - requested_at`` and no schema bump is needed — see
+  :func:`_stored_ttl_seconds` for the invariant and its fail-closed rules;
 * state machine ``pending -> running -> confirmed | unknown | expired``
   plus ``running|unknown -> reconcile -> confirmed | expired`` and
   ``pending -> expired`` (TTL / evidence invalidation); every transition is
@@ -224,7 +234,14 @@ def _validate_note(
     return note
 
 
-def _ttl_expires_at(ttl_seconds: int | None, now: str) -> str | None:
+def _normalize_ttl(ttl_seconds: int | None) -> int | None:
+    """Validate a caller-supplied TTL into its canonical identity form.
+
+    ``None`` means "no expiry deadline" and is a distinct identity member from
+    every integer TTL — it is not a default that an explicit TTL may later
+    match against.
+    """
+
     if ttl_seconds is None:
         return None
     if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
@@ -233,9 +250,77 @@ def _ttl_expires_at(ttl_seconds: int | None, now: str) -> str | None:
         raise ValidationError(
             f"ttl_seconds must be within 1..{MAX_TTL_SECONDS} (one month)"
         )
-    return (
-        datetime.fromisoformat(now) + timedelta(seconds=ttl_seconds)
-    ).isoformat()
+    return ttl_seconds
+
+
+def _ttl_expires_at(ttl_seconds: int | None, now: str) -> str | None:
+    """Absolute deadline for an ALREADY normalized TTL, at submit time only.
+
+    This value is written once and is never used to judge a retry: see
+    :func:`_stored_ttl_seconds`.
+    """
+
+    if ttl_seconds is None:
+        return None
+    return (datetime.fromisoformat(now) + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+def _stored_ttl_seconds(command: Command) -> int | None:
+    """Recover the originally requested TTL from a persisted row.
+
+    Invariant (why no v4 schema is needed): v3 writes ``requested_at`` and
+    ``expires_at`` exactly once, in the single ``INSERT`` of
+    :func:`submit_command`, and no code path or trigger rewrites either column
+    — the only ``UPDATE commands`` in this module is :func:`_cas_state`, whose
+    assignments are limited to ``state``/``updated_at``/``result_json``/
+    ``note``, and the v3 trigger forbids ``DELETE`` outright.  Therefore the
+    pair is immutable for the row's whole life and
+    ``expires_at - requested_at`` reproduces the caller's original validated
+    ``ttl_seconds`` bit-for-bit (``None`` when the row was submitted with no
+    deadline).  That relative duration is the durable representation of the
+    request's TTL, and it is what idempotency compares — never a retry's
+    freshly computed absolute deadline.
+
+    Fail-closed: a row whose pair cannot yield a sane duration (unparseable,
+    naive, non-integral, or outside the accepted TTL window) contradicts the
+    invariant above, so it can only come from tampering or a half-repair.  A
+    :class:`~teamcraft.errors.StorageError` is raised instead of guessing equal
+    or different, because inventing a TTL here would either silently reuse or
+    silently conflict a request on corrupted identity data.
+    """
+
+    if command.expires_at is None:
+        return None
+    try:
+        requested = datetime.fromisoformat(command.requested_at)
+        expires = datetime.fromisoformat(command.expires_at)
+    except ValueError as exc:
+        raise StorageError(
+            f"command {command.id} carries an unparseable TTL pair"
+            f" (requested_at={command.requested_at!r},"
+            f" expires_at={command.expires_at!r}); cannot recover the original"
+            " ttl_seconds for idempotency identity"
+        ) from exc
+    if requested.tzinfo is None or expires.tzinfo is None:
+        raise StorageError(
+            f"command {command.id} TTL pair is not timezone-aware"
+            f" (requested_at={command.requested_at!r},"
+            f" expires_at={command.expires_at!r})"
+        )
+    delta = (expires - requested).total_seconds()
+    if not float(delta).is_integer():
+        raise StorageError(
+            f"command {command.id} derived TTL {delta!r} is not a whole number"
+            " of seconds; the requested_at/expires_at invariant is violated"
+        )
+    ttl = int(delta)
+    if not 1 <= ttl <= MAX_TTL_SECONDS:
+        raise StorageError(
+            f"command {command.id} derived TTL {ttl}s falls outside"
+            f" 1..{MAX_TTL_SECONDS}; the requested_at/expires_at invariant is"
+            " violated"
+        )
+    return ttl
 
 
 def _is_expired(expires_at: str | None, now: str) -> bool:
@@ -293,6 +378,31 @@ def _associate(conn: TeamCraftConnection, evidence_json: str) -> tuple[str | Non
 # ---------------------------------------------------------------------------
 
 
+def _matches_identity(
+    command: Command,
+    *,
+    kind: str,
+    payload_json: str,
+    evidence_json: str,
+    ttl_seconds: int | None,
+) -> bool:
+    """Full normalized request identity: kind, payload, evidence, TTL.
+
+    All four components must match for a key to be a REPLAY; a difference in
+    any one of them is a different request under the same key, i.e. a
+    conflict.  TTL participates as relative seconds recovered from the stored
+    row (see :func:`_stored_ttl_seconds`), compared against the caller's
+    normalized ``ttl_seconds`` — not against an absolute deadline.
+    """
+
+    return (
+        command.kind == kind
+        and command.payload_json == payload_json
+        and command.evidence_json == evidence_json
+        and _stored_ttl_seconds(command) == ttl_seconds
+    )
+
+
 def submit_command(
     conn: TeamCraftConnection,
     *,
@@ -306,13 +416,15 @@ def submit_command(
 ) -> Submission:
     """Persist a command under its idempotency key.
 
-    Same key + identical request returns the stored command (``created``
-    False) — for a confirmed command this IS the reused result.  Same key
-    with any different kind/payload/evidence raises
-    :class:`IdempotencyConflictError`; nothing is written by refusals.  A
-    brand-new submission writes the row and its ``command.submitted`` event
-    inside one transaction.  Concurrent identical submissions converge onto
-    the winner's row via the UNIQUE index.
+    Same key + identical request identity (kind, payload, evidence, TTL)
+    returns the stored command (``created`` False) — for a confirmed command
+    this IS the reused result.  Same key with any different kind/payload/
+    evidence/TTL raises :class:`IdempotencyConflictError`; nothing is written
+    by refusals.  A brand-new submission writes the row and its
+    ``command.submitted`` event inside one transaction.  Concurrent identical
+    submissions converge onto the winner's row via the UNIQUE index;
+    concurrent submissions that differ (in any identity component, TTL
+    included) produce exactly one winner and one conflict.
     """
 
     _require_head(conn)
@@ -320,6 +432,7 @@ def submit_command(
     kind = _validate_kind(kind)
     payload_json = _validate_json(payload_json)
     evidence_json = _validate_evidence(evidence_json)
+    ttl_seconds = _normalize_ttl(ttl_seconds)
     now = _utc_iso(clock)
     expires_at = _ttl_expires_at(ttl_seconds, now)
     with _tx(conn):
@@ -329,16 +442,15 @@ def submit_command(
         ).fetchone()
         if existing is not None:
             command = _row_to_command(existing)
-            if (
-                command.kind == kind
-                and command.payload_json == payload_json
-                and command.evidence_json == evidence_json
+            if _matches_identity(
+                command, kind=kind, payload_json=payload_json,
+                evidence_json=evidence_json, ttl_seconds=ttl_seconds,
             ):
                 return Submission(command=command, created=False)
             raise IdempotencyConflictError(
                 f"idempotency key {key!r} already owns command"
                 f" {command.id} with different content (kind/payload/evidence"
-                " must match exactly to reuse)",
+                "/ttl must match exactly to reuse)",
                 idempotency_key=key,
                 existing_command_id=command.id,
             )
@@ -366,10 +478,9 @@ def submit_command(
                     f"command insert rejected but no holder row visible: {exc}"
                 ) from exc
             command = _row_to_command(raced)
-            if (
-                command.kind == kind
-                and command.payload_json == payload_json
-                and command.evidence_json == evidence_json
+            if _matches_identity(
+                command, kind=kind, payload_json=payload_json,
+                evidence_json=evidence_json, ttl_seconds=ttl_seconds,
             ):
                 return Submission(command=command, created=False)
             raise IdempotencyConflictError(
