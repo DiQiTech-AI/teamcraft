@@ -186,10 +186,14 @@ class DomainM104Tests(unittest.TestCase):
 
     def test_domain_refuses_lagging_v1_schema_but_storage_still_works(self) -> None:
         # Simulate an audited, un-upgraded v1 database (the historical state
-        # before this build's forward migration was run).
+        # before this build's forward migration was run).  M1-05: an honest
+        # v1 sheds the v2/v3 artifacts too — a lingering v3 audit record is
+        # (correctly) treated as an inconsistent schema by the write gate.
         with storage.transaction(self.conn):
             self.conn.execute("DROP TABLE task_dependencies")
-            self.conn.execute("DELETE FROM schema_migrations WHERE version = 2")
+            self.conn.execute("DROP TABLE events")
+            self.conn.execute("DROP TABLE commands")
+            self.conn.execute("DELETE FROM schema_migrations WHERE version > 1")
             self.conn.execute("PRAGMA user_version=1")
         with self.assertRaises(SchemaOutOfDateError):
             domain.get_task(self.conn, "whatever")
@@ -205,8 +209,8 @@ class DomainM104Tests(unittest.TestCase):
         # And the forward migration upgrades in place afterwards.
         report = storage.migrate_to_head(self.db)
         self.assertFalse(report.fresh)
-        self.assertEqual((report.from_version, report.to_version), (1, 2))
-        self.assertEqual(report.applied, (2,))
+        self.assertEqual((report.from_version, report.to_version), (1, 3))
+        self.assertEqual(report.applied, (2, 3))
         self.conn.close()
         self.conn = storage.connect(self.db)
         domain.require_head(self.conn)
@@ -1143,13 +1147,20 @@ class M104UpgradePathTests(unittest.TestCase):
         self.db = Path(self._tmp.name) / "teamcraft.db"
 
     def _downgrade_to_v1(self) -> None:
-        """Simulate a pre-M1-04 audited v1 database (rows included)."""
+        """Simulate a pre-M1-04 audited v1 database (rows included).
+
+        M1-05 adaptation: head is v3 now, so an honest v1 must also shed the
+        v2/v3 artifacts (events/commands + audit rows 2 and 3); the audit
+        consistency gate correctly refuses writes if a v3 record lingers.
+        """
         storage.migrate_to_head(self.db)
         conn = storage.connect(self.db)
         try:
             with storage.transaction(conn):
                 conn.execute("DROP TABLE task_dependencies")
-                conn.execute("DELETE FROM schema_migrations WHERE version = 2")
+                conn.execute("DROP TABLE events")
+                conn.execute("DROP TABLE commands")
+                conn.execute("DELETE FROM schema_migrations WHERE version > 1")
                 conn.execute("PRAGMA user_version=1")
             with storage.transaction(conn):
                 now = "2026-10-30T00:00:00+00:00"
@@ -1176,7 +1187,7 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertFalse(report.fresh)
         self.assertEqual(
             (report.from_version, report.to_version, report.applied),
-            (1, 2, (2,)),
+            (1, 3, (2, 3)),
         )
         info = storage.verify_database(self.db)
         self.assertTrue(info["ok"])
@@ -1202,12 +1213,12 @@ class M104UpgradePathTests(unittest.TestCase):
                         "INSERT INTO attempts (id, task_id, attempt_no, status)"
                         " VALUES ('a2', 't1', 2, 'created')"
                     )
-            # migration audit records both steps
+            # migration audit records every ladder step
             self.assertEqual(
                 [r[0] for r in conn.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )],
-                [1, 2],
+                [1, 2, 3],
             )
         finally:
             conn.close()
@@ -1240,10 +1251,12 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertFalse(info["at_head"])
         self.assertEqual(info["user_version"], 1)
         self.assertEqual(info["schema_migrations_recorded"], 1)
-        self.assertEqual(info["missing_head_tables"], ["task_dependencies"])
+        self.assertEqual(
+            info["missing_head_tables"], ["commands", "events", "task_dependencies"]
+        )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)
-        self.assertEqual((report.from_version, report.to_version), (1, 2))
+        self.assertEqual((report.from_version, report.to_version), (1, 3))
 
 
 if __name__ == "__main__":

@@ -104,12 +104,14 @@ from .errors import (
 )
 
 #: Highest schema version this build understands.
-#: v2 (M1-04) is a strictly ADDITIVE forward migration: it creates the
-#: ``task_dependencies`` table only and never rewrites a v1 table, so v1
-#: databases keep satisfying every M1-03 contract (connect/query/verify/
-#: backup/restore) whether or not they have been upgraded, and any schema
-#: newer than this build still fails closed read-only (8.2-13).
-SCHEMA_VERSION = 2
+#: v2 (M1-04) and v3 (M1-05) are strictly ADDITIVE forward migrations: v2
+#: creates ``task_dependencies``, v3 creates the ``events``/``commands``
+#: tables (plus their indexes/triggers) and neither rewrites any earlier
+#: table, so v1 and v2 databases keep satisfying every previously accepted
+#: contract (connect/query/verify/backup/restore) whether or not they have
+#: been upgraded, and any schema newer than this build still fails closed
+#: read-only (8.2-13).
+SCHEMA_VERSION = 3
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -238,24 +240,87 @@ CREATE TABLE task_dependencies (
 )""",
 )
 
+#: Tables added by the forward-only v3 migration (M1-05 Event/Command core).
+_V3_TABLES = frozenset({"events", "commands"})
+
+#: Forward-only v3 step (M1-05): the append-only event stream and the
+#: persistent command ledger (M0 review 8.2-1/-11, 9.1 M1-05; PLAN §4/§8.3).
+#: Columns follow the PLAN schema; ``evidence_json``/``expires_at``/
+#: ``updated_at``/``note`` carry the review-mandated evidence-version binding,
+#: TTL, and audit fields.  ``events.seq`` is AUTOINCREMENT: monotonically
+#: increasing and persistent (never reused across rollbacks), the ordering
+#: authority required by 9.1 M3-03.  Append-only is DB-enforced with
+#: RAISE(ABORT) triggers so no API mistake can rewrite or erase history;
+#: commands may change STATE (the command state machine) but rows themselves
+#: are never deletable.
+_V3_STATEMENTS = (
+    """
+CREATE TABLE events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id),
+  task_id TEXT REFERENCES tasks(id),
+  attempt_id TEXT REFERENCES attempts(id),
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  occurred_at TEXT NOT NULL
+)""",
+    "CREATE INDEX idx_events_task_seq ON events(task_id, seq)",
+    """
+CREATE TRIGGER trg_events_no_update BEFORE UPDATE ON events
+BEGIN
+  SELECT RAISE(ABORT, 'events is append-only: UPDATE forbidden');
+END""",
+    """
+CREATE TRIGGER trg_events_no_delete BEFORE DELETE ON events
+BEGIN
+  SELECT RAISE(ABORT, 'events is append-only: DELETE forbidden');
+END""",
+    """
+CREATE TABLE commands (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'confirmed', 'unknown', 'expired')),
+  requested_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT,
+  result_json TEXT,
+  note TEXT
+)""",
+    "CREATE INDEX idx_commands_state ON commands(state)",
+    """
+CREATE TRIGGER trg_commands_no_delete BEFORE DELETE ON commands
+BEGIN
+  SELECT RAISE(ABORT, 'commands rows are permanent audit records: DELETE forbidden');
+END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
 _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
+    (3, _V3_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
 #: from version ``v`` is the union over steps ``1..v`` (an audited database
 #: at ``v`` must carry all of them before further steps run).
-_TABLES_BY_VERSION: dict[int, frozenset[str]] = {1: _V1_TABLES, 2: _V2_TABLES}
+_TABLES_BY_VERSION: dict[int, frozenset[str]] = {
+    1: _V1_TABLES,
+    2: _V2_TABLES,
+    3: _V3_TABLES,
+}
 
 
 def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
-    return _V1_TABLES | _V2_TABLES
+    return _V1_TABLES | _V2_TABLES | _V3_TABLES
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -277,6 +342,53 @@ def _required_tables_for(version: int) -> frozenset[str]:
         if step <= version:
             required = required | step_tables
     return required
+
+
+#: Non-table schema objects each migration step introduces (CEO review
+#: M1-05 P1): the append-only triggers ARE the integrity contract of the
+#: events/commands tables — a database whose recorded version claims v3 but
+#: lost one of them is inconsistent, must fail closed at verify/transaction/
+#: migrate gates, and must never be silently treated as healthy or repaired.
+#: ``_V3_INDEXES`` rides along: the two v3 lookup indexes are cheap to pin
+#: and their absence signals tampering/half-repair.
+_V3_TRIGGERS = frozenset(
+    {
+        "trg_events_no_update",
+        "trg_events_no_delete",
+        "trg_commands_no_delete",
+    }
+)
+_V3_INDEXES = frozenset({"idx_events_task_seq", "idx_commands_state"})
+
+#: version -> (required triggers, required indexes) added by that step;
+#: cumulative lookups mirror :func:`_required_tables_for`.
+_OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
+    3: (_V3_TRIGGERS, _V3_INDEXES),
+}
+
+
+def _required_objects_for(version: int) -> tuple[frozenset[str], frozenset[str]]:
+    """(triggers, indexes) a database at ``version`` MUST already contain.
+
+    Version-aware exactly like the tables gate: v1/v2 databases legitimately
+    require no triggers/indexes from this build; v3 requires the full M1-05
+    integrity set.  A version above this build's ladder maps to the highest
+    known requirement (too-new itself is refused by the version-range gates).
+    """
+
+    triggers: frozenset[str] = frozenset()
+    indexes: frozenset[str] = frozenset()
+    for step, (step_triggers, step_indexes) in sorted(_OBJECTS_BY_VERSION.items()):
+        if step <= version:
+            triggers = triggers | step_triggers
+            indexes = indexes | step_indexes
+    return triggers, indexes
+
+
+def _head_objects() -> tuple[frozenset[str], frozenset[str]]:
+    """All non-table objects required at head (diagnostics for ``at_head``)."""
+
+    return _required_objects_for(SCHEMA_VERSION)
 
 _REMOTE_FSTYPES = frozenset(
     {
@@ -755,6 +867,31 @@ def _existing_tables_safe(conn: sqlite3.Connection) -> frozenset[str]:
         ) from exc
 
 
+def _existing_named_objects(
+    conn: sqlite3.Connection, type_name: str
+) -> frozenset[str]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = ?", (type_name,)
+    ).fetchall()
+    return frozenset(str(row[0]) for row in rows)
+
+
+def _existing_objects_safe(
+    conn: sqlite3.Connection
+) -> tuple[frozenset[str], frozenset[str]]:
+    """(triggers, indexes) present in sqlite_master, corruption-hardened."""
+
+    try:
+        return (
+            _existing_named_objects(conn, "trigger"),
+            _existing_named_objects(conn, "index"),
+        )
+    except sqlite3.Error as exc:
+        raise CorruptDatabaseError(
+            f"schema catalog unreadable (suspected corruption): {exc}"
+        ) from exc
+
+
 def _assert_writable_version(conn: sqlite3.Connection, stage: str) -> None:
     """Re-check ``user_version`` on an already-open connection.
 
@@ -809,7 +946,10 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
     the forward migration; a database whose recorded version claims v2 must
     actually carry v2's tables, or it is inconsistent and refused.  Requiring
     HEAD regardless of the recorded version remains the *domain* layer's job
-    (:class:`teamcraft.errors.SchemaOutOfDateError`), not this gate's.
+    (:class:`teamcraft.errors.SchemaOutOfDateError`), not this gate's.  CEO
+    review M1-05 P1 extends the same version-aware completeness to the
+    integrity OBJECTS (append-only triggers, lookup indexes) the recorded
+    version requires.
     """
 
     _assert_writable_version(conn, stage)
@@ -830,6 +970,21 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
             f"schema is incomplete for ordinary writes at version {version}, "
             f"missing tables: {sorted(missing)}; run "
             f"teamcraft.migrate_to_head() ({stage})"
+        )
+    # CEO review M1-05 P1: the append-only triggers and lookup indexes are
+    # part of the recorded version's integrity contract — a schema that lost
+    # one must fail closed here rather than let UPDATE/DELETE through.
+    required_triggers, required_indexes = _required_objects_for(version)
+    try:
+        triggers, indexes = _existing_objects_safe(conn)
+    except CorruptDatabaseError as exc:
+        raise StorageError(f"{exc} ({stage})") from exc
+    missing_objects = (required_triggers - triggers) | (required_indexes - indexes)
+    if missing_objects:
+        raise StorageError(
+            f"schema is incomplete for ordinary writes at version {version}, "
+            f"missing integrity objects: {sorted(missing_objects)}; refusing "
+            f"to write ({stage})"
         )
     recorded = _migration_record(conn)
     if recorded is None:
@@ -1477,6 +1632,21 @@ def migrate_to_head(
                             f"user_version={SCHEMA_VERSION} but tables are missing: "
                             f"{sorted(missing)}; refusing to continue"
                         )
+                    # CEO review M1-05 P1: integrity triggers/indexes are part
+                    # of head completeness — a v3 database that lost one is
+                    # NOT healthy; migrate refuses instead of silently
+                    # adopting or repairing it.
+                    head_triggers, head_indexes = _head_objects()
+                    triggers, indexes = _existing_objects_safe(inner)
+                    missing_objects = (
+                        (head_triggers - triggers) | (head_indexes - indexes)
+                    )
+                    if missing_objects:
+                        raise MigrationError(
+                            f"user_version={SCHEMA_VERSION} but integrity "
+                            f"objects are missing: {sorted(missing_objects)}; "
+                            "refusing to continue"
+                        )
                     recorded = inner.execute(
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()
@@ -1618,6 +1788,7 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
             row = conn.execute("PRAGMA integrity_check").fetchone()
             integrity = str(row[0]) if row else "unknown"
             tables = _existing_tables_safe(conn)
+            triggers, indexes = _existing_objects_safe(conn)
         except sqlite3.Error as exc:
             raise CorruptDatabaseError(f"integrity check failed to run: {exc}") from exc
         recorded = _migration_record(conn)
@@ -1627,8 +1798,16 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
     # (M1-03 support), but user_version=2 without task_dependencies is
     # inconsistent and must not be reported usable.
     missing_for_version = sorted(_required_tables_for(version) - tables)
+    # CEO review M1-05 P1: same rule for the recorded version's integrity
+    # objects — a v3 claim missing an append-only trigger or a v3 index is
+    # NOT schema-usable even though the file itself is integrity-"ok".
+    required_triggers, required_indexes = _required_objects_for(version)
+    missing_triggers = sorted(required_triggers - triggers)
+    missing_indexes = sorted(required_indexes - indexes)
     schema_usable = (
         not missing_for_version
+        and not missing_triggers
+        and not missing_indexes
         and recorded is not None
         and recorded == version
         and 0 <= version <= SCHEMA_VERSION
@@ -1640,10 +1819,15 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
     # head for M1-04 features.  Diagnostics only; never weakens the checks
     # above.
     missing_head = sorted(_head_tables() - tables)
+    head_triggers, head_indexes = _head_objects()
+    missing_head_objects = sorted(
+        (head_triggers - triggers) | (head_indexes - indexes)
+    )
     at_head = (
         version == SCHEMA_VERSION
         and recorded == SCHEMA_VERSION
         and not missing_head
+        and not missing_head_objects
     )
     return {
         "ok": ok,
@@ -1652,7 +1836,10 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
         "tables": sorted(tables),
         "missing_tables": missing,
         "missing_version_tables": missing_for_version,
+        "missing_version_triggers": missing_triggers,
+        "missing_version_indexes": missing_indexes,
         "missing_head_tables": missing_head,
+        "missing_head_objects": missing_head_objects,
         "at_head": at_head,
         "schema_migrations_recorded": recorded,
         "schema_usable": schema_usable,
@@ -1695,16 +1882,19 @@ def _hash_fd(fd: int) -> str:
 
 
 def _snapshot_versions(path: Path) -> tuple[int, int | None, frozenset[str]]:
-    """(user_version, schema_migrations_max, missing_version_required_tables).
+    """(user_version, schema_migrations_max, missing_version_required_objects).
 
     The missing set is version-aware (CEO review M1-04 fix 1): a snapshot at
     v1 requires only the v1 floor; a snapshot whose recorded version claims
-    v2 must also carry ``task_dependencies``.
+    v2 must also carry ``task_dependencies``.  CEO review M1-05 P1 folds in
+    the recorded version's integrity objects (append-only triggers, lookup
+    indexes): an otherwise-intact file that lost one is not restorable.
     """
 
     with _open_read_connection(path) as conn:
         user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = _existing_tables_safe(conn)
+        triggers, indexes = _existing_objects_safe(conn)
         recorded: int | None = None
         if "schema_migrations" in tables:
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
@@ -1712,6 +1902,8 @@ def _snapshot_versions(path: Path) -> tuple[int, int | None, frozenset[str]]:
         # Completeness for the recorded schema version is a hard consistency
         # requirement for any snapshot we would copy or restore.
         missing = _required_tables_for(user_version) - tables
+        required_triggers, required_indexes = _required_objects_for(user_version)
+        missing = missing | (required_triggers - triggers) | (required_indexes - indexes)
     return user_version, recorded, missing
 
 
@@ -1733,7 +1925,7 @@ def _assert_restorable_snapshot(
     if missing:
         raise BackupError(
             f"{subject} is incomplete for schema version {version}, missing "
-            f"tables: {sorted(missing)}"
+            f"tables or integrity objects: {sorted(missing)}"
         )
     if recorded is None:
         raise BackupError(

@@ -150,3 +150,41 @@ class AttemptSlotOccupiedError(DomainError):
         super().__init__(message)
         self.task_id = task_id
         self.occupying_id = occupying_id
+
+
+class IdempotencyConflictError(ConflictError):
+    """An idempotency key was reused with a DIFFERENT request (M1-05).
+
+    Same key + identical payload/kind/evidence binding must reuse the stored
+    result; presenting different content under an existing key is a client
+    error (409 territory, PLAN §8.5) and nothing is written.
+    """
+
+    def __init__(
+        self, message: str, *, idempotency_key: str, existing_command_id: str
+    ) -> None:
+        super().__init__(message)
+        self.idempotency_key = idempotency_key
+        self.existing_command_id = existing_command_id
+
+
+class CommandStateConflictError(DomainError):
+    """Compare-and-swap against a command's state lost the race (M1-05).
+
+    The command exists but its persisted state no longer equals the caller's
+    ``expected_state`` under the write lock; nothing was written (M0 review
+    8.2-7: every execution admission re-checks the row atomically).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        command_id: str,
+        expected_state: str,
+        found_state: str,
+    ) -> None:
+        super().__init__(message)
+        self.command_id = command_id
+        self.expected_state = expected_state
+        self.found_state = found_state

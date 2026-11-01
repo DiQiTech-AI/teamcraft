@@ -193,9 +193,9 @@ def _public_entries(directory: Path) -> list[Path]:
 
 def _staging_dirs(directory: Path) -> list[Path]:
     return sorted(p for p in directory.iterdir() if p.name.startswith(".tc-staging-"))
-# M1-04 schema v2 (mechanical version bump, semantics unchanged): v2 is a
-# strictly additive forward migration; the v1 six-table set above remains the
-# documented M1-03 floor and every other assertion in this suite is untouched.
+# M1-04 schema v2 / M1-05 schema v3 (mechanical additive bumps, semantics
+# unchanged): each new version only adds tables, the earlier sets remain the
+# documented floors, and every other assertion in this suite is untouched.
 EXPECTED_TABLES = {
     "schema_migrations",
     "projects",
@@ -204,6 +204,11 @@ EXPECTED_TABLES = {
     "attempts",
     "sessions",
     "task_dependencies",
+    "events",
+    "commands",
+    # SQLite-internal table materialised by the AUTOINCREMENT DDL of
+    # events.seq (M1-05); it appears in sqlite_master from schema creation on.
+    "sqlite_sequence",
 }
 
 
@@ -249,8 +254,8 @@ class StorageM103Tests(unittest.TestCase):
         report = migrate_to_head(self.db)
         self.assertTrue(report.fresh)
         self.assertEqual((report.from_version, report.to_version), (0, SCHEMA_VERSION))
-        # v2 ladder: a fresh database applies (1, 2) in one transaction.
-        self.assertEqual(report.applied, (1, 2))
+        # v3 ladder: a fresh database applies (1, 2, 3) in one transaction.
+        self.assertEqual(report.applied, (1, 2, 3))
 
         conn = connect(self.db)
         self.assertIsInstance(conn, TeamCraftConnection)
@@ -266,7 +271,7 @@ class StorageM103Tests(unittest.TestCase):
             }
             self.assertEqual(tables, EXPECTED_TABLES)
             rows = conn.execute("SELECT version, applied_at FROM schema_migrations").fetchall()
-            self.assertEqual([r[0] for r in rows], [1, 2])
+            self.assertEqual([r[0] for r in rows], [1, 2, 3])
             self.assertIn("+00:00", rows[0][1])  # UTC ISO-8601
             # Foreign keys are actually enforced, not just declared.
             with self.assertRaises(sqlite3.IntegrityError):
@@ -293,7 +298,8 @@ class StorageM103Tests(unittest.TestCase):
         conn = connect(self.db)
         try:
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                SCHEMA_VERSION,
             )
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
@@ -3130,7 +3136,8 @@ class StorageM103Tests(unittest.TestCase):
                 conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION
             )
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                SCHEMA_VERSION,
             )
         finally:
             conn.close()
@@ -3190,7 +3197,8 @@ class StorageM103Tests(unittest.TestCase):
         conn = connect(self.db)
         try:
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
+                conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                SCHEMA_VERSION,
             )
         finally:
             conn.close()
@@ -3712,14 +3720,25 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         """Fixture construction via RAW sqlite: after fix 1 the public
         transaction gate correctly refuses to open against an inconsistent
         v2-claim, so constructing that state must bypass the public API
-        (same pattern as the corrupt-snapshot fixtures above)."""
+        (same pattern as the corrupt-snapshot fixtures above).
+
+        M1-05 adaptation: head is now v3, so an honest v2-claim must also
+        shed the v3 artifacts (events/commands + audit row 3); the signature
+        of the tested fault stays exactly task_dependencies.
+        """
         raw = sqlite3.connect(str(self.db))
         try:
             raw.execute("PRAGMA busy_timeout=5000")
             raw.execute("DROP TABLE IF EXISTS task_dependencies")
+            raw.execute("DROP TABLE IF EXISTS events")
+            raw.execute("DROP TABLE IF EXISTS commands")
+            raw.execute("DELETE FROM schema_migrations WHERE version = 2")
             if back_to_v1:
-                raw.execute("DELETE FROM schema_migrations WHERE version = 2")
+                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
                 raw.execute("PRAGMA user_version=1")
+            else:
+                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+                raw.execute("PRAGMA user_version=2")
             raw.commit()
         finally:
             raw.close()
@@ -3772,7 +3791,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertTrue(lagging["schema_usable"])  # v1 stays fully usable
         self.assertFalse(lagging["at_head"])
         self.assertEqual(lagging["missing_version_tables"], [])
-        self.assertEqual(lagging["missing_head_tables"], ["task_dependencies"])
+        self.assertEqual(lagging["missing_head_tables"], ["commands", "events", "task_dependencies"])
 
     def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
         self._drop_v2_table()
@@ -3814,7 +3833,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         finally:
             probe.close()
         report = migrate_to_head(dest)  # restored v1 can still upgrade
-        self.assertEqual((report.from_version, report.to_version), (1, 2))
+        self.assertEqual((report.from_version, report.to_version), (1, SCHEMA_VERSION))
 
     def test_restore_refuses_snapshot_claiming_v2_without_task_dependencies(self) -> None:
         backups = self.base / "backups"
@@ -3826,6 +3845,13 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         shutil.copyfile(result.backup_path, rogue)
         raw = sqlite3.connect(str(rogue))
         raw.execute("DROP TABLE task_dependencies")
+        # head is v3 now: shed v3 artifacts too so the rogue is a *consistent*
+        # v2 except for the missing task_dependencies — that single fault is
+        # what this gate must catch.
+        raw.execute("DROP TABLE IF EXISTS events")
+        raw.execute("DROP TABLE IF EXISTS commands")
+        raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+        raw.execute("PRAGMA user_version=2")
         raw.commit()
         raw.close()
         manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -3845,6 +3871,243 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             restore_backup(rogue, dest)
         self.assertIn("task_dependencies", str(ctx.exception))
         self.assertFalse(dest.exists())
+
+    # -- M1-05: v3 (events/commands) completeness and crash safety ----------
+
+    def _drop_v3_tables(self, *, back_to_v2: bool = False) -> None:
+        """Raw-sqlite fixture: v3-claim that lost its events/commands tables
+        (the half-state the versioned gate must refuse), or the honest v2
+        state (forward-compatibility proof)."""
+        raw = sqlite3.connect(str(self.db))
+        try:
+            raw.execute("PRAGMA busy_timeout=5000")
+            raw.execute("DROP TABLE IF EXISTS events")
+            raw.execute("DROP TABLE IF EXISTS commands")
+            if back_to_v2:
+                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+                raw.execute("PRAGMA user_version=2")
+            raw.commit()
+        finally:
+            raw.close()
+
+    def test_inconsistent_v3_refused_while_intact_v2_stays_supported(self) -> None:
+        self._drop_v3_tables()  # user_version stays 3, audit stays {1,2,3}
+        broken = verify_database(self.db)
+        self.assertTrue(broken["ok"])  # integrity-only classification unchanged
+        self.assertFalse(broken["schema_usable"])
+        self.assertEqual(broken["missing_version_tables"], ["commands", "events"])
+        conn = connect(self.db)
+        self.addCleanup(conn.close)
+        with self.assertRaises(StorageError) as ctx:
+            with transaction(conn):
+                conn.execute(
+                    "INSERT INTO projects (id, name, repo_path, created_at)"
+                    " VALUES ('p-x', 'x', '/x', '2026-11-01T00:00:00+00:00')"
+                )
+        self.assertIn("events", str(ctx.exception))
+
+        # Honest v2 keeps full pre-M1-05 support (forward compatibility):
+        self._drop_v3_tables(back_to_v2=True)
+        lagging = verify_database(self.db)
+        self.assertTrue(lagging["ok"])
+        self.assertTrue(lagging["schema_usable"])
+        self.assertFalse(lagging["at_head"])
+        self.assertEqual(lagging["missing_version_tables"], [])
+        conn2 = connect(self.db)
+        self.addCleanup(conn2.close)
+        with transaction(conn2):
+            conn2.execute(
+                "INSERT INTO projects (id, name, repo_path, created_at)"
+                " VALUES ('p-v2', 'v2', '/v2', '2026-11-01T00:00:00+00:00')"
+            )
+        self.assertEqual(
+            conn2.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1
+        )
+        # …and a later upgrade adds v3 exactly once, converging to head.
+        report = migrate_to_head(self.db)
+        self.assertEqual((report.from_version, report.to_version), (2, 3))
+        self.assertEqual(report.applied, (3,))
+        conn3 = connect(self.db)
+        self.addCleanup(conn3.close)
+        with transaction(conn3):
+            conn3.execute(
+                "INSERT INTO events (event_id, kind, occurred_at)"
+                " VALUES ('e-v3', 'project.registered',"
+                " '2026-11-01T00:00:00+00:00')"
+            )
+        self.assertEqual(
+            conn3.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1
+        )
+
+    def test_migration_crash_mid_v3_leaves_intact_v2_and_retry_converges(self) -> None:
+        self._drop_v3_tables(back_to_v2=True)  # start from an honest v2
+
+        def boom(index: int, statement: str) -> None:
+            if "CREATE TABLE events" in statement:
+                raise RuntimeError("simulated crash mid-v3")
+
+        storage.MIGRATION_STATEMENT_HOOK = boom
+        try:
+            # hook exceptions propagate unwrapped, same as the M1-03/M1-04
+            # crash regressions.
+            with self.assertRaises(RuntimeError):
+                migrate_to_head(self.db)
+        finally:
+            storage.MIGRATION_STATEMENT_HOOK = None
+        # rolled back completely: still an intact, usable v2 — no half v3.
+        info = verify_database(self.db)
+        self.assertEqual(info["user_version"], 2)
+        self.assertTrue(info["ok"])
+        self.assertTrue(info["schema_usable"])
+        self.assertFalse(info["at_head"])
+        raw = sqlite3.connect(str(self.db))
+        try:
+            self.assertEqual(raw.execute("PRAGMA user_version").fetchone()[0], 2)
+            names = {
+                row[0] for row in raw.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertNotIn("events", names)
+            self.assertNotIn("commands", names)
+            self.assertEqual(
+                [row[0] for row in raw.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )],
+                [1, 2],
+            )
+        finally:
+            raw.close()
+        # retry converges (idempotent recovery, 8.2-14)
+        report = migrate_to_head(self.db)
+        self.assertEqual((report.from_version, report.to_version), (2, 3))
+        self.assertTrue(verify_database(self.db)["at_head"])
+
+    # -- M1-05 P1: integrity objects (triggers/indexes) are gated too --------
+
+    def _fresh_copy(self, name: str) -> Path:
+        """A separate fresh head database inside this test's temp directory."""
+
+        target = self.base / name
+        report = migrate_to_head(target)
+        self.assertTrue(report.fresh)
+        return target
+
+    def test_missing_integrity_triggers_fail_closed_at_every_gate(self) -> None:
+        """CEO repro: DROP TRIGGER must NOT leave a v3 database usable.
+
+        verify_database reports it incomplete, the public write transaction
+        refuses (UPDATE events can never execute through the facade again),
+        and migrate_to_head refuses rather than treating the corrupted head
+        as healthy or silently re-creating the trigger.
+        """
+
+        for trigger in (
+            "trg_events_no_update",
+            "trg_events_no_delete",
+            "trg_commands_no_delete",
+        ):
+            with self.subTest(trigger):
+                db = self._fresh_copy(f"drop-{trigger}.db")
+                raw = sqlite3.connect(str(db))
+                raw.execute(f"DROP TRIGGER {trigger}")
+                raw.commit()
+                raw.close()
+                info = verify_database(db)
+                self.assertTrue(info["ok"])  # the FILE is structurally intact…
+                self.assertFalse(info["schema_usable"])  # …the schema is not
+                self.assertFalse(info["at_head"])
+                self.assertEqual(info["missing_version_tables"], [])
+                self.assertEqual(info["missing_version_triggers"], [trigger])
+                conn = connect(db)
+                try:
+                    with self.assertRaises(StorageError) as ctx:
+                        with transaction(conn):
+                            conn.execute("UPDATE events SET kind = 'tampered'")
+                    self.assertIn(trigger, str(ctx.exception))
+                finally:
+                    conn.close()
+                with self.assertRaises(MigrationError):
+                    migrate_to_head(db)
+                # refusing is NOT repairing: the trigger stays absent
+                raw = sqlite3.connect(str(db))
+                try:
+                    names = {
+                        row[0]
+                        for row in raw.execute(
+                            "SELECT name FROM sqlite_master"
+                            " WHERE type = 'trigger'"
+                        )
+                    }
+                finally:
+                    raw.close()
+                self.assertNotIn(trigger, names)
+
+    def test_missing_v3_indexes_fail_closed(self) -> None:
+        for index in ("idx_events_task_seq", "idx_commands_state"):
+            with self.subTest(index):
+                db = self._fresh_copy(f"drop-{index}.db")
+                raw = sqlite3.connect(str(db))
+                raw.execute(f"DROP INDEX {index}")
+                raw.commit()
+                raw.close()
+                info = verify_database(db)
+                self.assertTrue(info["ok"])
+                self.assertFalse(info["schema_usable"])
+                self.assertFalse(info["at_head"])
+                self.assertEqual(info["missing_version_triggers"], [])
+                self.assertEqual(info["missing_version_indexes"], [index])
+                conn = connect(db)
+                self.addCleanup(conn.close)
+                with self.assertRaises(StorageError):
+                    with transaction(conn):
+                        conn.execute(
+                            "INSERT INTO projects (id, name, repo_path,"
+                            " created_at) VALUES ('p-x', 'x', '/x',"
+                            " '2026-11-01T00:00:00+00:00')"
+                        )
+
+    def test_complete_head_satisfies_all_object_gates(self) -> None:
+        """The healthy head schema passes every new object check and the
+        append-only triggers are verifiably live."""
+
+        db = self._fresh_copy("complete-head.db")
+        info = verify_database(db)
+        self.assertTrue(info["ok"])
+        self.assertTrue(info["schema_usable"])
+        self.assertTrue(info["at_head"])
+        self.assertEqual(info["missing_version_triggers"], [])
+        self.assertEqual(info["missing_version_indexes"], [])
+        self.assertEqual(info["missing_head_objects"], [])
+        conn = connect(db)
+        self.addCleanup(conn.close)
+        with transaction(conn):
+            conn.execute(
+                "INSERT INTO projects (id, name, repo_path, created_at)"
+                " VALUES ('p-ok', 'ok', '/ok', '2026-11-01T00:00:00+00:00')"
+            )
+        raw = sqlite3.connect(str(db))
+        self.addCleanup(raw.close)
+        # seed one row first: row-level triggers only fire when a statement
+        # actually matches rows
+        raw.execute(
+            "INSERT INTO events (event_id, kind, occurred_at)"
+            " VALUES ('e-live', 'audit.seed', '2026-11-01T00:00:00+00:00')"
+        )
+        raw.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            raw.execute("UPDATE events SET kind = 'tampered'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            raw.execute("DELETE FROM events")
+        raw.execute(
+            "INSERT INTO commands (id, idempotency_key, kind, payload_json,"
+            " evidence_json, state, requested_at, updated_at)"
+            " VALUES ('c1', 'k1', 'task.pause', '{}', '{}', 'pending',"
+            " '2026-11-01T00:00:00+00:00', '2026-11-01T00:00:00+00:00')"
+        )
+        raw.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            raw.execute("DELETE FROM commands")
 
 
 if __name__ == "__main__":

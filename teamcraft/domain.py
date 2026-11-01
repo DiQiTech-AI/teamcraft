@@ -65,7 +65,11 @@ Hard invariants pinned by tests (``tests/test_domain_m104.py``):
    (no occupying attempt); UNKNOWN always demands reconcile first; and
    dependencies are conservatively same-Project only — PLAN/ADR leave
    cross-Project semantics unspecified, so this implementation rejects them
-   (CEO review P1-A).
+   (CEO review P1-A);
+7. **Evidence-version bumps invalidate queued commands** (M1-05): every
+   accepted Task CAS bump atomically expires PENDING commands whose evidence
+   binds this Task at an older version (review 8.2-6 principle), inside the
+   same transaction (:mod:`teamcraft.commands` layer).
 """
 
 from __future__ import annotations
@@ -78,6 +82,7 @@ from typing import Any, Iterator
 
 from . import storage
 from .clock import Clock, SystemClock
+from .commands import invalidate_stale_commands_for_task
 from .errors import (
     AttemptSlotOccupiedError,
     ConflictError,
@@ -438,6 +443,11 @@ def _cas_task(
             expected=expected_version,
             found=current.version,
         )
+    # M1-05 (review 8.2-6 principle): this bump IS the evidence-version
+    # change — PENDING commands bound to an older version of this Task are
+    # invalidated atomically with it, so a queued side effect can never fire
+    # against facts that no longer exist.
+    invalidate_stale_commands_for_task(conn, task.id, now=now)
     return _fetch_task(conn, task.id)
 
 
