@@ -11,7 +11,15 @@ permission:
   grep: allow
   list: allow
   edit: allow
-  bash: allow
+  bash:
+    "*": ask
+    "pwd": allow
+    "ls": allow
+    "find .": allow
+    "rg .": allow
+    "git status --short": allow
+    "git --no-pager diff --no-ext-diff --no-color": allow
+    "git --no-pager log --oneline -10": allow
   external_directory: deny
   webfetch: deny
   websearch: deny
