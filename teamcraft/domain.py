@@ -58,7 +58,14 @@ Hard invariants pinned by tests (``tests/test_domain_m104.py``):
 5. **Schema head is demanded**: domain services refuse to run against an
    audited-but-lagging v1 database with
    :class:`teamcraft.errors.SchemaOutOfDateError`, while the storage layer's
-   own contracts keep working there (M1-03 compatibility).
+   own contracts keep working there (M1-03 compatibility);
+6. **Execution completion gates terminal Task movement** (CEO review P1-B):
+   ``worker_reported_done`` / DONE / FAILED / CANCELLED refuse unless the
+   current Attempt is ``finished`` (success claims) or at least settled
+   (no occupying attempt); UNKNOWN always demands reconcile first; and
+   dependencies are conservatively same-Project only — PLAN/ADR leave
+   cross-Project semantics unspecified, so this implementation rejects them
+   (CEO review P1-A).
 """
 
 from __future__ import annotations
@@ -482,6 +489,97 @@ _FACT_GUARDED_TASK_EVENTS = frozenset({"dependencies_satisfied"})
 #: event outright instead of trusting the caller to follow with a dispatch.
 _DISPATCH_EVENT = "dispatch_reserved"
 
+#: ``worker_reported_done`` asserts that a worker finished an execution
+#: (PLAN 5.1 "仅启动验证" presupposes a finished Attempt; M0 review 8.2-4
+#: "Worker 完成表示 Attempt 已停止执行并提交结构化结果").
+_WORKER_DONE_EVENT = "worker_reported_done"
+
+_CURRENT_ATTEMPT_SQL = (
+    "SELECT id, status FROM attempts WHERE task_id = ? ORDER BY attempt_no DESC LIMIT 1"
+)
+_OCCUPYING_ORDERED_SQL = (
+    "SELECT id, status FROM attempts WHERE task_id = ?" + _OCCUPYING_SQL
+    + " ORDER BY attempt_no DESC LIMIT 1"
+)
+
+
+def _require_execution_finished(
+    conn: TeamCraftConnection, task: Task, event: str, resolved: str
+) -> None:
+    """Shared scout/ship execution-completion guard (CEO review M1-04 P1-B).
+
+    Enforced for ``worker_reported_done`` and every transition reaching a
+    terminal Task status:
+
+    * success claims (``worker_reported_done``, or a transition into DONE)
+      require the Task's current Attempt to be ``finished`` — an Attempt in
+      created/starting/active has not stopped executing, failed/cancelled
+      cannot masquerade as success, and an unresolved UNKNOWN must NEVER pass
+      the ordinary path (reconcile-class transition first, M0 review 8.2-11);
+    * non-success terminal exits (FAILED/CANCELLED) may not leave an attempt
+      occupying the slot — settle it first (abandon/fail/reconcile);
+    * everything else (READY claims, retry via verification_failed,
+      needs_human, blocked) is untouched: verification/approval/delivery
+      semantics are unchanged beyond this gate.
+
+    Runs inside the caller's write transaction; a refusal writes nothing.
+    """
+
+    def refuse(reason: str, message: str) -> IllegalTransitionError:
+        return IllegalTransitionError(
+            message, entity="task", current=task.status, event=event, reason_code=reason
+        )
+
+    success_claim = event == _WORKER_DONE_EVENT or resolved == "done"
+    occupying = conn.execute(_OCCUPYING_ORDERED_SQL, (task.id,)).fetchone()
+    if success_claim:
+        row = occupying
+        if row is None:
+            row = conn.execute(_CURRENT_ATTEMPT_SQL, (task.id,)).fetchone()
+        if row is None:
+            raise refuse(
+                "NO_EXECUTION_ATTEMPT",
+                f"task {task.id} event {event!r}: no Attempt has ever run for "
+                "this Task; completion claims require a finished Attempt",
+            )
+        status = str(row[1])
+        if status == "finished":
+            return
+        if status == "unknown":
+            raise refuse(
+                "EXECUTION_UNRESOLVED_RECONCILE_REQUIRED",
+                f"task {task.id} event {event!r}: Attempt {row[0]} is UNKNOWN; "
+                "a reconcile-class Attempt transition "
+                "(reconciled_finished/reconciled_failed) is required first",
+            )
+        if status in ("failed", "cancelled"):
+            raise refuse(
+                "EXECUTION_NOT_SUCCESSFUL",
+                f"task {task.id} event {event!r}: latest Attempt {row[0]} is "
+                f"{status!r}; failed/cancelled execution cannot masquerade as "
+                "completion",
+            )
+        raise refuse(
+            "EXECUTION_NOT_FINISHED",
+            f"task {task.id} event {event!r}: current Attempt {row[0]} is "
+            f"{status!r} and still occupying the slot; execution has not "
+            "finished",
+        )
+    if resolved in TERMINAL_TASK_STATUSES and occupying is not None:
+        if str(occupying[1]) == "unknown":
+            raise refuse(
+                "EXECUTION_UNRESOLVED_RECONCILE_REQUIRED",
+                f"task {task.id} event {event!r}: Attempt {occupying[0]} is "
+                "UNKNOWN and holds the slot; reconcile it before terminalizing "
+                "the Task",
+            )
+        raise refuse(
+            "EXECUTION_NOT_FINISHED",
+            f"task {task.id} event {event!r}: Attempt {occupying[0]} is "
+            f"{occupying[1]!r} and still holds the slot; settle it "
+            "(abandon/fail) so the Task does not end with a dangling attempt",
+        )
+
 _UNFINISHED_DEPS_SQL = (
     "SELECT p.id, p.status FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on_id"
     " WHERE d.task_id = ? AND p.status <> 'done' ORDER BY p.id"
@@ -704,7 +802,11 @@ def apply_task_event(
     NOT applicable here: READY->RUNNING only happens atomically with an
     attempt reservation via :func:`create_attempt` (CEO review M1-04 fix 2);
     using it through this generic door raises reason code
-    ``RESERVATION_REQUIRED``.
+    ``RESERVATION_REQUIRED``.  ``worker_reported_done`` and every transition
+    into a terminal status pass the shared execution-completion guard
+    (:func:`_require_execution_finished`): DONE etc. require the current
+    Attempt to be ``finished``; UNKNOWN demands reconcile first
+    (CEO review M1-04 P1-B).
     """
 
     require_head(conn)
@@ -724,6 +826,8 @@ def apply_task_event(
         resolved = _resolve_target("task", task.status, event, targets, target)
         if event in _FACT_GUARDED_TASK_EVENTS:
             _require_deps_done(conn, task, event)
+        if event == _WORKER_DONE_EVENT or resolved in TERMINAL_TASK_STATUSES:
+            _require_execution_finished(conn, task, event, resolved)
         return _cas_task(conn, task, status=resolved, expected_version=expected_version, now=_utc_iso(clock))
 
 
@@ -766,6 +870,16 @@ def add_dependency(
     with _tx(conn):
         task = _fetch_task(conn, task_id)
         dependency = _fetch_task(conn, depends_on_id)
+        # PLAN/ADR do not specify cross-Project dependency semantics, and no
+        # scheduler behavior exists for such edges, so this implementation
+        # conservatively rejects them here — BEFORE any write, status, or
+        # version side effect (CEO review M1-04 P1-A).
+        _require(
+            task.project_id == dependency.project_id,
+            f"cross-Project dependency is not authorized: task {task.id} lives "
+            f"in project {task.project_id} but depends_on {dependency.id} lives "
+            f"in project {dependency.project_id}",
+        )
         _require(
             task.status not in TERMINAL_TASK_STATUSES,
             f"cannot edit dependencies of terminal task {task.id} ({task.status})",

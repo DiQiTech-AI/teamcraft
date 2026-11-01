@@ -34,7 +34,15 @@ Pinned contracts:
 * domain services demand head: an audited-but-lagging v1 database raises
   ``SchemaOutOfDateError`` while raw storage writes still work there;
 * domain writes are atomic across an outer ``storage.transaction`` (shared
-  rollback), proving the APIs join rather than nest transactions.
+  rollback), proving the APIs join rather than nest transactions;
+* dependencies are same-Project only: cross-Project edges raise
+  ``ValidationError`` before any write (same-Project adds remain legal and
+  bump the owning Task exactly once) (CEO review M1-04 P1-A);
+* execution completion gates terminal Task movement: ``worker_reported_done``
+  and any transition into DONE/FAILED/CANCELLED refuse unless the current
+  Attempt is ``finished`` — UNKNOWN demands a reconcile-class closure first,
+  created/starting/active still occupy the slot, failed/cancelled never
+  masquerade as success, and refusals write nothing (CEO review M1-04 P1-B).
 """
 
 from __future__ import annotations
@@ -107,6 +115,47 @@ class DomainM104Tests(unittest.TestCase):
         task = domain.get_task(self.conn, task.id)
         assert task.status == "running"
         return task
+
+    def settle_finished(self, task_id: str) -> domain.Attempt:
+        """created->starting->active->finished (P1-B: execution must actually
+        finish before the Task may claim completion)."""
+        att = domain.occupying_attempt(self.conn, task_id)
+        assert att is not None
+        if att.status == "created":
+            att = domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        if att.status == "starting":
+            att = domain.transition_attempt(self.conn, att.id, "activated", clock=self.clock)
+        if att.status == "active":
+            att = domain.transition_attempt(
+                self.conn, att.id, "finish", result_json='{"ok": true}',
+                clock=self.clock,
+            )
+        assert att.status == "finished"
+        return att
+
+    def settle_cancelled(self, task_id: str) -> domain.Attempt:
+        """Settle an occupying attempt to cancelled without claiming success."""
+        att = domain.occupying_attempt(self.conn, task_id)
+        assert att is not None
+        if att.status == "created":
+            att = domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        if att.status == "starting":
+            att = domain.transition_attempt(self.conn, att.id, "abandon", clock=self.clock)
+        assert att.status == "cancelled"
+        return att
+
+    def claim_done(self, task: domain.Task) -> domain.Task:
+        """worker_reported_done using the caller's version view."""
+        return domain.apply_task_event(
+            self.conn, task.id, "worker_reported_done",
+            expected_version=task.version, clock=self.clock,
+        )
+
+    def claim_refused(self, task: domain.Task, reason: str) -> None:
+        """Assert the completion claim is refused with this exact reason code."""
+        with self.assertRaises(IllegalTransitionError) as ctx:
+            self.claim_done(task)
+        self.assertEqual(ctx.exception.reason_code, reason)
 
     def raw_task_update(self, task_id: str, status: str) -> None:
         """Test scaffold: drive a task to a status SQL-directly (simulates
@@ -186,6 +235,7 @@ class DomainM104Tests(unittest.TestCase):
         self.assertEqual(attempt.attempt_no, 1)
         task = domain.get_task(self.conn, task.id)
         self.assertEqual((task.status, task.version), ("running", 2))
+        self.settle_finished(task.id)  # P1-B: finish the execution first
         task = domain.apply_task_event(
             self.conn, task.id, "worker_reported_done",
             expected_version=task.version, clock=self.clock,
@@ -206,6 +256,7 @@ class DomainM104Tests(unittest.TestCase):
         task = self.ready_task("scout-docs", kind="scout")
         task = self.run_task(task)
         self.assertEqual(task.status, "running")
+        self.settle_finished(task.id)  # P1-B: scout must finish its attempt too
         task = domain.apply_task_event(
             self.conn, task.id, "worker_reported_done",
             expected_version=task.version, clock=self.clock,
@@ -273,8 +324,18 @@ class DomainM104Tests(unittest.TestCase):
                 task = domain.get_task(self.conn, task.id)
             if kind_status == "running":
                 task = self.run_task(task)
+                # P1-B: a running task may not vanish while its Attempt still
+                # holds the slot; the attempt must be settled first.
+                with self.assertRaises(IllegalTransitionError) as ctx:
+                    domain.apply_task_event(
+                        self.conn, task.id, "user_cancel",
+                        expected_version=task.version, clock=self.clock,
+                    )
+                self.assertEqual(ctx.exception.reason_code, "EXECUTION_NOT_FINISHED")
+                self.settle_cancelled(task.id)
             elif kind_status == "blocked":
                 task = self.run_task(task)
+                self.settle_finished(task.id)  # P1-B: finish before claiming done
                 task = domain.apply_task_event(
                     self.conn, task.id, "worker_reported_done",
                     expected_version=task.version, clock=self.clock,
@@ -285,9 +346,37 @@ class DomainM104Tests(unittest.TestCase):
                 )
             elif kind_status == "needs_human":
                 task = self.run_task(task)
+                att = domain.occupying_attempt(self.conn, task.id)
+                domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+                domain.transition_attempt(self.conn, att.id, "activated", clock=self.clock)
                 task = domain.apply_task_event(
                     self.conn, task.id, "runtime_unknown",
                     expected_version=task.version, target="needs_human", clock=self.clock,
+                )
+                # Cancelling while the attempt is still active is refused...
+                with self.assertRaises(IllegalTransitionError) as ctx:
+                    domain.apply_task_event(
+                        self.conn, task.id, "user_cancel",
+                        expected_version=task.version, clock=self.clock,
+                    )
+                self.assertEqual(ctx.exception.reason_code, "EXECUTION_NOT_FINISHED")
+                # ...and so is cancelling with an unresolved UNKNOWN; the
+                # reconcile-class transition must close the fact first.
+                domain.transition_attempt(
+                    self.conn, att.id, "runtime_lost", clock=self.clock
+                )
+                with self.assertRaises(IllegalTransitionError) as ctx:
+                    domain.apply_task_event(
+                        self.conn, task.id, "user_cancel",
+                        expected_version=task.version, clock=self.clock,
+                    )
+                self.assertEqual(
+                    ctx.exception.reason_code,
+                    "EXECUTION_UNRESOLVED_RECONCILE_REQUIRED",
+                )
+                domain.transition_attempt(
+                    self.conn, att.id, "reconciled_failed",
+                    result_json='{"evidence": "operator audit"}', clock=self.clock,
                 )
             self.assertEqual(task.status, kind_status)
             task = domain.apply_task_event(
@@ -301,6 +390,217 @@ class DomainM104Tests(unittest.TestCase):
                     self.conn, task.id, "user_cancel",
                     expected_version=task.version, clock=self.clock,
                 )
+
+    # -- execution-completion guard (CEO review M1-04 P1-B) ---------------------
+
+    def test_regression_done_with_occupying_attempt_is_blocked(self) -> None:
+        """P1-B regression: reproduces the hole first, then proves it closed.
+
+        At commit ccce94b a scout Task could walk running ->
+        worker_reported_done -> verifying -> verification_passed -> DONE while
+        its only Attempt still sat in CREATED (and likewise STARTING/ACTIVE/
+        UNKNOWN): the scheduler called a Task complete whose execution never
+        stopped.  The shared guard now refuses the claim in every occupying
+        status, UNKNOWN demands a reconcile-class closure first (review
+        8.2-11), and only a ``finished`` Attempt lets the Task complete.
+        """
+        task = self.ready_task("hole", kind="scout")
+        task = self.run_task(task)  # Attempt lands in CREATED
+        att = domain.occupying_attempt(self.conn, task.id)
+        self.assertEqual(att.status, "created")
+        # REPRO: completion claimed while the Attempt merely exists.
+        self.claim_refused(task, "EXECUTION_NOT_FINISHED")
+        # STARTING and ACTIVE are equally "not finished".
+        domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        self.claim_refused(task, "EXECUTION_NOT_FINISHED")
+        domain.transition_attempt(self.conn, att.id, "activated", clock=self.clock)
+        self.claim_refused(task, "EXECUTION_NOT_FINISHED")
+        # UNKNOWN must never pass the ordinary path — reconcile first.
+        domain.transition_attempt(self.conn, att.id, "runtime_lost", clock=self.clock)
+        self.claim_refused(task, "EXECUTION_UNRESOLVED_RECONCILE_REQUIRED")
+        untouched = domain.get_task(self.conn, task.id)
+        self.assertEqual(
+            (untouched.status, untouched.version), ("running", task.version)
+        )  # refusals wrote nothing
+        # reconciled_finished lifts the gate and the scout completes normally.
+        domain.transition_attempt(
+            self.conn, att.id, "reconciled_finished",
+            result_json='{"evidence": "recovered output"}', clock=self.clock,
+        )
+        task = self.claim_done(task)
+        self.assertEqual(task.status, "verifying")
+        task = domain.apply_task_event(
+            self.conn, task.id, "verification_passed",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual(task.status, "done")
+        self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
+
+    def test_ship_completion_chain_requires_finished_attempt(self) -> None:
+        task = self.ready_task("ship-chain")
+        task = self.run_task(task)
+        self.claim_refused(task, "EXECUTION_NOT_FINISHED")  # CREATED blocks
+        self.settle_finished(task.id)
+        task = self.claim_done(task)
+        self.assertEqual(task.status, "verifying")
+        task = domain.apply_task_event(
+            self.conn, task.id, "verification_passed",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual(task.status, "ready_to_merge")
+        task = domain.apply_task_event(
+            self.conn, task.id, "approved_and_delivered",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual((task.status, task.version), ("done", 5))
+
+    def test_active_attempt_cannot_claim_done_and_version_is_untouched(self) -> None:
+        task = self.ready_task("active-refusal")
+        task = self.run_task(task)
+        att = domain.occupying_attempt(self.conn, task.id)
+        domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        domain.transition_attempt(self.conn, att.id, "activated", clock=self.clock)
+        self.claim_refused(task, "EXECUTION_NOT_FINISHED")
+        after = domain.get_task(self.conn, task.id)
+        self.assertEqual((after.status, after.version), ("running", task.version))
+
+    def test_failed_attempt_cannot_masquerade_as_success(self) -> None:
+        task = self.ready_task("masquerade")
+        task = self.run_task(task)
+        att = domain.occupying_attempt(self.conn, task.id)
+        domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        domain.transition_attempt(
+            self.conn, att.id, "start_failed",
+            result_json='{"error": "boom"}', clock=self.clock,
+        )
+        self.claim_refused(task, "EXECUTION_NOT_SUCCESSFUL")
+        # A settled (cancelled) attempt may end the Task non-successfully,
+        # but never through a success claim:
+        task = self.ready_task("masquerade-cancel")
+        task = self.run_task(task)
+        self.settle_cancelled(task.id)
+        task = domain.apply_task_event(
+            self.conn, task.id, "user_cancel",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual(task.status, "cancelled")
+
+    def test_recovery_after_failed_execution_completes_via_new_attempt(self) -> None:
+        task = self.ready_task("recovery")
+        task = self.run_task(task)
+        att = domain.occupying_attempt(self.conn, task.id)
+        domain.transition_attempt(self.conn, att.id, "start", clock=self.clock)
+        domain.transition_attempt(
+            self.conn, att.id, "start_failed",
+            result_json='{"error": "agent died"}', clock=self.clock,
+        )
+        self.claim_refused(task, "EXECUTION_NOT_SUCCESSFUL")
+        # repair loop: needs_human -> reconciled back to READY, reserve a
+        # second attempt, and only its finish unlocks the success path.
+        task = domain.apply_task_event(
+            self.conn, task.id, "runtime_unknown",
+            expected_version=task.version, target="needs_human", clock=self.clock,
+        )
+        task = domain.apply_task_event(
+            self.conn, task.id, "human_reconciled",
+            expected_version=task.version, target="ready", clock=self.clock,
+        )
+        self.assertEqual(task.status, "ready")
+        second = domain.create_attempt(
+            self.conn, task.id, expected_version=task.version, clock=self.clock
+        )
+        self.assertEqual(second.attempt_no, 2)
+        self.settle_finished(task.id)
+        task = self.claim_done(domain.get_task(self.conn, task.id))
+        task = domain.apply_task_event(
+            self.conn, task.id, "verification_passed",
+            expected_version=task.version, clock=self.clock,
+        )
+        task = domain.apply_task_event(
+            self.conn, task.id, "approved_and_delivered",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual(task.status, "done")
+
+    def test_terminal_done_is_frozen_after_guarded_completion(self) -> None:
+        task = self.ready_task("frozen")
+        task = self.run_task(task)
+        self.settle_finished(task.id)
+        task = self.claim_done(task)
+        task = domain.apply_task_event(
+            self.conn, task.id, "verification_passed",
+            expected_version=task.version, clock=self.clock,
+        )
+        task = domain.apply_task_event(
+            self.conn, task.id, "approved_and_delivered",
+            expected_version=task.version, clock=self.clock,
+        )
+        self.assertEqual(task.status, "done")
+        for event in (
+            "user_cancel", "worker_reported_done", "approved_and_delivered",
+            "dispatch_reserved", "verification_passed",
+        ):
+            with self.assertRaises(IllegalTransitionError):
+                domain.apply_task_event(
+                    self.conn, task.id, event,
+                    expected_version=task.version, clock=self.clock,
+                )
+        self.assertEqual(domain.get_task(self.conn, task.id).version, task.version)
+        self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
+
+    def test_outer_storage_transaction_commits_whole_execution_chain(self) -> None:
+        """Domain writes JOIN an outer storage.transaction (CEO review P1-B):
+        reservation, attempt lifecycle, and every Task event land in one
+        COMMIT."""
+        task = self.ready_task("tx-commit")
+        with storage.transaction(self.conn):
+            domain.create_attempt(
+                self.conn, task.id, expected_version=task.version, clock=self.clock
+            )
+            self.settle_finished(task.id)
+            running = domain.get_task(self.conn, task.id)
+            verifying = domain.apply_task_event(
+                self.conn, task.id, "worker_reported_done",
+                expected_version=running.version, clock=self.clock,
+            )
+            self.assertEqual(verifying.status, "verifying")
+            merge = domain.apply_task_event(
+                self.conn, task.id, "verification_passed",
+                expected_version=verifying.version, clock=self.clock,
+            )
+            done = domain.apply_task_event(
+                self.conn, task.id, "approved_and_delivered",
+                expected_version=merge.version, clock=self.clock,
+            )
+            self.assertEqual((done.status, done.version), ("done", 5))
+        after = domain.get_task(self.conn, task.id)
+        self.assertEqual((after.status, after.version), ("done", 5))  # committed
+        self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
+
+    def test_outer_storage_transaction_rolls_back_everything(self) -> None:
+        task = self.ready_task("tx-rollback")
+        with self.assertRaises(RuntimeError):
+            with storage.transaction(self.conn):
+                domain.create_attempt(
+                    self.conn, task.id,
+                    expected_version=task.version, clock=self.clock,
+                )
+                self.settle_finished(task.id)
+                running = domain.get_task(self.conn, task.id)
+                domain.apply_task_event(
+                    self.conn, task.id, "worker_reported_done",
+                    expected_version=running.version, clock=self.clock,
+                )
+                raise RuntimeError("operator abort")
+        after = domain.get_task(self.conn, task.id)
+        self.assertEqual((after.status, after.version), ("ready", task.version))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE task_id = ?", (task.id,)
+            ).fetchone()[0],
+            0,
+        )  # attempt rows rolled back with the Task CAS
+        self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
 
     # -- optimistic versioning ----------------------------------------------------
 
@@ -644,6 +944,53 @@ class DomainM104Tests(unittest.TestCase):
         self.assertEqual(domain.dependencies_of(self.conn, a.id), [])
         with self.assertRaises(NotFoundError):
             domain.dependencies_of(self.conn, "z" * 24)
+
+    def test_cross_project_dependency_rejected_before_any_write(self) -> None:
+        """CEO review M1-04 P1-A: PLAN/ADR do not explicitly address
+        cross-Project dependencies; this implementation conservatively
+        rejects them, before any write, status, or version side effect;
+        same-Project edges stay legal.
+        """
+        a = self.ready_task("home")
+        foreign = domain.create_project(
+            self.conn, "foreign", "/repo/foreign", clock=self.clock
+        )
+        b = domain.create_task(self.conn, foreign.id, "foreign-task", clock=self.clock)
+        self.assertEqual(b.project_id, foreign.id)
+        for owner, dep in ((a, b), (b, a)):  # either direction is unauthorized
+            with self.assertRaises(ValidationError):
+                domain.add_dependency(
+                    self.conn, owner.id, dep.id,
+                    expected_version=owner.version, clock=self.clock,
+                )
+            self.assertEqual(domain.dependencies_of(self.conn, owner.id), [])
+            self.assertEqual(
+                domain.get_task(self.conn, owner.id).version, owner.version
+            )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM task_dependencies").fetchone()[0],
+            0,
+        )  # rejection wrote nothing anywhere
+        # Same-Project control: the edge lands and bumps the owner exactly once.
+        c = self.make_task("same-project")
+        self.assertTrue(
+            domain.add_dependency(
+                self.conn, c.id, a.id, expected_version=c.version, clock=self.clock
+            )
+        )
+        self.assertEqual(domain.dependencies_of(self.conn, c.id), [a.id])
+        self.assertEqual(
+            domain.get_task(self.conn, c.id).version, c.version + 1
+        )
+        # Stale expected_version conflicts before any write (CEO review #1).
+        d = self.make_task("stale-edge")
+        with self.assertRaises(VersionConflictError):
+            domain.add_dependency(
+                self.conn, d.id, c.id, expected_version=d.version + 7,
+                clock=self.clock,
+            )
+        self.assertEqual(domain.dependencies_of(self.conn, d.id), [])
+        self.assertEqual(domain.get_task(self.conn, d.id).version, d.version)
 
     def test_dependency_edits_follow_task_status(self) -> None:
         a = self.ready_task("locked")
