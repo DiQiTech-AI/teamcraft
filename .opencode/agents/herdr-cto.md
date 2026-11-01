@@ -11,54 +11,7 @@ permission:
   grep: allow
   list: allow
   edit: allow
-  bash:
-    "*": ask
-    "pwd": allow
-    "ls": allow
-    "ls *": allow
-    "find *": allow
-    "rg *": allow
-    "grep *": allow
-    "sed *": allow
-    "awk *": allow
-    "head *": allow
-    "tail *": allow
-    "cat *": allow
-    "file *": allow
-    "stat *": allow
-    "wc *": allow
-    "sort *": allow
-    "uniq *": allow
-    "diff *": allow
-    "mkdir *": allow
-    "cp *": allow
-    "mv *": allow
-    "touch *": allow
-    "git *": allow
-    "python -m unittest *": allow
-    "python -B -m unittest *": allow
-    "python3 -m unittest *": allow
-    "python3 -B -m unittest *": allow
-    "python -m pytest *": allow
-    "python -B -m pytest *": allow
-    "python3 -m pytest *": allow
-    "python3 -B -m pytest *": allow
-    "pytest *": allow
-    "uv run pytest *": allow
-    "uv run python -m unittest *": allow
-    "uv run python3 -m unittest *": allow
-    "gh *": deny
-    "curl *": deny
-    "wget *": deny
-    "ssh *": deny
-    "scp *": deny
-    "sudo *": deny
-    "rm *": deny
-    "rmdir *": deny
-    "unlink *": deny
-    "truncate *": deny
-    "kill *": deny
-    "pkill *": deny
+  bash: allow
   external_directory: deny
   webfetch: deny
   websearch: deny
