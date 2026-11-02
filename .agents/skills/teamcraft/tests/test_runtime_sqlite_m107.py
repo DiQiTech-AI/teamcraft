@@ -318,6 +318,28 @@ class SqliteRuntimeTests(unittest.TestCase):
         view = self.store.read_unlocked()
         self.assertEqual(view["members"]["dev"]["phase"], "reserved")
 
+    def test_write_unlocked_without_member_identity_cannot_mutate(self):
+        # CEO follow-up: the identity-free write bypass must not exist.
+        teamctl.reserve_member(self.store, self.session,
+                             make_member("dev", ["src/**"]))
+        state = self.store.read_unlocked()
+        state["members"]["dev"]["phase"] = "released"  # tampered working copy
+        # Identity has no default anymore: omitting it is a hard TypeError.
+        with self.assertRaises(TypeError):
+            self.store.write_unlocked(state)
+        for bad in ("", "   ", None, "ghost"):
+            with self.subTest(member=repr(bad)), \
+                    self.assertRaises(teamctl.TeamctlError):
+                self.store.write_unlocked(state, member=bad)
+        # None of the refused attempts touched the authoritative store.
+        view = self.store.read_unlocked()
+        self.assertEqual(view["members"]["dev"]["phase"], "reserved")
+        # Honest identity still works (initialization/reservation preserved).
+        teamctl.update_member(self.store, self.session, "dev",
+                             phase="pane_created", pane_id="w-3")
+        self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
+                        "pane_created")
+
     def test_foreign_live_lease_blocks_resume_reconciliation(self):
         class SplitLoss(HerdrDouble):
             def __call__(self, arguments, **kwargs):

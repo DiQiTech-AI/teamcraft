@@ -299,7 +299,7 @@ class StateStore:
         finally:
             conn.close()
 
-    def write_unlocked(self, state: dict[str, Any], *, member: str | None = None,
+    def write_unlocked(self, state: dict[str, Any], *, member: str,
                        lease: _leader.Lease | None = None) -> None:
         """Persist the working dict authoritatively, fenced by the lease.
 
@@ -307,16 +307,27 @@ class StateStore:
         D): a stale/expired lease is refused, and when no lease object is
         passed the write still admits through a short auto-lease on
         ``member:<name>`` — refused while a foreign holder is live, and
-        released again unless this store already held it.  ``stage_unknown``
-        style ambiguity records stay lease-free by design.
+        released again unless this store already held it.  ``member`` is
+        REQUIRED (CEO review follow-up): there is no unfenced identity-free
+        write path at all, and the named member must be one the written dict
+        actually contains.  ``stage_unknown`` style ambiguity records stay
+        lease-free by design.
         """
 
+        if not isinstance(member, str) or not member.strip():
+            raise TeamctlError(
+                "authoritative writes must name the member whose lease scope"
+                " fences them; refusing an identity-free write"
+            )
+        members = state.get("members") or {}
+        if members and member not in members:
+            raise TeamctlError(
+                f"authoritative write names member {member!r} that is not part"
+                " of the written state; refusing a mismatched identity"
+            )
         self._ensure_ready()
         conn = self._connect()
         try:
-            if member is None:
-                _adapter.sync_state(conn, state)
-                return
             scope = f"member:{member}"
             with _adapter.storage.transaction(conn):
                 if lease is not None:
