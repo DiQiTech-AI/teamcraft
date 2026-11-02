@@ -193,6 +193,10 @@ class DomainM104Tests(unittest.TestCase):
             self.conn.execute("DROP TABLE task_dependencies")
             self.conn.execute("DROP TABLE events")
             self.conn.execute("DROP TABLE commands")
+            # M1-07 (v4): an honest v1 sheds the runtime artifacts too.
+            self.conn.execute("DROP TABLE leader_lease")
+            self.conn.execute("DROP TABLE runtime_meta")
+            self.conn.execute("DROP TABLE members")
             self.conn.execute("DELETE FROM schema_migrations WHERE version > 1")
             self.conn.execute("PRAGMA user_version=1")
         with self.assertRaises(SchemaOutOfDateError):
@@ -209,8 +213,9 @@ class DomainM104Tests(unittest.TestCase):
         # And the forward migration upgrades in place afterwards.
         report = storage.migrate_to_head(self.db)
         self.assertFalse(report.fresh)
-        self.assertEqual((report.from_version, report.to_version), (1, 3))
-        self.assertEqual(report.applied, (2, 3))
+        self.assertEqual((report.from_version, report.to_version),
+                       (1, storage.SCHEMA_VERSION))
+        self.assertEqual(report.applied, tuple(range(2, storage.SCHEMA_VERSION + 1)))
         self.conn.close()
         self.conn = storage.connect(self.db)
         domain.require_head(self.conn)
@@ -1160,6 +1165,10 @@ class M104UpgradePathTests(unittest.TestCase):
                 conn.execute("DROP TABLE task_dependencies")
                 conn.execute("DROP TABLE events")
                 conn.execute("DROP TABLE commands")
+                # M1-07 (v4): an honest v1 sheds the runtime artifacts too.
+                conn.execute("DROP TABLE leader_lease")
+                conn.execute("DROP TABLE runtime_meta")
+                conn.execute("DROP TABLE members")
                 conn.execute("DELETE FROM schema_migrations WHERE version > 1")
                 conn.execute("PRAGMA user_version=1")
             with storage.transaction(conn):
@@ -1187,7 +1196,8 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertFalse(report.fresh)
         self.assertEqual(
             (report.from_version, report.to_version, report.applied),
-            (1, 3, (2, 3)),
+            (1, storage.SCHEMA_VERSION,
+             tuple(range(2, storage.SCHEMA_VERSION + 1))),
         )
         info = storage.verify_database(self.db)
         self.assertTrue(info["ok"])
@@ -1218,7 +1228,7 @@ class M104UpgradePathTests(unittest.TestCase):
                 [r[0] for r in conn.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )],
-                [1, 2, 3],
+                [1, 2, 3, 4],
             )
         finally:
             conn.close()
@@ -1252,11 +1262,14 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertEqual(info["user_version"], 1)
         self.assertEqual(info["schema_migrations_recorded"], 1)
         self.assertEqual(
-            info["missing_head_tables"], ["commands", "events", "task_dependencies"]
+            info["missing_head_tables"],
+            ["commands", "events", "leader_lease", "members", "runtime_meta",
+             "task_dependencies"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)
-        self.assertEqual((report.from_version, report.to_version), (1, 3))
+        self.assertEqual((report.from_version, report.to_version),
+                       (1, storage.SCHEMA_VERSION))
 
 
 if __name__ == "__main__":

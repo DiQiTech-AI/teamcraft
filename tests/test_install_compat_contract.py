@@ -65,6 +65,11 @@ class InstallerCompatContractTests(unittest.TestCase):
             "---\nmode: primary\n---\nCEO\n", encoding="utf-8",
         )
         (root / "opencode.example.json").write_text('{"fake": true}\n', encoding="utf-8")
+        # M1-07: the installer bundles the core package; a fake-shaped root
+        # needs a minimal fake package to be installable at all.
+        core = root / "teamcraft"
+        core.mkdir(parents=True)
+        (core / "__init__.py").write_text('"""fake core"""\n', encoding="utf-8")
         return root
 
     def test_repository_exposes_only_teamcraft_skill_entry(self):
@@ -159,6 +164,10 @@ class InstallerCompatContractTests(unittest.TestCase):
         (skill / "__pycache__" / "teamctl.cpython-313.pyc").write_bytes(b"\x00")
         (skill / ".DS_Store").write_bytes(b"junk")
         (skill / "stale.pyo").write_bytes(b"\x00")
+        core = root / "teamcraft"
+        (core / "__pycache__").mkdir()
+        (core / "__pycache__" / "storage.cpython-313.pyc").write_bytes(b"\x00")
+        (core / ".DS_Store").write_bytes(b"junk")
         target = self.base / "project"
         result = self.run_installer(target, installer=root / "scripts" / "install.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -166,6 +175,13 @@ class InstallerCompatContractTests(unittest.TestCase):
                     for path in target.rglob("*") if path.is_file()]
         self.assertIn(".agents/skills/teamcraft/SKILL.md", installed)
         self.assertIn(".agents/skills/teamcraft/tests/test_fake.py", installed)
+        # M1-07 bundled core: exactly where teamctl._bootstrap_core searches.
+        self.assertIn(
+            ".agents/skills/teamcraft/scripts/core/teamcraft/__init__.py",
+            installed,
+        )
+        self.assertFalse([p for p in installed if "__pycache__" in p
+                         or p.endswith((".pyc", ".pyo")) or ".DS_Store" in p])
         self.assertIn(".opencode/agents/herdr-ceo.md", installed)
         self.assertIn("opencode.json", installed)
         self.assertFalse([p for p in installed if "__pycache__" in p

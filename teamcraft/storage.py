@@ -110,8 +110,10 @@ from .errors import (
 #: table, so v1 and v2 databases keep satisfying every previously accepted
 #: contract (connect/query/verify/backup/restore) whether or not they have
 #: been upgraded, and any schema newer than this build still fails closed
-#: read-only (8.2-13).
-SCHEMA_VERSION = 3
+#: read-only (8.2-13).  v4 (M1-07) is additive in the same sense: it adds
+#: the runtime-authority tables (``leader_lease``, ``runtime_meta``,
+#: ``members``) without touching any earlier table or contract.
+SCHEMA_VERSION = 4
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -298,6 +300,70 @@ BEGIN
 END""",
 )
 
+#: Tables added by the forward-only v4 migration (M1-07 runtime authority).
+_V4_TABLES = frozenset({"leader_lease", "runtime_meta", "members"})
+
+#: Forward-only v4 step (M1-07): the SQLite runtime authority the CLI/Skill
+#: layer uses instead of any JSON state file.  ``leader_lease`` is the
+#: single-holder fencing table with monotonic epochs (CEO gate D); epochs
+#: are durable history — a row is NEVER deleted, release only marks
+#: ``state='released'``, so release-then-reacquire always bumps the epoch
+#: and a zombie from any previous epoch can be detected forever.
+#: ``runtime_meta`` pins one team per project root together with the Herdr
+#: session identity it was created under; ``members`` carries the durable
+#: member facts whose shape mirrors the frozen CLI output contract.  No
+#: earlier table is touched; there is no JSON import, cutover, or dual write
+#: anywhere in this step — an empty database simply starts empty at v4.
+_V4_STATEMENTS = (
+    """
+CREATE TABLE leader_lease (
+  scope TEXT PRIMARY KEY,
+  holder_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL CHECK (epoch >= 1),
+  state TEXT NOT NULL DEFAULT 'held' CHECK (state IN ('held', 'released')),
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT
+)""",
+    """
+CREATE TABLE runtime_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  team_id TEXT NOT NULL UNIQUE,
+  project_root TEXT NOT NULL,
+  herdr_session_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)""",
+    """
+CREATE TABLE members (
+  name TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  responsibility TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  task TEXT NOT NULL,
+  ownership_json TEXT NOT NULL DEFAULT '[]',
+  read_only INTEGER NOT NULL DEFAULT 0,
+  cwd TEXT NOT NULL,
+  from_pane_id TEXT,
+  pane_id TEXT,
+  terminal_id TEXT,
+  agent_session_json TEXT,
+  agent_args_json TEXT NOT NULL DEFAULT '[]',
+  opencode_config_content TEXT,
+  direction TEXT,
+  start_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+  phase TEXT NOT NULL,
+  prompt_may_have_been_delivered INTEGER NOT NULL DEFAULT 0,
+  live_state TEXT,
+  error TEXT,
+  task_id TEXT REFERENCES tasks(id),
+  attempt_id TEXT REFERENCES attempts(id),
+  session_id TEXT REFERENCES sessions(id),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)""",
+    "CREATE INDEX idx_members_phase ON members(phase)",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -305,6 +371,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
     (3, _V3_STATEMENTS),
+    (4, _V4_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -314,13 +381,14 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     1: _V1_TABLES,
     2: _V2_TABLES,
     3: _V3_TABLES,
+    4: _V4_TABLES,
 }
 
 
 def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
-    return _V1_TABLES | _V2_TABLES | _V3_TABLES
+    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -360,10 +428,14 @@ _V3_TRIGGERS = frozenset(
 )
 _V3_INDEXES = frozenset({"idx_events_task_seq", "idx_commands_state"})
 
+#: v4 lookup index for phase scans (active-member ownership checks).
+_V4_INDEXES = frozenset({"idx_members_phase"})
+
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
 _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     3: (_V3_TRIGGERS, _V3_INDEXES),
+    4: (frozenset(), _V4_INDEXES),
 }
 
 

@@ -11,9 +11,9 @@ Create a task-specific team in sibling panes while preserving the current tab, p
 
 Before Herdr control, require `HERDR_ENV=1`, then run `herdr --skill` and follow the installed binary's semantics. Do not inspect or control a focused Herdr session from outside Herdr. Do not create a workspace, tab, or worktree unless the user requests that topology.
 
-Use `scripts/teamctl.py` for managed team members. It reserves ownership and intent in `<project>/.teamcraft/state.json` before layout mutation, records every later phase, and scopes the state to the current Herdr socket session. Do not edit this state by hand while a team operation is running.
+Use `scripts/teamctl.py` for managed team members. Runtime state lives ONLY in the SQLite database `<project>/.teamcraft/teamcraft.db` (schema v4): ownership and intent are reserved before layout mutation, every persistent Herdr side effect (pane split, agent start, prompt) is recorded as a durable Command claimed **before** it executes, and each later phase is written transactionally together with domain events, scoped to the current Herdr socket session and fenced by a per-member leader lease. Do not edit this state by hand while a team operation is running.
 
-The `.teamcraft/` runtime directory contains tasks, state, and locks and is ignored by version control. If the CLI detects legacy `.herdr-team/state.json`, it fails closed without calling Herdr or creating new state; resolve that state explicitly before continuing.
+The `.teamcraft/` runtime directory contains the SQLite database, locks, and journals and is ignored by version control. JSON is not runtime state: the CLI fails closed — without calling Herdr and without creating, reading, modifying, or deleting any file — when it finds legacy `.herdr-team/state.json` or a non-empty `.teamcraft/state.json`. Resolve such legacy JSON manually before continuing. The importable Python Core (`teamcraft`) ships bundled offline under `scripts/core/`; no network access is ever required at runtime.
 
 ## Team model
 
@@ -112,4 +112,4 @@ Neither operation closes a pane or terminates an agent. Do not pre-create idle s
 
 Release and completion refuse an agent in `working`, `blocked`, or `unknown` state. Use `--force` only after explicitly deciding that its ownership may be reassigned despite that state. Identity verification still applies.
 
-Member lifecycle operations use an exclusive lock. State and locks in `.teamcraft/` are local runtime files excluded from version control. OpenCode launches require the selected role profile in the target project and preserve existing JSON `OPENCODE_CONFIG_CONTENT` settings while overriding only `default_agent`.
+Member lifecycle operations use an exclusive lock plus a durable leader lease (monotonic epoch). An ambiguous outcome — crashed process, lost lease, or a response that arrives after the lease was lost — is recorded as UNKNOWN and must be settled by `resume` inspection against live facts; the CLI never blindly resends, and a stale leader can never commit success. State, database, and locks in `.teamcraft/` are local runtime files excluded from version control. OpenCode launches require the selected role profile in the target project and preserve existing JSON `OPENCODE_CONFIG_CONTENT` settings while overriding only `default_agent`.

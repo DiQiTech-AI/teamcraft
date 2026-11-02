@@ -599,3 +599,19 @@ M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Star
 **门禁通过证据（CEO 确认，2026-11-02）**：**Actions run 41466544296 @ `d7fddcd1783f0b724829179db1f8e7a0af318446`** 成功完成——ubuntu-26.04/Python 3.10（强制腿）：core unittest **249 OK**、Skill 契约 **42 OK**、包安装/导入探针 OK、installer 冒烟 OK；macOS/Python 3.13 基线腿全部步骤通过。**Python 3.10 / Linux / CI 三项先决门禁就此满足，M1-07 Runtime 接线阻断解除。**
 
 **边界声明**：门禁全绿不等于 M1-07 完成。Runtime 集成（CLI/Skill → SQLite Core Command Service、JSON 退出权威源）仍为独立实施阶段，实施切片、文件所有权与验收由 CEO 在只读架构审计后分解下达；本阶段未改任何产品运行代码，未读取或修改真实 `.teamcraft/state.json`，未启动或控制 Herdr 会话。
+
+### 12.8 M1-07 SQLite Runtime Integration 实施证据（2026-11-03，本地完成，待 CEO 独立评审）
+
+**实施范围（按 CEO 批准的 A–E 门禁与后续两项评审修正）**：
+
+* **单一权威（A）**：运行时状态仅存 `.teamcraft/teamcraft.db`（schema v4：`leader_lease`、`runtime_meta`、`members`、`idx_members_phase`，前向演进，无 JSON 导入/双写/cutover/回滚）。`.herdr-team/state.json` 或非空 `.teamcraft/state.json` 出现即 fail-closed（字节保留、零创建、读侧同样冻结，人工移除后恢复）；StateStore 构造保持纯检查 fail-fast，数据库 provisioning 延迟到首次操作，被拒根目录可证明零新文件。
+* **五命令兼容（B）**：launch/status/resume/complete/release 的 argv、默认值、退出码、JSON 输出键集冻结不变；status 仅读 SQLite + 实时 Herdr overlay；所有权/只读/会话校验强制；每次 mutation 经单一 Core 边界在同一事务写 state+event+command。
+* **持久 Command（C）**：split/start/prompt 三段副作用均为 effect 之前 claim 并提交的事务性 Command（测试以 effect 时刻独立连接证实 `running` 已落盘）；事务不跨 Herdr 调用；丢失响应/租约丧失 → UNKNOWN + resume 事实对账；无 pane 事实时仅给 `--split-action retry` 显式指引，绝不盲发（prompt 永不自动重发，保持 `prompt_may_have_been_delivered` 冻结语义）。
+* **Leader 租约/fencing（D）**：`member:<name>` 粒度租约、单调 epoch；**CEO 评审修正 1**：`release` 不再删行，保留 `state='released'` 行使 epoch 永不复位（含幂等 release、外部 release 拒绝、5 轮 release/acquire 单调回归）；**CEO 评审修正 2**：leader 与 adapter 原语经 `_tx` 复用具名事务（外层 `storage.transaction` 打开时 join，不再嵌套 BEGIN）；stale leader 的 success 提交被拒并记 UNKNOWN，command 待对账。
+* **离线安装（E）**：安装器将 `teamcraft/*.py` 捆绑至 `<target>/.agents/skills/teamcraft/scripts/core/teamcraft/`（与 `teamctl._bootstrap_core` 搜索路径一致，修正了安装/搜索路径不一致缺陷），忽略规则同步；新增隔离冒烟在剥离 PYTHONPATH 的清洁环境中真实执行已安装 `teamctl.py --help` 并断言导入解析到捆绑副本（非文件存在性声称）。
+
+**CEO 所有权批准**：`test_compat_contract.py` 中 8 处 JSON 钉死断言于 2026-11-03 获批迁移为 SQLite 等价（recorded-read→团队视图 dict、bytes 快照→跨操作视图等价、`temp_reset`→删 `.teamcraft` 整目录、v1 artifacts 内容→视图断言且 0700/state.lock 原样保留）；`cutover.json` 威胁夹具更新为 SQLite 语义（标记惰性、写入落 SQLite、JSON 永不复写）。存储/域测试的字面量表与降级夹具因 schema v4 机械同步（EXPECTED_TABLES、applied、missing_head_tables、honest v1/v2 降级夹具 shed v4 工件）。
+
+**本地测试证据（2026-11-03，macOS aarch64）**：`TMPDIR=$PWD/.tmp-m107 python3 -m pytest tests/ .agents/skills/teamcraft/tests/` → **332 passed + 136 subtests，exit 0**；`python3.10 -m unittest discover -s tests` → **279 OK**（基线 249 + `test_leader_m107.py` 13 + `test_runtime_adapter_m107.py` 16 + install 隔离冒烟 1）；`python3.10 -m unittest discover -s .agents/skills/teamcraft/tests` → **53 OK**（基线 42 + `test_runtime_sqlite_m107.py` 11）；`git diff --check` 干净。3.10 解释器为门禁缓存的 cpython-3.10-macos-aarch64。
+
+**边界与剩余事项**：本阶段未读取/修改真实 `.teamcraft/state.json`，未运行改动后的 teamctl 于本仓库根，未启动 Herdr，未 push。Linux/3.10 CI 复跑（push 后）、CEO 独立评审与 M1-07 验收为剩余事项；M1-07 未标记完成。

@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""Create and recover role-scoped agents in a Herdr development team."""
+"""Create and recover role-scoped agents in a Herdr development team.
+
+Runtime state authority (M1-07, SQLite-only Fresh Start):
+all team/member state lives in ``<project>/.teamcraft/teamcraft.db`` through
+the Core Runtime Command Service (``teamcraft.runtime_adapter``).  This CLI
+never reads, writes, imports, or deletes JSON runtime state.  Non-empty
+legacy ``state.json`` (in ``.teamcraft`` or the pre-rename ``.herdr-team``)
+fails closed with the bytes preserved.  Every persistent Herdr side effect
+(pane split / agent start / agent prompt) is a durable Command claimed
+BEFORE the effect executes, confirmed only while this process still holds
+the member's leader lease; ambiguous outcomes become UNKNOWN and must be
+reconciled by ``resume`` from observed facts — never blindly resent.
+"""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -13,10 +26,40 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Any, Iterator, Sequence
 import uuid
+
+
+def _bootstrap_core() -> None:
+    """Make the ``teamcraft`` Core importable without network or repo paths.
+
+    Import resolution order: (1) an installed ``teamcraft`` package
+    (``pip install .`` or the installer's site-packages step); (2) the
+    offline bundled copy shipped next to this script by ``install.sh`` at
+    ``core/teamcraft/``.  No implicit PYTHONPATH to a source checkout and no
+    runtime downloads.
+    """
+
+    try:
+        import teamcraft  # noqa: F401
+        return
+    except ImportError:
+        pass
+    core_dir = Path(__file__).resolve().parent / "core"
+    if (core_dir / "teamcraft" / "__init__.py").is_file():
+        sys.path.insert(0, str(core_dir))
+        return
+    raise ImportError(
+        "the TeamCraft core package is not importable; install it with"
+        " scripts/install.sh (bundled offline copy) or `pip install teamcraft`"
+    )
+
+
+_bootstrap_core()
+
+from teamcraft import leader as _leader  # noqa: E402
+from teamcraft import runtime_adapter as _adapter  # noqa: E402
 
 
 STATE_VERSION = 1
@@ -124,10 +167,53 @@ def now_epoch() -> int:
     return int(time.time())
 
 
+def _operation_ttl(start_timeout_ms: int, wait_timeout_ms: int | None,
+                   wait: bool) -> int:
+    """Leader-lease TTL long enough to outlive this operation's Herdr calls.
+
+    Deliberately generous: a lease that expires mid-flight would fence a
+    healthy leader.  A crashed holder's lease instead self-expires after at
+    most this window, and epoch monotonicity fences whatever it tried to
+    commit late.
+    """
+
+    seconds = 60 + max(0, int(start_timeout_ms)) / 1000
+    if wait:
+        seconds += max(0, int(wait_timeout_ms or 120_000)) / 1000 + 5
+    else:
+        seconds += 15
+    return int(seconds)
+
+
 class StateStore:
+    """SQLite-backed team state (frozen compatibility dict over v4 tables).
+
+    The compatibility dict shape (``version/team_id/project_root/
+    herdr_session/created_at/members``) is unchanged from the JSON era, but
+    the ONLY store is ``.teamcraft/teamcraft.db``.  Construction fails fast on
+    unsafe roots (legacy JSON, symlinks) by pure inspection — it creates
+    nothing.  The Fresh Start provisioning gate (migrate + verify + reopen)
+    runs on the store's first operation, so a refused root provably has
+    nothing created under it.
+    """
+
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
-        legacy_directory = project_root / LEGACY_RUNTIME_DIRECTORY_NAME
+        self.directory = project_root / RUNTIME_DIRECTORY_NAME
+        self.path = self.directory / "state.json"  # legacy attr; NEVER written
+        self.lock_path = self.directory / "state.lock"
+        self.db_path = self.directory / "teamcraft.db"
+        self._holder_id = f"pid:{os.getpid()}:{os.urandom(4).hex()}"
+        self._ready = False
+        self.fresh_start_report = None
+        # Frozen contract: construction itself fails fast on unsafe roots
+        # (pure inspection — creates nothing).  Database provisioning is
+        # deferred to the first operation so a refused root provably has no
+        # new files under it.
+        self._refusal_checks()
+
+    def _refusal_checks(self) -> None:
+        legacy_directory = self.project_root / LEGACY_RUNTIME_DIRECTORY_NAME
         legacy_state = legacy_directory / "state.json"
         if (
             legacy_directory.is_symlink()
@@ -137,18 +223,66 @@ class StateStore:
             raise TeamctlError(
                 f"legacy team state detected at {legacy_state}; stop legacy teamctl "
                 f"processes and resolve that state before using "
-                f"{project_root / RUNTIME_DIRECTORY_NAME}; no files were changed"
+                f"{self.directory}; no files were changed"
             )
-        self.directory = project_root / RUNTIME_DIRECTORY_NAME
         if self.directory.is_symlink():
             raise TeamctlError(
                 f"runtime directory must not be a symbolic link: {self.directory}"
             )
-        self.path = self.directory / "state.json"
-        self.lock_path = self.directory / "state.lock"
+        # M1-07 single authority: a pre-existing .teamcraft/state.json is
+        # legacy JSON.  Fail closed, bytes preserved: never read, rewritten,
+        # or deleted here.
+        json_state = self.path
+        try:
+            json_info = json_state.lstat()
+        except FileNotFoundError:
+            json_info = None
+        except OSError as exc:
+            raise TeamctlError(
+                f"cannot safely inspect runtime state {json_state}: {exc};"
+                " no files were changed"
+            ) from exc
+        if json_info is not None and (
+            json_state.is_symlink() or not json_info.st_size == 0
+        ):
+            raise TeamctlError(
+                f"legacy JSON runtime state detected at {json_state}; TeamCraft"
+                " 2.0 keeps runtime state only in"
+                f" {self.db_path}; the JSON file was not"
+                " read, modified, or deleted — resolve it manually before"
+                " continuing"
+            )
+
+    def _ensure_ready(self) -> None:
+        """Provision once; refusal checks re-run on EVERY operation (TOCTOU:
+        an external legacy JSON marker appearing mid-lifecycle must freeze all
+        further writes, bytes preserved)."""
+
+        self._refusal_checks()
+        if self._ready:
+            return
+        self._refusal_checks()
+        try:
+            _conn, self.fresh_start_report = _adapter.open_runtime(
+                self.project_root, busy_timeout_ms=10_000
+            )
+        except _adapter.TeamSessionMismatchError as exc:
+            raise TeamctlError(str(exc)) from exc
+        except Exception as exc:  # fresh-start refusals are actionable as-is
+            raise TeamctlError(
+                f"cannot open SQLite runtime state for {self.project_root}: {exc}"
+            ) from exc
+        finally:
+            if "_conn" in locals() and isinstance(_conn, _adapter.TeamCraftConnection):
+                _conn.close()
+        self._ready = True
+
+    def _connect(self) -> _adapter.TeamCraftConnection:
+        return _adapter.connect_runtime(self.project_root, busy_timeout_ms=5_000)
 
     @contextmanager
     def locked(self) -> Iterator[dict[str, Any] | None]:
+        self._ensure_ready()
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self.lock_path.open("a+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -156,40 +290,30 @@ class StateStore:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def read_unlocked(self) -> dict[str, Any] | None:
-        if not self.path.exists():
-            return None
+        self._ensure_ready()
+        conn = self._connect()
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except UnicodeDecodeError as exc:
-            raise TeamctlError(f"state file is not valid UTF-8: {self.path}") from exc
-        except (OSError, json.JSONDecodeError) as exc:
-            raise TeamctlError(f"cannot read state file {self.path}: {exc}") from exc
-        if not isinstance(value, dict) or value.get("version") != STATE_VERSION:
-            raise TeamctlError(f"unsupported or malformed state file: {self.path}")
-        return value
+            return _adapter.team_view(conn)
+        except _adapter.TeamSessionMismatchError as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
 
     def write_unlocked(self, state: dict[str, Any]) -> None:
-        descriptor, temp_name = tempfile.mkstemp(
-            prefix="state.", suffix=".tmp", dir=self.directory
-        )
+        self._ensure_ready()
+        conn = self._connect()
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, self.path)
-        except BaseException:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
-            raise
+            _adapter.sync_state(conn, state)
+        except _adapter.RuntimeAdapterError as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
 
     @contextmanager
     def member_operation(self, name: str) -> Iterator[None]:
         if not NAME_RE.fullmatch(name):
             raise TeamctlError("name must match [a-z][a-z0-9_-]{0,31}")
+        self._ensure_ready()
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         operation_path = self.directory / f"member.{name}.lock"
         with operation_path.open("a+b") as operation_file:
@@ -205,6 +329,97 @@ class StateStore:
                 yield
             finally:
                 fcntl.flock(operation_file.fileno(), fcntl.LOCK_UN)
+
+    # ----------------------------------------------------------- leases
+
+    def acquire_lease(self, name: str, ttl_seconds: int) -> _leader.Lease:
+        conn = self._connect()
+        try:
+            return _leader.acquire_or_renew(
+                conn, f"member:{name}", self._holder_id,
+                ttl_seconds=int(ttl_seconds),
+            )
+        except _leader.LeaderBusyError as exc:
+            raise TeamctlError(
+                f"another teamctl operation holds the leader lease for member"
+                f" {name} (holder {exc.holder_id}, epoch {exc.epoch},"
+                f" expires {exc.expires_at}); wait for it to finish or expire"
+                " before retrying"
+            ) from exc
+        finally:
+            conn.close()
+
+    def release_lease(self, lease: _leader.Lease) -> None:
+        conn = self._connect()
+        try:
+            _leader.release(conn, lease.scope, lease.holder_id,
+                            epoch=lease.epoch)
+        finally:
+            conn.close()
+
+    # -------------------------------------------------- stage commands
+
+    def stage_claim(self, name: str, stage: str, *, lease: _leader.Lease,
+                   payload: dict[str, Any]) -> Any:
+        conn = self._connect()
+        try:
+            view = _adapter.team_view(conn)
+            if view is None:
+                raise TeamctlError("team state disappeared during the operation")
+            member = view["members"].get(name)
+            if member is None:
+                raise TeamctlError(f"member is not recorded: {name}")
+            return _adapter.stage_claim(
+                conn, team_id=view["team_id"], member=name, stage=stage,
+                lease=lease, task_id=member.get("task_id"),
+                attempt_id=member.get("attempt_id"), payload=payload,
+            )
+        finally:
+            conn.close()
+
+    def stage_confirm(self, command_id: str, *, lease: _leader.Lease,
+                     evidence: dict[str, Any]) -> Any:
+        conn = self._connect()
+        try:
+            return _adapter.stage_confirm(conn, command_id, lease=lease,
+                                         evidence=evidence)
+        except _leader.StaleLeaderError as exc:
+            _adapter.stage_unknown(
+                conn, command_id,
+                note=f"leader lease lost before success could commit: {exc}",
+            )
+            raise TeamctlError(
+                "the runtime leader lease was lost before this result could be"
+                " committed, so the outcome is UNKNOWN; run resume <member> to"
+                " inspect and reconcile — do not blindly retry"
+            ) from exc
+        finally:
+            conn.close()
+
+    def stage_unknown(self, command_id: str, *, note: str) -> Any:
+        conn = self._connect()
+        try:
+            return _adapter.stage_unknown(conn, command_id, note=note)
+        finally:
+            conn.close()
+
+    def latest_stage_command(self, name: str, stage: str) -> Any:
+        conn = self._connect()
+        try:
+            return _adapter.latest_stage_command(conn, name, stage)
+        finally:
+            conn.close()
+
+    def reconcile_stage(self, command_id: str, *, evidence: dict[str, Any],
+                        resolved_ok: bool, note: str) -> Any:
+        conn = self._connect()
+        try:
+            return _adapter.stage_reconcile(
+                conn, command_id, evidence=evidence, resolved_ok=resolved_ok,
+                note=note,
+            )
+        finally:
+            conn.close()
 
 
 def new_state(project_root: Path, session: dict[str, Any]) -> dict[str, Any]:
@@ -515,72 +730,119 @@ def opencode_config_content(project_root: Path, role: str) -> str:
 
 
 def split_for_member(
-    member: dict[str, Any], store: StateStore, session: dict[str, Any]
+    member: dict[str, Any], store: StateStore, session: dict[str, Any],
+    *, lease: _leader.Lease | None = None,
 ) -> dict[str, Any]:
-    parent = resolve_pane(member.get("from_pane_id"))
-    parent_id = str(parent["pane_id"])
-    layout = run_herdr(["pane", "layout", "--pane", parent_id])
-    width, height = get_target_rect(layout, parent_id)
-    direction = choose_direction(member.get("direction"), width, height)
-    split_args = [
-        "pane", "split", "--pane", parent_id, "--direction", direction,
-        "--cwd", member["cwd"], "--no-focus",
-    ]
-    if member["kind"] == "opencode":
-        override = member.get("opencode_config_content")
-        if not override:
-            override = opencode_config_content(Path(member["cwd"]), member["role"])
-        split_args.extend(["--env", f"OPENCODE_CONFIG_CONTENT={override}"])
-    update_member(
-        store, session, member["name"], phase="split_requested",
-        from_pane_id=parent_id, direction=direction,
-    )
-    try:
-        pane = pane_from(run_herdr(split_args))
-    except TeamctlError as exc:
-        update_member(
-            store, session, member["name"], phase="split_ambiguous", error=str(exc)
+    own_lease = lease is None
+    if own_lease:
+        lease = store.acquire_lease(
+            member["name"], _operation_ttl(member["start_timeout_ms"], None, False)
         )
-        raise TeamctlError(
-            "pane split outcome is ambiguous; inspect the layout before explicitly "
-            f"retrying resume {member['name']} --split-action retry. Cause: {exc}"
-        ) from exc
-    return update_member(
-        store, session, member["name"], phase="pane_created",
-        pane_id=pane["pane_id"], terminal_id=pane.get("terminal_id"),
-        from_pane_id=parent_id, direction=direction,
-    )
+    try:
+        parent = resolve_pane(member.get("from_pane_id"))
+        parent_id = str(parent["pane_id"])
+        layout = run_herdr(["pane", "layout", "--pane", parent_id])
+        width, height = get_target_rect(layout, parent_id)
+        direction = choose_direction(member.get("direction"), width, height)
+        split_args = [
+            "pane", "split", "--pane", parent_id, "--direction", direction,
+            "--cwd", member["cwd"], "--no-focus",
+        ]
+        if member["kind"] == "opencode":
+            override = member.get("opencode_config_content")
+            if not override:
+                override = opencode_config_content(Path(member["cwd"]), member["role"])
+            split_args.extend(["--env", f"OPENCODE_CONFIG_CONTENT={override}"])
+        update_member(
+            store, session, member["name"], phase="split_requested",
+            from_pane_id=parent_id, direction=direction,
+        )
+        command = store.stage_claim(
+            member["name"], _adapter.STAGE_SPLIT, lease=lease,
+            payload={"argv": split_args, "direction": direction},
+        )
+        try:
+            pane = pane_from(run_herdr(split_args))
+        except TeamctlError as exc:
+            store.stage_unknown(
+                command.id, note=f"pane split outcome ambiguous: {exc}"
+            )
+            update_member(
+                store, session, member["name"], phase="split_ambiguous",
+                error=str(exc),
+            )
+            raise TeamctlError(
+                "pane split outcome is ambiguous; inspect the layout before explicitly "
+                f"retrying resume {member['name']} --split-action retry. Cause: {exc}"
+            ) from exc
+        store.stage_confirm(
+            command.id, lease=lease,
+            evidence={"pane_id": pane["pane_id"],
+                     "terminal_id": pane.get("terminal_id")},
+        )
+        return update_member(
+            store, session, member["name"], phase="pane_created",
+            pane_id=pane["pane_id"], terminal_id=pane.get("terminal_id"),
+            from_pane_id=parent_id, direction=direction,
+        )
+    finally:
+        if own_lease:
+            store.release_lease(lease)
 
 
 def start_member(
-    member: dict[str, Any], store: StateStore, session: dict[str, Any]
+    member: dict[str, Any], store: StateStore, session: dict[str, Any],
+    *, lease: _leader.Lease | None = None,
 ) -> dict[str, Any]:
     name, pane_id = member["name"], member.get("pane_id")
     if not pane_id:
         raise TeamctlError(f"member {name} has no recorded pane")
-    update_member(store, session, name, phase="start_requested")
-    args = [
-        "agent", "start", name, "--kind", member["kind"], "--pane", pane_id,
-        "--timeout", str(member["start_timeout_ms"]),
-    ]
-    if member.get("agent_args"):
-        args.extend(["--", *member["agent_args"]])
-    try:
-        run_herdr(
-            args, timeout_seconds=max(10, member["start_timeout_ms"] / 1000 + 5)
+    own_lease = lease is None
+    if own_lease:
+        lease = store.acquire_lease(
+            name, _operation_ttl(member["start_timeout_ms"], None, False)
         )
-    except TeamctlError as exc:
-        update_member(store, session, name, phase="start_ambiguous", error=str(exc))
-        raise TeamctlError(
-            f"agent start is ambiguous in existing pane {pane_id}; resume {name} to inspect or reuse that pane. Cause: {exc}"
-        ) from exc
-    info = agent_info_from(run_herdr(["agent", "get", name]))
-    return update_member(
-        store, session, name, phase="agent_started",
-        pane_id=info.get("pane_id", pane_id),
-        terminal_id=info.get("terminal_id", member.get("terminal_id")),
-        agent_session=info.get("agent_session"), live_state=live_state(info), error=None,
-    )
+    try:
+        update_member(store, session, name, phase="start_requested")
+        args = [
+            "agent", "start", name, "--kind", member["kind"], "--pane", pane_id,
+            "--timeout", str(member["start_timeout_ms"]),
+        ]
+        if member.get("agent_args"):
+            args.extend(["--", *member["agent_args"]])
+        command = store.stage_claim(
+            name, _adapter.STAGE_START, lease=lease, payload={"argv": args},
+        )
+        try:
+            run_herdr(
+                args, timeout_seconds=max(10, member["start_timeout_ms"] / 1000 + 5)
+            )
+        except TeamctlError as exc:
+            store.stage_unknown(
+                command.id, note=f"agent start outcome ambiguous: {exc}"
+            )
+            update_member(store, session, name, phase="start_ambiguous",
+                         error=str(exc))
+            raise TeamctlError(
+                f"agent start is ambiguous in existing pane {pane_id}; resume {name} to inspect or reuse that pane. Cause: {exc}"
+            ) from exc
+        info = agent_info_from(run_herdr(["agent", "get", name]))
+        store.stage_confirm(
+            command.id, lease=lease,
+            evidence={"pane_id": info.get("pane_id", pane_id),
+                     "terminal_id": info.get("terminal_id"),
+                     "agent_session": info.get("agent_session")},
+        )
+        return update_member(
+            store, session, name, phase="agent_started",
+            pane_id=info.get("pane_id", pane_id),
+            terminal_id=info.get("terminal_id", member.get("terminal_id")),
+            agent_session=info.get("agent_session"), live_state=live_state(info),
+            error=None,
+        )
+    finally:
+        if own_lease:
+            store.release_lease(lease)
 
 
 def prompt_member(
@@ -590,33 +852,67 @@ def prompt_member(
     *,
     wait: bool,
     timeout_ms: int,
+    lease: _leader.Lease | None = None,
 ) -> dict[str, Any]:
     name = member["name"]
-    update_member(
-        store, session, name, phase="prompt_submitting",
-        prompt_may_have_been_delivered=True,
-    )
-    args = ["agent", "prompt", name, build_prompt(member)]
-    if wait:
-        args.extend(["--wait", "--timeout", str(timeout_ms)])
-    try:
-        run_herdr(
-            args, timeout_seconds=max(15, timeout_ms / 1000 + 5) if wait else 15
+    own_lease = lease is None
+    if own_lease:
+        lease = store.acquire_lease(
+            name, _operation_ttl(member.get("start_timeout_ms", 30_000),
+                                timeout_ms, wait)
         )
-    except TeamctlError as exc:
+    try:
         update_member(
-            store, session, name, phase="prompt_ambiguous", error=str(exc),
+            store, session, name, phase="prompt_submitting",
             prompt_may_have_been_delivered=True,
         )
-        raise TeamctlError(
-            f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
-        ) from exc
-    info = agent_info_from(run_herdr(["agent", "get", name]))
-    return update_member(
-        store, session, name, phase="prompt_submitted", live_state=live_state(info),
-        agent_session=info.get("agent_session", member.get("agent_session")),
-        terminal_id=info.get("terminal_id", member.get("terminal_id")), error=None,
-    )
+        prompt_text = build_prompt(member)
+        args = ["agent", "prompt", name, prompt_text]
+        if wait:
+            args.extend(["--wait", "--timeout", str(timeout_ms)])
+        command = store.stage_claim(
+            name, _adapter.STAGE_PROMPT, lease=lease,
+            payload={
+                "argv_head": args[:3], "wait": wait, "timeout_ms": timeout_ms,
+                "prompt_sha256": hashlib.sha256(
+                    prompt_text.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        try:
+            run_herdr(
+                args, timeout_seconds=max(15, timeout_ms / 1000 + 5) if wait else 15
+            )
+        except TeamctlError as exc:
+            store.stage_unknown(
+                command.id, note=f"prompt outcome ambiguous: {exc}"
+            )
+            update_member(
+                store, session, name, phase="prompt_ambiguous", error=str(exc),
+                prompt_may_have_been_delivered=True,
+            )
+            raise TeamctlError(
+                f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
+            ) from exc
+        info = agent_info_from(run_herdr(["agent", "get", name]))
+        store.stage_confirm(
+            command.id, lease=lease,
+            evidence={"pane_id": info.get("pane_id"),
+                     "terminal_id": info.get("terminal_id"),
+                     "agent_session": info.get("agent_session"),
+                     "prompt_sha256": hashlib.sha256(
+                         prompt_text.encode("utf-8")).hexdigest()},
+        )
+        return update_member(
+            store, session, name, phase="prompt_submitted",
+            live_state=live_state(info),
+            agent_session=info.get("agent_session", member.get("agent_session")),
+            terminal_id=info.get("terminal_id", member.get("terminal_id")),
+            error=None,
+        )
+    finally:
+        if own_lease:
+            store.release_lease(lease)
 
 
 def member_output(
@@ -660,32 +956,40 @@ def _launch_operation(args: argparse.Namespace) -> int:
     ensure_live_name_available(args.name)
     parent = resolve_pane(args.from_pane)
     session, store = current_session_identity(), StateStore(root)
-    opencode_content = (
-        opencode_config_content(root, args.role) if args.kind == "opencode" else None
+    lease = store.acquire_lease(
+        args.name,
+        _operation_ttl(args.start_timeout_ms, args.timeout_ms, args.wait),
     )
-    member = {
-        "name": args.name, "role": args.role, "responsibility": responsibility,
-        "kind": args.kind, "task": task, "ownership": ownership,
-        "read_only": args.read_only, "cwd": str(root),
-        "from_pane_id": parent["pane_id"], "pane_id": None, "terminal_id": None,
-        "agent_session": None, "agent_args": list(args.agent_arg),
-        "opencode_config_content": opencode_content,
-        "direction": args.direction, "start_timeout_ms": args.start_timeout_ms,
-        "phase": "reserved", "prompt_may_have_been_delivered": False,
-        "live_state": "missing", "created_at": now_epoch(),
-        "updated_at": now_epoch(), "error": None,
-    }
-    reserve_member(store, session, member)
-    member = split_for_member(member, store, session)
-    member = start_member(member, store, session)
-    member = prompt_member(
-        member, store, session, wait=args.wait, timeout_ms=args.timeout_ms
-    )
-    with store.locked() as state:
-        assert state is not None
-        output = member_output(state, member)
-    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    return 0
+    try:
+        opencode_content = (
+            opencode_config_content(root, args.role) if args.kind == "opencode" else None
+        )
+        member = {
+            "name": args.name, "role": args.role, "responsibility": responsibility,
+            "kind": args.kind, "task": task, "ownership": ownership,
+            "read_only": args.read_only, "cwd": str(root),
+            "from_pane_id": parent["pane_id"], "pane_id": None, "terminal_id": None,
+            "agent_session": None, "agent_args": list(args.agent_arg),
+            "opencode_config_content": opencode_content,
+            "direction": args.direction, "start_timeout_ms": args.start_timeout_ms,
+            "phase": "reserved", "prompt_may_have_been_delivered": False,
+            "live_state": "missing", "created_at": now_epoch(),
+            "updated_at": now_epoch(), "error": None,
+        }
+        reserve_member(store, session, member)
+        member = split_for_member(member, store, session, lease=lease)
+        member = start_member(member, store, session, lease=lease)
+        member = prompt_member(
+            member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
+            lease=lease,
+        )
+        with store.locked() as state:
+            assert state is not None
+            output = member_output(state, member)
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    finally:
+        store.release_lease(lease)
 
 
 def load_member_for_mutation(
@@ -773,6 +1077,23 @@ def verify_recorded_occupant(
     return pane, None
 
 
+def _reconcile_observed_stage(store: StateStore, name: str, stage: str,
+                              evidence: dict[str, Any], note: str) -> None:
+    """Close a still-running/unknown stage command from verified live facts.
+
+    This is inspection-driven reconciliation (CEO gate C): the effect is NOT
+    re-executed; the durable command is settled against what Herdr now shows.
+    Prompt delivery is deliberately never auto-closed by mere occupant
+    presence — that stays an explicit ``--prompt-action`` decision.
+    """
+
+    command = store.latest_stage_command(name, stage)
+    if command is None or command.state not in ("running", "unknown"):
+        return
+    store.reconcile_stage(command.id, evidence=evidence, resolved_ok=True,
+                          note=note)
+
+
 def _resume_operation(args: argparse.Namespace) -> int:
     require_herdr()
     if args.wait and args.timeout_ms <= 0:
@@ -782,61 +1103,84 @@ def _resume_operation(args: argparse.Namespace) -> int:
     if member["phase"] in TERMINAL_PHASES:
         raise TeamctlError(f"member {args.name} is already {member['phase']}")
     preflight_kind(member["kind"])
-    pane, agent = verify_recorded_occupant(member)
-    if pane and pane.get("pane_id") != member.get("pane_id"):
-        member = update_member(
-            store, session, args.name, pane_id=pane["pane_id"],
-            terminal_id=pane.get("terminal_id", member.get("terminal_id")),
-        )
-    if (
-        not pane
-        and member["phase"] in {"split_requested", "split_ambiguous"}
-        and args.split_action != "retry"
-    ):
-        output = member_output(state, member)
+    lease = store.acquire_lease(
+        args.name,
+        _operation_ttl(member["start_timeout_ms"], args.timeout_ms, args.wait),
+    )
+    try:
+        pane, agent = verify_recorded_occupant(member)
+        if pane:
+            _reconcile_observed_stage(
+                store, args.name, _adapter.STAGE_SPLIT,
+                {"pane_id": pane.get("pane_id"),
+                 "terminal_id": pane.get("terminal_id")},
+                "resume inspection: recorded pane exists and matches identity",
+            )
+        if agent:
+            _reconcile_observed_stage(
+                store, args.name, _adapter.STAGE_START,
+                {"pane_id": agent.get("pane_id"),
+                 "terminal_id": agent.get("terminal_id"),
+                 "agent_session": agent.get("agent_session")},
+                "resume inspection: recorded agent is live and matches identity",
+            )
+        if pane and pane.get("pane_id") != member.get("pane_id"):
+            member = update_member(
+                store, session, args.name, pane_id=pane["pane_id"],
+                terminal_id=pane.get("terminal_id", member.get("terminal_id")),
+            )
+        if (
+            not pane
+            and member["phase"] in {"split_requested", "split_ambiguous"}
+            and args.split_action != "retry"
+        ):
+            output = member_output(state, member)
+            output["prompt_action"] = args.prompt_action
+            output["next_action_required"] = (
+                "inspect the current layout, then use --split-action retry only if no pane was created"
+            )
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            return 0
+        if not pane:
+            member = split_for_member(member, store, session, lease=lease)
+            pane = pane_from(run_herdr(["pane", "get", member["pane_id"]]))
+        if agent is None:
+            member = start_member(member, store, session, lease=lease)
+            agent = agent_info_from(run_herdr(["agent", "get", args.name]))
+        else:
+            member = update_member(
+                store, session, args.name,
+                terminal_id=agent.get("terminal_id", member.get("terminal_id")),
+                agent_session=agent.get("agent_session", member.get("agent_session")),
+                live_state=live_state(agent),
+            )
+        if args.prompt_action == "send":
+            member = prompt_member(
+                member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
+                lease=lease,
+            )
+            agent = agent_info_from(run_herdr(["agent", "get", args.name]))
+        elif args.prompt_action == "skip":
+            member = update_member(
+                store, session, args.name, phase="prompt_skipped", error=None
+            )
+        with store.locked() as latest:
+            assert latest is not None
+            output = member_output(latest, member, agent)
         output["prompt_action"] = args.prompt_action
-        output["next_action_required"] = (
-            "inspect the current layout, then use --split-action retry only if no pane was created"
-        )
+        if args.prompt_action == "inspect":
+            if member.get("prompt_may_have_been_delivered"):
+                output["next_action_required"] = (
+                    "choose --prompt-action send or skip after inspection"
+                )
+            elif member["phase"] not in {"prompt_submitted", "prompt_skipped"}:
+                output["next_action_required"] = (
+                    "use --prompt-action send to submit the recorded assignment"
+                )
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return 0
-    if not pane:
-        member = split_for_member(member, store, session)
-        pane = pane_from(run_herdr(["pane", "get", member["pane_id"]]))
-    if agent is None:
-        member = start_member(member, store, session)
-        agent = agent_info_from(run_herdr(["agent", "get", args.name]))
-    else:
-        member = update_member(
-            store, session, args.name,
-            terminal_id=agent.get("terminal_id", member.get("terminal_id")),
-            agent_session=agent.get("agent_session", member.get("agent_session")),
-            live_state=live_state(agent),
-        )
-    if args.prompt_action == "send":
-        member = prompt_member(
-            member, store, session, wait=args.wait, timeout_ms=args.timeout_ms
-        )
-        agent = agent_info_from(run_herdr(["agent", "get", args.name]))
-    elif args.prompt_action == "skip":
-        member = update_member(
-            store, session, args.name, phase="prompt_skipped", error=None
-        )
-    with store.locked() as latest:
-        assert latest is not None
-        output = member_output(latest, member, agent)
-    output["prompt_action"] = args.prompt_action
-    if args.prompt_action == "inspect":
-        if member.get("prompt_may_have_been_delivered"):
-            output["next_action_required"] = (
-                "choose --prompt-action send or skip after inspection"
-            )
-        elif member["phase"] not in {"prompt_submitted", "prompt_skipped"}:
-            output["next_action_required"] = (
-                "use --prompt-action send to submit the recorded assignment"
-            )
-    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    return 0
+    finally:
+        store.release_lease(lease)
 
 
 def status(args: argparse.Namespace) -> int:
@@ -895,9 +1239,13 @@ def _finish_member_operation(args: argparse.Namespace) -> int:
             "or repeat with --force"
         )
     phase = "completed" if args.command == "complete" else "released"
-    member = update_member(
-        store, session, args.name, phase=phase, ownership=[], error=None
-    )
+    lease = store.acquire_lease(args.name, 60)
+    try:
+        member = update_member(
+            store, session, args.name, phase=phase, ownership=[], error=None
+        )
+    finally:
+        store.release_lease(lease)
     output = member_output(state, member, agent)
     output["pane_closed"] = False
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))

@@ -30,6 +30,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -306,8 +307,9 @@ class CompatContractTests(unittest.TestCase):
         self.assertEqual(payload["ownership"], ["src/api/**"])
         self.assertEqual(payload["pane_id"], CHILD_PANE_ID)
         self.assertNotIn("pane_closed", payload)
-        recorded = json.loads((self.root_resolved / ".teamcraft" / "state.json")
-                             .read_text(encoding="utf-8"))
+        self.assertFalse((self.root_resolved / ".teamcraft" / "state.json")
+                        .exists())  # SQLite era never writes JSON state
+        recorded = self.recorded_state()
         self.assertEqual(recorded["members"]["dev"]["phase"], "prompt_submitted")
         # Current implementation flags possible delivery before submitting and
         # never clears it on success; freeze that exact behaviour.
@@ -367,7 +369,8 @@ class CompatContractTests(unittest.TestCase):
         mode = runtime.stat().st_mode & 0o777
         self.assertEqual(mode, 0o700)
         self.assertTrue((runtime / "state.lock").exists())
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertFalse(state_path.exists())  # SQLite authority: no JSON file
+        state = self.recorded_state()
         self.assertEqual(
             set(state),
             {"version", "team_id", "project_root", "herdr_session",
@@ -376,39 +379,47 @@ class CompatContractTests(unittest.TestCase):
         self.assertEqual(state["version"], 1)
         self.assertEqual(
             [p.name for p in runtime.iterdir() if p.name.endswith(".tmp")],
-            [],  # atomic replace must not leave temp files behind
+            [],  # committed transactions leave no temp files behind
         )
-        foreign = dict(state, version=2)
-        state_path.write_text(json.dumps(foreign), encoding="utf-8")
+        # A legacy JSON state file appearing mid-lifecycle freezes every
+        # further write (single-authority guard), bytes preserved untouched,
+        # and manual resolution restores service.
+        state_path.write_text(json.dumps({"version": 2}), encoding="utf-8")
         snapshot = state_path.read_bytes()
         with self.assertRaisesRegex(teamctl.TeamctlError,
-                                   "unsupported or malformed state file"):
+                                   "legacy JSON runtime state detected"):
             teamctl.reserve_member(self.store, self.session,
                                  make_member("late", ["docs/**"]))
         self.assertEqual(state_path.read_bytes(), snapshot)  # refusal is read-only
+        state_path.unlink()
+        teamctl.reserve_member(self.store, self.session,
+                             make_member("late", ["docs/**"]))
+        self.assertIn("late", self.recorded_state()["members"])
 
     def test_json_write_path_ignores_external_cutover_marker(self):
-        """Read-only threat fixture (M0 review 8.3 / 11.1; M1-07 guard gap).
+        """Post-cutover threat fixture, M1-07 updated semantics.
 
         A post-cutover environment is *simulated externally* inside this
         temp project only: a ``cutover.json`` marker declaring DB authority
         with a generation, plus the imported snapshot it references by
-        SHA-256.  The current JSON write path (``update_member`` /
+        SHA-256.  The normal write path (``update_member`` /
         ``reserve_member``, each taking the normal ``state.lock``) is then
         exercised after that marker exists.
 
-        Frozen current behaviour: the JSON writer never reads the marker or
-        generation, so JSON keeps being rewritten post-cutover.  This pins
-        the detection gap M1-07 must close with an explicit guard.  It does
-        NOT prove a stale pre-cutover process was ever running (the
-        2026-10-23 user confirmation says none is), and it implements no
-        fence itself.
+        M1-07 behaviour: there is no JSON write path anymore — runtime state
+        lives only in ``teamcraft.db``.  The CLI never reads the marker or
+        generation (nothing dual-reads), writes land in SQLite, marker and
+        snapshot files stay byte-identical, and no guard metadata (generation,
+        authority flag) enters runtime state.  The single-authority guard the
+        M0 review asked for is structural: a non-empty ``state.json`` freezes
+        writes (see the version-gate test), but a stray marker alone changes
+        nothing.
         """
         teamctl.reserve_member(self.store, self.session,
                              make_member("alpha", ["src/a/**"]))
         runtime = self.root_resolved / ".teamcraft"
-        state_path = runtime / "state.json"
-        snapshot = state_path.read_bytes()
+        snapshot = json.dumps(self.recorded_state(), sort_keys=True).encode(
+            "utf-8")
         snapshot_path = runtime / "imported-snapshot.json"
         marker_path = runtime / "cutover.json"
         snapshot_path.write_bytes(snapshot)
@@ -419,18 +430,18 @@ class CompatContractTests(unittest.TestCase):
         }, sort_keys=True), encoding="utf-8")
         marker_before = marker_path.read_bytes()
 
-        # Real JSON write path, normal locking, after the simulated cutover:
+        # Real write path, normal locking, after the simulated cutover:
         teamctl.update_member(self.store, self.session, "alpha",
                              phase="released", ownership=[])
         teamctl.reserve_member(self.store, self.session,
                              make_member("post_cutover", ["src/z/**"]))
 
-        after = json.loads(state_path.read_bytes().decode("utf-8"))
-        self.assertNotEqual(state_path.read_bytes(), snapshot)  # still writable
+        after = self.recorded_state()
+        self.assertFalse((runtime / "state.json").exists())  # no JSON written
         self.assertEqual(after["members"]["alpha"]["phase"], "released")
         self.assertIn("post_cutover", after["members"])
         # Nothing consulted the marker: marker/snapshot untouched, and no
-        # guard metadata (generation, authority flag) entered v1 state.
+        # guard metadata (generation, authority flag) entered runtime state.
         self.assertEqual(marker_path.read_bytes(), marker_before)
         self.assertEqual(snapshot_path.read_bytes(), snapshot)
         self.assertEqual(
@@ -496,7 +507,7 @@ class CompatContractTests(unittest.TestCase):
     def test_foreign_session_status_is_unknown_and_mutation_refused(self):
         teamctl.reserve_member(self.store, self.session,
                              make_member("dev", ["src/**"]))
-        snapshot = (self.root_resolved / ".teamcraft" / "state.json").read_bytes()
+        snapshot = self.recorded_state()
         other_socket = self.root / "other-herdr.sock"
         other_socket.touch()
         double = HerdrDouble()
@@ -517,9 +528,8 @@ class CompatContractTests(unittest.TestCase):
             teamctl.reserve_member(self.store, other_session,
                                  make_member("invader", ["docs/**"]))
         self.assertEqual(
-            (self.root_resolved / ".teamcraft" / "state.json").read_bytes(),
-            snapshot,
-        )
+            self.recorded_state(), snapshot,
+        )  # refusal never mutated the authoritative store
 
     def test_session_identity_missing_socket_has_null_ids(self):
         with mock.patch.dict(
@@ -603,9 +613,7 @@ class CompatContractTests(unittest.TestCase):
                 self.assertEqual(["agent", "prompt"] in called, prompts)
                 self.assertFalse(any(call[:2] == ["pane", "split"] for call in
                                    double.calls))
-                recorded = json.loads(
-                    (self.root_resolved / ".teamcraft" / "state.json")
-                    .read_text(encoding="utf-8"))
+                recorded = self.recorded_state()
                 self.assertEqual(recorded["members"]["dev"]["phase"],
                                expected_phase)
 
@@ -639,18 +647,31 @@ class CompatContractTests(unittest.TestCase):
                 self.assertIs(payload["pane_closed"], False)
                 self.assertFalse(forbidden & {tuple(call[:2]) for call in
                                             double.calls})
-                recorded = json.loads(
-                    (self.root_resolved / ".teamcraft" / "state.json")
-                    .read_text(encoding="utf-8"))
+                recorded = self.recorded_state()
                 member = recorded["members"]["dev"]
                 self.assertEqual(member["phase"], expected_phase)
                 self.assertEqual(member["ownership"], [])
 
+    # ------------------------------------------------------------------ helpers
+
+    def recorded_state(self):
+        """Authoritative team view read from SQLite.
+
+        M1-07 replacement for the former ``.teamcraft/state.json`` read:
+        the frozen compatibility dict comes from ``teamcraft.db`` (the single
+        authority), same keys, same shapes, independent store instance.
+        """
+
+        return teamctl.StateStore(self.root_resolved).read_unlocked()
+
     def temp_reset(self):
-        """Remove state between subtests without recreating the temp dir."""
-        state_path = self.root_resolved / ".teamcraft" / "state.json"
-        if state_path.exists():
-            state_path.unlink()
+        """Remove all runtime state between subtests (no temp-dir recreate)."""
+
+        runtime = self.root_resolved / ".teamcraft"
+        shutil.rmtree(runtime, ignore_errors=True)
+        # Drop the cached readiness/holder of the shared store so the next
+        # operation re-provisions SQLite against the freshly emptied root.
+        self.store = teamctl.StateStore(self.root_resolved)
 
 
 if __name__ == "__main__":

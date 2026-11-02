@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -110,6 +111,53 @@ class InstallScriptTests(unittest.TestCase):
             )
             self.assertEqual(local_config.read_text(), '{"private": true}\n')
 
+    def test_installed_cli_resolves_bundled_core_offline(self) -> None:
+        """Gate E: the installed target must import and run WITHOUT the repo.
+
+        Not a file-presence claim: this executes the installed teamctl with
+        PYTHONPATH stripped and a clean environment, so success proves the
+        bundled ``scripts/core/teamcraft`` copy is what resolves the import
+        (exactly where ``teamctl._bootstrap_core`` searches) and no network
+        or source checkout is involved.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "project"
+            self.run_installer(target)
+
+            core_dir = (target / ".agents" / "skills" / "teamcraft"
+                       / "scripts" / "core" / "teamcraft")
+            for module in ("__init__.py", "storage.py", "leader.py",
+                          "runtime_adapter.py", "commands.py", "domain.py"):
+                self.assertTrue((core_dir / module).is_file(),
+                              f"bundled core missing {module}")
+
+            installed_cli = (target / ".agents" / "skills" / "teamcraft"
+                            / "scripts" / "teamctl.py")
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(Path(temporary) / "fake-home"),
+            }
+            result = subprocess.run(
+                [sys.executable, str(installed_cli), "--help"],
+                cwd=str(target), env=env, text=True, capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0,
+                             f"stdout:\n{result.stdout}\n"
+                             f"stderr:\n{result.stderr}")
+            self.assertIn("usage", result.stdout.lower())
+            # The import must have come from the bundled copy, not the repo.
+            probe = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, "
+                 "r'%s'); import teamcraft; print(teamcraft.__file__)"
+                 % str(core_dir.parent)],
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertTrue(probe.stdout.strip().startswith(str(core_dir)))
+
     def test_dry_run_does_not_create_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "project"
@@ -153,7 +201,9 @@ class InstallScriptTests(unittest.TestCase):
             self.run_installer(target)
             updated = ignore.read_text()
             self.assertTrue(updated.startswith(original))
-            self.assertTrue(updated.endswith("/.teamcraft/\n/opencode.json\n"))
+            self.assertTrue(updated.endswith(
+                "/.teamcraft/\n/opencode.json\n"
+                "/.agents/skills/teamcraft/scripts/core/\n"))
             self.run_installer(target)
             self.assertEqual(ignore.read_text(), updated)
 

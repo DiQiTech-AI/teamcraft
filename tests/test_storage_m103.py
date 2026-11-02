@@ -197,6 +197,10 @@ def _staging_dirs(directory: Path) -> list[Path]:
 # unchanged): each new version only adds tables, the earlier sets remain the
 # documented floors, and every other assertion in this suite is untouched.
 EXPECTED_TABLES = {
+    # M1-07 (schema v4) runtime authority tables:
+    "leader_lease",
+    "runtime_meta",
+    "members",
     "schema_migrations",
     "projects",
     "tasks",
@@ -254,8 +258,9 @@ class StorageM103Tests(unittest.TestCase):
         report = migrate_to_head(self.db)
         self.assertTrue(report.fresh)
         self.assertEqual((report.from_version, report.to_version), (0, SCHEMA_VERSION))
-        # v3 ladder: a fresh database applies (1, 2, 3) in one transaction.
-        self.assertEqual(report.applied, (1, 2, 3))
+        # Forward ladder: a fresh database applies (1, 2, 3, 4) in one
+        # transaction (M1-07 added v4).
+        self.assertEqual(report.applied, (1, 2, 3, 4))
 
         conn = connect(self.db)
         self.assertIsInstance(conn, TeamCraftConnection)
@@ -271,7 +276,7 @@ class StorageM103Tests(unittest.TestCase):
             }
             self.assertEqual(tables, EXPECTED_TABLES)
             rows = conn.execute("SELECT version, applied_at FROM schema_migrations").fetchall()
-            self.assertEqual([r[0] for r in rows], [1, 2, 3])
+            self.assertEqual([r[0] for r in rows], [1, 2, 3, 4])
             self.assertIn("+00:00", rows[0][1])  # UTC ISO-8601
             # Foreign keys are actually enforced, not just declared.
             with self.assertRaises(sqlite3.IntegrityError):
@@ -3732,12 +3737,17 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             raw.execute("DROP TABLE IF EXISTS task_dependencies")
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
-            raw.execute("DELETE FROM schema_migrations WHERE version = 2")
+            # M1-07 (v4) artifacts must be shed too so the demoted claim
+            # stays honest; the tested fault remains exactly
+            # task_dependencies.
+            raw.execute("DROP TABLE IF EXISTS leader_lease")
+            raw.execute("DROP TABLE IF EXISTS runtime_meta")
+            raw.execute("DROP TABLE IF EXISTS members")
+            raw.execute("DELETE FROM schema_migrations WHERE version >= 2")
             if back_to_v1:
-                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
                 raw.execute("PRAGMA user_version=1")
             else:
-                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+                raw.execute("DELETE FROM schema_migrations WHERE version >= 3")
                 raw.execute("PRAGMA user_version=2")
             raw.commit()
         finally:
@@ -3791,7 +3801,9 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertTrue(lagging["schema_usable"])  # v1 stays fully usable
         self.assertFalse(lagging["at_head"])
         self.assertEqual(lagging["missing_version_tables"], [])
-        self.assertEqual(lagging["missing_head_tables"], ["commands", "events", "task_dependencies"])
+        self.assertEqual(lagging["missing_head_tables"],
+                         ["commands", "events", "leader_lease", "members",
+                          "runtime_meta", "task_dependencies"])
 
     def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
         self._drop_v2_table()
@@ -3850,7 +3862,10 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         # what this gate must catch.
         raw.execute("DROP TABLE IF EXISTS events")
         raw.execute("DROP TABLE IF EXISTS commands")
-        raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+        raw.execute("DROP TABLE IF EXISTS leader_lease")
+        raw.execute("DROP TABLE IF EXISTS runtime_meta")
+        raw.execute("DROP TABLE IF EXISTS members")
+        raw.execute("DELETE FROM schema_migrations WHERE version >= 3")
         raw.execute("PRAGMA user_version=2")
         raw.commit()
         raw.close()
@@ -3884,7 +3899,12 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
             if back_to_v2:
-                raw.execute("DELETE FROM schema_migrations WHERE version = 3")
+                # Honest v2 must also shed the v4 runtime artifacts and audit
+                # rows added by M1-07 (head is v4).
+                raw.execute("DROP TABLE IF EXISTS leader_lease")
+                raw.execute("DROP TABLE IF EXISTS runtime_meta")
+                raw.execute("DROP TABLE IF EXISTS members")
+                raw.execute("DELETE FROM schema_migrations WHERE version >= 3")
                 raw.execute("PRAGMA user_version=2")
             raw.commit()
         finally:
@@ -3925,8 +3945,9 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         )
         # …and a later upgrade adds v3 exactly once, converging to head.
         report = migrate_to_head(self.db)
-        self.assertEqual((report.from_version, report.to_version), (2, 3))
-        self.assertEqual(report.applied, (3,))
+        self.assertEqual((report.from_version, report.to_version),
+                       (2, SCHEMA_VERSION))
+        self.assertEqual(report.applied, tuple(range(3, SCHEMA_VERSION + 1)))
         conn3 = connect(self.db)
         self.addCleanup(conn3.close)
         with transaction(conn3):
@@ -3980,7 +4001,8 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             raw.close()
         # retry converges (idempotent recovery, 8.2-14)
         report = migrate_to_head(self.db)
-        self.assertEqual((report.from_version, report.to_version), (2, 3))
+        self.assertEqual((report.from_version, report.to_version),
+                       (2, SCHEMA_VERSION))
         self.assertTrue(verify_database(self.db)["at_head"])
 
     # -- M1-05 P1: integrity objects (triggers/indexes) are gated too --------

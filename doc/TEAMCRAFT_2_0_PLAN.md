@@ -725,6 +725,8 @@ SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitH
 
 （历史约束）门禁三项全绿前，禁止任何 M1-07 Runtime 接线改动（含 `teamctl.py`、Skill 状态读写、安装器运行语义）。2026-11-02 三项已全绿（run 41466544296），该阻断解除；Runtime 集成仍须依 M0 Review 第 9.1/12 节执行，具体实施切片待 CEO 分解后开工。
 
+**M1-07 实施进展（2026-11-03，本地实施完成、待 CEO 独立评审，未标记完成）**：CLI/Skill 已切换为 SQLite 单一权威（详见 M0 Review 第 12.8 节实施证据）。要点：`teamctl.py` 重写为 SQLite 权威（构造 fail-fast 纯检查、首次操作 provisioning；冻结五命令 argv/输出/退出码不变）；新增 `teamcraft/runtime_adapter.py`（sync_state 单事务成员+lineage+events；stage 命令 effect 前持久 claim；stale leader 拒绝 success）与 `teamcraft/leader.py`（per-member 租约、单调 epoch、release 保留行使 epoch 永不复位、可组合外层事务——两项 CEO 评审修正已落地并有回归）；schema v4（`leader_lease/runtime_meta/members` + `idx_members_phase`，前向演进）；`state.json` 不再是运行时状态，出现即 fail-closed（字节保留，读侧同样冻结，人工移除后恢复服务）；安装器离线捆绑 `teamcraft/` → `.agents/skills/teamcraft/scripts/core/teamcraft/`（与 `_bootstrap_core` 搜索路径一致），新增隔离目标真实执行 `teamctl --help` 的安装冒烟（剥离 PYTHONPATH）。本地证据：macOS/3.13 pytest 全仓 332 passed + 136 subtests；3.10 core unittest 279 OK（249 基线 + leader 13 + adapter 16 + install 冒烟 1）；3.10 Skill 53 OK（42 基线 + 11 新 CLI 级）。compat 契约 8 处 JSON 钉死断言经 CEO 2026-11-03 批准迁移为 SQLite 等价断言。真实仓库 `.teamcraft/state.json` 未被读取/修改；全部测试仅用合成临时根。Linux/3.10 CI 复跑与独立评审为剩余验收事项。
+
 ---
 
 ## 12. 里程碑目标与退出原则

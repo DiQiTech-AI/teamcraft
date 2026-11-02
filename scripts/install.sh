@@ -17,7 +17,8 @@ import sys
 import tempfile
 
 
-IGNORE_RULES = ("/.teamcraft/", "/opencode.json")
+IGNORE_RULES = ("/.teamcraft/", "/opencode.json",
+                "/.agents/skills/teamcraft/scripts/core/")
 
 
 class InstallError(RuntimeError):
@@ -49,7 +50,7 @@ def parse_args() -> argparse.Namespace:
 
 def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
     roots = [source_root / ".agents" / "skills" / "teamcraft"]
-    sources: list[Path] = []
+    sources: list[tuple[Path, Path]] = []
     for root in roots:
         if not root.is_dir() or root.is_symlink():
             raise InstallError(f"missing or unsafe source directory: {root}")
@@ -59,7 +60,28 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
             if path.is_symlink():
                 raise InstallError(f"source resources must not contain symlinks: {path}")
             if path.is_file():
-                sources.append(path)
+                sources.append((path, path.relative_to(source_root)))
+
+    # M1-07: bundle the importable Python Core next to the skill's teamctl so
+    # the installed CLI resolves `teamcraft` WITHOUT a source-checkout
+    # PYTHONPATH and WITHOUT any network access at runtime (smallest
+    # reviewable offline design: a verbatim copy of the pure-stdlib package
+    # under scripts/core/teamcraft, exactly where teamctl._bootstrap_core
+    # looks for it).
+    core_package = source_root / "teamcraft"
+    if not core_package.is_dir() or core_package.is_symlink():
+        raise InstallError(f"missing or unsafe core package directory: {core_package}")
+    core_members = sorted(p for p in core_package.glob("*.py") if p.is_file())
+    if "__init__.py" not in {p.name for p in core_members}:
+        raise InstallError(f"core package lacks __init__.py: {core_package}")
+    for path in core_members:
+        if path.is_symlink():
+            raise InstallError(f"core package must not contain symlinks: {path}")
+        sources.append(
+            (path,
+             Path(".agents") / "skills" / "teamcraft" / "scripts" / "core"
+             / "teamcraft" / path.name)
+        )
 
     profiles_dir = source_root / ".opencode" / "agents"
     profiles = sorted(profiles_dir.glob("herdr-*.md"))
@@ -68,14 +90,14 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
     for path in profiles:
         if path.is_symlink() or not path.is_file():
             raise InstallError(f"invalid OpenCode role profile: {path}")
-        sources.append(path)
+        sources.append((path, path.relative_to(source_root)))
 
     template = source_root / "opencode.example.json"
     if template.is_symlink() or not template.is_file():
         raise InstallError(f"missing or unsafe config template: {template}")
-    sources.append(template)
+    sources.append((template, template.relative_to(source_root)))
 
-    return [(path, path.relative_to(source_root)) for path in sources]
+    return sources
 
 
 def validate_target_root(target: Path) -> None:
