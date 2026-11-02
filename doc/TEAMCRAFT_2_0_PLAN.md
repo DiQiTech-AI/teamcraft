@@ -2,11 +2,11 @@
 
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
-> **版本**：v1.4（CEO Protocol 与跨 Harness 编排规划草案）
-> **日期**：2026-10-27
+> **版本**：v1.5（SQLite-only Fresh Start 路线调整；CEO Protocol 与跨 Harness 规划仍为 Proposed）
+> **日期**：2026-11-02
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03 及以后未获授权。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。2026-11-02 Owner 决策改为 **SQLite-only Fresh Start**：M1-06 重定义为 SQLite Fresh Start Validation（实施中，验收以 CEO 独立复核为准），M1-07 重定义为 SQLite Runtime Integration（仍未获开工授权）；政策与依据见第 11.1 节。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
 ---
 
@@ -637,7 +637,7 @@ GET    /api/v1/usage?project_id=&range=
 
 > 不要求立即按下列结构重排；现阶段保留 `teamctl` 外部 CLI 与 `.agents/skills/teamcraft/` Skill 入口，采用渐进式迁移。M1-02 只建立最小 Python 包边界并迁移 Skill 技术名，未提前实现存储、调度、Web 或模型路由。
 >
-> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 实现中落地（已条件验收通过）：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧 Skill 目录、兼容窗口或别名。M1-02 当时保留的 `.herdr-team/` 运行目录决定已被 2026-10-27 的后续指示取代，当前运行目录为 `.teamcraft/`；旧状态只触发安全拒绝，不自动迁移。JSON→SQLite cutover 仍归 M1-06/M1-07，且本次目录统一不执行该 cutover。
+> Skill 技术名 `herdr-team` → `teamcraft`（2026-10-23 决策）已在 M1-02 实现中落地（已条件验收通过）：仓库与安装器只提供 `.agents/skills/teamcraft/`，frontmatter `name` 为 `teamcraft`，不保留旧 Skill 目录、兼容窗口或别名。M1-02 当时保留的 `.herdr-team/` 运行目录决定已被 2026-10-27 的后续指示取代，当前运行目录为 `.teamcraft/`；旧状态只触发安全拒绝，不自动迁移。原“JSON→SQLite cutover 归 M1-06/M1-07”的安排已被 2026-11-02 Owner 决策（SQLite-only Fresh Start，见第 11.1 节）取代，产品不执行该 cutover。
 
 ```text
 teamcraft/
@@ -686,25 +686,34 @@ teamcraft/
 └── pyproject.toml
 ```
 
-建议运行目录：`.teamcraft/` 中保存状态与缓存；新数据库可用 `.teamcraft/teamcraft.db`，日志和工件放受控子目录。若发现旧 `.herdr-team/state.json`，当前 CLI 先安全拒绝并要求显式处置，不自动搬移。JSON→SQLite cutover 仍是独立问题，归 M1-06/M1-07 决策。
+建议运行目录：`.teamcraft/` 中保存状态与缓存；新数据库可用 `.teamcraft/teamcraft.db`，日志和工件放受控子目录。若发现旧 `.herdr-team/state.json`，当前 CLI 先安全拒绝并要求显式处置，不自动搬移。原 JSON→SQLite cutover 独立议题已被 2026-11-02 Owner 决策（SQLite-only Fresh Start，见第 11.1 节）取代：不做 JSON 导入、不做切换、不做 JSON 回滚。
 
 ---
 
-## 11. 渐进迁移与兼容策略
+## 11. 持久化路线与兼容策略
 
-### 11.1 迁移原则
+### 11.1 已接受路线：SQLite-only Fresh Start（2026-11-02）
 
-- 现有 JSON 数据不得被原地覆盖；迁移前备份并计算校验摘要。
-- 初期 **读取旧 JSON → 建库 → 校验 → 切换单一写入源**。不建议长期 JSON/SQLite 双主写入；必要的兼容导出应为只读派生。
-- 切换前停止新派工或持有全局迁移锁；如果有活动会话，先记录 Session 映射并对恢复状态做显式 Reconcile。
-- 每个版本的 Schema 都要有版本记录、上行迁移、可行时的回滚策略；无法无损回滚时提供快照恢复。
-- 兼容命令执行行为、状态字段语义和错误码。任何弃用 CLI 命令至少在一个可见版本给出警告。M1-02 的 Skill 目录技术名变更是已批准例外：旧入口从未对外部署，因此直接改名且不保留旧目录；CLI 命令和参数不适用此例外。运行状态目录随后已按 2026-10-27 指示独立统一为 `.teamcraft/`，对旧状态采取 fail-closed，事实与证据见 M0 Review 第 12.2 节。
+Owner 确认 TeamCraft 2.0 没有需要迁移或保留的生产旧系统及历史状态。实施基线因此采用 SQLite-only Fresh Start：
 
-### 11.2 迁移测试
+- 不提供生产 Legacy JSON → SQLite 导入、生产回滚到 JSON、JSON/SQLite 双写或旧 writer freeze/compat 服务。
+- 任何旧状态文件都不得静默导入、覆盖、移动或删除；检测到非空 `.teamcraft/state.json` 或 `.herdr-team/state.json` 时，Fresh Start 明确拒绝并要求人工处置。
+- M1-06 只验证全新项目目录的 SQLite 初始化，不接入 CLI Runtime、不改变当前 `teamctl.py` JSON 行为，也不对真实运行目录操作。
+- M1-07 定义为 SQLite Runtime Integration，不是 Legacy Cutover；它将来把 CLI/Skill 接入 Core Command Service，仍需 Owner 单独授权。
+- 历史 Commit `1477cc0` 及原 Legacy rehearsal 验收记录保留为历史事实，不改写为 Fresh Start 证据；该路线已被本决策 supersede。
+- 本路线不降低可靠性约束：SQLite Schema 前向升级、WAL 一致性备份与数据库恢复、Command/Event 事务原子性、UNKNOWN/Reconcile、Ownership、Session 身份、Runtime Leader fencing、重复派发防护和外部副作用对账继续适用。
+- SQLite 数据库只支持单机本地磁盘；网络文件系统、同步盘和多机共享 DB 不在 2.0 支持范围内。Schema 升级采用版本化、前向 migration；恢复后先做完整性检查及 DB/Herdr/Git 对账。
+- 继续兼容既有 CLI 参数、输出、错误码及保守恢复语义。M1-02 的 Skill 技术名直接改为 `teamcraft` 是已批准例外（旧入口未对外部署）；运行目录自 2026-10-27 起为 `.teamcraft/`，旧状态 fail-closed，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
-- 空项目、只读成员、多个活动成员、缺失 Pane、`unknown` 状态、路径范围重叠、损坏 JSON、重复迁移、迁移中断。
-- 比较迁移前后：成员数、任务与角色、Ownership、会话映射和当前活动状态。
-- 迁移后应用重启再次检查，避免只在第一次成功。
+### 11.2 M1-06 Fresh Start 验证范围
+
+Fresh Start 验收只使用临时目录和合成数据，至少覆盖：首次初始化及完整 Schema/索引/约束；重复初始化幂等和已有有效 DB 数据保留；Schema version 校验及过新/损坏 DB 拒绝；非空 Legacy JSON 冲突拒绝且原字节不变；不可写目录；初始化异常/进程崩溃后的不可用状态与安全重试；双进程首次初始化、锁竞争和完整性。不得读取真实 `.teamcraft/state.json`、执行 Legacy 导入或修改 Herdr 会话。M0 Review 第 9.1 节为任务步骤和逐项退出条件的唯一权威来源。
+
+### 11.3 M1-07 SQLite Runtime Integration 准入
+
+M1-07 未获开工授权。授权后需先审查实际 CLI、Skill、安装器和 Core API，再将状态读写接入同一持久化 Command Service：写入与 Domain Event 同事务；Command 幂等及状态 CAS；UNKNOWN 必须先 Reconcile；Task version、Attempt、Session 身份和 Ownership 校验；外部副作用由唯一有效 Runtime Leader fenced 执行；旧结果不明不得盲目重发。Service 未运行时须安全拒绝或持久化待处理 Command，并有可恢复的 Reconcile 路径。安装器必须提供 CLI 实际需要的 Python Core 模块，不能依赖源码仓库隐式 `PYTHONPATH`。
+
+SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitHub exactly-once；对外操作仍需在失租、崩溃和回执未知时查询外部事实并保守对账。M1-07 必须保持当前 CLI/Skill/Herdr/Ownership 兼容性并完成 CLI、Skill、安装与多进程/故障回归；完成 M1-06 不自动授权 M1-07。
 
 ---
 
@@ -716,13 +725,13 @@ teamcraft/
 
 **目标**：摸清现有代码、运行语义和测试基准，为变更划出兼容边界。M0-01 架构审计与 M1-01 兼容契约测试是不同任务；M0-01 的证据和状态见 M0 Review 第 2–3、12 节。
 
-**退出原则**：现状、差距、基线测试、未知风险与 ADR-001 已记录；用户原则接受设计并单独授权首个实施任务。原则接受不代表正式数据迁移获批。
+**退出原则**：现状、差距、基线测试、未知风险与 ADR-001 已记录；用户原则接受设计并单独授权首个实施任务。原则接受与 M1-06 开工授权不等于 M1-07 开工授权。
 
 ### M1 — Durable Core（P0）
 
 **目标**：在保留旧 CLI、Herdr、Ownership 和保守恢复语义的前提下，使持久化 Task、Attempt、Session、Event 和 Command 可在无 Web 时使用，并定义版本化 CEO Protocol 元数据及 Codex/OpenCode 的共享发现契约。
 
-**退出原则**：一致性备份、Schema 前向版本保护、事务与幂等通过；CEO Protocol 的单一来源、版本/hash、缺失/不兼容 fail-closed 和 Codex/OpenCode Mock 发现契约通过；旧入口 Guard、冻结、代际和双进程故障矩阵通过后，才允许受控 JSON→SQLite 单真源切换。旧 writer 无法可靠阻断时保持 JSON 单写，不能宣称 M1 退出。实际切换仍须单独审批。
+**退出原则**：SQLite Fresh Start 初始化、完整性、重复初始化、数据保留、异常/并发恢复通过；一致性备份、Schema 前向版本保护、事务与幂等通过；CEO Protocol 单一来源、版本/hash、缺失/不兼容 fail-closed 和 Codex/OpenCode 发现契约通过；M1-07 经独立授权后完成 CLI/Skill 到 Core Command Service 的集成及兼容回归。M1-06 完成不代表 M1 整体完成；Legacy JSON 导入、旧 writer freeze、双真源和 JSON cutover 不属于当前路线，也不是 M1 退出门禁。
 
 ### M2 — Watcher & Safe Recovery（P0）
 
@@ -866,7 +875,7 @@ teamcraft/
 
 ### 15.3 后续任务开工提示词模板
 
-> 先阅读 `doc/TEAMCRAFT_2_0_PLAN.md` 的产品需求和 [M0 Review](TEAMCRAFT_2_0_M0_REVIEW.md) 的 ADR-001、第 9 节任务依赖及第 12 节授权记录。仅在用户对具体任务另行授权后，执行该任务的实施步骤与验收；先核对真实代码和测试，不把设计写成已实现功能。保持现有 Herdr、Skill 语义、Ownership 和保守恢复；本任务之外的里程碑、正式数据库 cutover、远程发布及高风险外部操作分别遵守对应门禁。交付须说明证据路径、测试命令与退出码、风险和未完成事项。
+> 先阅读 `doc/TEAMCRAFT_2_0_PLAN.md` 的产品需求和 [M0 Review](TEAMCRAFT_2_0_M0_REVIEW.md) 的 ADR-001、第 9 节任务依赖及第 12 节授权记录。仅在用户对具体任务另行授权后，执行该任务的实施步骤与验收；先核对真实代码和测试，不把设计写成已实现功能。保持现有 Herdr、Skill 语义、Ownership 和保守恢复；本任务之外的里程碑、SQLite 运行时集成（M1-07，见第 11.3 节；原“正式数据库 cutover”门禁已随 2026-11-02 SQLite-only Fresh Start 决策取消）、远程发布及高风险外部操作分别遵守对应门禁。交付须说明证据路径、测试命令与退出码、风险和未完成事项。
 
 ---
 

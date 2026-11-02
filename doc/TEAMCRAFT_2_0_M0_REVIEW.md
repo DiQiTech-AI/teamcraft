@@ -1,10 +1,10 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。M1-06 已于 2026-11-01 获单独开工授权，当前实施中；M1-07 及以后未授权。正式 JSON→SQLite cutover 尚未审批。
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start：旧 M1-06 cutover 排练范围已被取代，新 M1-06 正在实施；M1-07 Runtime Integration 尚未授权。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
 >
-> 报告版本：v1.6（M1-05 完成验收与 M1-06 开工授权登记）
+> 报告版本：v1.7（SQLite-only Fresh Start 路线调整与 M1-06 新授权）
 >
-> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与 M1-06 授权：2026-11-01
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 路线决策与新 M1-06 授权：2026-11-02
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
@@ -208,7 +208,7 @@ flowchart LR
 
 ### 8.1 状态
 
-**原则接受（2026-10-23）**。本节是实施设计基线；原则接受不等于后续任务开工授权、任务完成验收或正式数据迁移审批。这四种决策分别记录于第 12 节。M1-01 已单独获准、交付并通过评审；正式 cutover 仍须满足 8.3 与 M1-06/M1-07 的门禁及单独审批。本报告不实施迁移。
+**原则接受（2026-10-23）；持久化路线于 2026-11-02 更新**。本节的状态机、事务、Command/Event、并发与恢复原则仍是设计基线；其中 legacy 导入、旧 writer fencing、JSON rollback 和生产 cutover 方案被 2026-11-02 的 Owner 决策明确取代，不再是 TeamCraft 2.0 的实施路径。原则接受不等于任务开工授权或任务完成验收；决策状态见第 12 节。M1-01 的原验收记录不变。
 
 PRD 的建议 DDL 在实施前必须修正两点：
 
@@ -220,8 +220,8 @@ PRD 的建议 DDL 在实施前必须修正两点：
 ### 8.2 决策
 
 1. **持久化真源**：新 Core 使用 `.teamcraft/teamcraft.db`，SQLite 开启 foreign keys、WAL 和 busy timeout。所有领域写入只经 Repository/Command Service，状态变更与 append-only Event 在同一事务提交。数据库只支持单机、本地磁盘；网络文件系统、同步盘和多机共享 DB 不在 2.0 支持边界内。
-2. **单写入源迁移**：M1 开发前半段不接管现有 Herdr 成员；旧 `teamctl` 继续是 JSON 唯一写入者，新 Core 只管理隔离测试数据。切换必须先部署旧入口写阻断，再完成冻结、静止性证明、导入和代际切换；切换后 DB 是唯一写入源，`state.json` 只保留原始快照或由 DB 生成的只读兼容导出，禁止长期双写。现有 JSON 明确绑定创建它的 Herdr socket Session（`teamctl.py:192-207`）；如果迁移发生在另一个 Session，记录可导入为历史，但关联 Attempt/Session 必须为 UNKNOWN，绝不按成员名自动认领 Pane、自动恢复或重发 Prompt。
-3. **领域分层**：Task 表示用户目标和验收；Attempt 表示一次执行；Session 表示 Herdr/Harness 运行实例；Agent 表示能力配置。旧 Member 记录导入时生成稳定 ID，并把原 JSON 保存在受控 legacy payload/迁移审计中，便于核对而不是覆盖原文件。
+2. **旧版迁移约束（历史基线，2026-11-02 已 superseded）**：此前方案要求旧 `teamctl` JSON 唯一写入、部署旧入口写阻断、冻结与静止性证明后导入，再切换 DB 权威；其会话身份和 UNKNOWN 约束仅作为旧方案的审计记录保留。当前路线不读取或导入历史 JSON，不支持 JSON 回滚或双写；新 Core 以 SQLite-only Fresh Start 初始化，发现非空旧状态时拒绝并要求人工处置。
+3. **领域分层**：Task 表示用户目标和验收；Attempt 表示一次执行；Session 表示 Herdr/Harness 运行实例；Agent 表示能力配置。此前“导入旧 Member 并保存原 JSON payload”的内容属于已 supersede 的 Legacy 迁移设计，不是当前功能或 M1-06 验收范围。
 4. **三层状态与交付状态**：Task 状态、Attempt 状态和 Session/Herdr live signal 独立。`idle/done` 只是实时信号；Worker 完成表示 Attempt 已停止执行并提交结构化结果，Verifier 通过表示绑定证据满足验证规则，PR 创建只表示远端候选已存在，PR 合并才是 direct-PR 的交付事实。这些事件都不单独等于 Task DONE。交付就绪使用策略中立的 `READY_FOR_ACCEPTANCE`；只有 direct-PR 在 PR 已创建、检查通过且等待 merge 决定时使用 `READY_TO_MERGE`。若实现继续沿用 PRD 的 Task 主状态枚举，则把前者建模为独立 `delivery_status`，不得把报告或本地 Commit 描述成“待合并”。这是目标状态设计，不是现有 CLI 已实现能力。现有 launch phase 作为兼容字段/事件保留。
 5. **交付策略的 DONE 条件**：`report-only`/scout 必须有受控 report artifact、摘要匹配、Verifier PASS 和明确的人类接受；`local-only` 必须从 M4 的隔离 Worktree 产生 Commit，完整 Diff 通过 Ownership Gate，Verifier PASS，并由人明确接受指定本地 Commit/分支；`direct-PR` 必须绑定预期 base/head，必需检查和 Approval 通过，且 PR 已合并到预期 base。Worker FINISHED、Verifier PASS、Approval 记录或 PR created 都是独立状态，不可折叠为 DONE；PR created 最多进入 READY_TO_MERGE。
 6. **Approval 证据绑定**：Approval 至少绑定 `task_id/task_version`、`attempt_id/attempt_no`、artifact digest 或 `commit_sha + diff_digest`、Verifier 结果与配置版本、proposed action；direct-PR 还绑定 repository、PR、head SHA 和 base branch/base SHA。任一绑定字段、策略或验证配置变化都使旧 Approval 失效，将 Task 重新打开到 VERIFYING/NEEDS_HUMAN；执行副作用前 Command 必须以 compare-and-swap 再核对 evidence version，不能复用过期批准。
@@ -231,10 +231,10 @@ PRD 的建议 DDL 在实施前必须修正两点：
 10. **Herdr/Watcher 边界**：所有 Herdr 命令经 Adapter；Adapter 复用现有 terminal/native-session 核验和错误语义。Watcher 分别记录进程存活、Agent 活跃和实际任务进展；Pane/进程存在或日志仍滚动都不能证明验收进展。实际进展只由版本化规则认可的产物、状态里程碑、Commit/report digest 或验证结果推进。Watcher 只做确定性观察、Reconcile 和事件产生，空闲时不调用 LLM。
 11. **外部副作用与恢复**：Command 采用 `pending/running/confirmed/unknown`，通过 idempotency key 去重。系统承诺 at-least-once 检查和幂等处理，不承诺外部操作 exactly-once。重启先 Reconcile `running/unknown/PENDING_SERVICE`，确认旧副作用事实后才继续；`unknown` 不自动产生新 Attempt。
 12. **安全默认**：保留 Ownership/read-only；M4 叠加 Worktree 和 Diff Gate。merge、deploy、删除脏 Worktree、强制释放和不确定重试均进入 Approval/显式人审。
-13. **SQLite 运维**：备份必须使用 SQLite Online Backup API、`VACUUM INTO`（满足适用条件时）或在受控 checkpoint/停写后的等价一致性流程，并连同 schema version、应用版本、校验摘要和 cutover generation 写 manifest；禁止在 WAL 活跃时只复制主 `.db` 文件。启动时发现数据库 schema 高于当前二进制支持版本必须只读失败并拒绝服务写入，不得自动降级。事件、命令、日志和 artifact 的保留期按项目策略执行，但迁移审计、Approval/交付摘要和恢复必需事件不能被无证明清除。恢复到备份后先做完整性检查和 DB/Herdr/Git Reconcile，再恢复派工。
-14. **回滚**：迁移失败不写 cutover 标记，继续使用原 JSON；迁移成功后如需回滚，必须冻结派工并恢复同一 generation 的一致性快照，不能把较新的 DB 状态无提示地倒灌旧 JSON。Schema 降级不可无损时采用数据库快照恢复。
+13. **SQLite 运维**：备份必须使用 SQLite Online Backup API、`VACUUM INTO`（满足适用条件时）或在受控 checkpoint/停写后的等价一致性流程，并连同 schema version、应用版本与校验摘要写 manifest；generation 若出现，仅表示备份 lineage 元数据，不代表 legacy writer fencing。禁止在 WAL 活跃时只复制主 `.db` 文件。启动时发现数据库 schema 高于当前二进制支持版本必须只读失败并拒绝服务写入，不得自动降级。事件、命令、日志和 artifact 的保留期按项目策略执行；恢复必需证据不能被无证明清除。恢复到备份后先做完整性检查和 DB/Herdr/Git Reconcile，再恢复派工。
+14. **恢复政策**：保留 SQLite 数据库快照恢复和 Schema 前向升级；不支持生产状态回滚至 JSON。数据库恢复后必须完成完整性检查和 DB/Herdr/Git Reconcile，未知 Attempt/外部副作用仍按 UNKNOWN 人工核对。
 
-### 8.3 SQLite cutover 协议与崩溃恢复
+### 8.3 SQLite cutover 协议与崩溃恢复（历史设计，已于 2026-11-02 superseded）
 
 当前实现的 `STATE_VERSION = 1` 只校验 JSON 格式代际（`teamctl.py:22`、`:140-151`）；`StateStore` 的 `fcntl` 锁只协调仍使用同一 `state.lock` 的 JSON 操作（`:125-169`），而 `reserve_member` 在锁内直接覆写 JSON（`:310-332`）。它没有 cutover generation、旧入口写阻断或跨 JSON/SQLite 的共同事务。即使替换了磁盘上的脚本，已经载入旧 Python 代码的进程仍能在导入后取得旧锁并覆盖 `state.json`。因此“持有 state.lock 后导入”不足以证明安全。
 
@@ -247,7 +247,7 @@ PRD 的建议 DDL 在实施前必须修正两点：
 5. **原子切换**：迁移器从上述最终 JSON hash 检查开始持续持有同一个 legacy `state.lock`，在 DB 事务写入 `DB_AUTHORITATIVE` generation 和事件，并等待 DB transaction/cutover marker 的结果持久化后才释放该锁。兼容入口只有观察到精确 generation 后才可转到 Command Service。保留原 JSON 字节快照，不原地改写为新格式。这个顺序可以约束已部署 guard 的新入口，但仍不能 fence 已载入且不认识 marker 的旧代码，因此第 3 步的 quiescence 证明和无法证明时取消 cutover 仍是硬门禁。
 6. **切后监视**：记录 cutover 时 JSON 指纹。其后任何非受控兼容导出导致的 JSON 指纹变化都视为 stale writer 证据：立即暂停 dispatch，将相关 Command/Attempt 置 UNKNOWN/NEEDS_HUMAN，保存双方证据并要求人工 reconciliation；不得把变化自动合并进 DB，也不得回到双主。
 
-无法可靠枚举、停止或以共同 generation 栅栏约束旧进程时，安全策略是取消 cutover：JSON 保持唯一 writer，SQLite 仅作为可丢弃的 shadow/read model，且不得承载新外部副作用或被 Web/CLI 展示为权威状态。M1-06 必须用双进程交错和故障注入覆盖：旧进程在 freeze 前载入后延迟写、hash 检查间写、导入提交前写、DB 提交后旧写、每个 marker/backup/事务边界崩溃、重启选择权威 generation。只有这些测试证明 fail closed，M1-07 才允许实际切换。**2026-10-23 时点确认（非永久保证）**：用户确认当前没有旧版 `teamctl.py` 进程在运行，因此此刻不存在需要立即 fence 的历史进程。该确认只描述当下时点，不构成迁移日仍然静止的证明：M1-06/M1-07 仍必须保留安全迁移、备份/回滚和必要的旧进程故障注入测试，每次 cutover 前重新执行静止性证明；但不为此建设长期跨版本兼容服务。
+无法可靠枚举、停止或以共同 generation 栅栏约束旧进程时，旧方案的安全结论是取消 cutover。**2026-11-02 Owner 路线决策（当前基线）**：Owner 确认 TeamCraft 2.0 没有需要保留或迁移的生产旧系统及历史状态，因此取消生产 Legacy JSON→SQLite 迁移、生产 JSON 回滚、JSON/SQLite 双真源与旧 writer freeze/compat 服务。旧 cutover 细节保留为历史审计，不再是活动实施门禁。M1-06 改为 SQLite Fresh Start Validation：全程仅临时目录与合成数据；非空 legacy `state.json` 必须 fail closed，原文件不自动导入、移动或删除。M1-07 改为 SQLite Runtime Integration，仍需 Owner 单独授权。SQLite Schema 版本升级、数据库备份/恢复、事务/事件原子性与 Runtime Leader fencing 不随该路线取消。
 
 ### 8.4 交付状态判定表
 
@@ -271,7 +271,7 @@ PRD 的建议 DDL 在实施前必须修正两点：
 
 ### 8.6 主要后果
 
-该方案增加 SQLite Schema、迁移、Leader 和服务生命周期复杂度，但能保留现有 CLI 的调用方式，并为 Task 历史、事件、幂等和重启恢复提供确定边界。M1 的关键风险不在建表，而在旧 Member 到 Task/Attempt/Session 的映射、已载入旧代码的进程和切换窗口；因此迁移排练与实际切换必须分开验收，不能与 Scheduler 或 Web 一并发布。显式 queue/TTL 和一次性 Leader 会增加 CLI 交互状态，但避免服务恢复后意外执行陈旧请求。
+SQLite Core 仍增加 Schema、Leader 和服务生命周期复杂度，但本路线避免了没有生产迁移对象支撑的 JSON 字段映射、双真源和旧 writer cutover 服务。M1-06 风险聚焦初始化原子性、Schema 完整性、权限、既有数据保护和并发恢复；M1-07 Runtime Integration 风险则聚焦 CLI/Skill 接线、Command Service 边界和外部副作用 Reconcile。Schema 迁移与数据库备份恢复仍是运行期能力，不等同于 Legacy JSON 迁移。
 
 ### 8.7 ADR-001 提议扩展：CEO Protocol、Harness 入口与 Wake（待人工审查）
 
@@ -323,8 +323,8 @@ flowchart LR
 | **M1-03 SQLite Repository/Migration v1**；依赖 M1-02 | 实现连接、WAL/外键、migration 表、事务 API、busy timeout；先建 Project/Task/Agent/Attempt/Session 基础表；修正 PRD DDL 的活动 Attempt 与可空 Commit/report 证据模型；实现 Online Backup API/等价一致性备份、manifest、保留策略入口和恢复检查 | 空库初始化、重复 migrate、并发写、事务中断、损坏、磁盘路径不支持和 schema 版本过新均有测试；版本过新拒绝写；WAL 活跃备份可恢复且通过 integrity check；禁止只复制主 DB；ship/scout Schema 样例均可表达 | WAL/锁在不同文件系统语义差异；误放网络盘；保留策略删掉审计证据；降级不可逆 |
 | **M1-04 领域状态与 DAG**；依赖 M1-03 | 实现 Task/Attempt/Session 状态机、数据库级单活动 Attempt 约束、DAG 循环路径检测、READY 推导、优先级排序和 optimistic version | 合法/非法转换均测试；循环返回具体路径；Session 消失不改变 Task ID；两个独立 DB 连接竞争时只有一个活动 Attempt | 状态枚举与现有 phase/live_state 混淆；SQLite 部分唯一索引兼容 |
 | **M1-05 Event/Command 原子性（已验收，2026-11-01）**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、载荷/evidence version、TTL、同键载荷冲突和 pending/running/confirmed/unknown/expired；定义 Command Service API 和 CAS。**TTL 纳入归一化请求身份**：TTL 取 `None` 或校验后的整数秒（1..30 天），其持久表示直接复用 v3 已有的不可变 `requested_at`/`expires_at` 列对，由该原始时间对派生并校验出原请求 TTL，**因此不需升 v4** | 状态+事件+Command 同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键冲突；证据变化使待执行命令失效。**TTL 身份语义**：仅 kind/payload/evidence/TTL 四要素全同才复用原结果（含已确认命令的 `result_json`）；任何 TTL 差异（含 `None`↔显式两个方向）均以 `IdempotencyConflictError` 拒绝且零副作用；比较**只用相对秒**（自存储行的原始时间对派生），绝不比较重试按自身时钟新算的绝对 `expires_at`；已过期行仍仲裁其幂等键——同 TTL 重放复用该过期行且不新增任何事件，不同 TTL 重放仍冲突；并发同 TTL 收敛为单行单事件，并发不同 TTL 恰好一胜一冲突且失败方无额外事件；派生结果不合法（不可解析/naive/非整秒/越界）时 fail closed 抛 `StorageError`，不得猜测相等或不等 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长；TTL 若误比绝对期限会把每次重试误判为冲突，若忽略 TTL 则会使不同期限的副作用承诺被静默复用 |
-| **M1-06 Legacy 导入排练与 cutover 故障矩阵（已获开工授权，2026-11-01）**；依赖 M1-03、M1-04、M1-05 | 冻结 v1 reader；实现只读 backup/hash/import rehearsal、generation/freeze/cutover 协议和 guard contract；覆盖空/只读/多成员/unknown/损坏/跨 Session；用双进程故障注入模拟已载入旧 writer 在 hash 检查间、提交前后写入及各边界崩溃。本任务不把生产入口切为 DB | 原 JSON 字节不被覆盖；重复 rehearsal 幂等；字段映射可核对；跨 Session 不 adopt/resume/resend；stale/interleaving writer 必须中止切换或触发切后 pause；若无法 fence，测试证明 JSON 继续唯一 writer、DB shadow 不执行副作用；重启选择唯一权威 generation | 旧进程无法枚举或停止；测试时序假阳性；legacy 记录缺稳定 ID |
-| **M1-07 共享 Command Service、旧 CLI Guard 与原子 cutover**；依赖 M1-06 | 先将旧 `teamctl.py` 改为薄兼容入口并在所有写路径部署 freeze/generation guard；状态查询/变更收口到 Command Service；为新 Task CRUD/依赖提供 CLI；实现只读离线、服务缺席拒绝/显式 TTL queue，以及供旧 CLI 单次操作使用的最小持久 Command executor。该 executor 每次只处理本次命令，必须取得排他 fenced lease，不承担长期调度；最后按 8.3 条件执行可回滚 cutover | guard 在持有 legacy `state.lock` 且紧邻 mutation 前检查 marker/generation；迁移器从最终 JSON hash 检查到 DB_AUTHORITATIVE/marker 持久化持续持有同一锁；guard 契约通过后才允许冻结；已载入旧进程无法可靠 fence 时 cutover 被拒绝；新旧查询最终指向同一 DB 真源；CLI 不能直写表或直调 Herdr，Command Service API 明确约束未来 Web 也只能提交 Command；一次性 executor 失租后不能继续副作用；切后意外 JSON 变化暂停 dispatch；全部 crash matrix 通过 | 替换磁盘入口不能约束已载入旧代码；一次性 executor 与后台服务竞争 lease；兼容输出额外查询竞态 |
+| **M1-06 SQLite Fresh Start Validation（已获开工授权，2026-11-02）**；依赖 M1-03、M1-04、M1-05 | 在合成数据与临时项目根验证首次 SQLite 初始化、完整 Schema/索引/约束、Schema 版本、重复初始化、现有有效库保留、损坏/过新库拒绝、不可写目录与初始化崩溃恢复、并发首次初始化；对非空 `.teamcraft/state.json` / `.herdr-team/state.json` fail closed，不读取、导入、移动或删除；移除已确认无运行时调用的 Legacy JSON 导入/cutover 专用代码。本任务不接入现有 CLI Runtime，也不改 Herdr | 所有验证只用临时目录；重复初始化幂等且不覆盖状态；Schema 不完整时不得显示 ready，失败后可安全拒绝或重试收敛；损坏/不兼容库和旧状态冲突均保留原字节并明确拒绝；双进程初始化只得到一个完整可验证 DB；M1-03/04/05、CLI/Skill 回归通过；不得执行正式 Cutover | 初始化事务异常后的 schema-zero 残留须保持不可用；文件系统权限语义随平台变化；错误处理不能把权限错误当作状态缺失 |
+| **M1-07 SQLite Runtime Integration（未授权）**；依赖 M1-06 完成并独立验收 | 将 CLI/Skill 状态读写接入 SQLite Core 与唯一 Command Service；运行入口不得以 JSON 为权威源；所有状态变更与 Event 同事务提交；保留 Command 幂等性、UNKNOWN/Reconcile、Task version、Attempt、Session 身份、Ownership、Herdr Adapter 执行协议、Runtime Leader fencing、重复派发防护与崩溃恢复；安装器提供可导入 Python Core 模块。不得实现 Legacy 导入、JSON 回滚或双写 | CLI/Skill 读写仅走 Core Command Service；服务未运行/结果未知时 fail closed 或持久化排队并由受控 Leader 恢复，不盲目重发外部副作用；多进程 fencing 与状态 CAS 测试通过；CLI/安装回归通过；不启动真实 Agent、不自动恢复旧状态；M1-07 必须另获 Owner 开工授权 | CLI 与 Core 接线可能改变既有兼容语义；SQLite fencing 不能使 Herdr/GitHub exactly-once，需外部对账；服务缺席处理不得静默丢命令 |
 | **M1-08 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约**；依赖 M1-05、M1-02 | 按 8.7 建立未来 `teamcraft-ceo` 薄 Skill 和唯一 `references/CEO_PROTOCOL.md` 的实现契约；定义 protocol version/hash 与八阶段门禁元数据；Attempt 创建时固定 protocol version/hash，运行中不自动切换；旧协议无法恢复时 NEEDS_HUMAN，不兼容升级须重新初始化并审计；为 Codex/OpenCode 的 `.agents/skills/`、精简 `AGENTS.md`、OpenCode 薄 CEO Agent 设计预检/安装/no-op/dry-run/冲突策略；保留现有 `teamcraft` 运行 Skill。此任务实现时才创建文件，本轮仅规划 | 同一协议内容只维护一次；Codex/OpenCode Mock 发现、缺失、读取失败、hash/version 不兼容均测试且失败时禁止派工；安装器不覆盖已有规则/Agent 配置；真实 Harness 冒烟按实际版本单列，不能用 Mock 代替；测试 Attempt 创建后升级仍保持原 version/hash、不可恢复旧协议转 NEEDS_HUMAN、不兼容升级须重新初始化并留下审计记录 | 官方发现规则随版本变化；symlink/副本漂移；规则文件合并语义；协议过早固化 |
 
 > **M1-05 后续集成门禁（本轮未实现，留给后续集成任务）**：上行的 TTL 与幂等验收只覆盖 Event/Command 持久核心自身。以下两项是 M1-05 边界内已定义但**尚未接线**的集成门禁，不得以本行验收为准宣称其已完成：
@@ -334,7 +334,7 @@ flowchart LR
 >
 > 两项均需各自独立的开工授权与验收证据；M1-05 不为此扩张模块或预埋功能代码。
 
-**M1 退出门禁**：ADR-001 已获原则接受；8.7 提议扩展须另行人工接受后 M1-08 才可开工。新 Core 可在无 Web 情况下创建/查询 Task、DAG、Attempt、Session、Event 和持久 Command；一致性备份/恢复、schema forward protection 和本地磁盘检查通过；CEO Protocol 单一来源、version/hash、Codex/OpenCode 发现及缺失/不兼容 fail-closed 契约通过；旧入口 guard 先于 cutover 生效；冻结、双进程 interleaving、generation、hash/CAS、崩溃恢复矩阵全部通过且实际切换获单独审批后，DB 才成为唯一写入源。若任何旧 writer 不能可靠 fence，门禁不允许 cutover，JSON 保持唯一 writer 且 M1 不得宣称退出。全部既有回归和新增事务/迁移测试通过。
+**M1 退出门禁（SQLite-only Fresh Start 路线，2026-11-02）**：ADR-001 的事务、状态、Command/Event、Schema、备份恢复和 Runtime Leader 安全原则继续有效；生产 Legacy JSON 迁移、JSON rollback、双真源和旧 writer freeze/cutover 门禁不再适用。新 Core 可在无 Web 情况下管理持久 Task、DAG、Attempt、Session、Event 和 Command；SQLite 可从全新项目根安全初始化，Schema 前向版本保护、事务/备份恢复和单机本地磁盘边界通过；CEO Protocol 单一来源/version/hash 与 Harness 契约通过；M1-06 Fresh Start 及 M1-03/04/05 回归验收通过。将既有 CLI/Skill 运行态接入 SQLite 属于 M1-07，必须另获 Owner 授权后实施；正式 JSON→SQLite cutover 不属于本产品路线。
 
 ### 9.2 M2 — Watcher & Safe Recovery
 
@@ -440,7 +440,7 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 8. 不自动 merge、部署、删除脏 Worktree、push 受保护主分支或批准高风险升级。
 9. 文档只描述已验证能力；性能、兼容性、成本节省和成功率必须附实测条件。
 10. 每个 PR 小而可回滚，附变更文件、Schema/迁移、测试命令与退出码、失败场景、回滚和未完成项。
-11. JSON→SQLite 切换必须先部署旧入口 guard；无法 fence 任何已知或疑似旧 writer 时保持 JSON 单写，禁止双主和强行 cutover。
+11. **历史方案，已 superseded**：此前 JSON→SQLite 切换要求先部署旧入口 guard；当前 SQLite-only Fresh Start 不做此切换。Runtime Leader fencing 仍用于将来 SQLite 外部副作用执行，不因 Legacy cutover 取消。
 12. SQLite 只运行在单机本地磁盘；WAL 活跃备份不得只复制主 DB；schema 版本过新必须拒绝写入；恢复后先 Reconcile 再派工。
 13. Approval 绑定 evidence version；artifact、Commit/Diff、Verifier/config 或 PR head/base 变化必须失效并重新审批。
 14. 未知 Token 保持 NULL，不作为零成本、低成本或仍有完整预算的依据。
@@ -456,13 +456,13 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 
 | 风险 | 等级 | 真实代码/测试证据 | 解决策略与验收阶段 |
 |---|---|---|---|
-| 旧进程在 SQLite 导入后继续写 JSON，形成双主 | **Critical** | 当前仅有 JSON `version=1`、`state.lock` 和原子替换（`teamctl.py:22`、`:125-169`）；写路径没有 generation guard（`:210-224`、`:310-332`）；现有测试只证明同锁并发 Ownership 有一个成功（`test_teamctl.py:97-110`） | M1-06 双进程 interleaving/crash matrix；M1-07 先 guard 后 cutover；不能可靠 fence 时 fail closed，JSON 保持唯一 writer |
+| Legacy JSON writer 与 SQLite 并存（旧方案历史风险，当前路线不执行 cutover） | **历史 Critical / 当前不适用** | 旧 `teamctl.py` 仍以 JSON 为运行状态，但 SQLite-only Fresh Start 不接管该入口、不导入旧状态；当前实现不存在并行权威源 | 不提供生产迁移、双写或 freeze/compat 服务；M1-07 若未来获授权，单独验证唯一 Command Service 与 Runtime Leader，不把历史 cutover matrix 当作已实现能力 |
 | CLI、服务或旧 Leader 重复执行 Herdr/GitHub 副作用 | **Critical** | 当前 `teamctl.py` 直接调用 Herdr（`:89-99`、`:499-601`），仓库无 Command Service/Leader 测试 | M1-05 持久 Command/CAS；M1-07 服务缺席规则；M2-02 epoch fencing；M2-07 换届与回执丢失故障注入 |
 | Approval 对象在批准后改变仍被执行 | **High** | 当前无 Approval 实体（差距表 FR-012）；PRD UI 只提出展示 Commit/Verifier（PRD `:517`） | 绑定 task/attempt/artifact 或 Commit/Diff/verifier-config/PR head-base；变化即失效；副作用前 CAS；M2-06/M4-04/M4-05 验收 |
 | Worker、Verifier、PR created 被错误折叠成 DONE | **High** | 现有 `complete` 是人工归档成员且不终止 Agent（`teamctl.py:866-886`）；PRD 明言 PR 创建不等于已合并（`:350`） | 按 8.4 区分状态；M2 仅 report-only/scout DONE；M4 验收 local-only/direct-PR |
 | Pane/进程活着或日志变化被误判为任务进展，导致无限等待/重试 | **High** | 当前 live state 只有 `blocked/working/idle/done/unknown`（`teamctl.py:25-26`、`:429-433`）；测试只验证 blocked/unknown 展示（`test_teamctl.py:303-339`） | M2-04 三类信号和进展时钟；M2-05 timeout/max Attempts/升级；UNKNOWN 不自动重试 |
 | 未知 Token 被当作零成本，错误放行预算或路由 | **High** | 当前完全没有 usage 数据；PRD 要求缺失不写零（`:325`、`:472`） | NULL 贯穿 Watcher/Router/UI；未知值采用保守预算决策；M2-04、M5-03/M5-04 验收 |
-| WAL 活跃时朴素复制导致不一致备份，或旧二进制写入新 Schema | **High** | 仓库当前无 SQLite、migration 或备份实现；现有测试不覆盖数据库 | M1-03 使用 SQLite 一致性备份、manifest、integrity check、forward-version write refusal；恢复后 Reconcile |
+| WAL 活跃时朴素复制导致不一致备份，或旧二进制写入新 Schema | **High**（备份风险仍适用；旧二进制共存部分为历史 cutover 风险） | M1-03 已实现 SQLite Storage、Schema 版本保护与在线备份；旧 JSON CLI 未接入 SQLite Runtime | WAL 活跃时必须使用 SQLite 一致性备份；恢复后做 integrity check 和 Reconcile；不把历史 JSON writer 风险当作运行中双真源 |
 | Web Task 写入绕过 Core 或运行中编辑使 Brief/证据失效 | **High** | 当前无 Web/API；`teamctl.py` 单文件直接写 StateStore（`:125-169`、`:310-332`） | M3-04 全部 Task CRUD/依赖/优先级/策略经 Command Service；optimistic version、DAG cycle、运行中策略和证据失效测试 |
 | M2 local-only 快照扩大范围仍不能排除系统外写入 | **Medium** | 当前共享同一 `cwd`（`teamctl.py:507-510`），Ownership 明确不是文件系统隔离（`README.md:168-174`） | 取消 M2 快照；M2/M3 只闭环 report-only/scout；M4 用 Worktree/Commit/完整 Diff 证据 |
 | 迁移或 Core 改造削弱 Ownership、Session 身份和保守恢复 | **High** | 现有 normalize/overlap、session identity、默认 inspect 已有代码和测试（`teamctl.py:109-118`、`:264-332`、`:688-821`；`test_teamctl.py:83-132`、`:218-301`） | 30 项回归保持；M1-01 契约固定语义；各阶段强制门禁 3–4 |
@@ -477,9 +477,9 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 “已接受”仅表示设计原则已获认可，不表示功能已实现、后续任务获准开工或正式数据迁移获批；各项决策状态见第 12 节。
 
 - 保留现有 Herdr/Skill 行为语义、Ownership/read-only、锁、Session 身份和 inspect-first 恢复语义（M1-02 Skill 目录改名不保留旧路径，但承接相同语义）。
-- SQLite 目标是单机本地磁盘上的单一真源；不长期双写，不能 fence 旧 writer 就不 cutover。
-- 旧 CLI guard 必须先于实际切换发布；M1-06 做只读排练/故障矩阵，M1-07 才允许条件切换。
-- Skill 命名迁移 `herdr-team` → `teamcraft`（2026-10-23 确认）：用户确认旧 Skill 入口从未对外部署，无需双版本迁移或别名；M1-02 实现（已条件验收）已直接改名目录与 frontmatter `name`，同步 installer、README、中英命令路径与测试引用，只安装一个入口。M1-02 当时保留 `.herdr-team/` 运行目录的决定已被 2026-10-27 后续指示取代，当前目录为 `.teamcraft/`；旧状态存在时安全拒绝且不自动迁移。SQLite 的备份、冻结、旧进程故障测试与安全门禁仍归 M1-06/M1-07。
+- SQLite Core 目标是单机本地磁盘上的状态真源；当前 Fresh Start 不迁移、不接管旧 CLI JSON 状态。
+- M1-06 仅验证 SQLite 从零初始化；M1-07 是需单独授权的 Runtime Integration，不执行 JSON cutover。
+- Skill 命名迁移 `herdr-team` → `teamcraft`（2026-10-23 确认）：用户确认旧 Skill 入口从未对外部署，无需双版本迁移或别名；M1-02 实现（已条件验收）已直接改名目录与 frontmatter `name`，同步 installer、README、中英命令路径与测试引用，只安装一个入口。M1-02 当时保留 `.herdr-team/` 运行目录的决定已被 2026-10-27 后续指示取代，当前目录为 `.teamcraft/`；旧状态存在时安全拒绝且不自动迁移。SQLite 的 Schema 迁移、备份恢复与 Runtime Leader 安全门禁继续适用；Legacy JSON cutover 不适用。
 - Python Core 最低版本保持 3.10，与现有 CLI 支持范围一致；`pyproject.toml` 固定该边界，M1-02 本地回归记录实际解释器版本。Linux CI 验证仍是未完成证据，不据此宣称跨平台通过。
 - CLI/Web 只作适配器；所有写入经 Command Service，所有外部副作用经持久 Command 和唯一 fenced Leader。
 - report-only/scout 在 M2/M3 完整验收；local-only 与 direct-PR 的 Worktree/Commit/Diff/PR 交付集中到 M4，不建设 M2 共享树快照。
@@ -495,7 +495,7 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 
 ### 11.3 未解决决策（按最晚决策点）
 
-1. **正式 cutover 审批（M1-07 实际切换前）**：在 M1-06 故障矩阵、备份恢复、旧 writer 静止性证明与 M1-07 Guard 验收后，单独审查切换窗口与恢复方案；ADR-001 的原则接受不能替代该审批。
+1. **旧状态人工处置**：若遇到旧 `state.json`，由 Owner 在 TeamCraft 外人工决定归档或删除；产品不提供导入、自动恢复或 JSON rollback。
 2. **稳定 ID（M1-03/04 前）**：在 UUIDv7/ULID/UUID4 中选择并固定排序/序列化；M1-02 仅定义 opaque ID 与注入式生成边界，不提前选择格式；Event 继续以 SQLite seq 排序。
 3. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
 4. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
@@ -566,13 +566,13 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
 | CEO Protocol / 跨 Harness / Wake 提议扩展 | **待人工审查（2026-10-27 Proposed）** | 第 8.7 节与 M1-08/M2-08/M2-09/M6-06 只是规划更新；未扩大既有 ADR 接受范围，也未授权实现 |
-| 任务开工授权 | **M1-01–M1-06 已分别获单独授权；M1-07 及以后未授权** | 本轮授权 M1-06 只覆盖第 9.1 节的只读 Legacy 导入排练、generation/freeze 协议模拟及双进程故障矩阵；不包含 M1-07 Guard 实装或任何正式 JSON→SQLite cutover。 |
+| 任务开工授权 | **M1-01–M1-06 已分别获单独授权；M1-07 及以后未授权** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。当前 M1-06 授权仅覆盖第 9.1 节 Fresh Start Validation；M1-07 Runtime Integration 未授权。 |
 | 任务完成验收 | **M1-01 已验收；M1-02 有条件验收通过；M1-03、M1-04、M1-05 已验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；条件为 12.2 残余 1（Python 3.10/Linux 与 CI），须在 Python Core 成为 CLI 运行时依赖前补齐。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，实施提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`。 |
-| 正式数据迁移 / cutover 审批 | **尚未批准** | M1-06 仅排练，M1-07 必须先验收 Guard、备份恢复、静止性与故障矩阵，再单独批准实际切换；当前没有旧进程运行的时点确认不代替切换日证明 |
+| 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05 已在 2026-11-01 通过独立运行验收并关闭；当前执行 **M1-06 Legacy 导入排练与 cutover 故障矩阵**。M1-06 只处理合成或明确指定的临时 JSON fixture 与临时 SQLite DB，验证只读快照、hash、字段映射、generation/freeze 协议和故障恢复；不得读取真实 `.teamcraft/state.json`，不得执行生产 JSON→SQLite 导入或 cutover，不改旧 CLI 运行语义。M1-06 完成后仍需独立验收；下一步 M1-07 需单独授权，正式 cutover 继续单独审批。
+M1-05 已在 2026-11-01 通过独立运行验收并关闭。当前执行 **M1-06 SQLite Fresh Start Validation**，只使用临时项目根和合成数据，验证从零初始化、Schema/索引/约束、重复初始化、数据保留、旧状态冲突拒绝、损坏/不兼容数据库、权限、并发与崩溃恢复；不得读取或修改真实 `.teamcraft/state.json`，不执行 Legacy 导入或正式 Cutover，不改变 CLI/Herdr 运行态。M1-06 独立验收通过后，M1-07 SQLite Runtime Integration 仍须另获 Owner 授权。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -582,4 +582,12 @@ M1-05 已在 2026-11-01 通过独立运行验收并关闭；当前执行 **M1-06
 
 未解决集成门禁保持待后续阶段处理：`evidence_json` 的 Attempt/Digest 只验证结构，尚未与真实 Attempt 事实校验；Domain Event 目前仅为 Command Event 流，尚未建立领域实体双向审计关联。详见第 9.1 节 M1-05 后续集成门禁，不影响本次 Event/Command 持久核心的验收结论。
 
-**M1-06：已获开工授权（2026-11-01）。** 授权范围为第 9.1 节该任务：在临时 fixture 上实现只读备份/hash/import rehearsal、generation/freeze/cutover guard contract 与双进程故障矩阵。本任务不实施 M1-07 的旧 CLI Guard，不触碰真实运行状态，不执行正式 Cutover。正式数据迁移 / cutover 仍为“尚未批准”。
+**M1-06：旧开工授权（2026-11-01，已被 2026-11-02 路线决策取代）。** 当时授权范围为只读 Legacy 导入排练、generation/freeze 模拟与双进程故障矩阵；该范围是历史记录，不得当作本次 Fresh Start 验收证据。当前授权和验收状态另记于第 12.6 节。
+
+### 12.6 SQLite-only Fresh Start 路线决策与 M1-06 验收（2026-11-02）
+
+**Owner 决策与授权**：Owner 确认 TeamCraft 2.0 无需保留或迁移的生产旧系统及历史状态，采用 SQLite-only Fresh Start；正式 JSON→SQLite 生产迁移、JSON rollback、双真源、旧 writer freeze/compat 服务从产品路线移除。该决策不削弱 SQLite Schema 升级、事务/Event 原子性、数据库备份恢复、Runtime Leader fencing 或外部副作用 Reconcile。Owner 授权按此新范围执行 M1-06；M1-07 SQLite Runtime Integration 未获授权。
+
+**M1-06：实现提交前运行证据（尚未登记 Completed）**：CEO 在 Python 3.13.14、macOS 27.0.1、Darwin arm64 独立复跑，所有 M1-06 测试只使用临时项目根与合成数据。`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_fresh_start_m106.py -q` 退出码 0（27 passed、2 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_storage_m103.py -q` 退出码 0（108 passed、95 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_domain_m104.py -q` 退出码 0（36 passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_events_m105.py -q` 退出码 0（38 passed、4 subtests passed）；`python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v` 退出码 0（42 tests）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q` 退出码 0（238 passed、101 subtests passed）；`git diff --check` 退出码 0。M1-06 尚待检查最终代码/文档差异并生成提交 SHA 后方可登记 Completed；本段不能替代最终验收。
+
+本轮未执行正式迁移；未读取或修改真实 `.teamcraft/state.json`，未启动 Herdr Agent 或发送 Prompt，未改变现有 CLI/Herdr 运行状态。测试证据仅覆盖上述当前 Python/macOS 环境；Linux 与 Python 3.10 实测/CI 仍未提供。验收通过后下一项只能是申请 Owner 授权 M1-07，不自动开始。

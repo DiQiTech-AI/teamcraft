@@ -18,12 +18,24 @@ permission:
     "ls": allow
     "ls -la": allow
     "ls -1": allow
+    "ls *": allow
+    "cat *": allow
+    "head *": allow
+    "tail *": allow
+    "wc *": allow
+    "grep *": allow
+    "sed -n *": allow
     "mkdir -p .tmp-m106": allow
     "find .": allow
     "rg .": allow
-    "rg -n '^class |^def |^    def test_' teamcraft/migration.py tests/test_migration_m106.py": allow
-    "sed -n '1,220p' teamcraft/migration.py": allow
-    "wc -l teamcraft/migration.py tests/test_migration_m106.py": allow
+    "git status *": allow
+    "git diff *": allow
+    "git log *": allow
+    "git show *": allow
+    "git grep *": allow
+    "rg -n '^class |^def |^    def test_' teamcraft/fresh_start.py tests/test_fresh_start_m106.py": allow
+    "sed -n '1,220p' teamcraft/fresh_start.py": allow
+    "wc -l teamcraft/fresh_start.py tests/test_fresh_start_m106.py": allow
     "cat pyproject.toml": allow
     "git status --short": allow
     "git status -sb": allow
@@ -35,9 +47,14 @@ permission:
     "python3 --version": allow
     "python3 -V": allow
     "uname -sm": allow
-    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_migration_m106.py -q": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_fresh_start_m106.py -q": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_storage_m103.py -q": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_domain_m104.py -q": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_events_m105.py -q": allow
     "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q": allow
-    "python3 -m ruff check teamcraft/migration.py tests/test_migration_m106.py": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest -q": allow
+    "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v": allow
+    "python3 -m ruff check teamcraft/fresh_start.py tests/test_fresh_start_m106.py": allow
   external_directory: deny
   webfetch: deny
   websearch: deny
