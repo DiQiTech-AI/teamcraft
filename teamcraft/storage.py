@@ -553,25 +553,38 @@ def _classify_mount(path: Path, lines: list[str]) -> dict[str, str]:
         line = raw_line.strip()
         if not line:
             continue
-        # macOS/BSD form: "<dev> on <point> (<opts>)" — the mount point may
-        # contain literal spaces, so match it non-greedily up to the options.
-        match = re.match(r"^(\S+) on (.+?) \((.*)\)\s*$", line)
+        # util-linux form: "<dev> on <point> type <fstype> (<opts>)" — must
+        # be tried BEFORE the macOS form, whose non-greedy mount-point capture
+        # would otherwise swallow the "type <fstype>" tokens into the point
+        # (breaking every Linux line; CI run 41461763132 root cause).
+        match = re.match(r"^(\S+) on (.+?) type (\S+) \((.*)\)\s*$", line)
         if match:
             device = match.group(1)
             point = _unescape_mount_path(match.group(2))
-            opts = match.group(3)
-            fstype = opts.split(",")[0].strip()
+            fstype = match.group(3)
+            opts = match.group(4)
         else:
-            # /proc/mounts form: "<dev> <point> <fstype> <opts> 0 0"
-            parts = line.split()
-            if len(parts) >= 3 and parts[1] != "on":
-                device = parts[0]
-                point = _unescape_mount_path(parts[1])
-                fstype = parts[2]
-                opts = parts[3] if len(parts) > 3 else ""
+            # macOS/BSD form: "<dev> on <point> (<opts>)" — the mount point may
+            # contain literal spaces, so match it non-greedily up to the options.
+            match = re.match(r"^(\S+) on (.+?) \((.*)\)\s*$", line)
+            if match:
+                device = match.group(1)
+                point = _unescape_mount_path(match.group(2))
+                opts = match.group(3)
+                fstype = opts.split(",")[0].strip()
             else:
-                unparsed_depth = max(unparsed_depth, _unparsed_candidate_depth(target, line))
-                continue
+                # /proc/mounts form: "<dev> <point> <fstype> <opts> 0 0"
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] != "on":
+                    device = parts[0]
+                    point = _unescape_mount_path(parts[1])
+                    fstype = parts[2]
+                    opts = parts[3] if len(parts) > 3 else ""
+                else:
+                    unparsed_depth = max(
+                        unparsed_depth, _unparsed_candidate_depth(target, line)
+                    )
+                    continue
         if _covers(target, point) and (best_point is None or len(point) > len(best_point)):
             best_point, best_dev, best_fstype, best_opts = point, device, fstype, opts
 
