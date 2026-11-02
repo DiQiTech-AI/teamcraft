@@ -1,10 +1,10 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start：旧 M1-06 cutover 排练范围已被取代，新 M1-06 正在实施；M1-07 Runtime Integration 尚未授权。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05、M1-06 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start；M1-07 Runtime Integration 尚未授权。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
 >
-> 报告版本：v1.7（SQLite-only Fresh Start 路线调整与 M1-06 新授权）
+> 报告版本：v1.8（SQLite-only Fresh Start 决策及 M1-06 完成验收）
 >
-> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 路线决策与新 M1-06 授权：2026-11-02
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 路线决策、M1-06 新授权与验收：2026-11-02
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
@@ -567,12 +567,12 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
 | CEO Protocol / 跨 Harness / Wake 提议扩展 | **待人工审查（2026-10-27 Proposed）** | 第 8.7 节与 M1-08/M2-08/M2-09/M6-06 只是规划更新；未扩大既有 ADR 接受范围，也未授权实现 |
 | 任务开工授权 | **M1-01–M1-06 已分别获单独授权；M1-07 及以后未授权** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。当前 M1-06 授权仅覆盖第 9.1 节 Fresh Start Validation；M1-07 Runtime Integration 未授权。 |
-| 任务完成验收 | **M1-01 已验收；M1-02 有条件验收通过；M1-03、M1-04、M1-05 已验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；条件为 12.2 残余 1（Python 3.10/Linux 与 CI），须在 Python Core 成为 CLI 运行时依赖前补齐。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，实施提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`。 |
+| 任务完成验收 | **M1-01 已验收；M1-02 有条件验收通过；M1-03、M1-04、M1-05、M1-06 已验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；条件为 12.2 残余 1（Python 3.10/Linux 与 CI），须在 Python Core 成为 CLI 运行时依赖前补齐。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节。 |
 | 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05 已在 2026-11-01 通过独立运行验收并关闭。当前执行 **M1-06 SQLite Fresh Start Validation**，只使用临时项目根和合成数据，验证从零初始化、Schema/索引/约束、重复初始化、数据保留、旧状态冲突拒绝、损坏/不兼容数据库、权限、并发与崩溃恢复；不得读取或修改真实 `.teamcraft/state.json`，不执行 Legacy 导入或正式 Cutover，不改变 CLI/Herdr 运行态。M1-06 独立验收通过后，M1-07 SQLite Runtime Integration 仍须另获 Owner 授权。
+M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Start Validation 于 2026-11-02 独立验收并关闭（证据见第 12.6 节）。下一项 **M1-07 SQLite Runtime Integration 尚未授权**；只有 Owner 明确开工授权后才能开始。生产 JSON→SQLite 迁移已从产品路线取消。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -588,6 +588,6 @@ M1-05 已在 2026-11-01 通过独立运行验收并关闭。当前执行 **M1-06
 
 **Owner 决策与授权**：Owner 确认 TeamCraft 2.0 无需保留或迁移的生产旧系统及历史状态，采用 SQLite-only Fresh Start；正式 JSON→SQLite 生产迁移、JSON rollback、双真源、旧 writer freeze/compat 服务从产品路线移除。该决策不削弱 SQLite Schema 升级、事务/Event 原子性、数据库备份恢复、Runtime Leader fencing 或外部副作用 Reconcile。Owner 授权按此新范围执行 M1-06；M1-07 SQLite Runtime Integration 未获授权。
 
-**M1-06：实现提交前运行证据（尚未登记 Completed）**：CEO 在 Python 3.13.14、macOS 27.0.1、Darwin arm64 独立复跑，所有 M1-06 测试只使用临时项目根与合成数据。`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_fresh_start_m106.py -q` 退出码 0（27 passed、2 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_storage_m103.py -q` 退出码 0（108 passed、95 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_domain_m104.py -q` 退出码 0（36 passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_events_m105.py -q` 退出码 0（38 passed、4 subtests passed）；`python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v` 退出码 0（42 tests）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q` 退出码 0（238 passed、101 subtests passed）；`git diff --check` 退出码 0。M1-06 尚待检查最终代码/文档差异并生成提交 SHA 后方可登记 Completed；本段不能替代最终验收。
+**M1-06：Completed / CEO 验收通过（2026-11-02）**：实施提交 `959e1a2b92baf66cee470a4f9b46e26c13057138`（分支 `docs/teamcraft-2-0-planning`）；交付 `teamcraft/fresh_start.py`、`tests/test_fresh_start_m106.py`、删除仅服务于 Legacy Import/Cutover 的 `teamcraft/migration.py` 与 `tests/test_migration_m106.py`、`teamcraft/__init__.py`、PLAN/M0 Review 及 CTO 安全只读 shell allowlist。M1-06 不接入 CLI Runtime。CEO 在 Python 3.13.14、macOS 27.0.1、Darwin arm64 独立复跑，所有 Fresh Start 测试仅用临时项目根与合成数据：`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_fresh_start_m106.py -q` 退出码 0（27 passed、2 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_storage_m103.py -q` 退出码 0（108 passed、95 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_domain_m104.py -q` 退出码 0（36 passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_events_m105.py -q` 退出码 0（38 passed、4 subtests passed）；`python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v` 退出码 0（42 tests）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q` 退出码 0（238 passed、101 subtests passed）；`python3 -m ruff check teamcraft/fresh_start.py teamcraft/__init__.py tests/test_fresh_start_m106.py` 与 `git diff --check` 均退出码 0。旧 M1-06 migration-only 测试撤销是因为其只覆盖已取消的生产 Legacy 导入/cutover 设计；新 Fresh Start 与 M1-03/04/05、全量和 Skill 回归均实际执行通过，并未保留或改写旧测试的历史结果。
 
 本轮未执行正式迁移；未读取或修改真实 `.teamcraft/state.json`，未启动 Herdr Agent 或发送 Prompt，未改变现有 CLI/Herdr 运行状态。测试证据仅覆盖上述当前 Python/macOS 环境；Linux 与 Python 3.10 实测/CI 仍未提供。验收通过后下一项只能是申请 Owner 授权 M1-07，不自动开始。

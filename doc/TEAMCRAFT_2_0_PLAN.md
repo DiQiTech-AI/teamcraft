@@ -6,7 +6,7 @@
 > **日期**：2026-11-02
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。2026-11-02 Owner 决策改为 **SQLite-only Fresh Start**：M1-06 重定义为 SQLite Fresh Start Validation（实施中，验收以 CEO 独立复核为准），M1-07 重定义为 SQLite Runtime Integration（仍未获开工授权）；政策与依据见第 11.1 节。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-06 SQLite Fresh Start Validation 已于 2026-11-02 完成独立验收（证据见 [M0 Review 第 12.6 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-07 SQLite Runtime Integration 尚未获开工授权；政策与依据见第 11 节。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
 
 ---
 
