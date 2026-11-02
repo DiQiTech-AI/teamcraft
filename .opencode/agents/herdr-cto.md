@@ -25,7 +25,12 @@ permission:
     "wc *": allow
     "grep *": allow
     "sed -n *": allow
+    "which *": allow
+    "command -v *": allow
+    "uv python list *": allow
     "mkdir -p .tmp-m106": allow
+    "mkdir -p .tmp-m107": allow
+    "mkdir -p .github/workflows": allow
     "find .": allow
     "rg .": allow
     "git status *": allow
@@ -54,6 +59,8 @@ permission:
     "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q": allow
     "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest -q": allow
     "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m107 /Users/blade/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -m unittest discover -s tests -v": allow
+    "env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m107 /Users/blade/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -m unittest discover -s .agents/skills/teamcraft/tests -v": allow
     "python3 -m ruff check teamcraft/fresh_start.py tests/test_fresh_start_m106.py": allow
   external_directory: deny
   webfetch: deny

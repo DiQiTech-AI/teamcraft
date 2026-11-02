@@ -1,10 +1,10 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05、M1-06 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start；M1-07 Runtime Integration 尚未授权。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01、M1-03、M1-04、M1-05、M1-06 已验收；M1-02 **有条件验收通过**（2026-10-24，Python 3.10/Linux 与 CI 为未关闭限制，须在 Python Core 成为 CLI 运行时依赖前补齐）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start，并授权 M1-07 Runtime Integration；其 Python 3.10/Linux/CI 先决门禁尚未全绿，Runtime 接线仍阻断。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
 >
-> 报告版本：v1.8（SQLite-only Fresh Start 决策及 M1-06 完成验收）
+> 报告版本：v1.9（M1-07 开工授权与 Python/Linux/CI 门禁）
 >
-> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 路线决策、M1-06 新授权与验收：2026-11-02
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 决策与 M1-06 验收：2026-11-02；M1-07 授权及运行环境门禁：2026-11-02
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
@@ -324,7 +324,7 @@ flowchart LR
 | **M1-04 领域状态与 DAG**；依赖 M1-03 | 实现 Task/Attempt/Session 状态机、数据库级单活动 Attempt 约束、DAG 循环路径检测、READY 推导、优先级排序和 optimistic version | 合法/非法转换均测试；循环返回具体路径；Session 消失不改变 Task ID；两个独立 DB 连接竞争时只有一个活动 Attempt | 状态枚举与现有 phase/live_state 混淆；SQLite 部分唯一索引兼容 |
 | **M1-05 Event/Command 原子性（已验收，2026-11-01）**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、载荷/evidence version、TTL、同键载荷冲突和 pending/running/confirmed/unknown/expired；定义 Command Service API 和 CAS。**TTL 纳入归一化请求身份**：TTL 取 `None` 或校验后的整数秒（1..30 天），其持久表示直接复用 v3 已有的不可变 `requested_at`/`expires_at` 列对，由该原始时间对派生并校验出原请求 TTL，**因此不需升 v4** | 状态+事件+Command 同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键冲突；证据变化使待执行命令失效。**TTL 身份语义**：仅 kind/payload/evidence/TTL 四要素全同才复用原结果（含已确认命令的 `result_json`）；任何 TTL 差异（含 `None`↔显式两个方向）均以 `IdempotencyConflictError` 拒绝且零副作用；比较**只用相对秒**（自存储行的原始时间对派生），绝不比较重试按自身时钟新算的绝对 `expires_at`；已过期行仍仲裁其幂等键——同 TTL 重放复用该过期行且不新增任何事件，不同 TTL 重放仍冲突；并发同 TTL 收敛为单行单事件，并发不同 TTL 恰好一胜一冲突且失败方无额外事件；派生结果不合法（不可解析/naive/非整秒/越界）时 fail closed 抛 `StorageError`，不得猜测相等或不等 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长；TTL 若误比绝对期限会把每次重试误判为冲突，若忽略 TTL 则会使不同期限的副作用承诺被静默复用 |
 | **M1-06 SQLite Fresh Start Validation（已获开工授权，2026-11-02）**；依赖 M1-03、M1-04、M1-05 | 在合成数据与临时项目根验证首次 SQLite 初始化、完整 Schema/索引/约束、Schema 版本、重复初始化、现有有效库保留、损坏/过新库拒绝、不可写目录与初始化崩溃恢复、并发首次初始化；对非空 `.teamcraft/state.json` / `.herdr-team/state.json` fail closed，不读取、导入、移动或删除；移除已确认无运行时调用的 Legacy JSON 导入/cutover 专用代码。本任务不接入现有 CLI Runtime，也不改 Herdr | 所有验证只用临时目录；重复初始化幂等且不覆盖状态；Schema 不完整时不得显示 ready，失败后可安全拒绝或重试收敛；损坏/不兼容库和旧状态冲突均保留原字节并明确拒绝；双进程初始化只得到一个完整可验证 DB；M1-03/04/05、CLI/Skill 回归通过；不得执行正式 Cutover | 初始化事务异常后的 schema-zero 残留须保持不可用；文件系统权限语义随平台变化；错误处理不能把权限错误当作状态缺失 |
-| **M1-07 SQLite Runtime Integration（未授权）**；依赖 M1-06 完成并独立验收 | 将 CLI/Skill 状态读写接入 SQLite Core 与唯一 Command Service；运行入口不得以 JSON 为权威源；所有状态变更与 Event 同事务提交；保留 Command 幂等性、UNKNOWN/Reconcile、Task version、Attempt、Session 身份、Ownership、Herdr Adapter 执行协议、Runtime Leader fencing、重复派发防护与崩溃恢复；安装器提供可导入 Python Core 模块。不得实现 Legacy 导入、JSON 回滚或双写 | CLI/Skill 读写仅走 Core Command Service；服务未运行/结果未知时 fail closed 或持久化排队并由受控 Leader 恢复，不盲目重发外部副作用；多进程 fencing 与状态 CAS 测试通过；CLI/安装回归通过；不启动真实 Agent、不自动恢复旧状态；M1-07 必须另获 Owner 开工授权 | CLI 与 Core 接线可能改变既有兼容语义；SQLite fencing 不能使 Herdr/GitHub exactly-once，需外部对账；服务缺席处理不得静默丢命令 |
+| **M1-07 SQLite Runtime Integration（已授权，Runtime 接线受前置门禁阻断）**；依赖 M1-06 完成并独立验收 | 首先通过 Python 3.10、Linux、CI 三项运行门禁；门禁通过前只允许环境验证与 CI 基础设施，不改 Runtime。通过后将 CLI/Skill 状态读写接入 SQLite Core 与唯一 Command Service；运行入口不得以 JSON 为权威源；状态变更与 Event 同事务；保留 Command 幂等性、UNKNOWN/Reconcile、Task version、Attempt、Session 身份、Ownership、Herdr Adapter 协议、Runtime Leader fencing、重复派发防护与崩溃恢复；安装器提供可导入 Python Core 模块。不得实现 Legacy 导入、JSON 回滚或双写 | 门禁要求：Python 3.10 全量及 Skill/安装回归通过；GitHub Actions Ubuntu/Python 3.10 必须全绿。Runtime 验收：CLI/Skill 读写仅走 Core Command Service；服务未运行/结果未知时 fail closed 或持久化排队并受控 Reconcile，不盲目重发外部副作用；多进程 fencing/CAS 及 CLI/安装回归通过；不启动真实 Agent、不自动恢复旧状态 | CLI 与 Core 接线可能改变既有兼容语义；SQLite fencing 不能使 Herdr/GitHub exactly-once，需外部对账；服务缺席处理不得静默丢命令 |
 | **M1-08 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约**；依赖 M1-05、M1-02 | 按 8.7 建立未来 `teamcraft-ceo` 薄 Skill 和唯一 `references/CEO_PROTOCOL.md` 的实现契约；定义 protocol version/hash 与八阶段门禁元数据；Attempt 创建时固定 protocol version/hash，运行中不自动切换；旧协议无法恢复时 NEEDS_HUMAN，不兼容升级须重新初始化并审计；为 Codex/OpenCode 的 `.agents/skills/`、精简 `AGENTS.md`、OpenCode 薄 CEO Agent 设计预检/安装/no-op/dry-run/冲突策略；保留现有 `teamcraft` 运行 Skill。此任务实现时才创建文件，本轮仅规划 | 同一协议内容只维护一次；Codex/OpenCode Mock 发现、缺失、读取失败、hash/version 不兼容均测试且失败时禁止派工；安装器不覆盖已有规则/Agent 配置；真实 Harness 冒烟按实际版本单列，不能用 Mock 代替；测试 Attempt 创建后升级仍保持原 version/hash、不可恢复旧协议转 NEEDS_HUMAN、不兼容升级须重新初始化并留下审计记录 | 官方发现规则随版本变化；symlink/副本漂移；规则文件合并语义；协议过早固化 |
 
 > **M1-05 后续集成门禁（本轮未实现，留给后续集成任务）**：上行的 TTL 与幂等验收只覆盖 Event/Command 持久核心自身。以下两项是 M1-05 边界内已定义但**尚未接线**的集成门禁，不得以本行验收为准宣称其已完成：
@@ -334,7 +334,7 @@ flowchart LR
 >
 > 两项均需各自独立的开工授权与验收证据；M1-05 不为此扩张模块或预埋功能代码。
 
-**M1 退出门禁（SQLite-only Fresh Start 路线，2026-11-02）**：ADR-001 的事务、状态、Command/Event、Schema、备份恢复和 Runtime Leader 安全原则继续有效；生产 Legacy JSON 迁移、JSON rollback、双真源和旧 writer freeze/cutover 门禁不再适用。新 Core 可在无 Web 情况下管理持久 Task、DAG、Attempt、Session、Event 和 Command；SQLite 可从全新项目根安全初始化，Schema 前向版本保护、事务/备份恢复和单机本地磁盘边界通过；CEO Protocol 单一来源/version/hash 与 Harness 契约通过；M1-06 Fresh Start 及 M1-03/04/05 回归验收通过。将既有 CLI/Skill 运行态接入 SQLite 属于 M1-07，必须另获 Owner 授权后实施；正式 JSON→SQLite cutover 不属于本产品路线。
+**M1 退出门禁（SQLite-only Fresh Start 路线，2026-11-02）**：ADR-001 的事务、状态、Command/Event、Schema、备份恢复和 Runtime Leader 安全原则继续有效；生产 Legacy JSON 迁移、JSON rollback、双真源和旧 writer freeze/cutover 门禁不再适用。新 Core 可在无 Web 情况下管理持久 Task、DAG、Attempt、Session、Event 和 Command；SQLite 可从全新项目根安全初始化，Schema 前向版本保护、事务/备份恢复和单机本地磁盘边界通过；CEO Protocol 单一来源/version/hash 与 Harness 契约通过；M1-06 Fresh Start 及 M1-03/04/05 回归验收通过。M1-07 已获 Owner 授权，但 Runtime 接线先决门禁必须先满足 Python 3.10、Linux、CI 全绿；之后再验收 CLI/Skill 到 Core Command Service 的集成。正式 JSON→SQLite cutover 不属于本产品路线。
 
 ### 9.2 M2 — Watcher & Safe Recovery
 
@@ -566,13 +566,13 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
 | CEO Protocol / 跨 Harness / Wake 提议扩展 | **待人工审查（2026-10-27 Proposed）** | 第 8.7 节与 M1-08/M2-08/M2-09/M6-06 只是规划更新；未扩大既有 ADR 接受范围，也未授权实现 |
-| 任务开工授权 | **M1-01–M1-06 已分别获单独授权；M1-07 及以后未授权** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。当前 M1-06 授权仅覆盖第 9.1 节 Fresh Start Validation；M1-07 Runtime Integration 未授权。 |
+| 任务开工授权 | **M1-01–M1-07 已分别获授权；M1-07 Runtime 接线处于门禁阻断态** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。当前 M1-07 授权（2026-11-02）先允许验证/建立 Python 3.10、Linux、CI 门禁；三项全绿前禁止 Runtime 接线。 |
 | 任务完成验收 | **M1-01 已验收；M1-02 有条件验收通过；M1-03、M1-04、M1-05、M1-06 已验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；条件为 12.2 残余 1（Python 3.10/Linux 与 CI），须在 Python Core 成为 CLI 运行时依赖前补齐。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节。 |
 | 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Start Validation 于 2026-11-02 独立验收并关闭（证据见第 12.6 节）。下一项 **M1-07 SQLite Runtime Integration 尚未授权**；只有 Owner 明确开工授权后才能开始。生产 JSON→SQLite 迁移已从产品路线取消。
+M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Start Validation 于 2026-11-02 独立验收并关闭（证据见第 12.6 节）。Owner 已授权 **M1-07 SQLite Runtime Integration**；当前阶段仅执行 Python 3.10/Linux/CI 前置门禁。Linux 与首次 CI 结果全绿前，不得改 CLI/Skill 状态接线；通过后由 CEO 核实证据，再继续 M1-07。生产 JSON→SQLite 迁移已从产品路线取消。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -584,10 +584,10 @@ M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Star
 
 **M1-06：旧开工授权（2026-11-01，已被 2026-11-02 路线决策取代）。** 当时授权范围为只读 Legacy 导入排练、generation/freeze 模拟与双进程故障矩阵；该范围是历史记录，不得当作本次 Fresh Start 验收证据。当前授权和验收状态另记于第 12.6 节。
 
-### 12.6 SQLite-only Fresh Start 路线决策与 M1-06 验收（2026-11-02）
+### 12.6 SQLite-only Fresh Start 路线决策、M1-06 验收与 M1-07 门禁（2026-11-02）
 
-**Owner 决策与授权**：Owner 确认 TeamCraft 2.0 无需保留或迁移的生产旧系统及历史状态，采用 SQLite-only Fresh Start；正式 JSON→SQLite 生产迁移、JSON rollback、双真源、旧 writer freeze/compat 服务从产品路线移除。该决策不削弱 SQLite Schema 升级、事务/Event 原子性、数据库备份恢复、Runtime Leader fencing 或外部副作用 Reconcile。Owner 授权按此新范围执行 M1-06；M1-07 SQLite Runtime Integration 未获授权。
+**Owner 决策与授权**：Owner 确认 TeamCraft 2.0 无需保留或迁移的生产旧系统及历史状态，采用 SQLite-only Fresh Start；正式 JSON→SQLite 生产迁移、JSON rollback、双真源、旧 writer freeze/compat 服务从产品路线移除。该决策不削弱 SQLite Schema 升级、事务/Event 原子性、数据库备份恢复、Runtime Leader fencing 或外部副作用 Reconcile。Owner 授权按此新范围执行 M1-06（已验收），并于 2026-11-02 授权 M1-07 SQLite Runtime Integration；在 Python 3.10/Linux/CI 先决门禁全部通过前，Runtime 接线仍被阻断。
 
 **M1-06：Completed / CEO 验收通过（2026-11-02）**：实施提交 `959e1a2b92baf66cee470a4f9b46e26c13057138`（分支 `docs/teamcraft-2-0-planning`）；交付 `teamcraft/fresh_start.py`、`tests/test_fresh_start_m106.py`、删除仅服务于 Legacy Import/Cutover 的 `teamcraft/migration.py` 与 `tests/test_migration_m106.py`、`teamcraft/__init__.py`、PLAN/M0 Review 及 CTO 安全只读 shell allowlist。M1-06 不接入 CLI Runtime。CEO 在 Python 3.13.14、macOS 27.0.1、Darwin arm64 独立复跑，所有 Fresh Start 测试仅用临时项目根与合成数据：`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_fresh_start_m106.py -q` 退出码 0（27 passed、2 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_storage_m103.py -q` 退出码 0（108 passed、95 subtests passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_domain_m104.py -q` 退出码 0（36 passed）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/test_events_m105.py -q` 退出码 0（38 passed、4 subtests passed）；`python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v` 退出码 0（42 tests）；`env TMPDIR=/Users/blade/GitHub/teamcraft/.tmp-m106 python3 -B -m pytest tests/ -q` 退出码 0（238 passed、101 subtests passed）；`python3 -m ruff check teamcraft/fresh_start.py teamcraft/__init__.py tests/test_fresh_start_m106.py` 与 `git diff --check` 均退出码 0。旧 M1-06 migration-only 测试撤销是因为其只覆盖已取消的生产 Legacy 导入/cutover 设计；新 Fresh Start 与 M1-03/04/05、全量和 Skill 回归均实际执行通过，并未保留或改写旧测试的历史结果。
 
-本轮未执行正式迁移；未读取或修改真实 `.teamcraft/state.json`，未启动 Herdr Agent 或发送 Prompt，未改变现有 CLI/Herdr 运行状态。测试证据仅覆盖上述当前 Python/macOS 环境；Linux 与 Python 3.10 实测/CI 仍未提供。验收通过后下一项只能是申请 Owner 授权 M1-07，不自动开始。
+本轮未执行正式迁移；未读取或修改真实 `.teamcraft/state.json`，未改变现有 CLI/Herdr 运行状态。M1-07 已获授权，当前仅建立 Python/Linux/CI 前置门禁；本机 Python 3.10.22 macOS 全量回归通过，但 Linux 实测与 GitHub Actions 结果仍待首次推送触发。门禁全绿前不接入 Runtime，不自动越过该阻断条件。

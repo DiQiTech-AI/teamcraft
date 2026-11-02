@@ -6,7 +6,7 @@
 > **日期**：2026-11-02
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-06 SQLite Fresh Start Validation 已于 2026-11-02 完成独立验收（证据见 [M0 Review 第 12.6 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-07 SQLite Runtime Integration 尚未获开工授权；政策与依据见第 11 节。决策与证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-06 SQLite Fresh Start Validation 已于 2026-11-02 完成独立验收（证据见 [M0 Review 第 12.6 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。Owner 已授权 M1-07 SQLite Runtime Integration，但 Python 3.10/Linux/CI 先决门禁尚未全绿，门禁通过前不接入 CLI/Skill 运行时；详见第 11 节与 M0 Review 第 12 节。
 
 ---
 
@@ -711,9 +711,17 @@ Fresh Start 验收只使用临时目录和合成数据，至少覆盖：首次�
 
 ### 11.3 M1-07 SQLite Runtime Integration 准入
 
-M1-07 未获开工授权。授权后需先审查实际 CLI、Skill、安装器和 Core API，再将状态读写接入同一持久化 Command Service：写入与 Domain Event 同事务；Command 幂等及状态 CAS；UNKNOWN 必须先 Reconcile；Task version、Attempt、Session 身份和 Ownership 校验；外部副作用由唯一有效 Runtime Leader fenced 执行；旧结果不明不得盲目重发。Service 未运行时须安全拒绝或持久化待处理 Command，并有可恢复的 Reconcile 路径。安装器必须提供 CLI 实际需要的 Python Core 模块，不能依赖源码仓库隐式 `PYTHONPATH`。
+Owner 已于 2026-11-02 授权 M1-07，但运行时实现受下方 Python 3.10/Linux/CI 先决门禁阻断。在门禁全绿前只允许完成环境验证和 CI 基础设施；不得修改 CLI/Skill 状态权威源。门禁通过后，先审查实际 CLI、Skill、安装器和 Core API，再将状态读写接入同一持久化 Command Service：写入与 Domain Event 同事务；Command 幂等及状态 CAS；UNKNOWN 必须先 Reconcile；Task version、Attempt、Session 身份和 Ownership 校验；外部副作用由唯一有效 Runtime Leader fenced 执行；旧结果不明不得盲目重发。Service 未运行时须安全拒绝或持久化待处理 Command，并有可恢复的 Reconcile 路径。安装器必须提供 CLI 实际需要的 Python Core 模块，不能依赖源码仓库隐式 `PYTHONPATH`。
 
-SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitHub exactly-once；对外操作仍需在失租、崩溃和回执未知时查询外部事实并保守对账。M1-07 必须保持当前 CLI/Skill/Herdr/Ownership 兼容性并完成 CLI、Skill、安装与多进程/故障回归；完成 M1-06 不自动授权 M1-07。
+SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitHub exactly-once；对外操作仍需在失租、崩溃和回执未知时查询外部事实并保守对账。M1-07 必须保持当前 CLI/Skill/Herdr/Ownership 兼容性并完成 CLI、Skill、安装与多进程/故障回归；M1-06 完成不会自动授权 M1-07，本项目 Owner 已另行明确授权（见门禁与 M0 Review 第 12 节）。
+
+**M1-07 先决阻断门禁（Owner，2026-11-02）**：在修改任何 `teamctl`/Skill 状态权威源或 CLI Runtime 接线之前，**Python 3.10、Linux、CI 三项必须实际通过**。当前状态：
+
+- ✅ Python 3.10（macOS arm64，本机实测，2026-11-02）：uv 缓存解释器 `cpython-3.10.22`（未下载、未安装），`TMPDIR=$PWD/.tmp-m107 python3.10 -B -m unittest discover -s tests` → **238 tests OK, exit 0**；Skill 契约套件 → **42 tests OK, exit 0**；`scripts/install.sh` 沙箱安装冒烟通过，且 `teamctl.py` 在 3.10 下可导入。**此 macOS 证据不等价于 Linux/CI。**
+- ⛔ Linux：本机无 docker/podman 等执行手段，唯一路线为 GitHub Actions `ubuntu-latest`；等待 CEO 安排推送触发。
+- ⛔ CI：`.github/workflows/ci.yml` 已建立，两条显式 leg——**ubuntu-latest + Python 3.10（M1-07 强制门禁腿）**与 macos-latest + Python 3.13（基线腿，仅作参照）；每条腿运行单次 `python -B -m unittest discover -s tests -v`（全量、pytest-free）、Skill 契约 discover、`pip install .` 后于仓库外目录 import 校验（断言 `SCHEMA_VERSION` 为正整数、`initialize_project_root` 可调用；不钉死具体版本，避免 Schema 升级误伤 CI）、`install.sh` 隔离沙箱冒烟。不设 pytest（unittest 已覆盖全量并在缓存版 3.10 实证通过）；不设 Ruff（仓库无稳定 ruff 版本/配置文件，不满足保留条件）。YAML 已本地校验；**首次 CI 全绿前 Linux/CI 门禁保持未通过**。
+
+门禁三项全绿前，禁止任何 M1-07 Runtime 接线改动（含 `teamctl.py`、Skill 状态读写、安装器运行语义）；全绿后须向 CEO 报告并依 M0 Review 第 9.1/12 节继续。
 
 ---
 
@@ -731,7 +739,7 @@ SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitH
 
 **目标**：在保留旧 CLI、Herdr、Ownership 和保守恢复语义的前提下，使持久化 Task、Attempt、Session、Event 和 Command 可在无 Web 时使用，并定义版本化 CEO Protocol 元数据及 Codex/OpenCode 的共享发现契约。
 
-**退出原则**：SQLite Fresh Start 初始化、完整性、重复初始化、数据保留、异常/并发恢复通过；一致性备份、Schema 前向版本保护、事务与幂等通过；CEO Protocol 单一来源、版本/hash、缺失/不兼容 fail-closed 和 Codex/OpenCode 发现契约通过；M1-07 经独立授权后完成 CLI/Skill 到 Core Command Service 的集成及兼容回归。M1-06 完成不代表 M1 整体完成；Legacy JSON 导入、旧 writer freeze、双真源和 JSON cutover 不属于当前路线，也不是 M1 退出门禁。
+**退出原则**：SQLite Fresh Start 初始化、完整性、重复初始化、数据保留、异常/并发恢复通过；一致性备份、Schema 前向版本保护、事务与幂等通过；CEO Protocol 单一来源、版本/hash、缺失/不兼容 fail-closed 和 Codex/OpenCode 发现契约通过；M1-07 完成 CLI/Skill 到 Core Command Service 的集成及兼容回归。Owner 已授权 M1-07，但 Runtime 接线须先满足第 11.3 节的 Python 3.10、Linux 与 CI 全绿门禁；M1-06 完成不代表 M1 整体完成。Legacy JSON 导入、旧 writer freeze、双真源和 JSON cutover 不属于当前路线，也不是 M1 退出门禁。
 
 ### M2 — Watcher & Safe Recovery（P0）
 
