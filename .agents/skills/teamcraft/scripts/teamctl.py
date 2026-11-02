@@ -320,7 +320,7 @@ class StateStore:
                 " fences them; refusing an identity-free write"
             )
         members = state.get("members") or {}
-        if members and member not in members:
+        if member not in members:
             raise TeamctlError(
                 f"authoritative write names member {member!r} that is not part"
                 " of the written state; refusing a mismatched identity"

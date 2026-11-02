@@ -340,6 +340,25 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
                         "pane_created")
 
+    def test_empty_members_rejects_invented_identity_before_provisioning(self):
+        # CEO follow-up on b6f9660: the membership check is unconditional, so
+        # an invented identity can never ride an empty members dict — and the
+        # refusal happens before any mutation or DB provisioning.
+        blank = teamctl.new_state(self.root_resolved, self.session)
+        self.assertEqual(blank["members"], {})
+        with self.assertRaisesRegex(teamctl.TeamctlError,
+                                   "not part of the written state"):
+            self.store.write_unlocked(blank, member="ghost")
+        # Nothing was provisioned by the refused attempt.
+        self.assertFalse((self.root_resolved / ".teamcraft"
+                         / "teamcraft.db").exists())
+        # Honest initialization is preserved: reserve puts the member in the
+        # dict it writes, so the unconditional check admits it.
+        teamctl.reserve_member(self.store, self.session,
+                             make_member("dev", ["src/**"]))
+        self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
+                         "reserved")
+
     def test_foreign_live_lease_blocks_resume_reconciliation(self):
         class SplitLoss(HerdrDouble):
             def __call__(self, arguments, **kwargs):
