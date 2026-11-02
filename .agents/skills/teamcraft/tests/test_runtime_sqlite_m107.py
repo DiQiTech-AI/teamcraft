@@ -289,6 +289,63 @@ class SqliteRuntimeTests(unittest.TestCase):
 
     # ------------------------------------------- legacy JSON fails closed (A)
 
+    def test_stale_lease_never_commits_member_state(self):
+        # CEO gate D follow-up: member-state changes are authoritative writes.
+        teamctl.reserve_member(self.store, self.session,
+                             make_member("dev", ["src/**"]))
+        lease = self.store.acquire_lease("dev", 30)
+        conn = teamctl._adapter.connect_runtime(self.root_resolved)
+        try:
+            teamctl._adapter.leader.acquire_or_renew(
+                conn, "member:dev", "pid:thief", ttl_seconds=3600,
+                clock=_FarClock())
+        finally:
+            conn.close()
+        # An explicitly stale lease can never commit a member-state change.
+        with self.assertRaisesRegex(teamctl.TeamctlError,
+                                   "leader lease was lost"):
+            teamctl.update_member(self.store, self.session, "dev",
+                                  lease=lease, phase="pane_created",
+                                  pane_id="w-9")
+        view = self.store.read_unlocked()
+        self.assertEqual(view["members"]["dev"]["phase"], "reserved")
+        self.assertIsNone(view["members"]["dev"]["pane_id"])
+        # The lease-free auto-admission path is refused too while a foreign
+        # holder is live: no back door around the fence.
+        with self.assertRaisesRegex(teamctl.TeamctlError, "leader lease"):
+            teamctl.update_member(self.store, self.session, "dev",
+                                 phase="pane_created")
+        view = self.store.read_unlocked()
+        self.assertEqual(view["members"]["dev"]["phase"], "reserved")
+
+    def test_foreign_live_lease_blocks_resume_reconciliation(self):
+        class SplitLoss(HerdrDouble):
+            def __call__(self, arguments, **kwargs):
+                args = [str(item) for item in arguments]
+                if tuple(args[:2]) == ("pane", "split"):
+                    raise teamctl.HerdrCommandError(args, 1, "timeout")
+                return super().__call__(arguments, **kwargs)
+
+        self.launch(SplitLoss())  # durable split command ends UNKNOWN
+        conn = teamctl._adapter.connect_runtime(self.root_resolved)
+        try:
+            teamctl._adapter.leader.acquire_or_renew(
+                conn, "member:dev", "pid:rival", ttl_seconds=3600)
+        finally:
+            conn.close()
+        double = HerdrDouble()
+        with mock.patch.object(teamctl, "preflight_kind"), \
+                mock.patch.object(teamctl, "run_herdr", side_effect=double):
+            code, out, err = self.run_main(
+                ["resume", "dev", "--cwd", str(self.root_resolved)])
+        self.assertEqual(code, 1)
+        self.assertIn("leader lease", err)
+        # Admission failed before any Herdr probe, so nothing was reconciled.
+        self.assertEqual(double.calls, [])
+        self.assertEqual(self.stage_states("pane.split"), ["unknown"])
+        view = self.store.read_unlocked()
+        self.assertEqual(view["members"]["dev"]["phase"], "split_ambiguous")
+
     def test_legacy_herdr_team_refused_bytes_preserved_no_db(self):
         legacy = self.root_resolved / ".herdr-team"
         legacy.mkdir()

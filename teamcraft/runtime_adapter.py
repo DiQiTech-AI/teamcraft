@@ -533,7 +533,7 @@ def stage_claim(
         attempt = domain.get_attempt(conn, attempt_id)
         evidence["attempt_id"] = attempt_id
         evidence["attempt_no"] = attempt.attempt_no
-    with storage.transaction(conn):
+    with _tx(conn):
         leader.require_lease(conn, lease, clock=clock)
         prior = conn.execute(
             "SELECT COUNT(*) FROM commands WHERE kind = ? AND"
@@ -575,7 +575,7 @@ def stage_confirm(
     """
 
     payload = {"result": result or {}, "evidence": evidence or {}}
-    with storage.transaction(conn):
+    with _tx(conn):
         leader.require_lease(conn, lease, clock=clock)
         return command_core.confirm_command(
             conn, command_id,
@@ -592,26 +592,31 @@ def stage_unknown(
     """Record a fail-safe UNKNOWN outcome (always permitted, lease or not)."""
 
     audit = note if not evidence else f"{note} | evidence={json.dumps(evidence, sort_keys=True, default=str)}"
-    with storage.transaction(conn):
+    with _tx(conn):
         return command_core.mark_command_unknown(
             conn, command_id, note=audit, clock=clock,
         )
 
 
 def stage_reconcile(
-    conn: TeamCraftConnection, command_id: str, *,
+    conn: TeamCraftConnection, command_id: str, *, lease: leader.Lease,
     evidence: dict[str, Any], resolved_ok: bool, note: str,
     clock: Any = None,
 ) -> command_core.Command:
     """Close a ``running``/``unknown`` command from inspected external facts.
 
-    ``confirmed`` means the facts prove the effect DID happen; ``expired``
-    means the facts prove it did not (abandoned/never occurred). UNKNOWN
-    never auto-retries: reconciliation records, it does not re-dispatch.
+    Reconciliation commits an AUTHORITATIVE outcome (``confirmed`` = the facts
+    prove the effect happened; ``expired`` = they prove it did not), so it
+    requires the live leader lease exactly like ``stage_confirm`` (CEO gate D,
+    M1-07 review follow-up): a stale or expired leader can never commit
+    reconciliation either.  Recording ambiguity via :func:`stage_unknown`
+    remains always permitted.  UNKNOWN never auto-retries: reconciliation
+    records, it does not re-dispatch.
     """
 
     audit = f"{note} | evidence={json.dumps(evidence, sort_keys=True, default=str)}"
-    with storage.transaction(conn):
+    with _tx(conn):
+        leader.require_lease(conn, lease, clock=clock)
         if resolved_ok:
             return command_core.reconcile_command(
                 conn, command_id, outcome="confirmed", note=audit,

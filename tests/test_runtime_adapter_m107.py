@@ -334,11 +334,30 @@ class RuntimeAdapterTests(unittest.TestCase):
             ra.latest_stage_command(self.conn, "dev", ra.STAGE_SPLIT).state,
             "unknown",
         )
-        ra.stage_reconcile(self.conn, command.id,
+        # The stale epoch cannot reconcile either — authoritative outcomes
+        # (confirmed AND expired) both require the live lease.
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_reconcile(self.conn, command.id, lease=lease,
+                              evidence={"pane_id": "w-2"}, resolved_ok=True,
+                              note="stale must not confirm",
+                              clock=_FixedClock(34))
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_reconcile(self.conn, command.id, lease=lease,
+                              evidence={"pane_id": None}, resolved_ok=False,
+                              note="stale must not expire either",
+                              clock=_FixedClock(34))
+        self.assertEqual(
+            ra.latest_stage_command(self.conn, "dev", ra.STAGE_SPLIT).state,
+            "unknown",
+        )
+        # The CURRENT leader settles it from facts.
+        current = leader.acquire_or_renew(self.conn, "member:dev", "thief",
+                                         ttl_seconds=30, clock=_FixedClock(35))
+        ra.stage_reconcile(self.conn, command.id, lease=current,
                           evidence={"pane_id": "w-2", "observed": "pane exists"},
                           resolved_ok=True,
                           note="resume inspection proved the split happened",
-                          clock=_FixedClock(34))
+                          clock=_FixedClock(36))
         self.assertEqual(
             ra.latest_stage_command(self.conn, "dev", ra.STAGE_SPLIT).state,
             "confirmed",
@@ -355,7 +374,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         ra.stage_unknown(self.conn, command.id,
                         note="response lost in transport",
                         clock=_FixedClock(2))
-        ra.stage_reconcile(self.conn, command.id,
+        ra.stage_reconcile(self.conn, command.id, lease=lease,
                           evidence={"pane": "w-2", "prompt_visible": False},
                           resolved_ok=False,
                           note="facts prove the prompt never landed",
@@ -364,6 +383,24 @@ class RuntimeAdapterTests(unittest.TestCase):
             ra.latest_stage_command(self.conn, "dev", ra.STAGE_PROMPT).state,
             "expired",
         )
+
+    def test_unknown_recording_stays_available_after_lease_loss(self):
+        # CEO requirement: fencing blocks authoritative commits, but recording
+        # ambiguity must remain available even with a live foreign holder.
+        _, dev = self._ready_member()
+        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+                                       ttl_seconds=30, clock=_FixedClock())
+        command = ra.stage_claim(self.conn, team_id="team-synthetic",
+                                member="dev", stage=ra.STAGE_START, lease=lease,
+                                task_id=dev["task_id"],
+                                attempt_id=dev["attempt_id"],
+                                clock=_FixedClock(1))
+        leader.acquire_or_renew(self.conn, "member:dev", "thief",
+                               ttl_seconds=3600, clock=_FixedClock(31))
+        settled = ra.stage_unknown(self.conn, command.id,
+                                  note="effect response lost with lease gone",
+                                  clock=_FixedClock(32))
+        self.assertEqual(settled.state, "unknown")
 
     def test_claim_requires_live_lease(self) -> None:
         _, dev = self._ready_member()

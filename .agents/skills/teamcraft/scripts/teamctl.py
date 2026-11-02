@@ -299,11 +299,51 @@ class StateStore:
         finally:
             conn.close()
 
-    def write_unlocked(self, state: dict[str, Any]) -> None:
+    def write_unlocked(self, state: dict[str, Any], *, member: str | None = None,
+                       lease: _leader.Lease | None = None) -> None:
+        """Persist the working dict authoritatively, fenced by the lease.
+
+        Member-state changes MUST carry the operation's leader lease (CEO gate
+        D): a stale/expired lease is refused, and when no lease object is
+        passed the write still admits through a short auto-lease on
+        ``member:<name>`` — refused while a foreign holder is live, and
+        released again unless this store already held it.  ``stage_unknown``
+        style ambiguity records stay lease-free by design.
+        """
+
         self._ensure_ready()
         conn = self._connect()
         try:
-            _adapter.sync_state(conn, state)
+            if member is None:
+                _adapter.sync_state(conn, state)
+                return
+            scope = f"member:{member}"
+            with _adapter.storage.transaction(conn):
+                if lease is not None:
+                    _leader.require_lease(conn, lease)
+                    _adapter.sync_state(conn, state)
+                    return
+                live = _leader.current_lease(conn, scope)
+                admitted = _leader.acquire_or_renew(
+                    conn, scope, self._holder_id, ttl_seconds=30,
+                )
+                _adapter.sync_state(conn, state)
+                if live is None or live.holder_id != self._holder_id:
+                    _leader.release(conn, admitted.scope, admitted.holder_id,
+                                   epoch=admitted.epoch)
+        except _leader.LeaderBusyError as exc:
+            raise TeamctlError(
+                f"another teamctl operation holds the leader lease for member"
+                f" {member} (holder {exc.holder_id}, epoch {exc.epoch},"
+                f" expires {exc.expires_at}); wait for it to finish or expire"
+                " before retrying"
+            ) from exc
+        except _leader.StaleLeaderError as exc:
+            raise TeamctlError(
+                "the runtime leader lease was lost before this member state"
+                " change could be committed; a current leader must retry —"
+                " nothing was changed"
+            ) from exc
         except _adapter.RuntimeAdapterError as exc:
             raise TeamctlError(str(exc)) from exc
         finally:
@@ -410,14 +450,28 @@ class StateStore:
         finally:
             conn.close()
 
-    def reconcile_stage(self, command_id: str, *, evidence: dict[str, Any],
+    def reconcile_stage(self, command_id: str, *, lease: _leader.Lease,
+                        evidence: dict[str, Any],
                         resolved_ok: bool, note: str) -> Any:
+        """Settle a stage command from verified facts — requires the lease.
+
+        Reconciliation commits an authoritative outcome, so it is fenced
+        exactly like ``stage_confirm``: a stale leader is refused and the
+        command stays UNKNOWN for a live leader to settle.
+        """
+
         conn = self._connect()
         try:
             return _adapter.stage_reconcile(
-                conn, command_id, evidence=evidence, resolved_ok=resolved_ok,
-                note=note,
+                conn, command_id, lease=lease, evidence=evidence,
+                resolved_ok=resolved_ok, note=note,
             )
+        except _leader.StaleLeaderError as exc:
+            raise TeamctlError(
+                "the runtime leader lease was lost before this reconciliation"
+                " could be committed; a current leader must run resume"
+                " <member> again — nothing was changed"
+            ) from exc
         finally:
             conn.close()
 
@@ -441,7 +495,8 @@ def validate_state_session(state: dict[str, Any], session: dict[str, Any]) -> No
 
 
 def update_member(
-    store: StateStore, session: dict[str, Any], name: str, **changes: Any
+    store: StateStore, session: dict[str, Any], name: str, *,
+    lease: "_leader.Lease | None" = None, **changes: Any
 ) -> dict[str, Any]:
     with store.locked() as state:
         if state is None:
@@ -453,7 +508,7 @@ def update_member(
             raise TeamctlError(f"member is not recorded: {name}") from exc
         member.update(changes)
         member["updated_at"] = now_epoch()
-        store.write_unlocked(state)
+        store.write_unlocked(state, member=name, lease=lease)
         return dict(member)
 
 
@@ -541,7 +596,8 @@ def claims_overlap(left: str, right: str) -> bool:
 
 
 def reserve_member(
-    store: StateStore, session: dict[str, Any], member: dict[str, Any]
+    store: StateStore, session: dict[str, Any], member: dict[str, Any], *,
+    lease: "_leader.Lease | None" = None,
 ) -> dict[str, Any]:
     with store.locked() as state:
         if state is None:
@@ -561,7 +617,7 @@ def reserve_member(
                                 f"ownership {claim!r} overlaps active member {other.get('name')!r} claim {existing!r}"
                             )
         members[member["name"]] = member
-        store.write_unlocked(state)
+        store.write_unlocked(state, member=member["name"], lease=lease)
         return dict(member)
 
 
@@ -754,7 +810,8 @@ def split_for_member(
                 override = opencode_config_content(Path(member["cwd"]), member["role"])
             split_args.extend(["--env", f"OPENCODE_CONFIG_CONTENT={override}"])
         update_member(
-            store, session, member["name"], phase="split_requested",
+            store, session, member["name"], lease=lease,
+            phase="split_requested",
             from_pane_id=parent_id, direction=direction,
         )
         command = store.stage_claim(
@@ -768,7 +825,8 @@ def split_for_member(
                 command.id, note=f"pane split outcome ambiguous: {exc}"
             )
             update_member(
-                store, session, member["name"], phase="split_ambiguous",
+                store, session, member["name"], lease=lease,
+                phase="split_ambiguous",
                 error=str(exc),
             )
             raise TeamctlError(
@@ -781,7 +839,8 @@ def split_for_member(
                      "terminal_id": pane.get("terminal_id")},
         )
         return update_member(
-            store, session, member["name"], phase="pane_created",
+            store, session, member["name"], lease=lease,
+            phase="pane_created",
             pane_id=pane["pane_id"], terminal_id=pane.get("terminal_id"),
             from_pane_id=parent_id, direction=direction,
         )
@@ -803,7 +862,8 @@ def start_member(
             name, _operation_ttl(member["start_timeout_ms"], None, False)
         )
     try:
-        update_member(store, session, name, phase="start_requested")
+        update_member(store, session, name, lease=lease,
+                             phase="start_requested")
         args = [
             "agent", "start", name, "--kind", member["kind"], "--pane", pane_id,
             "--timeout", str(member["start_timeout_ms"]),
@@ -821,7 +881,8 @@ def start_member(
             store.stage_unknown(
                 command.id, note=f"agent start outcome ambiguous: {exc}"
             )
-            update_member(store, session, name, phase="start_ambiguous",
+            update_member(store, session, name, lease=lease,
+                         phase="start_ambiguous",
                          error=str(exc))
             raise TeamctlError(
                 f"agent start is ambiguous in existing pane {pane_id}; resume {name} to inspect or reuse that pane. Cause: {exc}"
@@ -834,7 +895,8 @@ def start_member(
                      "agent_session": info.get("agent_session")},
         )
         return update_member(
-            store, session, name, phase="agent_started",
+            store, session, name, lease=lease,
+            phase="agent_started",
             pane_id=info.get("pane_id", pane_id),
             terminal_id=info.get("terminal_id", member.get("terminal_id")),
             agent_session=info.get("agent_session"), live_state=live_state(info),
@@ -863,7 +925,8 @@ def prompt_member(
         )
     try:
         update_member(
-            store, session, name, phase="prompt_submitting",
+            store, session, name, lease=lease,
+            phase="prompt_submitting",
             prompt_may_have_been_delivered=True,
         )
         prompt_text = build_prompt(member)
@@ -888,7 +951,8 @@ def prompt_member(
                 command.id, note=f"prompt outcome ambiguous: {exc}"
             )
             update_member(
-                store, session, name, phase="prompt_ambiguous", error=str(exc),
+                store, session, name, lease=lease,
+                phase="prompt_ambiguous", error=str(exc),
                 prompt_may_have_been_delivered=True,
             )
             raise TeamctlError(
@@ -904,7 +968,8 @@ def prompt_member(
                          prompt_text.encode("utf-8")).hexdigest()},
         )
         return update_member(
-            store, session, name, phase="prompt_submitted",
+            store, session, name, lease=lease,
+            phase="prompt_submitted",
             live_state=live_state(info),
             agent_session=info.get("agent_session", member.get("agent_session")),
             terminal_id=info.get("terminal_id", member.get("terminal_id")),
@@ -976,7 +1041,7 @@ def _launch_operation(args: argparse.Namespace) -> int:
             "live_state": "missing", "created_at": now_epoch(),
             "updated_at": now_epoch(), "error": None,
         }
-        reserve_member(store, session, member)
+        reserve_member(store, session, member, lease=lease)
         member = split_for_member(member, store, session, lease=lease)
         member = start_member(member, store, session, lease=lease)
         member = prompt_member(
@@ -1078,7 +1143,8 @@ def verify_recorded_occupant(
 
 
 def _reconcile_observed_stage(store: StateStore, name: str, stage: str,
-                              evidence: dict[str, Any], note: str) -> None:
+                              evidence: dict[str, Any], note: str, *,
+                              lease: "_leader.Lease") -> None:
     """Close a still-running/unknown stage command from verified live facts.
 
     This is inspection-driven reconciliation (CEO gate C): the effect is NOT
@@ -1090,8 +1156,8 @@ def _reconcile_observed_stage(store: StateStore, name: str, stage: str,
     command = store.latest_stage_command(name, stage)
     if command is None or command.state not in ("running", "unknown"):
         return
-    store.reconcile_stage(command.id, evidence=evidence, resolved_ok=True,
-                          note=note)
+    store.reconcile_stage(command.id, lease=lease, evidence=evidence,
+                          resolved_ok=True, note=note)
 
 
 def _resume_operation(args: argparse.Namespace) -> int:
@@ -1115,6 +1181,7 @@ def _resume_operation(args: argparse.Namespace) -> int:
                 {"pane_id": pane.get("pane_id"),
                  "terminal_id": pane.get("terminal_id")},
                 "resume inspection: recorded pane exists and matches identity",
+                lease=lease,
             )
         if agent:
             _reconcile_observed_stage(
@@ -1123,10 +1190,12 @@ def _resume_operation(args: argparse.Namespace) -> int:
                  "terminal_id": agent.get("terminal_id"),
                  "agent_session": agent.get("agent_session")},
                 "resume inspection: recorded agent is live and matches identity",
+                lease=lease,
             )
         if pane and pane.get("pane_id") != member.get("pane_id"):
             member = update_member(
-                store, session, args.name, pane_id=pane["pane_id"],
+                store, session, args.name, lease=lease,
+                pane_id=pane["pane_id"],
                 terminal_id=pane.get("terminal_id", member.get("terminal_id")),
             )
         if (
@@ -1149,7 +1218,7 @@ def _resume_operation(args: argparse.Namespace) -> int:
             agent = agent_info_from(run_herdr(["agent", "get", args.name]))
         else:
             member = update_member(
-                store, session, args.name,
+                store, session, args.name, lease=lease,
                 terminal_id=agent.get("terminal_id", member.get("terminal_id")),
                 agent_session=agent.get("agent_session", member.get("agent_session")),
                 live_state=live_state(agent),
@@ -1162,7 +1231,8 @@ def _resume_operation(args: argparse.Namespace) -> int:
             agent = agent_info_from(run_herdr(["agent", "get", args.name]))
         elif args.prompt_action == "skip":
             member = update_member(
-                store, session, args.name, phase="prompt_skipped", error=None
+                store, session, args.name, lease=lease,
+                phase="prompt_skipped", error=None
             )
         with store.locked() as latest:
             assert latest is not None
@@ -1242,7 +1312,8 @@ def _finish_member_operation(args: argparse.Namespace) -> int:
     lease = store.acquire_lease(args.name, 60)
     try:
         member = update_member(
-            store, session, args.name, phase=phase, ownership=[], error=None
+            store, session, args.name, lease=lease,
+            phase=phase, ownership=[], error=None
         )
     finally:
         store.release_lease(lease)
