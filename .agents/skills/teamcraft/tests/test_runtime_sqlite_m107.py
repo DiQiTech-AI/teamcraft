@@ -51,10 +51,18 @@ class SqliteRuntimeTests(unittest.TestCase):
             "HERDR_PANE_ID": PARENT_PANE_ID,
         })
         self.env.start()
+        # CI runners have no herdr executable.  Stub ONLY the
+        # executable-presence gate (preflight_kind -> supported_kinds' real
+        # `herdr agent` subprocess + shutil.which PATH probe), which carries
+        # no runtime state effect.  Every actual Herdr effect still flows
+        # through the per-test run_herdr double and is asserted there.
+        self.gate = mock.patch.object(teamctl, "preflight_kind")
+        self.gate.start()
         self.session = teamctl.current_session_identity()
         self.store = teamctl.StateStore(self.root_resolved)
 
     def tearDown(self) -> None:
+        self.gate.stop()
         self.env.stop()
         self.temp.cleanup()
 
