@@ -218,7 +218,19 @@ def sync_state(conn: TeamCraftConnection, state: dict[str, Any],
     session = state.get("herdr_session")
     if not isinstance(session, dict):
         raise ValidationError("state herdr_session must be an object")
-    for name, member in state.get("members", {}).items():
+    members = state.get("members", {})
+    if not isinstance(members, dict):
+        raise ValidationError("state members must be an object keyed by member name")
+    for name, member in members.items():
+        if not isinstance(name, str) or not isinstance(member, dict):
+            raise ValidationError(
+                "state members must map string names to member objects"
+            )
+        if member.get("name") != name:
+            raise RuntimeAdapterError(
+                f"member map key {name!r} does not match the member record"
+                f" identity {member.get('name')!r}; refusing mismatched state"
+            )
         phase = str(member.get("phase", ""))
         if phase not in MEMBER_PHASES:
             raise ValidationError(

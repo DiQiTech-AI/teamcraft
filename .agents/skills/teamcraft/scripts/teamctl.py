@@ -329,6 +329,18 @@ class StateStore:
                 f"authoritative write names member {member!r} that is not part"
                 " of the written state; refusing a mismatched identity"
             )
+        member_record = members[member]
+        if not isinstance(member_record, dict) or member_record.get("name") != member:
+            raise TeamctlError(
+                f"authoritative write member key {member!r} does not match"
+                " the member record identity; refusing a mismatched identity"
+            )
+        expected_scope = f"member:{member}"
+        if lease is not None and lease.scope != expected_scope:
+            raise TeamctlError(
+                f"authoritative write for member {member!r} requires lease"
+                f" scope {expected_scope!r}; refusing lease scope {lease.scope!r}"
+            )
         if confirm_command_id is not None and lease is None:
             raise TeamctlError(
                 "confirming an external action and its member state requires"

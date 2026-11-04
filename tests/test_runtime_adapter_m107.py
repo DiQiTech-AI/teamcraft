@@ -153,6 +153,13 @@ class RuntimeAdapterTests(unittest.TestCase):
         ).fetchone()
         self.assertGreaterEqual(int(events[0]), 1)
 
+    def test_sync_rejects_member_map_key_identity_mismatch(self) -> None:
+        state = _state(members={"alice": _member("bob")})
+        with self.assertRaisesRegex(ra.RuntimeAdapterError,
+                                    "does not match the member record identity"):
+            ra.sync_state(self.conn, state, clock=_FixedClock())
+        self.assertIsNone(ra.team_view(self.conn))
+
     def test_lineage_progresses_with_member_lifecycle(self) -> None:
         state = _state(members={"dev": _member("dev")})
         ra.sync_state(self.conn, state, clock=_FixedClock())

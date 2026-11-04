@@ -117,6 +117,30 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(member["attempt_id"])
         self.assertIsNotNone(member["session_id"])
 
+    def test_effect_confirmation_rolls_back_with_member_state_write(self):
+        double = HerdrDouble()
+        sync_state = teamctl._adapter.sync_state
+
+        def fail_on_pane_created(conn, state, **kwargs):
+            if state["members"]["dev"]["phase"] == "pane_created":
+                raise teamctl._adapter.RuntimeAdapterError(
+                    "injected member-state write failure"
+                )
+            return sync_state(conn, state, **kwargs)
+
+        # The external split succeeds, then the following DB member-state
+        # write fails. Command confirmation and member state must share the
+        # transaction, leaving the command unresolved for resume inspection.
+        with mock.patch.object(teamctl._adapter, "sync_state",
+                               side_effect=fail_on_pane_created):
+            code, _out, err = self.launch(double)
+        self.assertEqual(code, 1)
+        self.assertIn("injected member-state write failure", err)
+        self.assertIn(["pane", "split"], [call[:2] for call in double.calls])
+        self.assertEqual(self.stage_states("pane.split"), ["running"])
+        self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
+                         "split_requested")
+
     def test_split_claim_is_committed_before_effect_executes(self):
         probe = {}
 
@@ -347,6 +371,27 @@ class SqliteRuntimeTests(unittest.TestCase):
                              phase="pane_created", pane_id="w-3")
         self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
                         "pane_created")
+
+    def test_write_unlocked_binds_member_record_and_lease_scope(self):
+        teamctl.reserve_member(self.store, self.session,
+                              make_member("dev", ["src/**"]))
+        state = self.store.read_unlocked()
+        with self.subTest("record identity mismatch"):
+            state["members"]["dev"]["name"] = "other"
+            with self.assertRaisesRegex(teamctl.TeamctlError,
+                                        "does not match"):
+                self.store.write_unlocked(state, member="dev")
+            state["members"]["dev"]["name"] = "dev"
+        with self.subTest("lease scope mismatch"):
+            foreign = self.store.acquire_lease("other", 30)
+            try:
+                with self.assertRaisesRegex(teamctl.TeamctlError,
+                                            "requires lease scope"):
+                    self.store.write_unlocked(state, member="dev", lease=foreign)
+            finally:
+                self.store.release_lease(foreign)
+        self.assertEqual(self.store.read_unlocked()["members"]["dev"]["phase"],
+                         "reserved")
 
     def test_empty_members_rejects_invented_identity_before_provisioning(self):
         # CEO follow-up on b6f9660: the membership check is unconditional, so
