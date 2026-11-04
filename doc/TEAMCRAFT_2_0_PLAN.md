@@ -3,10 +3,10 @@
 > **文档性质**：产品需求文档（PRD）＋里程碑目标＋AI 开发代理执行契约；实施设计以已原则接受的 [M0 Review / ADR-001](TEAMCRAFT_2_0_M0_REVIEW.md) 为基线，详细任务、依赖和逐项验收以该报告第 9 节为唯一权威来源
 >
 > **版本**：v1.5（SQLite-only Fresh Start 路线调整；CEO Protocol 与跨 Harness 规划仍为 Proposed）
-> **日期**：2026-11-02
+> **日期**：2026-11-04
 > **目标仓库**：https://github.com/DiQiTech-AI/teamcraft  
 > **目标读者**：产品维护者、Codex/OpenCode 等编码 Agent、后续贡献者  
-> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 已通过评审；M1-02 已**有条件验收通过**（2026-10-24，证据见 [M0 Review 第 12.2 节](TEAMCRAFT_2_0_M0_REVIEW.md)；Python 3.10/Linux 与 CI 为未关闭验收限制，详见该节）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05 已完成并按对应记录验收（见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。M1-06 SQLite Fresh Start Validation 已于 2026-11-02 完成独立验收（证据见 [M0 Review 第 12.6 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。Owner 已授权 M1-07 SQLite Runtime Integration，其 Python 3.10/Linux/CI 先决门禁已于 2026-11-02 全绿（GitHub Actions run 41466544296 @ `d7fddcd`，首跑失败与修复见第 11 节），Runtime 接线阻断解除；M1-07 未完成，实施切片待 CEO 分解；详见第 11 节与 M0 Review 第 12 节。
+> **状态**：M0 Review / ADR-001 已获原则接受，M1-01 至 M1-07 均已验收（M1-02 原有的 Python 3.10/Linux/CI 条件已由后续门禁满足，M1-07 于 2026-11-04 关闭；证据见 [M0 Review 第 12 节](TEAMCRAFT_2_0_M0_REVIEW.md)）。本版新增的 CEO Protocol、跨 Harness 入口和 Wake Dispatcher 是**待人工审查的规划扩展**，不改变既有 ADR-001 的接受状态，也不代表已实现或获准开工。M1-03、M1-04、M1-05、M1-06 与 M1-07 均已完成并按对应记录验收。M1-08 及 M2 后续任务仍按依赖和授权推进。
 
 ---
 
@@ -721,11 +721,11 @@ SQLite fencing 只约束受控准入和本地状态提交，不提供 Herdr/GitH
 - ✅ Linux（GitHub Actions，2026-11-02）：本机仍无 docker/podman，Linux 实测经 Actions `ubuntu-latest`（实际 runner Ubuntu 26.04）完成——run **41466544296** @ `d7fddcd` 的 ubuntu/Python 3.10 强制腿全绿：core unittest **249 OK**、Skill 契约 **42 OK**、`pip install .` 仓库外 import 探针 OK、`install.sh` 沙箱冒烟 OK。
 - ✅ CI：`.github/workflows/ci.yml` 已建立，两条显式 leg——**ubuntu-latest + Python 3.10（M1-07 强制门禁腿）**与 macos-latest + Python 3.13（基线腿，仅作参照）；每条腿运行单次 `python -B -m unittest discover -s tests -v`（全量、pytest-free）、Skill 契约 discover、`pip install .` 后于仓库外目录 import 校验（断言 `SCHEMA_VERSION` 为正整数、`initialize_project_root` 可调用；不钉死具体版本，避免 Schema 升级误伤 CI）、`install.sh` 隔离沙箱冒烟。不设 pytest（unittest 已覆盖全量并在缓存版 3.10 实证通过）；不设 Ruff（仓库无稳定 ruff 版本/配置文件，不满足保留条件）。
   - **首跑结果（Actions run 41461763132 @ `acfe9c9`，2026-11-02）**：macOS/3.13 腿通过；ubuntu/3.10 腿失败（238 例中 8 failures + 181 errors）。根因：`storage._classify_mount` 只识别 macOS 的 `dev on POINT (opts)`，util-linux 输出为 `dev on POINT type FSTYPE (opts)`，mount point 被 `type ext4` 污染，Linux mount 表整体无法覆盖临时目录 → 全量写入门禁 fail-closed。**已实施最小修复**（新增 util-linux 解析分支，先于 macOS 分支；不放宽 local/remote/unknown 语义、不使用 `allow_unverified_location`、不 skip 测试、强制腿不变）+ 合成 mount 表回归 `tests/test_mount_parsing_m107gate.py`（util-linux local/嵌套/nfs+cifs 保持 remote/tmpfs 不判 local/proc 与 macOS 形式保持/无覆盖保持 unknown/列格式 fail-closed）。本地验证：macOS 3.13 pytest **249 passed, 101 subtests**、cached 3.10 unittest **249 OK**、Skill 42 OK、`git diff --check` clean。该次失败作为历史证据保留。**（当时的）Linux 门禁维持 ⛔ 未通过；Runtime 接线保持冻结。**
-  - **复跑结果（Actions run 41466544296 @ `d7fddcd`，2026-11-02）：两条腿全部通过**——ubuntu-26.04/Python 3.10（强制腿）：core unittest 249 OK、Skill 契约 42 OK、包安装/导入探针 OK、installer 冒烟 OK；macOS/Python 3.13 基线腿全部步骤通过。**至此 Python 3.10、Linux、CI 三项前置门禁满足（2026-11-02）；Runtime 接线冻结解除，但实施切片与开工顺序由 CEO 在架构审计后下达，M1-07 尚未完成。**
+  - **复跑结果（Actions run 41466544296 @ `d7fddcd`，2026-11-02）：两条腿全部通过**——ubuntu-26.04/Python 3.10（强制腿）：core unittest 249 OK、Skill 契约 42 OK、包安装/导入探针 OK、installer 冒烟 OK；macOS/Python 3.13 基线腿全部步骤通过。该次 run 满足 Runtime 接线的前置门禁并解除冻结；当时 M1-07 仍未完成，最终验收见 M0 Review 第 12.9 节。
 
-（历史约束）门禁三项全绿前，禁止任何 M1-07 Runtime 接线改动（含 `teamctl.py`、Skill 状态读写、安装器运行语义）。2026-11-02 三项已全绿（run 41466544296），该阻断解除；Runtime 集成仍须依 M0 Review 第 9.1/12 节执行，具体实施切片待 CEO 分解后开工。
+（历史约束）门禁三项全绿前，禁止任何 M1-07 Runtime 接线改动（含 `teamctl.py`、Skill 状态读写、安装器运行语义）。2026-11-02 三项已全绿（run 41466544296），该阻断解除；Runtime 集成随后按 M0 Review 第 9.1/12 节实施，并已于 2026-11-04 验收关闭。
 
-**M1-07 实施进展（2026-11-03，本地实施完成、待 CEO 独立评审，未标记完成）**：CLI/Skill 已切换为 SQLite 单一权威（详见 M0 Review 第 12.8 节实施证据）。要点：`teamctl.py` 重写为 SQLite 权威（构造 fail-fast 纯检查、首次操作 provisioning；冻结五命令 argv/输出/退出码不变）；新增 `teamcraft/runtime_adapter.py`（sync_state 单事务成员+lineage+events；stage 命令 effect 前持久 claim；stale leader 拒绝 success）与 `teamcraft/leader.py`（per-member 租约、单调 epoch、release 保留行使 epoch 永不复位、可组合外层事务——两项 CEO 评审修正已落地并有回归）；schema v4（`leader_lease/runtime_meta/members` + `idx_members_phase`，前向演进）；`state.json` 不再是运行时状态，出现即 fail-closed（字节保留，读侧同样冻结，人工移除后恢复服务）；安装器离线捆绑 `teamcraft/` → `.agents/skills/teamcraft/scripts/core/teamcraft/`（与 `_bootstrap_core` 搜索路径一致），新增隔离目标真实执行 `teamctl --help` 的安装冒烟（剥离 PYTHONPATH）。本地证据：macOS/3.13 pytest 全仓 332 passed + 136 subtests；3.10 core unittest 279 OK（249 基线 + leader 13 + adapter 16 + install 冒烟 1）；3.10 Skill 53 OK（42 基线 + 11 新 CLI 级）。compat 契约 8 处 JSON 钉死断言经 CEO 2026-11-03 批准迁移为 SQLite 等价断言。真实仓库 `.teamcraft/state.json` 未被读取/修改；全部测试仅用合成临时根。Linux/3.10 CI 复跑与独立评审为剩余验收事项。
+**M1-07 已完成并验收关闭（2026-11-04）**：CLI/Skill 已切换为 SQLite 单一权威（实施范围见 M0 Review 第 12.8 节，最终评审修正、测试与 CI 证据见第 12.9 节）。最终提交 `6638341` 修复了 Command 确认/成员状态事务原子性和成员身份/租约 scope 绑定；Python 3.10 核心 281 tests、Skill 59 tests、包安装/导入与隔离安装器检查通过。GitHub Actions run **41779790463** 的 Ubuntu/Python 3.10 强制门禁和 macOS/Python 3.13 基线两条腿全部成功。生产 JSON→SQLite cutover 不属于当前路线。
 
 ---
 
