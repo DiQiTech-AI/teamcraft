@@ -79,6 +79,16 @@ class FixedClock:
         self.t = self.t + timedelta(seconds=seconds)
 
 
+def _shed_v5_protocol_artifacts(conn) -> None:
+    """Make a synthetic older-schema fixture match its claimed version."""
+    for trigger in storage._V5_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
+    for column in ("protocol_hash", "protocol_version"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
+
+
 class DomainM104Tests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="teamcraft-m104-")
@@ -190,6 +200,7 @@ class DomainM104Tests(unittest.TestCase):
         # v1 sheds the v2/v3 artifacts too — a lingering v3 audit record is
         # (correctly) treated as an inconsistent schema by the write gate.
         with storage.transaction(self.conn):
+            _shed_v5_protocol_artifacts(self.conn)
             self.conn.execute("DROP TABLE task_dependencies")
             self.conn.execute("DROP TABLE events")
             self.conn.execute("DROP TABLE commands")
@@ -1162,6 +1173,7 @@ class M104UpgradePathTests(unittest.TestCase):
         conn = storage.connect(self.db)
         try:
             with storage.transaction(conn):
+                _shed_v5_protocol_artifacts(conn)
                 conn.execute("DROP TABLE task_dependencies")
                 conn.execute("DROP TABLE events")
                 conn.execute("DROP TABLE commands")
@@ -1228,7 +1240,7 @@ class M104UpgradePathTests(unittest.TestCase):
                 [r[0] for r in conn.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )],
-                [1, 2, 3, 4],
+                list(range(1, storage.SCHEMA_VERSION + 1)),
             )
         finally:
             conn.close()

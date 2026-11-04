@@ -60,6 +60,7 @@ _bootstrap_core()
 
 from teamcraft import leader as _leader  # noqa: E402
 from teamcraft import runtime_adapter as _adapter  # noqa: E402
+from teamcraft.herdr_adapter import HerdrAdapter, HerdrError  # noqa: E402
 
 
 STATE_VERSION = 1
@@ -73,6 +74,7 @@ MIN_SPLIT_WIDTH = 50
 MIN_SPLIT_HEIGHT = 16
 PREFER_RIGHT_WIDTH = 120
 SKILL_PATH = Path(__file__).resolve().parent.parent / "SKILL.md"
+CEO_SKILL_PATH = SKILL_PATH.parent.parent / "teamcraft-ceo" / "SKILL.md"
 
 ROLE_RESPONSIBILITIES = {
     "ceo": "Own requirements, planning, staffing, assignments, review, integration, and the final delivery decision.",
@@ -131,8 +133,46 @@ def run_process(
     return stdout, stderr, completed.returncode
 
 
+class _TeamctlHerdrAdapter(HerdrAdapter):
+    """Keep the CLI's established error type for its UNKNOWN handling paths."""
+
+    @staticmethod
+    def _translate(call: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return call(*args, **kwargs)
+        except HerdrError as exc:
+            raise TeamctlError(str(exc)) from exc
+
+    def request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._translate(super().request, *args, **kwargs)
+
+    def pane(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._translate(super().pane, *args, **kwargs)
+
+    def agent(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._translate(super().agent, *args, **kwargs)
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        return self._translate(super().list_agents)
+
+
+def _herdr_adapter() -> HerdrAdapter:
+    def runner(argv: Sequence[str], timeout: float, accepted: tuple[int, ...]):
+        # Keep the historical low-level seam used by callers embedding or
+        # mocking teamctl. All production lifecycle entry points still invoke
+        # typed adapter methods; this runner only supplies their transport.
+        if list(argv[1:]) == ["agent"] and accepted == (0, 2):
+            return run_process(argv, timeout_seconds=timeout, accepted_codes=accepted)
+        payload = run_herdr(argv[1:], timeout_seconds=timeout)
+        return json.dumps(payload), "", 0
+    return _TeamctlHerdrAdapter(runner)
+
+
 def run_herdr(arguments: Sequence[str], *, timeout_seconds: float = 15) -> dict[str, Any]:
-    stdout, _, _ = run_process(["herdr", *arguments], timeout_seconds=timeout_seconds)
+    """Low-level JSON transport retained as the CLI's compatibility seam."""
+    stdout, _, _ = run_process(
+        ["herdr", *arguments], timeout_seconds=timeout_seconds,
+    )
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -679,15 +719,10 @@ def reserve_member(
 
 
 def supported_kinds() -> set[str]:
-    stdout, stderr, _ = run_process(
-        ["herdr", "agent"], timeout_seconds=5, accepted_codes=(0, 2)
-    )
-    match = re.search(
-        r"^\s*kinds:\s*([^\r\n]+)", stdout + "\n" + stderr, re.MULTILINE
-    )
-    if not match:
-        raise TeamctlError("could not discover supported agent kinds from installed Herdr")
-    return {item.strip() for item in match.group(1).split("|") if item.strip()}
+    try:
+        return _herdr_adapter().supported_kinds()
+    except HerdrError as exc:
+        raise TeamctlError(str(exc)) from exc
 
 
 def preflight_kind(kind: str) -> None:
@@ -697,37 +732,16 @@ def preflight_kind(kind: str) -> None:
         raise TeamctlError(f"agent executable is not available in PATH: {kind}")
 
 
-def agents_from(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    try:
-        agents = payload["result"]["agents"]
-    except (KeyError, TypeError) as exc:
-        raise TeamctlError("Herdr agent list response is missing agent data") from exc
-    if not isinstance(agents, list):
-        raise TeamctlError("Herdr agent list returned invalid agent data")
-    return [agent for agent in agents if isinstance(agent, dict)]
-
-
 def ensure_live_name_available(name: str) -> None:
     if any(
         agent.get("name") == name
-        for agent in agents_from(run_herdr(["agent", "list"]))
+        for agent in _herdr_adapter().list_agents()
     ):
         raise TeamctlError(f"a live Herdr agent is already named {name!r}")
 
 
-def pane_from(payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        pane = payload["result"]["pane"]
-    except (KeyError, TypeError) as exc:
-        raise TeamctlError("Herdr response is missing pane data") from exc
-    if not isinstance(pane, dict) or not pane.get("pane_id"):
-        raise TeamctlError("Herdr returned invalid pane data")
-    return pane
-
-
 def resolve_pane(target: str | None) -> dict[str, Any]:
-    selector = ["--pane", target] if target else ["--current"]
-    return pane_from(run_herdr(["pane", "current", *selector]))
+    return _herdr_adapter().current_pane(target)
 
 
 def get_target_rect(payload: dict[str, Any], pane_id: str) -> tuple[int, int]:
@@ -760,16 +774,6 @@ def choose_direction(requested: str | None, width: int, height: int) -> str:
     if can_right:
         return "right"
     raise TeamctlError(f"pane is too small to split safely ({width}x{height})")
-
-
-def agent_info_from(payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        agent = payload["result"]["agent"]
-    except (KeyError, TypeError) as exc:
-        raise TeamctlError("Herdr response is missing agent data") from exc
-    if not isinstance(agent, dict):
-        raise TeamctlError("Herdr returned invalid agent data")
-    return agent
 
 
 def live_state(agent: dict[str, Any] | None) -> str:
@@ -807,7 +811,8 @@ def build_prompt(member: dict[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                f"Read and follow the team skill at {SKILL_PATH}.",
+                f"Read and follow the CEO protocol Skill at {CEO_SKILL_PATH} first.",
+                f"Read and follow the team skill at {SKILL_PATH} for Herdr operations.",
                 "Create only needed workers. Give each concrete deliverables, acceptance criteria, and non-overlapping ownership; review evidence before integration.",
             ]
         )
@@ -854,7 +859,7 @@ def split_for_member(
     try:
         parent = resolve_pane(member.get("from_pane_id"))
         parent_id = str(parent["pane_id"])
-        layout = run_herdr(["pane", "layout", "--pane", parent_id])
+        layout = _herdr_adapter().layout(parent_id)
         width, height = get_target_rect(layout, parent_id)
         direction = choose_direction(member.get("direction"), width, height)
         split_args = [
@@ -876,7 +881,9 @@ def split_for_member(
             payload={"argv": split_args, "direction": direction},
         )
         try:
-            pane = pane_from(run_herdr(split_args))
+            pane = _herdr_adapter().split_pane(
+                parent_id, direction, member["cwd"], extra=split_args[9:],
+            )
         except TeamctlError as exc:
             store.stage_unknown(
                 command.id, note=f"pane split outcome ambiguous: {exc}"
@@ -931,8 +938,9 @@ def start_member(
             name, _adapter.STAGE_START, lease=lease, payload={"argv": args},
         )
         try:
-            run_herdr(
-                args, timeout_seconds=max(10, member["start_timeout_ms"] / 1000 + 5)
+            _herdr_adapter().start_agent(
+                name, member["kind"], pane_id, member["start_timeout_ms"],
+                member.get("agent_args", []),
             )
         except TeamctlError as exc:
             store.stage_unknown(
@@ -944,7 +952,7 @@ def start_member(
             raise TeamctlError(
                 f"agent start is ambiguous in existing pane {pane_id}; resume {name} to inspect or reuse that pane. Cause: {exc}"
             ) from exc
-        info = agent_info_from(run_herdr(["agent", "get", name]))
+        info = _herdr_adapter().get_agent(name)
         return update_member(
             store, session, name, lease=lease,
             phase="agent_started",
@@ -1000,8 +1008,8 @@ def prompt_member(
             },
         )
         try:
-            run_herdr(
-                args, timeout_seconds=max(15, timeout_ms / 1000 + 5) if wait else 15
+            _herdr_adapter().prompt_agent(
+                name, prompt_text, wait=wait, timeout_ms=timeout_ms,
             )
         except TeamctlError as exc:
             store.stage_unknown(
@@ -1015,7 +1023,7 @@ def prompt_member(
             raise TeamctlError(
                 f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
             ) from exc
-        info = agent_info_from(run_herdr(["agent", "get", name]))
+        info = _herdr_adapter().get_agent(name)
         return update_member(
             store, session, name, lease=lease,
             phase="prompt_submitted",
@@ -1136,11 +1144,11 @@ def verify_recorded_occupant(
     if not pane_id:
         return {}, None
     try:
-        pane = pane_from(run_herdr(["pane", "current", "--pane", pane_id]))
+        pane = _herdr_adapter().current_pane(pane_id)
     except HerdrCommandError:
         # A moved pane gets a new public ID. Resolve by the still-unique live name,
         # then require persisted terminal/session identity before adopting it.
-        candidate = agent_info_from(run_herdr(["agent", "get", member["name"]]))
+        candidate = _herdr_adapter().get_agent(member["name"])
         pane = candidate
     recorded_terminal = member.get("terminal_id")
     if recorded_terminal and pane.get("terminal_id") != recorded_terminal:
@@ -1155,9 +1163,7 @@ def verify_recorded_occupant(
         # terminal before adopting the occupant.
         if not pane.get("name"):
             try:
-                candidate = agent_info_from(
-                    run_herdr(["agent", "get", member["name"]])
-                )
+                candidate = _herdr_adapter().get_agent(member["name"])
             except TeamctlError as exc:
                 raise TeamctlError(
                     f"pane {pane['pane_id']} contains an unrelated agent {pane.get('agent')}"
@@ -1185,7 +1191,7 @@ def verify_recorded_occupant(
             if recorded_session != current_session:
                 raise TeamctlError("recorded agent session does not match the live occupant")
         return pane, agent
-    process = run_herdr(["pane", "process-info", "--pane", pane["pane_id"]])
+    process = _herdr_adapter().process_info(pane["pane_id"])
     try:
         info = process["result"]["process_info"]
         shell_pid = info.get("shell_pid")
@@ -1269,10 +1275,10 @@ def _resume_operation(args: argparse.Namespace) -> int:
             return 0
         if not pane:
             member = split_for_member(member, store, session, lease=lease)
-            pane = pane_from(run_herdr(["pane", "get", member["pane_id"]]))
+            pane = _herdr_adapter().get_pane(member["pane_id"])
         if agent is None:
             member = start_member(member, store, session, lease=lease)
-            agent = agent_info_from(run_herdr(["agent", "get", args.name]))
+            agent = _herdr_adapter().get_agent(args.name)
         else:
             member = update_member(
                 store, session, args.name, lease=lease,
@@ -1285,7 +1291,7 @@ def _resume_operation(args: argparse.Namespace) -> int:
                 member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
                 lease=lease,
             )
-            agent = agent_info_from(run_herdr(["agent", "get", args.name]))
+            agent = _herdr_adapter().get_agent(args.name)
         elif args.prompt_action == "skip":
             member = update_member(
                 store, session, args.name, lease=lease,

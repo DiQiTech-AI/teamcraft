@@ -110,10 +110,9 @@ from .errors import (
 #: table, so v1 and v2 databases keep satisfying every previously accepted
 #: contract (connect/query/verify/backup/restore) whether or not they have
 #: been upgraded, and any schema newer than this build still fails closed
-#: read-only (8.2-13).  v4 (M1-07) is additive in the same sense: it adds
-#: the runtime-authority tables (``leader_lease``, ``runtime_meta``,
-#: ``members``) without touching any earlier table or contract.
-SCHEMA_VERSION = 4
+#: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
+#: protocol identity columns to attempts and guards their pin with triggers.
+SCHEMA_VERSION = 5
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -364,6 +363,33 @@ CREATE TABLE members (
     "CREATE INDEX idx_members_phase ON members(phase)",
 )
 
+#: v5 (M1-08): attempts pin the exact CEO protocol identity at creation.
+#: The pair is all-null for non-CEO/legacy attempts or both present. Neither
+#: pinned nor unpinned rows can be changed later; old rows remain unpinned.
+_V5_TABLES = frozenset()
+_V5_TRIGGERS = frozenset({
+    "trg_attempt_protocol_pin_pair_insert",
+    "trg_attempt_protocol_pin_pair_update",
+    "trg_attempt_protocol_pin_fixed",
+})
+_V5_STATEMENTS = (
+    "ALTER TABLE attempts ADD COLUMN protocol_version TEXT",
+    "ALTER TABLE attempts ADD COLUMN protocol_hash TEXT",
+    """CREATE TRIGGER trg_attempt_protocol_pin_pair_insert
+       BEFORE INSERT ON attempts
+       WHEN (NEW.protocol_version IS NULL) != (NEW.protocol_hash IS NULL)
+       BEGIN SELECT RAISE(ABORT, 'protocol version/hash must be pinned together'); END""",
+    """CREATE TRIGGER trg_attempt_protocol_pin_pair_update
+       BEFORE UPDATE OF protocol_version, protocol_hash ON attempts
+       WHEN (NEW.protocol_version IS NULL) != (NEW.protocol_hash IS NULL)
+       BEGIN SELECT RAISE(ABORT, 'protocol version/hash must be pinned together'); END""",
+    """CREATE TRIGGER trg_attempt_protocol_pin_fixed
+       BEFORE UPDATE OF protocol_version, protocol_hash ON attempts
+       WHEN NEW.protocol_version IS NOT OLD.protocol_version OR
+            NEW.protocol_hash IS NOT OLD.protocol_hash
+       BEGIN SELECT RAISE(ABORT, 'attempt protocol pin cannot be changed'); END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -372,6 +398,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (2, _V2_STATEMENTS),
     (3, _V3_STATEMENTS),
     (4, _V4_STATEMENTS),
+    (5, _V5_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -382,6 +409,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     2: _V2_TABLES,
     3: _V3_TABLES,
     4: _V4_TABLES,
+    5: _V5_TABLES,
 }
 
 
@@ -436,6 +464,7 @@ _V4_INDEXES = frozenset({"idx_members_phase"})
 _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     3: (_V3_TRIGGERS, _V3_INDEXES),
     4: (frozenset(), _V4_INDEXES),
+    5: (_V5_TRIGGERS, frozenset()),
 }
 
 

@@ -18,7 +18,7 @@
 - **Harness 与角色分离**：角色决定职责，`--kind` 选择 Herdr 支持的 Codex、OpenCode 等 harness。
 - **责任范围协调**：编辑任务必须声明项目内的文件或目录范围，活动成员之间的重叠范围会被拒绝。
 - **只读成员**：评审、调研和验收任务可使用 `--read-only`，不占用编辑范围。
-- **状态持久化**：成员、pane 身份、任务、责任范围和执行阶段保存在 `.teamcraft/state.json`。
+- **状态持久化**：成员、pane 身份、责任范围和执行阶段保存在 SQLite 数据库 `.teamcraft/teamcraft.db`。
 - **安全恢复**：`resume` 会核对 terminal 和原生 Agent session；结果不明确时默认只检查，不自动重复发送任务。
 - **真实状态检查**：`status` 展示 `blocked`、`working`、`idle`、`done`、`unknown` 或 `missing`，避免把缓存状态当成实时状态。
 - **并发保护**：状态写入和成员生命周期操作使用文件锁，降低并发创建或恢复造成的冲突。
@@ -92,15 +92,17 @@ bash scripts/install.sh
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-安装脚本会复制项目本地的 `teamcraft` Skill、六个 OpenCode 角色配置和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本还会在保留目标项目 `.gitignore` 原有内容的基础上，加入 `/.teamcraft/` 和 `/opencode.json`。
+安装脚本会复制 `teamcraft` 运行 Skill、共享的 `teamcraft-ceo` 协议 Skill、六个 OpenCode 角色配置、精简 CEO 入口和示例模型配置。只有缺少 `opencode.json` 时才会创建该文件，已有的 `opencode.json` 始终保留。脚本会保留目标项目 `.gitignore` 原有内容并补充运行目录规则，且不会创建或修改 `AGENTS.md`、`CLAUDE.md`。
 
-默认情况下，如果已存在的托管文件内容不同，安装会报错且不会覆盖。只有确定要替换团匠管理的 Skill、角色或模板文件时才使用 `--force`：
+默认情况下，如果已存在的托管文件内容不同，安装会报错且不会覆盖。若 `.opencode/agents/teamcraft-ceo.md` 是用户自有配置，即使使用 `--force` 也会保留并在预检时报错。只有确定要替换团匠管理的 Skill、角色或模板文件时才使用 `--force`；CEO 入口必须带有团匠管理标记才能替换：
 
 ```bash
 bash scripts/install.sh --target /path/to/project --force
 ```
 
-`--force` 也绝不会覆盖已有的 `opencode.json`。相同内容可以安全重复安装，结果保持幂等。安装脚本不会安装依赖、访问网络或修改全局配置。
+`--force` 也绝不会覆盖已有的 `opencode.json` 或用户自有 CEO 入口。相同内容可以安全重复安装，结果保持幂等。安装脚本不会安装依赖、访问网络或修改全局配置。
+
+`teamcraft-ceo` Skill 供 Codex 和 OpenCode 共用。唯一协议位于 `references/CEO_PROTOCOL.md`，版本和正文精确 UTF-8 字节的 SHA-256 由 `references/protocol.manifest.json` 固定。若当前 Attempt 绑定的协议无法恢复或校验，必须停止并请求人工处理。该入口尚不支持 Claude Code。
 
 安装完成后：
 
@@ -253,7 +255,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 └── PROGRESS.md                  # 实现与实机验证记录
 ```
 
-`.teamcraft/` 是本地运行目录，保存状态、任务和锁文件，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。若存在 `.herdr-team/state.json`，CLI 会在任何 Herdr 调用或新状态写入前停止，不会自动迁移，也不会创建第二份状态。
+`.teamcraft/` 是本地运行目录，保存 SQLite 数据库、锁和日志，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。若存在 `.herdr-team/state.json` 或非空 `.teamcraft/state.json`，CLI 会在任何 Herdr 调用或新数据库写入前停止，不会自动迁移、移动或删除旧 JSON。
 
 ## 验证
 

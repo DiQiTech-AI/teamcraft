@@ -49,7 +49,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
-    roots = [source_root / ".agents" / "skills" / "teamcraft"]
+    roots = [source_root / ".agents" / "skills" / "teamcraft",
+             source_root / ".agents" / "skills" / "teamcraft-ceo"]
     sources: list[tuple[Path, Path]] = []
     for root in roots:
         if not root.is_dir() or root.is_symlink():
@@ -85,6 +86,9 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
 
     profiles_dir = source_root / ".opencode" / "agents"
     profiles = sorted(profiles_dir.glob("herdr-*.md"))
+    ceo_entry = profiles_dir / "teamcraft-ceo.md"
+    if ceo_entry.is_file() and not ceo_entry.is_symlink():
+        profiles.append(ceo_entry)
     if not profiles:
         raise InstallError(f"no OpenCode role profiles found in: {profiles_dir}")
     for path in profiles:
@@ -214,6 +218,17 @@ def install(args: argparse.Namespace) -> int:
             if identical_path or same_file_contents(source, destination):
                 unchanged += 1
                 continue
+            if relative == Path(".opencode/agents/teamcraft-ceo.md"):
+                marker = b"<!-- teamcraft-managed: teamcraft-ceo-entry v1 -->"
+                try:
+                    is_managed = marker in destination.read_bytes().splitlines()[:3]
+                except OSError:
+                    is_managed = False
+                if not is_managed:
+                    raise InstallError(
+                        f"user-owned CEO agent entry conflicts with TeamCraft: {destination}; "
+                        "move it yourself or install into a different project"
+                    )
             if not args.force:
                 raise InstallError(
                     f"managed file differs: {destination}\n"

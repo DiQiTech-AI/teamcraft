@@ -53,12 +53,16 @@ class InstallerCompatContractTests(unittest.TestCase):
         """Minimal TeamCraft-shaped source tree owned by this test."""
         root = self.base / "fakeroot"
         skill = root / ".agents" / "skills" / "teamcraft"
+        ceo_skill = root / ".agents" / "skills" / "teamcraft-ceo"
         (skill / "scripts").mkdir(parents=True)
         (skill / "tests").mkdir(parents=True)
+        (ceo_skill / "references").mkdir(parents=True)
         (root / ".opencode" / "agents").mkdir(parents=True)
         (root / "scripts").mkdir(parents=True)
         shutil.copyfile(INSTALLER, root / "scripts" / "install.sh")
         (skill / "SKILL.md").write_text("# fake skill\n", encoding="utf-8")
+        (ceo_skill / "SKILL.md").write_text("# fake CEO skill\n", encoding="utf-8")
+        (ceo_skill / "references" / "CEO_PROTOCOL.md").write_text("# protocol\n", encoding="utf-8")
         (skill / "scripts" / "teamctl.py").write_text("print('fake')\n", encoding="utf-8")
         (skill / "tests" / "test_fake.py").write_text("pass\n", encoding="utf-8")
         (root / ".opencode" / "agents" / "herdr-ceo.md").write_text(
@@ -75,11 +79,12 @@ class InstallerCompatContractTests(unittest.TestCase):
     def test_repository_exposes_only_teamcraft_skill_entry(self):
         skills = REPOSITORY / ".agents" / "skills"
         entries = sorted(path.name for path in skills.iterdir() if path.is_dir())
-        self.assertEqual(entries, ["teamcraft"])
+        self.assertEqual(entries, ["teamcraft", "teamcraft-ceo"])
         skill_text = (skills / "teamcraft" / "SKILL.md").read_text(encoding="utf-8")
         frontmatter = skill_text.split("---", 2)[1]
         self.assertRegex(frontmatter, r"(?m)^name: teamcraft$")
         self.assertTrue((skills / "teamcraft" / "scripts" / "teamctl.py").is_file())
+        self.assertTrue((skills / "teamcraft-ceo" / "references" / "CEO_PROTOCOL.md").is_file())
 
     def test_installer_uses_teamcraft_entry_and_runtime_name(self):
         target = self.base / "project"

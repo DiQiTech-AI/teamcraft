@@ -39,6 +39,11 @@ class InstallScriptTests(unittest.TestCase):
                 (REPOSITORY / ".agents/skills/teamcraft/SKILL.md").read_bytes(),
             )
             self.assertTrue(target.joinpath(".opencode/agents/herdr-ceo.md").is_file())
+            self.assertTrue(target.joinpath(".opencode/agents/teamcraft-ceo.md").is_file())
+            self.assertTrue(target.joinpath(".agents/skills/teamcraft-ceo/SKILL.md").is_file())
+            self.assertTrue(target.joinpath(
+                ".agents/skills/teamcraft-ceo/references/protocol.manifest.json"
+            ).is_file())
             self.assertEqual(
                 target.joinpath("opencode.json").read_bytes(),
                 REPOSITORY.joinpath("opencode.example.json").read_bytes(),
@@ -94,6 +99,42 @@ class InstallScriptTests(unittest.TestCase):
             self.assertFalse(target.joinpath("opencode.json").exists())
             self.assertFalse(target.joinpath(".gitignore").exists())
 
+    def test_user_ceo_entry_and_rules_are_preserved_and_conflict_fails_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "project"
+            custom_entry = target / ".opencode/agents/teamcraft-ceo.md"
+            custom_entry.parent.mkdir(parents=True)
+            custom_entry.write_text("user agent\n")
+            (target / "AGENTS.md").write_text("user rules\n")
+            (target / "CLAUDE.md").write_text("claude rules\n")
+            result = self.run_installer(target, "--force", expected_code=1)
+            self.assertIn("user-owned CEO agent entry conflicts", result.stderr)
+            self.assertEqual(custom_entry.read_text(), "user agent\n")
+            self.assertEqual((target / "AGENTS.md").read_text(), "user rules\n")
+            self.assertEqual((target / "CLAUDE.md").read_text(), "claude rules\n")
+            self.assertFalse((target / ".agents/skills").exists())
+            self.assertFalse((target / "opencode.json").exists())
+
+    def test_installer_does_not_create_or_modify_harness_instruction_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "project"
+            target.mkdir()
+            (target / "AGENTS.md").write_text("custom agents\n")
+            (target / "CLAUDE.md").write_text("custom claude\n")
+            self.run_installer(target)
+            self.assertEqual((target / "AGENTS.md").read_text(), "custom agents\n")
+            self.assertEqual((target / "CLAUDE.md").read_text(), "custom claude\n")
+
+    def test_force_updates_only_agent_entry_with_teamcraft_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "project"
+            self.run_installer(target)
+            entry = target / ".opencode/agents/teamcraft-ceo.md"
+            entry.write_text("<!-- teamcraft-managed: teamcraft-ceo-entry v1 -->\nold\n")
+            self.run_installer(target, "--force")
+            self.assertEqual(entry.read_bytes(),
+                             REPOSITORY.joinpath(".opencode/agents/teamcraft-ceo.md").read_bytes())
+
     def test_force_replaces_only_managed_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "project"
@@ -128,7 +169,8 @@ class InstallScriptTests(unittest.TestCase):
             core_dir = (target / ".agents" / "skills" / "teamcraft"
                        / "scripts" / "core" / "teamcraft")
             for module in ("__init__.py", "storage.py", "leader.py",
-                          "runtime_adapter.py", "commands.py", "domain.py"):
+                          "runtime_adapter.py", "commands.py", "domain.py",
+                          "ceo_protocol.py", "herdr_adapter.py"):
                 self.assertTrue((core_dir / module).is_file(),
                               f"bundled core missing {module}")
 
@@ -157,6 +199,16 @@ class InstallScriptTests(unittest.TestCase):
             )
             self.assertEqual(probe.returncode, 0, probe.stderr)
             self.assertTrue(probe.stdout.strip().startswith(str(core_dir)))
+
+            protocol_env = dict(env, PYTHONPATH=str(core_dir.parent))
+            protocol = subprocess.run(
+                [sys.executable, "-m", "teamcraft.ceo_protocol", str(
+                    target / ".agents/skills/teamcraft-ceo/references")],
+                cwd=str(target), env=protocol_env, text=True, capture_output=True,
+                check=False,
+            )
+            self.assertEqual(protocol.returncode, 0, protocol.stderr)
+            self.assertIn('"protocol_version": "1.0.0"', protocol.stdout)
 
     def test_dry_run_does_not_create_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

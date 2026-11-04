@@ -75,6 +75,7 @@ Hard invariants pinned by tests (``tests/test_domain_m104.py``):
 from __future__ import annotations
 
 import contextlib
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import timezone
@@ -300,6 +301,8 @@ class Attempt:
     commit_sha: str | None
     report_ref: str | None
     result_json: str | None
+    protocol_version: str | None
+    protocol_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -390,7 +393,7 @@ _TASK_COLUMNS = (
 _ATTEMPT_COLUMNS = (
     "id", "task_id", "agent_id", "attempt_no", "status", "worktree_path",
     "branch", "started_at", "finished_at", "commit_sha", "report_ref",
-    "result_json",
+    "result_json", "protocol_version", "protocol_hash",
 )
 _SESSION_COLUMNS = (
     "id", "attempt_id", "backend", "native_session_id", "pane_id", "state",
@@ -1139,6 +1142,8 @@ def create_attempt(
     agent_id: str | None = None,
     worktree_path: str | None = None,
     branch: str | None = None,
+    protocol_version: str | None = None,
+    protocol_hash: str | None = None,
     id_factory: IdFactory | None = None,
     clock: Clock | None = None,
 ) -> Attempt:
@@ -1160,6 +1165,17 @@ def create_attempt(
 
     require_head(conn)
     task_id = require_entity_id(task_id)
+    if (protocol_version is None) != (protocol_hash is None):
+        raise ValidationError("protocol version and hash must be supplied together")
+    if protocol_version is not None:
+        if not isinstance(protocol_version, str) or not re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+", protocol_version
+        ):
+            raise ValidationError("protocol_version must use MAJOR.MINOR.PATCH")
+        if not isinstance(protocol_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", protocol_hash
+        ):
+            raise ValidationError("protocol_hash must be a lowercase SHA-256 hex digest")
     if agent_id is not None:
         agent_id = require_entity_id(agent_id)
     factory = id_factory if id_factory is not None else DEFAULT_ID_FACTORY
@@ -1188,9 +1204,11 @@ def create_attempt(
             conn.execute(
                 "INSERT INTO attempts (id, task_id, agent_id, attempt_no, status,"
                 " worktree_path, branch, started_at, finished_at, commit_sha,"
-                " report_ref, result_json) VALUES (?, ?, ?, ?, 'created', ?, ?,"
-                " NULL, NULL, NULL, NULL, NULL)",
-                (aid, task_id, agent_id, attempt_no, worktree_path, branch),
+                " report_ref, result_json, protocol_version, protocol_hash)"
+                " VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, NULL, NULL,"
+                " NULL, ?, ?)",
+                (aid, task_id, agent_id, attempt_no, worktree_path, branch,
+                 protocol_version, protocol_hash),
             )
         except sqlite3.IntegrityError as exc:
             holder = _occupying_attempt_row(conn, task_id)

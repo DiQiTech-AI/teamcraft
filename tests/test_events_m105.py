@@ -66,6 +66,15 @@ from teamcraft.errors import (
     ValidationError,
 )
 
+
+def _shed_v5_protocol_artifacts(conn) -> None:
+    for trigger in storage._V5_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
+    for column in ("protocol_hash", "protocol_version"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
+
 class FixedClock:
     """Deterministic injectable UTC clock."""
 
@@ -221,6 +230,7 @@ class EventStoreM105Tests(unittest.TestCase):
 
     def test_event_store_refuses_lagging_schema(self) -> None:
         raw = sqlite3.connect(str(self.db))
+        _shed_v5_protocol_artifacts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")
@@ -1119,6 +1129,7 @@ class CommandServiceM105Tests(unittest.TestCase):
 
     def test_command_service_refuses_lagging_schema(self) -> None:
         raw = sqlite3.connect(str(self.db))
+        _shed_v5_protocol_artifacts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")

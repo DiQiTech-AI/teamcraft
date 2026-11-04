@@ -2,7 +2,7 @@
 
 This is the single authoritative path for runtime state in TeamCraft 2.0
 (CEO gate A/B): the CLI's team/member state lives ONLY in
-``.teamcraft/teamcraft.db`` (schema v4).  There is deliberately NO JSON
+``.teamcraft/teamcraft.db`` (schema v5).  There is deliberately NO JSON
 authority, no dual write, no import, no cutover marker, and no rollback:
 ``fresh_start`` keeps failing closed (bytes preserved) on any non-empty
 legacy ``state.json`` it finds.
@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import commands as command_core
+from . import ceo_protocol
 from . import domain
 from . import fresh_start
 from . import leader
@@ -425,9 +426,12 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
     if attempt_id is None and phase in _ATTEMPT_PHASES:
         task = domain.get_task(conn, task_id)
         if task.status == "ready":
+            protocol = _discover_member_protocol(state, member)
             attempt = domain.create_attempt(conn, task_id,
                                            expected_version=task.version,
                                            worktree_path=str(member["cwd"]),
+                                           protocol_version=(protocol.version if protocol else None),
+                                           protocol_hash=(protocol.sha256 if protocol else None),
                                            clock=clock)
             attempt = domain.transition_attempt(conn, attempt.id, "start",
                                                clock=clock)
@@ -437,6 +441,7 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
             attempt_id = attempt.id
     if attempt_id is not None:
         attempt = domain.get_attempt(conn, attempt_id)
+        _verify_member_protocol(state, member, attempt)
         if member.get("pane_id") and member.get("session_id") is None:
             native = member.get("agent_session")
             native_id = (
@@ -490,6 +495,36 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
                                            clock=clock)
 
 
+def _discover_member_protocol(state: dict[str, Any], member: dict[str, Any]):
+    """Return the current immutable CEO protocol snapshot for new Attempts."""
+    if member.get("role") != "ceo":
+        return None
+    try:
+        return ceo_protocol.discover_protocol(
+            str(state["project_root"]), str(member["kind"]),
+        )
+    except ceo_protocol.ProtocolError as exc:
+        raise RuntimeAdapterError(f"NEEDS_HUMAN: CEO protocol cannot be pinned: {exc}") from exc
+
+
+def _verify_member_protocol(state: dict[str, Any], member: dict[str, Any], attempt: Any) -> None:
+    """Fail closed before further lifecycle progress if a CEO pin is absent or changed."""
+    if member.get("role") != "ceo":
+        return
+    if not attempt.protocol_version or not attempt.protocol_hash:
+        raise RuntimeAdapterError(
+            "NEEDS_HUMAN: active CEO Attempt has no protocol pin; inspect and reinitialize explicitly"
+        )
+    try:
+        ceo_protocol.discover_protocol(
+            str(state["project_root"]), str(member["kind"]),
+            expected_version=attempt.protocol_version,
+            expected_sha256=attempt.protocol_hash,
+        )
+    except ceo_protocol.ProtocolError as exc:
+        raise RuntimeAdapterError(f"NEEDS_HUMAN: pinned CEO protocol unavailable: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # persistent stage commands (CEO gate C: claim BEFORE the external effect)
 # ---------------------------------------------------------------------------
@@ -538,6 +573,22 @@ def stage_claim(
     payload = dict(payload or {})
     payload.setdefault("member", member)
     evidence: dict[str, Any] = {}
+    member_row = conn.execute(
+        "SELECT role, kind FROM members WHERE name = ?", (member,)
+    ).fetchone()
+    if member_row is not None and str(member_row[0]) == "ceo":
+        row = conn.execute(
+            "SELECT project_root FROM runtime_meta WHERE id = 1"
+        ).fetchone()
+        if row is None or attempt_id is None:
+            raise RuntimeAdapterError(
+                "NEEDS_HUMAN: CEO dispatch has no protocol-pinned Attempt"
+            )
+        attempt = domain.get_attempt(conn, attempt_id)
+        _verify_member_protocol(
+            {"project_root": str(row[0])},
+            {"role": str(member_row[0]), "kind": str(member_row[1])}, attempt,
+        )
     if task_id is not None:
         evidence["task_id"] = task_id
         evidence["task_version"] = domain.get_task(conn, task_id).version

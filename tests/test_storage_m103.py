@@ -166,6 +166,16 @@ from teamcraft import (
     verify_database,
 )
 
+
+def _shed_v5_protocol_artifacts(conn: sqlite3.Connection) -> None:
+    """Strip schema-v5 additions when a fixture claims a historical version."""
+    for trigger in storage._V5_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
+    for column in ("protocol_hash", "protocol_version"):
+        if column in columns:
+            conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
+
 # P-fixes 10: backup_database/restore_backup are live public API again —
 # copies happen in a private 0700 staging file, are verified there, and the
 # verified inode is published via os.link (EEXIST = never overwrite).  The
@@ -258,9 +268,8 @@ class StorageM103Tests(unittest.TestCase):
         report = migrate_to_head(self.db)
         self.assertTrue(report.fresh)
         self.assertEqual((report.from_version, report.to_version), (0, SCHEMA_VERSION))
-        # Forward ladder: a fresh database applies (1, 2, 3, 4) in one
-        # transaction (M1-07 added v4).
-        self.assertEqual(report.applied, (1, 2, 3, 4))
+        # Forward ladder: a fresh database applies every migration atomically.
+        self.assertEqual(report.applied, tuple(range(1, SCHEMA_VERSION + 1)))
 
         conn = connect(self.db)
         self.assertIsInstance(conn, TeamCraftConnection)
@@ -276,7 +285,7 @@ class StorageM103Tests(unittest.TestCase):
             }
             self.assertEqual(tables, EXPECTED_TABLES)
             rows = conn.execute("SELECT version, applied_at FROM schema_migrations").fetchall()
-            self.assertEqual([r[0] for r in rows], [1, 2, 3, 4])
+            self.assertEqual([r[0] for r in rows], list(range(1, SCHEMA_VERSION + 1)))
             self.assertIn("+00:00", rows[0][1])  # UTC ISO-8601
             # Foreign keys are actually enforced, not just declared.
             with self.assertRaises(sqlite3.IntegrityError):
@@ -3734,6 +3743,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         raw = sqlite3.connect(str(self.db))
         try:
             raw.execute("PRAGMA busy_timeout=5000")
+            _shed_v5_protocol_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS task_dependencies")
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
@@ -3856,6 +3866,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         rogue = self.base / "rogue.db"
         shutil.copyfile(result.backup_path, rogue)
         raw = sqlite3.connect(str(rogue))
+        _shed_v5_protocol_artifacts(raw)
         raw.execute("DROP TABLE task_dependencies")
         # head is v3 now: shed v3 artifacts too so the rogue is a *consistent*
         # v2 except for the missing task_dependencies — that single fault is
@@ -3896,6 +3907,8 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         raw = sqlite3.connect(str(self.db))
         try:
             raw.execute("PRAGMA busy_timeout=5000")
+            if back_to_v2:
+                _shed_v5_protocol_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
             if back_to_v2:

@@ -1,10 +1,10 @@
 # TeamCraft 2.0 M0 架构审计与实施审查报告
 
-> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 至 M1-07 均已验收，M1-02 原有的 Python 3.10/Linux/CI 条件已关闭（证据见第 12.7、12.9 节）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start，并授权 M1-07 Runtime Integration；最终 Runtime 实施与验收于 2026-11-04 完成（GitHub Actions run 41779790463 @ `6638341`，证据见第 12.9 节）。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
+> 状态：ADR-001 与 M0 退出门禁已获**原则接受**；M1-01 至 M1-07 已验收；M1-08 的协议、Codex/OpenCode 入口及安装契约已实施，离线门禁通过（证据见第 12.11 节）。M1-02 原有的 Python 3.10/Linux/CI 条件已关闭（证据见第 12.7、12.9 节）。Owner 于 2026-11-02 决定采用 SQLite-only Fresh Start，最终 Runtime 于 2026-11-04 通过 GitHub Actions run 41779790463 @ `6638341`（第 12.9 节）。OpenCode 实际模型调用因 `provider.no-route` 未能验证 Skill 加载；记录为限制，不以 Mock 代替。项目不提供生产 JSON→SQLite 迁移或 JSON 回滚。
 >
-> 报告版本：v2.1（M1-07 SQLite Runtime Integration 验收关闭）
+> 报告版本：v2.2（M1-08 CEO Protocol 与 Harness 入口契约实施）
 >
-> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 决策与 M1-06 验收：2026-11-02；M1-07 授权及运行环境门禁：2026-11-02；M1-07 最终验收关闭：2026-11-04
+> 审计日期：2026-10-21；ADR-001 设计修订：2026-10-22；M1-01 门禁与规划一致性修订：2026-10-23；M1-02 实施记录：2026-10-23；M1-02 有条件验收登记：2026-10-24；运行目录统一及 CEO Protocol 规划复核：2026-10-27；M1-05 验收与旧 M1-06 授权：2026-11-01；SQLite-only Fresh Start 决策与 M1-06 验收：2026-11-02；M1-07 授权及运行环境门禁：2026-11-02；M1-07 最终验收关闭：2026-11-04；M1-08 CEO Protocol 接受及实施：2026-11-04
 >
 > 产品需求与里程碑目标：[TEAMCRAFT_2_0_PLAN.md](TEAMCRAFT_2_0_PLAN.md)；本文第 9 节是 M1–M6 任务 ID、依赖和逐项验收的唯一权威来源
 >
@@ -29,7 +29,7 @@
 
 PRD 中的 SQLite、Task DAG、Attempt、Event/Command、Scheduler、Watcher、Web/API/SSE、Approval、Worktree、Verifier、GitHub PR 和成本路由均未实现。M1 不应先启动 Web 或 Worktree；应先把上述现有语义写成兼容契约，然后引入 SQLite Core，并在一次有冻结、代际栅栏和回滚条件的切换中将旧 JSON 从写入真源迁移为只读兼容视图。M2 再把直接 Herdr 调用收口为 Adapter，并增加确定性调度、观察和恢复。由于 FR-011 Verifier 和 FR-012 Approval 都是 P0，M2 还必须在 M3 Web 验收前提供面向 report-only/scout 的最小程序化验证和持久审批门禁；M4 负责 Worktree、Diff、Commit、local-only 和 direct-PR 的完整证据链。在 M4 之前，共享工作树上的验证不能证明普通 ship 产物与某个隔离执行一一对应，因此普通 ship 必须保持未交付状态，不能宣称已满足完整 P0 闭环。
 
-本轮规划复核还确认：当前 CEO 行为只存在于 `teamcraft` Skill、OpenCode 角色配置和 `teamctl.build_prompt()` 的固定文本中；仓库没有独立 `teamcraft-ceo` Skill、权威 `CEO_PROTOCOL.md`、协议版本握手、CEO 初始化状态、Wake Dispatcher 或 Claude Code 入口。`teamctl.prompt_member()` 已保留“提交前记录可能已投递、结果歧义不自动重发”的安全语义，可作为后续持久 Command/Reconcile 的兼容基础，但它尚未区分 Agent 接收、实际执行和 Task 完成。以下新增设计是 ADR-001 的待人工审查扩展，不改写或自动扩大 2026-10-23 的原则接受范围。
+截至 2026-11-04 的 M1-08 验收，仓库已有独立薄 `teamcraft-ceo` Skill、唯一 CEO_PROTOCOL.md、detached version/hash manifest 和 OpenCode 薄 CEO Agent；当前仍没有协议初始化 Runtime 握手、CEO 初始化状态、Wake Dispatcher 或 Claude Code 入口。`teamctl.prompt_member()` 已保留“提交前记录可能已投递、结果歧义不自动重发”的安全语义，可作为后续持久 Command/Reconcile 的兼容基础，但它尚未区分 Agent 接收、实际执行和 Task 完成。以下新增设计是 ADR-001 的待人工审查扩展，不改写或自动扩大 2026-10-23 的原则接受范围。
 
 规划与审计文档的规范目录是 `doc/`：PRD 位于 `doc/TEAMCRAFT_2_0_PLAN.md`，本报告位于 `doc/TEAMCRAFT_2_0_M0_REVIEW.md`。早期草案中的 `docs/` 写法已修正，不再作为当前路径说明；目标目录树中的其他文档仍只是未来建议。
 
@@ -154,7 +154,7 @@ flowchart LR
 | FR-021 Review 专家 | 部分 | Tester/Custom/CTO 可按需启动；没有基于 Task 的交叉审查策略 |
 | FR-022 远程访问 | 缺失/P2 | 当前仅本地 Herdr；没有 Web 认证、TLS、VPN/SSH 入口设计实现 |
 | FR-023 多机 Worker | 缺失/P2 | 单机实现，符合当前非目标 |
-| FR-024 CEO Protocol/跨 Harness | 缺失 | 当前没有 `teamcraft-ceo` 或协议文件；Codex/OpenCode 的项目发现规则有官方文档依据，但尚无本仓库实现或真实发现测试；Claude CLI 本机不可用 |
+| FR-024 CEO Protocol/跨 Harness | 部分 | M1-08 建立单一协议、Codex/OpenCode 薄入口与安装契约并通过 Codex 0.166.0 实机发现；OpenCode v2.0.29 入口实机调用因模型 `provider.no-route` 未完成；Claude 延至 M6-06；初始化握手仍属 M2-08 |
 | FR-025 CEO 初始化/Wake | 缺失 | 当前 CEO 与 Worker 均经同步 `herdr agent prompt`；没有初始化握手、持久 Wake、事件合并、Dormant 或自动启动策略 |
 
 除 FR 清单外，当前已有而目标必须继续支持的能力是项目内安全安装、配置保留、角色模板、Pane 自动布局和焦点保持。这些能力不应在引入 Python 包或服务进程时丢失。
@@ -273,9 +273,9 @@ PRD 的建议 DDL 在实施前必须修正两点：
 
 SQLite Core 仍增加 Schema、Leader 和服务生命周期复杂度，但本路线避免了没有生产迁移对象支撑的 JSON 字段映射、双真源和旧 writer cutover 服务。M1-06 风险聚焦初始化原子性、Schema 完整性、权限、既有数据保护和并发恢复；M1-07 Runtime Integration 风险则聚焦 CLI/Skill 接线、Command Service 边界和外部副作用 Reconcile。Schema 迁移与数据库备份恢复仍是运行期能力，不等同于 Legacy JSON 迁移。
 
-### 8.7 ADR-001 提议扩展：CEO Protocol、Harness 入口与 Wake（待人工审查）
+### 8.7 ADR-001 扩展：CEO Protocol、Harness 入口与 Wake（分项接受）
 
-**状态：Proposed（2026-10-27），未接受。** 本节是对已原则接受 ADR-001 的加法提案；在人工审查前不得把它记为 Accepted，也不授权 M1-03、M1-08、M2 或后续实现。已接受的 8.1–8.6、M0-01 事实和 M1-01/M1-02 验收记录不变。
+**状态：部分接受（2026-11-04）。** Owner 接受并授权 M1-08：本节第 1 项的协议唯一来源/version/hash，以及第 2 项中 Codex/OpenCode 的薄入口和安全安装契约。协议使用 `1.0.0`；外置 `protocol.manifest.json` 保存正文原始 UTF-8 字节 SHA-256，避免自引用；安装器不写 `AGENTS.md`/`CLAUDE.md`，用户自有 CEO Agent 冲突即使 `--force` 也保留并拒绝安装。第 2 项 Claude Code 入口，以及第 3–8 项初始化握手、Prompt、Watcher、Wake 和观测仍为 Proposed，未接受或授权实现。已接受的 8.1–8.6 与 ADR-001 原则边界不变。
 
 1. **协议唯一来源**：未来以 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 维护唯一 CEO 业务协议，内容覆盖 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八阶段、责任边界和审批门禁。协议有显式 `protocol_version` 与稳定内容 hash；Attempt 创建时固定版本/hash，运行中不自动切换；旧协议无法恢复时进入 NEEDS_HUMAN，不兼容升级须重新初始化并留下审计记录。相邻 `teamcraft-ceo/SKILL.md` 是薄加载器，不复制协议正文。现有 `.agents/skills/teamcraft/` 继续负责 Herdr/Agent 运行，不更名、不复制 Core 或 Herdr CLI。
 2. **跨 Harness 薄入口**：Codex/OpenCode 共用 `.agents/skills/teamcraft-ceo/`；`AGENTS.md` 只写必要加载规则，OpenCode 可由 `.opencode/agents/` 的薄 CEO 配置适配。Claude Code 通过 `.claude/skills/` 安装受管副本或经目标版本验证的 symlink，并由精简 `CLAUDE.md` 引导；两种方式都必须指向或验证同一协议 version/hash。安装器先探测目标 Harness/版本和冲突，支持 dry-run/no-op，绝不覆盖已有 `AGENTS.md`、`CLAUDE.md` 或 Agent 配置。不兼容时明确降级/fail closed，不维护不同 CEO 业务协议。
@@ -325,7 +325,7 @@ flowchart LR
 | **M1-05 Event/Command 原子性（已验收，2026-11-01）**；依赖 M1-04 | 实现 append-only Event、单调 seq、Command idempotency key、载荷/evidence version、TTL、同键载荷冲突和 pending/running/confirmed/unknown/expired；定义 Command Service API 和 CAS。**TTL 纳入归一化请求身份**：TTL 取 `None` 或校验后的整数秒（1..30 天），其持久表示直接复用 v3 已有的不可变 `requested_at`/`expires_at` 列对，由该原始时间对派生并校验出原请求 TTL，**因此不需升 v4** | 状态+事件+Command 同事务；故障注入后不存在只有状态无事件；相同请求复用结果，不同载荷同键冲突；证据变化使待执行命令失效。**TTL 身份语义**：仅 kind/payload/evidence/TTL 四要素全同才复用原结果（含已确认命令的 `result_json`）；任何 TTL 差异（含 `None`↔显式两个方向）均以 `IdempotencyConflictError` 拒绝且零副作用；比较**只用相对秒**（自存储行的原始时间对派生），绝不比较重试按自身时钟新算的绝对 `expires_at`；已过期行仍仲裁其幂等键——同 TTL 重放复用该过期行且不新增任何事件，不同 TTL 重放仍冲突；并发同 TTL 收敛为单行单事件，并发不同 TTL 恰好一胜一冲突且失败方无额外事件；派生结果不合法（不可解析/naive/非整秒/越界）时 fail closed 抛 `StorageError`，不得猜测相等或不等 | 外部副作用误宣称 exactly-once；payload 可能泄密或无限增长；TTL 若误比绝对期限会把每次重试误判为冲突，若忽略 TTL 则会使不同期限的副作用承诺被静默复用 |
 | **M1-06 SQLite Fresh Start Validation（已获开工授权，2026-11-02）**；依赖 M1-03、M1-04、M1-05 | 在合成数据与临时项目根验证首次 SQLite 初始化、完整 Schema/索引/约束、Schema 版本、重复初始化、现有有效库保留、损坏/过新库拒绝、不可写目录与初始化崩溃恢复、并发首次初始化；对非空 `.teamcraft/state.json` / `.herdr-team/state.json` fail closed，不读取、导入、移动或删除；移除已确认无运行时调用的 Legacy JSON 导入/cutover 专用代码。本任务不接入现有 CLI Runtime，也不改 Herdr | 所有验证只用临时目录；重复初始化幂等且不覆盖状态；Schema 不完整时不得显示 ready，失败后可安全拒绝或重试收敛；损坏/不兼容库和旧状态冲突均保留原字节并明确拒绝；双进程初始化只得到一个完整可验证 DB；M1-03/04/05、CLI/Skill 回归通过；不得执行正式 Cutover | 初始化事务异常后的 schema-zero 残留须保持不可用；文件系统权限语义随平台变化；错误处理不能把权限错误当作状态缺失 |
 | **M1-07 SQLite Runtime Integration（已授权；前置门禁已于 2026-11-02 全绿，实施切片待 CEO 分解，任务未完成）**；依赖 M1-06 完成并独立验收 | 门禁已通过（见第 12.7 节）；将 CLI/Skill 状态读写接入 SQLite Core 与唯一 Command Service；运行入口不得以 JSON 为权威源；状态变更与 Event 同事务；保留 Command 幂等性、UNKNOWN/Reconcile、Task version、Attempt、Session 身份、Ownership、Herdr Adapter 协议、Runtime Leader fencing、重复派发防护与崩溃恢复；安装器提供可导入 Python Core 模块。不得实现 Legacy 导入、JSON 回滚或双写 | 门禁要求（**已满足，2026-11-02**）：Python 3.10 全量及 Skill/安装回归通过；GitHub Actions Ubuntu/Python 3.10 全绿——run **41466544296** @ `d7fddcd`（ubuntu-26.04/3.10：core unittest 249 OK、Skill 42 OK、包安装/导入探针 OK、installer 冒烟 OK；macOS/3.13 基线腿同步通过；首跑 41461763132 @ `acfe9c9` 的失败与根因修复为历史记录，见第 12.7 节）。Runtime 验收：CLI/Skill 读写仅走 Core Command Service；服务未运行/结果未知时 fail closed 或持久化排队并受控 Reconcile，不盲目重发外部副作用；多进程 fencing/CAS 及 CLI/安装回归通过；不启动真实 Agent、不自动恢复旧状态 | CLI 与 Core 接线可能改变既有兼容语义；SQLite fencing 不能使 Herdr/GitHub exactly-once，需外部对账；服务缺席处理不得静默丢命令 |
-| **M1-08 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约**；依赖 M1-05、M1-02 | 按 8.7 建立未来 `teamcraft-ceo` 薄 Skill 和唯一 `references/CEO_PROTOCOL.md` 的实现契约；定义 protocol version/hash 与八阶段门禁元数据；Attempt 创建时固定 protocol version/hash，运行中不自动切换；旧协议无法恢复时 NEEDS_HUMAN，不兼容升级须重新初始化并审计；为 Codex/OpenCode 的 `.agents/skills/`、精简 `AGENTS.md`、OpenCode 薄 CEO Agent 设计预检/安装/no-op/dry-run/冲突策略；保留现有 `teamcraft` 运行 Skill。此任务实现时才创建文件，本轮仅规划 | 同一协议内容只维护一次；Codex/OpenCode Mock 发现、缺失、读取失败、hash/version 不兼容均测试且失败时禁止派工；安装器不覆盖已有规则/Agent 配置；真实 Harness 冒烟按实际版本单列，不能用 Mock 代替；测试 Attempt 创建后升级仍保持原 version/hash、不可恢复旧协议转 NEEDS_HUMAN、不兼容升级须重新初始化并留下审计记录 | 官方发现规则随版本变化；symlink/副本漂移；规则文件合并语义；协议过早固化 |
+| **M1-08 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约（已授权并实施；验收证据见 12.11）**；依赖 M1-05、M1-02 | 建立薄 CEO Skill、唯一协议正文和 OpenCode 薄入口；正文 frontmatter 声明 `1.0.0`，detached manifest 记录正文原始字节 SHA-256；Attempt pin 为不可变精确 version/hash，缺失/漂移/pin 不匹配即拒绝；恢复不到原 bytes 时由后续 Runtime 转 `NEEDS_HUMAN`，升级使用新 Attempt；Codex/OpenCode 共用 `.agents/skills/`。安装器支持 dry-run/预检，不生成或改写 `AGENTS.md`、`CLAUDE.md`；用户自有 CEO Agent 冲突即使 `--force` 也 fail-before-write，带 TeamCraft 管理标记的文件才可显式升级；保留现有 `teamcraft` Runtime Skill，Claude 延至 M6-06 | Codex/OpenCode mock discovery 返回相同版本/hash；缺失/不可读/坏 manifest/正文漂移/version/hash pin 不匹配均拒绝；Attempt pin 不能被静默替换；安装器首次安装、dry-run、幂等、用户规则保留、冲突零部分写入、受管文件显式升级均有测试；实机冒烟和 Mock 分栏，Mock 不代替实测 | Harness 官方发现规则变化；旧协议 bytes 需要精确恢复；管理标记可能被误复制；Claude 暂未适配 |
 
 > **M1-05 后续集成门禁（本轮未实现，留给后续集成任务）**：上行的 TTL 与幂等验收只覆盖 Event/Command 持久核心自身。以下两项是 M1-05 边界内已定义但**尚未接线**的集成门禁，不得以本行验收为准宣称其已完成：
 >
@@ -340,7 +340,7 @@ flowchart LR
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
-| **M2-01 Herdr Adapter 契约**；依赖 M1-07 | 从 teamctl 提取 capability/list/pane split/start/get/prompt/read/stop；统一超时、JSON shape、错误码；提供 Fake 和当前 Herdr 可选实机契约 | 现有 launch/status/resume argv 与身份核验不变；缺字段、非 UTF-8、超时、命令失败均归一化；无 Herdr 可跑离线测试 | Herdr 0.9.3 响应不是稳定协议；stop/read 在版本间差异 |
+| **M2-01 Herdr Adapter 契约（实现完成，验收证据见 12.10）**；依赖 M1-07 | 从 teamctl 提取 capability/list/pane split/start/get/prompt/read/stop；统一超时、JSON shape、错误码；提供 Fake 和当前 Herdr 可选实机契约 | 现有 launch/status/resume argv 与身份核验不变；缺字段、非 UTF-8、超时、命令失败均归一化；无 Herdr 可跑离线测试 | Herdr 0.9.3 响应不是稳定协议；stop/read 在版本间差异 |
 | **M2-02 Scheduler 与 fenced Leader**；依赖 M1-07、M2-01 | 复用 M1-07 的 durable Command executor、lease schema、epoch/fencing token，将一次性排他执行扩展为长期 Scheduler Leader、续租、READY Task 领取和受配额的并行 dispatch；应用优先级、创建顺序、Ownership/read-only；仍只有当前 Leader 可执行持久外部副作用 Command | 一次性 CLI executor 与长期 Scheduler 竞争时只有一个有效 lease；两 Scheduler 竞争只派发/执行一次；旧 Leader 失租后不能提交状态或继续新副作用；两个非重叠任务可并行；冲突任务保持 READY/BLOCKED 并解释原因；读查询不触发派工 | Lease 时钟漂移；已经发出的不可撤销副作用；长事务；跨项目公平性不足 |
 | **M2-03 分层角色 Prompt、版本化 Brief 与完成报告**；依赖 M1-04、M1-05、M2-01 | 统一 CEO/CTO/Developer/Tester/custom Prompt 层：稳定角色规则、Task/Attempt、带 digest/version 的任务文件、Ownership/read-only、依赖、验收、命令白名单和预算；不复制 CEO Protocol；投递前持久化 Command/Attempt/Session/evidence version，并记录 pending/sending/submitted/acknowledged/executing/execution_finished/unknown；定义 Worker result schema 并保留纯文本兼容 | Codex/OpenCode 均收到既有角色/责任/只读限制；Herdr argv 与 API 不被替代；提交、接收、执行结束和 Task 完成可区分；崩溃/回执丢失进入 Reconcile 且不盲重发；缺失/非法结果不会直接完成 Task；报告绑定 Attempt 和任务版本 | 本地模型结构化输出不稳定；Prompt 过长；旧 Harness 只支持文本；ack 信号可能不可得 |
 | **M2-04 Deterministic Watcher 与进展时钟**；依赖 M1-05、M2-01 | 先探测 Herdr 是否存在可验证、可恢复的事件订阅；契约不满足时低频查询；分别观察 process liveness、Agent activity、progress evidence；仅认可版本化里程碑/artifact/report digest/verification 为实际进展；维护 `last_observed_at`、`last_activity_at`、`last_progress_at`、task deadline、可配置无进展阈值和退避；事件以 SQLite seq 和 dedupe key 持久化；未知 Token 保持 NULL | 订阅与 polling 产生相同领域事件语义；进程活着但无进展达到阈值时进入 STALLED/NEEDS_HUMAN；日志滚动不重置进展时钟；任务超时产生可审计事件；相同观察不重复事件；重启后不重复派工；未知用量不显示为 0、免费或低成本；空闲不调用 LLM | Herdr 事件能力可能不存在或版本不稳；阈值误报；日志噪声；Token 数据缺失使预算决策更保守 |
@@ -467,7 +467,7 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 | M2 local-only 快照扩大范围仍不能排除系统外写入 | **Medium** | 当前共享同一 `cwd`（`teamctl.py:507-510`），Ownership 明确不是文件系统隔离（`README.md:168-174`） | 取消 M2 快照；M2/M3 只闭环 report-only/scout；M4 用 Worktree/Commit/完整 Diff 证据 |
 | 迁移或 Core 改造削弱 Ownership、Session 身份和保守恢复 | **High** | 现有 normalize/overlap、session identity、默认 inspect 已有代码和测试（`teamctl.py:109-118`、`:264-332`、`:688-821`；`test_teamctl.py:83-132`、`:218-301`） | 30 项回归保持；M1-01 契约固定语义；各阶段强制门禁 3–4 |
 | CEO Protocol 在 Harness 入口复制或版本漂移 | **High** | 当前没有独立协议或版本字段；CEO 规则散在 Skill、Profile 和 `build_prompt()` | M1-08 单一 `CEO_PROTOCOL.md` + version/hash；入口只加载；M2-08 初始化握手；M6-06 跨 Harness 校验 |
-| Skill 被发现但协议未读取/初始化却开始派工 | **Critical** | 当前 `teamctl` Prompt 提交后只有 `prompt_submitted`，没有协议读取确认或 dispatch gate | M2-08 区分 discovered/read/initialized 并 fail closed；M2-07 缺失/不兼容故障注入 |
+| Skill 被发现但协议未读取/初始化却开始派工 | **High** | CTO 接线后 active CEO Attempt 的 version/hash 会在每次 runtime 同步和派发 claim 前独立复验；但仍没有 Agent 读取回执、初始化状态或 nonce/Session 绑定 | M2-08 区分 discovered/read/initialized 并验证回执；M2-07 缺失/不兼容故障注入 |
 | Wake 投递结果不明导致重复 CEO 决策或重复派工 | **Critical** | 当前 prompt 歧义只存 JSON phase，无持久 Event/Wake/Command 对账 | M1-05/M2-03 持久 Command；M2-09 Wake 状态/合并/ack；M2-07 sending/失租/崩溃测试；禁止盲重发 |
 | Harness 官方发现规则或版本变化 | **High** | 本机只有 Codex 0.163.0、OpenCode 2.0.25；Claude 不可用，官方文档不能替代实测 | M1-08/M5-01 能力矩阵；每版本真实冒烟；Claude 延至 M6-06，未测不宣称支持 |
 | CEO 唤醒过频消耗云端 Token | **High** | 当前无 Wake 合并、预算或用量数据 | M2-09 working 延后、合并窗口、优先级、Dormant；M5-03/04 预算和统计；未知用量保守处理 |
@@ -487,11 +487,11 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 - M3 MVP 包含 Task 创建、编辑、查询、依赖、优先级和执行策略管理。
 - Watcher 区分 process liveness、Agent activity 和 task progress；未知 Token 永不解释为零。
 
-### 11.2.1 待审查的新增设计（未接受）
+### 11.2.1 已接受的 M1-08 与仍待审设计
 
-- 第 8.7 节的 CEO Protocol 唯一来源、跨 Harness 薄入口、初始化握手、Prompt 分层和 Wake Dispatcher 尚为 **Proposed**。
-- 相应的 M1-08、M2-08、M2-09 与 M6-06 已纳入依赖图和验收清单，但在本轮人工审查明确接受前不得开工，也不得改变第 12.3 节的授权状态。
-- Codex/OpenCode 官方文档已复核；真实 Skill 发现尚未执行。Claude 仅完成文档层设计，本机无二进制，因此适配方式和端到端结果均未决。
+- M1-08 的协议唯一来源、Codex/OpenCode 薄入口与安装契约已于 2026-11-04 接受并授权实施；验收结果见第 12.11 节。
+- 第 8.7 节的初始化握手、Prompt 分层、Watcher、Wake 与观测，以及 M2-08、M2-09、M6-06，仍为 Proposed，未由 M1-08 接受一并授权。
+- Codex/OpenCode 真实 Harness 冒烟单独登记；本次离线 Mock 契约不等于实机发现证据。Claude Code 入口仍推迟到 M6-06。
 
 ### 11.3 未解决决策（按最晚决策点）
 
@@ -500,8 +500,8 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 3. **运维默认值（对应实现任务前）**：Command queue TTL、Watcher 周期/无进展阈值/任务超时/max Attempts、备份和日志/artifact 保留期必须以测试和项目策略定值，不能照抄 PRD 示例。
 4. **一次性 CLI Leader 默认策略（M1-07 前）**：决定默认允许即时启动，还是要求显式参数；两者都不得静默排队或绕过 fencing。
 5. **Core 模块在已安装项目中的可用性（旧 CLI 或入口脚本依赖 Python Core 前，最晚 M1-07）**：一旦 `teamcraft/` Python Core 成为 CLI 的运行时依赖，安装器必须让目标项目获得可导入模块——例如在目标环境执行打包安装（`pip install`）、将包随 Skill 分发并由入口脚本显式注入模块路径，或提供其他可回滚的离线安装方式；不得依赖源码仓库根目录的隐式 PYTHONPATH（当前 `teamctl.py` 尚未导入 `teamcraft`，故 M1-02 无此问题，但引入依赖即触发本决策）。
-6. **CEO Protocol 首版与升级规则（M1-08 前）**：确定首个版本号、兼容范围、hash 规范及旧协议的安全保留/恢复方式。拟议策略已明确 Attempt 固定创建时的版本/hash，运行中不自动切换；旧协议不可恢复进入 NEEDS_HUMAN，不兼容升级须重新初始化并审计，具体版本兼容判定和审计字段仍待决定。
-7. **Harness 入口安装策略（M1-08/M6-06 前）**：`AGENTS.md`/`CLAUDE.md` 的安全合并或旁路说明、Claude 使用受管副本还是经验证 symlink、冲突时 no-op/fail 的具体 UX，须按真实版本与跨平台测试决定，不能覆盖用户文件。
+6. **CEO Protocol 首版与升级规则（M1-08 已解决）**：首版 `1.0.0`；协议文件原始 UTF-8 字节由外置 manifest 的 SHA-256 固定；Attempt 精确 pin 版本/hash，不静默切换；不可恢复 pin 时 NEEDS_HUMAN，不兼容升级用新 Attempt。
+7. **Harness 入口安装策略（M1-08 部分解决）**：Codex/OpenCode 共用 `.agents/skills/`，OpenCode 使用薄 Agent 文件；不创建/修改 `AGENTS.md`、`CLAUDE.md`，用户配置冲突 fail-before-write。Claude 方式仍由 M6-06 决定。
 8. **Wake 默认策略（M2-09 前）**：合并窗口、优先级、ack 超时、事件保留期与云端预算需用真实负载校准；CEO auto-start 继续默认关闭，开启方式须显式且可审计。
 
 ### 11.4 推迟解决的决策
@@ -565,14 +565,14 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 | 决策类型 | 当前状态 | 证据与边界 |
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
-| CEO Protocol / 跨 Harness / Wake 提议扩展 | **待人工审查（2026-10-27 Proposed）** | 第 8.7 节与 M1-08/M2-08/M2-09/M6-06 只是规划更新；未扩大既有 ADR 接受范围，也未授权实现 |
-| 任务开工授权 | **M1-01–M1-07 均已获授权；M1-07 已于 2026-11-04 验收关闭** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。M1-07 的 Python 3.10/Linux/CI 门禁于 2026-11-02 通过（run 41466544296 @ `d7fddcd`，见第 12.7 节）；Runtime 接线随后按 Owner 授权实施，并于 run 41779790463 @ `6638341` 全绿后关闭（见第 12.9 节）。 |
-| 任务完成验收 | **M1-01、M1-02、M1-03、M1-04、M1-05、M1-06、M1-07 均已验收** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节。 |
+| CEO Protocol / 跨 Harness / Wake 提议扩展 | **M1-08 部分接受（2026-11-04）；其余仍 Proposed** | 第 8.7 节第 1 项和 Codex/OpenCode 第 2 项子集已接受；初始化/Wake/Claude 等未接受，也未授权 |
+| 任务开工授权 | **M1-01–M1-08 均已获授权；M1-08 实施于 2026-11-04 完成** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。M1-07 的 Python 3.10/Linux/CI 门禁于 2026-11-02 通过（run 41466544296 @ `d7fddcd`，见第 12.7 节）；Runtime 接线随后按 Owner 授权实施，并于 run 41779790463 @ `6638341` 全绿后关闭（见第 12.9 节）。 |
+| 任务完成验收 | **M1-01–M1-07 已验收；M1-08 实施/离线验收完成，OpenCode Skill 实机调用待模型路由恢复后复验** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节；M1-08 见第 12.11 节。 |
 | 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Start Validation 于 2026-11-02 独立验收并关闭（证据见第 12.6 节）。M1-07 SQLite Runtime Integration 已获 Owner 授权并于 2026-11-04 通过验收关闭（证据见第 12.9 节）。生产 JSON→SQLite 迁移已从产品路线取消。
+M1-05、M1-06、M1-07 和 M1-08 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。后续应按依赖推进 M2-02 Scheduler 与 fenced Leader；协议初始化 Runtime 仍在 M2-08。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -624,4 +624,30 @@ M1-05 于 2026-11-01 通过独立运行验收并关闭；M1-06 SQLite Fresh Star
 
 **GitHub Actions 门禁**：Actions run [41779790463](https://github.com/DiQiTech-AI/teamcraft/actions/runs/41779790463)，head `6638341fdf81359aa15281d14bc42b559b50010e`，结论 **success**。`ubuntu-latest / Python 3.10 (M1-07 gate)` 与 `macos-latest / Python 3.13 (baseline)` 两条 job 的核心 unittest、Skill 契约、包安装/导入检查、隔离安装器冒烟全部通过。
 
-**验收结论：M1-07 SQLite Runtime Integration 于 2026-11-04 完成并关闭。** 代码提交 `ec0970a` 与 `6638341` 已推送至 `docs/teamcraft-2-0-planning`；最终 CI 通过。未读取或修改真实 `.teamcraft/state.json`，未启动或控制真实 Herdr 会话。后续 M1-08 及 M2 工作仍按依赖和单独授权推进。
+**验收结论：M1-07 SQLite Runtime Integration 于 2026-11-04 完成并关闭。** 代码提交 `ec0970a` 与 `6638341` 已推送至 `docs/teamcraft-2-0-planning`；最终 CI 通过。未读取或修改真实 `.teamcraft/state.json`，未启动或控制真实 Herdr 会话。M1-08 已于 2026-11-04 按第 12.11 节验收；后续 M2 仍按依赖和单独授权推进。
+
+### 12.10 M2-01 Herdr Adapter 契约实现与离线验收（2026-11-04）
+
+新增 `teamcraft/herdr_adapter.py`，抽出 Herdr subprocess/JSON 边界、稳定错误码、agent/pane/list 形状解析及 capability、pane、agent start/get/prompt/read/stop 接口。`teamctl.py` 保留原有命令参数构造、身份核验和持久副作用前 Command claim 顺序；`run_herdr` 与 kind 探测经 Adapter transport，既有 launch/status/resume argv 合同不变。Fake 测试不依赖 Herdr，覆盖 list/pane 缺字段、JSON/shape/UTF-8/timeout/命令错误分类，以及 split/start/prompt/read/stop argv 和 timeout。
+
+**本地验证**：Python 3.10.20 下 `python3.10 -m unittest tests.test_herdr_adapter -v`（6 tests）、`python3.10 -m unittest discover -s tests -v`（287 tests）及 `python3.10 -m unittest discover -s .agents/skills/teamcraft/tests -v`（59 tests）均通过；`git diff --check` 通过。没有 Herdr 实机契约运行证据；该项为可选验证，故不声称实机兼容已验证。M1-08 随后的实施和验收见第 12.11 节。
+
+### 12.11 M1-08 CEO Protocol 与 Codex/OpenCode 入口实施（2026-11-04）
+
+**Owner 接受与开工授权**：Owner 接受 M1-08 的 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约并授权实施。8.7 第 1 项与第 2 项中的 Codex/OpenCode 子集接受；Claude、CEO 初始化握手、Prompt、Watcher、Wake 与可观测性仍 Proposed，未随本次接受扩大。
+
+**实现**：新增 `.agents/skills/teamcraft-ceo/` 薄 Skill、唯一 `references/CEO_PROTOCOL.md`（`1.0.0`，Discovery→Recovery 八阶段）和 detached `protocol.manifest.json`。Manifest 的 SHA-256 覆盖协议 Markdown 原始 UTF-8 字节；校验器拒绝 symlink、非 UTF-8、缺失、格式错误、版本/hash 漂移和 Attempt pin 不匹配，不可恢复旧 pin 时要求人工处理。Schema v5 为 Attempt 增加成对的 `protocol_version`/`protocol_hash` 字段；创建时可原子设置，DB trigger 禁止其后任何改变（包括从未 pin 改成有 pin）；v4 升级为前向迁移，历史 Attempt 保持 null。CEO 的真实 Attempt 创建、runtime 同步和每个 durable dispatch claim 均已接入协议发现/pin 复验；历史活跃 CEO Attempt 缺 pin 时 fail closed。新 `teamctl` 派发 Prompt 明确加载 CEO Skill 与 Herdr runtime Skill。Agent 读取回执、初始化状态及 nonce/Session 绑定仍留给 M2-08。新增 `.opencode/agents/teamcraft-ceo.md` 作为无重复协议正文的薄入口。安装器将 CEO Skill/入口纳入全量预检、dry-run、幂等安装；从不写 `AGENTS.md`/`CLAUDE.md`；用户自有同名 CEO Agent 冲突即使 `--force` 也在写入前失败，带管理标记的受管入口才可显式更新。README 中英同步说明。
+
+**离线验证**：Python 3.10.20 下 CEO protocol/discovery、Attempt pin/升级保持、v4→v5 数据保留、pin 不可改、manifest/hash 与 symlink 路径保护由测试覆盖。完整 `python3.10 -m unittest discover -s tests -q` **298 tests OK**；Skill 回归 **59 tests OK**；`git diff --check` 通过。安装器隔离冒烟实际执行安装后的 `teamcraft.ceo_protocol`，验证已安装副本能读取协议 manifest。
+
+**Harness 实机证据与限制**：Codex CLI **0.166.0** 的只读实机调用发现并加载 `teamcraft-ceo` Skill，返回 `1.0.0`、manifest 一致的 SHA-256 `c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742` 和八阶段。OpenCode **v2.0.29** 的 `opencode debug agents` 实机发现 `teamcraft-ceo` Agent 配置；进一步运行该 Agent 的只读 Skill smoke 失败，返回 `provider.no-route: Model unavailable: omlx/Qwen3.8-Flash-Next-oQ4e-mtp`，因此 OpenCode 的模型驱动 Skill 加载本次未验证，须在模型路由恢复后复验。Claude Code 本机版本为 2.1.284，但其入口按 M6-06 推迟，本次未安装或测试。Mock/离线结果未代替上述实机状态。
+
+**结论**：M1-08 代码、安装和离线契约已完成；Codex 实机通过，OpenCode 实机发现 Agent 配置通过但模型调用未验证。该限制已显式登记，不影响已通过的 Python 3.10/Linux 兼容测试设计，但 OpenCode 真实 Skill 加载仍需后续补验。本次未提交或推送。
+
+### 12.12 CTO follow-up：协议 Attempt 接线与 Herdr typed adapter（2026-11-04）
+
+此前只读复核发现 M1-08 的协议字段仅由 domain API 接受、正常 runtime Attempt 创建未传入 pin；同时 `teamctl` 仍用通用 Herdr argv 路径执行生命周期操作。本次将 CEO `discover_protocol` 接入实际 Attempt 创建，并在同步/恢复推进及 `stage_claim` 前按 Attempt 固定版本/hash复验；失配时返回 `NEEDS_HUMAN`，不创建新的副作用命令。旧活跃 CEO Attempt 若无 pin 也 fail closed，不尝试追认当前文件。完整 Agent 读取/初始化证明仍属于 M2-08，没有以静态校验冒充 Agent 证明。
+
+`teamctl` 的 pane split、agent start、prompt、get/list/current/layout/process-info 等生产操作现调用 typed `HerdrAdapter` 方法。Stage payload 中的历史 argv 保持不变，split/start/prompt 仍先持久 claim 再产生副作用；CLI 将 adapter 的解析错误映射回既有 `TeamctlError`，确保歧义结果仍进入 UNKNOWN 并要求 resume 检查。回归测试覆盖 runtime pin 创建、变更协议对同步和 dispatch 的拒绝、v4→v5 历史 Attempt 保持、adapter argv/timeout 以及生产 start 路径的 claim-before-effect 顺序。
+
+**验证**：Python 3.10.20 下定向协议/Adapter/Runtime/Schema 回归 **142 tests**、完整 Core `python3.10 -m unittest discover -s tests -q` **301 tests**、Skill `python3.10 -m unittest discover -s .agents/skills/teamcraft/tests -q` **59 tests**均通过；`git diff --check` 和相关模块 `py_compile` 通过。真实 Herdr 会话未用于本次离线验证；OpenCode Skill 实机模型路由限制仍见第 12.11 节。未提交或推送。

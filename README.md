@@ -18,7 +18,7 @@ Multi-agent development can easily lead to duplicate assignments, overlapping ed
 - **Separate harness and role choices:** The role defines responsibility, while `--kind` selects a Herdr-supported harness such as Codex or OpenCode.
 - **Ownership coordination:** Every editing task must declare project-relative file or directory scopes. Overlapping scopes among active members are rejected.
 - **Read-only members:** Reviews, research, and acceptance checks can use `--read-only` without reserving an edit scope.
-- **Persistent state:** Members, pane identities, tasks, ownership scopes, and execution phases are stored in `.teamcraft/state.json`.
+- **Persistent state:** Members, pane identities, ownership scopes, and execution phases are stored in `.teamcraft/teamcraft.db` (SQLite).
 - **Safe recovery:** `resume` checks the terminal and native agent session. When the outcome is ambiguous, it inspects by default instead of submitting a task again.
 - **Live status checks:** `status` reports `blocked`, `working`, `idle`, `done`, `unknown`, or `missing` rather than treating cached state as live state.
 - **Concurrency protection:** State writes and member lifecycle operations use file locks to reduce conflicts during concurrent launches or recovery.
@@ -92,15 +92,17 @@ Preview the changes without writing files:
 bash scripts/install.sh --target /path/to/project --dry-run
 ```
 
-The installer copies the project-local `teamcraft` skill, six OpenCode role profiles, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds `/.teamcraft/` and `/opencode.json` to the target project's `.gitignore` while retaining the file's existing content.
+The installer copies the `teamcraft` runtime skill, the shared `teamcraft-ceo` protocol skill, six OpenCode role profiles, a thin OpenCode CEO entry, and the example model configuration. It creates `opencode.json` only when that file is missing. An existing `opencode.json` is always preserved. It also adds runtime ignore rules to the target project's `.gitignore` while retaining existing content. It never creates or changes `AGENTS.md` or `CLAUDE.md`.
 
-By default, an existing managed file with different content causes an error and is not overwritten. Use `--force` only when you intend to replace TeamCraft-managed skill, role, or template files:
+By default, an existing managed file with different content causes an error and is not overwritten. A conflicting user-owned `.opencode/agents/teamcraft-ceo.md` is always preserved and causes a preflight error, including with `--force`. Use `--force` only when you intend to replace TeamCraft-managed skill, role, or template files; the CEO entry is replaceable only when it carries the TeamCraft managed marker:
 
 ```bash
 bash scripts/install.sh --target /path/to/project --force
 ```
 
-`--force` never overwrites an existing `opencode.json`. Reinstalling identical content is safe and idempotent. The installer does not install dependencies, access the network, or modify global configuration.
+`--force` never overwrites an existing `opencode.json` or user-owned CEO entry. Reinstalling identical content is safe and idempotent. The installer does not install dependencies, access the network, or modify global configuration.
+
+The `teamcraft-ceo` Skill is shared by Codex and OpenCode. Its single protocol is versioned in `references/CEO_PROTOCOL.md`; `references/protocol.manifest.json` pins the exact UTF-8 bytes by SHA-256. If the protocol cannot be verified against an active Attempt's pin, stop and request human recovery. Claude Code is not supported by this entry yet.
 
 After installation:
 
@@ -253,7 +255,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 └── PROGRESS.md                  # Implementation and live verification notes
 ```
 
-`.teamcraft/` is a local runtime directory containing state, tasks, and lock files. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session. If `.herdr-team/state.json` is present, the CLI stops before any Herdr call or new state write; it never migrates or creates a second state automatically.
+`.teamcraft/` is a local runtime directory containing the SQLite database, locks, and journals. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session. If `.herdr-team/state.json` or a non-empty `.teamcraft/state.json` is present, the CLI stops before any Herdr call or new database write; it never migrates, moves, or deletes legacy JSON automatically.
 
 ## Verification
 
