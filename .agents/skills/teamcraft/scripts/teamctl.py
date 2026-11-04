@@ -299,8 +299,12 @@ class StateStore:
         finally:
             conn.close()
 
-    def write_unlocked(self, state: dict[str, Any], *, member: str,
-                       lease: _leader.Lease | None = None) -> None:
+    def write_unlocked(
+        self, state: dict[str, Any], *, member: str,
+        lease: _leader.Lease | None = None,
+        confirm_command_id: str | None = None,
+        confirmation_evidence: dict[str, Any] | None = None,
+    ) -> None:
         """Persist the working dict authoritatively, fenced by the lease.
 
         Member-state changes MUST carry the operation's leader lease (CEO gate
@@ -325,6 +329,11 @@ class StateStore:
                 f"authoritative write names member {member!r} that is not part"
                 " of the written state; refusing a mismatched identity"
             )
+        if confirm_command_id is not None and lease is None:
+            raise TeamctlError(
+                "confirming an external action and its member state requires"
+                " the operation's leader lease"
+            )
         self._ensure_ready()
         conn = self._connect()
         try:
@@ -332,6 +341,11 @@ class StateStore:
             with _adapter.storage.transaction(conn):
                 if lease is not None:
                     _leader.require_lease(conn, lease)
+                    if confirm_command_id is not None:
+                        _adapter.stage_confirm(
+                            conn, confirm_command_id, lease=lease,
+                            evidence=confirmation_evidence,
+                        )
                     _adapter.sync_state(conn, state)
                     return
                 live = _leader.current_lease(conn, scope)
@@ -350,6 +364,19 @@ class StateStore:
                 " before retrying"
             ) from exc
         except _leader.StaleLeaderError as exc:
+            if confirm_command_id is not None:
+                # The Herdr effect may already have happened, but the fenced
+                # confirmation+state transaction rolled back. Preserve that
+                # ambiguity durably so resume must inspect before any retry.
+                self.stage_unknown(
+                    confirm_command_id,
+                    note=f"leader lease lost before success and member state could commit: {exc}",
+                )
+                raise TeamctlError(
+                    "the runtime leader lease was lost after the Herdr action;"
+                    " its outcome is UNKNOWN. Run resume to inspect and"
+                    " reconcile — do not blindly retry"
+                ) from exc
             raise TeamctlError(
                 "the runtime leader lease was lost before this member state"
                 " change could be committed; a current leader must retry —"
@@ -507,7 +534,10 @@ def validate_state_session(state: dict[str, Any], session: dict[str, Any]) -> No
 
 def update_member(
     store: StateStore, session: dict[str, Any], name: str, *,
-    lease: "_leader.Lease | None" = None, **changes: Any
+    lease: "_leader.Lease | None" = None,
+    confirm_command_id: str | None = None,
+    confirmation_evidence: dict[str, Any] | None = None,
+    **changes: Any,
 ) -> dict[str, Any]:
     with store.locked() as state:
         if state is None:
@@ -519,7 +549,11 @@ def update_member(
             raise TeamctlError(f"member is not recorded: {name}") from exc
         member.update(changes)
         member["updated_at"] = now_epoch()
-        store.write_unlocked(state, member=name, lease=lease)
+        store.write_unlocked(
+            state, member=name, lease=lease,
+            confirm_command_id=confirm_command_id,
+            confirmation_evidence=confirmation_evidence,
+        )
         return dict(member)
 
 
@@ -844,16 +878,16 @@ def split_for_member(
                 "pane split outcome is ambiguous; inspect the layout before explicitly "
                 f"retrying resume {member['name']} --split-action retry. Cause: {exc}"
             ) from exc
-        store.stage_confirm(
-            command.id, lease=lease,
-            evidence={"pane_id": pane["pane_id"],
-                     "terminal_id": pane.get("terminal_id")},
-        )
         return update_member(
             store, session, member["name"], lease=lease,
             phase="pane_created",
             pane_id=pane["pane_id"], terminal_id=pane.get("terminal_id"),
             from_pane_id=parent_id, direction=direction,
+            confirm_command_id=command.id,
+            confirmation_evidence={
+                "pane_id": pane["pane_id"],
+                "terminal_id": pane.get("terminal_id"),
+            },
         )
     finally:
         if own_lease:
@@ -899,12 +933,6 @@ def start_member(
                 f"agent start is ambiguous in existing pane {pane_id}; resume {name} to inspect or reuse that pane. Cause: {exc}"
             ) from exc
         info = agent_info_from(run_herdr(["agent", "get", name]))
-        store.stage_confirm(
-            command.id, lease=lease,
-            evidence={"pane_id": info.get("pane_id", pane_id),
-                     "terminal_id": info.get("terminal_id"),
-                     "agent_session": info.get("agent_session")},
-        )
         return update_member(
             store, session, name, lease=lease,
             phase="agent_started",
@@ -912,6 +940,12 @@ def start_member(
             terminal_id=info.get("terminal_id", member.get("terminal_id")),
             agent_session=info.get("agent_session"), live_state=live_state(info),
             error=None,
+            confirm_command_id=command.id,
+            confirmation_evidence={
+                "pane_id": info.get("pane_id", pane_id),
+                "terminal_id": info.get("terminal_id"),
+                "agent_session": info.get("agent_session"),
+            },
         )
     finally:
         if own_lease:
@@ -970,14 +1004,6 @@ def prompt_member(
                 f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
             ) from exc
         info = agent_info_from(run_herdr(["agent", "get", name]))
-        store.stage_confirm(
-            command.id, lease=lease,
-            evidence={"pane_id": info.get("pane_id"),
-                     "terminal_id": info.get("terminal_id"),
-                     "agent_session": info.get("agent_session"),
-                     "prompt_sha256": hashlib.sha256(
-                         prompt_text.encode("utf-8")).hexdigest()},
-        )
         return update_member(
             store, session, name, lease=lease,
             phase="prompt_submitted",
@@ -985,6 +1011,14 @@ def prompt_member(
             agent_session=info.get("agent_session", member.get("agent_session")),
             terminal_id=info.get("terminal_id", member.get("terminal_id")),
             error=None,
+            confirm_command_id=command.id,
+            confirmation_evidence={
+                "pane_id": info.get("pane_id"),
+                "terminal_id": info.get("terminal_id"),
+                "agent_session": info.get("agent_session"),
+                "prompt_sha256": hashlib.sha256(
+                    prompt_text.encode("utf-8")).hexdigest(),
+            },
         )
     finally:
         if own_lease:
