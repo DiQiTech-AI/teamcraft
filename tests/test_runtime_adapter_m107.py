@@ -263,7 +263,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_claim_is_durable_running_before_effect(self) -> None:
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=60, clock=_FixedClock())
         command = ra.stage_claim(
             self.conn, team_id="team-synthetic", member="dev",
@@ -285,7 +285,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_stage_sequence_numbers_and_idempotent_submit(self) -> None:
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=60, clock=_FixedClock())
         first = ra.stage_claim(self.conn, team_id="team-synthetic",
                               member="dev", stage=ra.STAGE_SPLIT, lease=lease,
@@ -315,7 +315,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_stale_leader_can_never_commit_success(self) -> None:
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=30, clock=_FixedClock())
         command = ra.stage_claim(self.conn, team_id="team-synthetic",
                                 member="dev", stage=ra.STAGE_SPLIT, lease=lease,
@@ -323,7 +323,7 @@ class RuntimeAdapterTests(unittest.TestCase):
                                 attempt_id=dev["attempt_id"],
                                 clock=_FixedClock(1))
         # Another epoch takes over while our effect is in flight.
-        leader.acquire_or_renew(self.conn, "member:dev", "thief",
+        leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "thief",
                                ttl_seconds=30, clock=_FixedClock(31))
         with self.assertRaises(leader.StaleLeaderError):
             ra.stage_confirm(self.conn, command.id, lease=lease,
@@ -358,7 +358,7 @@ class RuntimeAdapterTests(unittest.TestCase):
             "unknown",
         )
         # The CURRENT leader settles it from facts.
-        current = leader.acquire_or_renew(self.conn, "member:dev", "thief",
+        current = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "thief",
                                          ttl_seconds=30, clock=_FixedClock(35))
         ra.stage_reconcile(self.conn, command.id, lease=current,
                           evidence={"pane_id": "w-2", "observed": "pane exists"},
@@ -372,7 +372,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_unknown_then_expired_reconcile(self) -> None:
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=30, clock=_FixedClock())
         command = ra.stage_claim(self.conn, team_id="team-synthetic",
                                 member="dev", stage=ra.STAGE_PROMPT, lease=lease,
@@ -395,14 +395,14 @@ class RuntimeAdapterTests(unittest.TestCase):
         # CEO requirement: fencing blocks authoritative commits, but recording
         # ambiguity must remain available even with a live foreign holder.
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=30, clock=_FixedClock())
         command = ra.stage_claim(self.conn, team_id="team-synthetic",
                                 member="dev", stage=ra.STAGE_START, lease=lease,
                                 task_id=dev["task_id"],
                                 attempt_id=dev["attempt_id"],
                                 clock=_FixedClock(1))
-        leader.acquire_or_renew(self.conn, "member:dev", "thief",
+        leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "thief",
                                ttl_seconds=3600, clock=_FixedClock(31))
         settled = ra.stage_unknown(self.conn, command.id,
                                   note="effect response lost with lease gone",
@@ -411,20 +411,63 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_claim_requires_live_lease(self) -> None:
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        wrong_scope = leader.acquire_or_renew(
+            self.conn, leader.project_scope("another-project"), "wrong",
+            ttl_seconds=30, clock=_FixedClock(),
+        )
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_claim(self.conn, team_id="team-synthetic", member="dev",
+                           stage=ra.STAGE_SPLIT, lease=wrong_scope,
+                           task_id=dev["task_id"], clock=_FixedClock(1))
+        legacy_member_lease = leader.acquire_or_renew(
+            self.conn, "member:dev", "legacy", ttl_seconds=30,
+            clock=_FixedClock(),
+        )
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_claim(self.conn, team_id="team-synthetic", member="dev",
+                           stage=ra.STAGE_SPLIT, lease=legacy_member_lease,
+                           task_id=dev["task_id"], clock=_FixedClock(1))
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=30, clock=_FixedClock())
-        leader.release(self.conn, "member:dev", "A", epoch=lease.epoch,
+        leader.release(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A", epoch=lease.epoch,
                       clock=_FixedClock(1))
         with self.assertRaises(leader.StaleLeaderError):
             ra.stage_claim(self.conn, team_id="team-synthetic", member="dev",
                          stage=ra.STAGE_SPLIT, lease=lease,
                          task_id=dev["task_id"], clock=_FixedClock(2))
 
+    def test_confirm_and_reconcile_reject_another_project_scope(self) -> None:
+        _, dev = self._ready_member()
+        project = ra.project_id_for_root(self.conn, "/synthetic/root")
+        lease = leader.acquire_or_renew(
+            self.conn, leader.project_scope(project), "owner",
+            ttl_seconds=60, clock=_FixedClock(),
+        )
+        command = ra.stage_claim(
+            self.conn, team_id="team-synthetic", member="dev",
+            stage=ra.STAGE_SPLIT, lease=lease, task_id=dev["task_id"],
+            clock=_FixedClock(1),
+        )
+        wrong = leader.acquire_or_renew(
+            self.conn, leader.project_scope("other"), "other",
+            ttl_seconds=60, clock=_FixedClock(),
+        )
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_confirm(self.conn, command.id, lease=wrong,
+                             evidence={"pane_id": "w-2"}, clock=_FixedClock(2))
+        ra.stage_unknown(self.conn, command.id, note="ambiguous", clock=_FixedClock(3))
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.stage_reconcile(self.conn, command.id, lease=wrong,
+                               evidence={"pane_id": "w-2"}, resolved_ok=True,
+                               note="wrong project", clock=_FixedClock(4))
+        self.assertEqual(ra.latest_stage_command(self.conn, "dev", ra.STAGE_SPLIT).state,
+                         "unknown")
+
     def test_launch_failure_rollback_after_claim_keeps_audit(self) -> None:
         # A crash AFTER the durable claim leaves the command running (never
         # silently deleted) so resume must reconcile from facts.
         _, dev = self._ready_member()
-        lease = leader.acquire_or_renew(self.conn, "member:dev", "A",
+        lease = leader.acquire_or_renew(self.conn, leader.project_scope(ra.project_id_for_root(self.conn, "/synthetic/root")), "A",
                                        ttl_seconds=30, clock=_FixedClock())
         command = ra.stage_claim(self.conn, team_id="team-synthetic",
                                 member="dev", stage=ra.STAGE_SPLIT, lease=lease,

@@ -341,7 +341,7 @@ flowchart LR
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M2-01 Herdr Adapter 契约（实现完成，验收证据见 12.10）**；依赖 M1-07 | 从 teamctl 提取 capability/list/pane split/start/get/prompt/read/stop；统一超时、JSON shape、错误码；提供 Fake 和当前 Herdr 可选实机契约 | 现有 launch/status/resume argv 与身份核验不变；缺字段、非 UTF-8、超时、命令失败均归一化；无 Herdr 可跑离线测试 | Herdr 0.9.3 响应不是稳定协议；stop/read 在版本间差异 |
-| **M2-02 Scheduler 与 fenced Leader**；依赖 M1-07、M2-01 | 复用 M1-07 的 durable Command executor、lease schema、epoch/fencing token，将一次性排他执行扩展为长期 Scheduler Leader、续租、READY Task 领取和受配额的并行 dispatch；应用优先级、创建顺序、Ownership/read-only；仍只有当前 Leader 可执行持久外部副作用 Command | 一次性 CLI executor 与长期 Scheduler 竞争时只有一个有效 lease；两 Scheduler 竞争只派发/执行一次；旧 Leader 失租后不能提交状态或继续新副作用；两个非重叠任务可并行；冲突任务保持 READY/BLOCKED 并解释原因；读查询不触发派工 | Lease 时钟漂移；已经发出的不可撤销副作用；长事务；跨项目公平性不足 |
+| **M2-02 Scheduler 与 fenced Leader（已完成，CEO 验收见 12.13）**；依赖 M1-07、M2-01 | 复用 M1-07 的 durable Command executor、lease schema、epoch/fencing token，将一次性排他执行扩展为长期 Scheduler Leader、续租、READY Task 领取和受配额的并行 dispatch；应用优先级、创建顺序、Ownership/read-only；仍只有当前 Leader 可执行持久外部副作用 Command | 一次性 CLI executor 与长期 Scheduler 竞争时只有一个有效 lease；两 Scheduler 竞争只派发/执行一次；旧 Leader 失租后不能提交状态或继续新副作用；两个非重叠任务可并行；冲突任务保持 READY/BLOCKED 并解释原因；读查询不触发派工 | Lease 时钟漂移；已经发出的不可撤销副作用；长事务；跨项目公平性不足 |
 | **M2-03 分层角色 Prompt、版本化 Brief 与完成报告**；依赖 M1-04、M1-05、M2-01 | 统一 CEO/CTO/Developer/Tester/custom Prompt 层：稳定角色规则、Task/Attempt、带 digest/version 的任务文件、Ownership/read-only、依赖、验收、命令白名单和预算；不复制 CEO Protocol；投递前持久化 Command/Attempt/Session/evidence version，并记录 pending/sending/submitted/acknowledged/executing/execution_finished/unknown；定义 Worker result schema 并保留纯文本兼容 | Codex/OpenCode 均收到既有角色/责任/只读限制；Herdr argv 与 API 不被替代；提交、接收、执行结束和 Task 完成可区分；崩溃/回执丢失进入 Reconcile 且不盲重发；缺失/非法结果不会直接完成 Task；报告绑定 Attempt 和任务版本 | 本地模型结构化输出不稳定；Prompt 过长；旧 Harness 只支持文本；ack 信号可能不可得 |
 | **M2-04 Deterministic Watcher 与进展时钟**；依赖 M1-05、M2-01 | 先探测 Herdr 是否存在可验证、可恢复的事件订阅；契约不满足时低频查询；分别观察 process liveness、Agent activity、progress evidence；仅认可版本化里程碑/artifact/report digest/verification 为实际进展；维护 `last_observed_at`、`last_activity_at`、`last_progress_at`、task deadline、可配置无进展阈值和退避；事件以 SQLite seq 和 dedupe key 持久化；未知 Token 保持 NULL | 订阅与 polling 产生相同领域事件语义；进程活着但无进展达到阈值时进入 STALLED/NEEDS_HUMAN；日志滚动不重置进展时钟；任务超时产生可审计事件；相同观察不重复事件；重启后不重复派工；未知用量不显示为 0、免费或低成本；空闲不调用 LLM | Herdr 事件能力可能不存在或版本不稳；阈值误报；日志噪声；Token 数据缺失使预算决策更保守 |
 | **M2-05 Reconcile、超时与有界 Attempt**；依赖 M2-02、M2-04 | 复用 terminal/native-session 核验；交叉检查 DB、Herdr、结果；为等待、取消、人工处理、经批准的新 Attempt 定义 Command；配置 max Attempts 和异常升级路径 | Prompt 回执丢失不重发；Pane 移动可验证恢复；身份不符拒绝接管；达到无进展/任务超时或 max Attempts 时升级，不无限重试；UNKNOWN 不自动重试且未审批不能产生新 Attempt | 证据不足时用户负担；阈值和最大次数设置不当；把活跃误判成进展 |
@@ -567,12 +567,12 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
 | CEO Protocol / 跨 Harness / Wake 提议扩展 | **M1-08 部分接受（2026-11-04）；其余仍 Proposed** | 第 8.7 节第 1 项和 Codex/OpenCode 第 2 项子集已接受；初始化/Wake/Claude 等未接受，也未授权 |
 | 任务开工授权 | **M1-01–M1-08 均已获授权；M1-08 实施于 2026-11-04 完成** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。M1-07 的 Python 3.10/Linux/CI 门禁于 2026-11-02 通过（run 41466544296 @ `d7fddcd`，见第 12.7 节）；Runtime 接线随后按 Owner 授权实施，并于 run 41779790463 @ `6638341` 全绿后关闭（见第 12.9 节）。 |
-| 任务完成验收 | **M1-01–M1-07 已验收；M1-08 实施/离线验收完成，OpenCode Skill 实机调用待模型路由恢复后复验** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节；M1-08 见第 12.11 节。 |
+| 任务完成验收 | **M1-01–M1-07、M2-02 已验收；M1-08 实施/离线验收完成，OpenCode Skill 实机调用待模型路由恢复后复验** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节；M1-08 见第 12.11 节；M2-02 见第 12.13 节。 |
 | 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05、M1-06、M1-07 和 M1-08 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。后续应按依赖推进 M2-02 Scheduler 与 fenced Leader；协议初始化 Runtime 仍在 M2-08。
+M1-05、M1-06、M1-07、M1-08 和 M2-02 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。后续可按依赖推进 M2-03 与 M2-04；协议初始化 Runtime 仍在 M2-08。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -651,3 +651,13 @@ M1-05、M1-06、M1-07 和 M1-08 已分别通过验收关闭（证据见第 12.5�
 `teamctl` 的 pane split、agent start、prompt、get/list/current/layout/process-info 等生产操作现调用 typed `HerdrAdapter` 方法。Stage payload 中的历史 argv 保持不变，split/start/prompt 仍先持久 claim 再产生副作用；CLI 将 adapter 的解析错误映射回既有 `TeamctlError`，确保歧义结果仍进入 UNKNOWN 并要求 resume 检查。回归测试覆盖 runtime pin 创建、变更协议对同步和 dispatch 的拒绝、v4→v5 历史 Attempt 保持、adapter argv/timeout 以及生产 start 路径的 claim-before-effect 顺序。
 
 **验证**：Python 3.10.20 下定向协议/Adapter/Runtime/Schema 回归 **142 tests**、完整 Core `python3.10 -m unittest discover -s tests -q` **301 tests**、Skill `python3.10 -m unittest discover -s .agents/skills/teamcraft/tests -q` **59 tests**均通过；`git diff --check` 和相关模块 `py_compile` 通过。真实 Herdr 会话未用于本次离线验证；OpenCode Skill 实机模型路由限制仍见第 12.11 节。未提交或推送。
+
+### 12.13 M2-02 Scheduler 与 fenced Leader 验收关闭（2026-11-04）
+
+**实现范围**：新增 SQLite Scheduler Core 的确定性只读计划、项目级 Leader acquire/renew/release 与 epoch fencing、基于优先级/创建顺序/配额的 READY Task 原子预留，以及 Ownership 冲突和 read-only 规则。Scheduler 与 one-shot `teamctl` 共用 `project:<project_id>` 租约；首次 CLI 操作幂等建立 Project 行。Runtime Command claim、confirm、reconcile 均校验成员/Task 所属 Project 的租约，UNKNOWN 仍可在失租后记录。生命周期 helper 支持调用方注入 Scheduler 租约；新增 `launch_reserved()` 将 Scheduler 产生的 Task/Attempt 带入成员 reservation、pane split、agent start、prompt 与确认，不再次创建 Task/Attempt，也不在内部 acquire/release Scheduler 租约。
+
+持久 Command claim 后、每次 Herdr split/start/prompt 调用前都重新校验项目租约；校验失败时不调用 Herdr，将 Command 置为 UNKNOWN 以便事实对账。Herdr 调用仍在 SQLite 事务之外。
+
+**验证证据**：DIQI CTO 最终只读复评无可执行代码发现并建议关闭。Python 3.10.20：定向 Leader/Runtime/Scheduler **41 tests**、SQLite 生命周期与 Scheduler 端到端 **21 tests**、Core 全量 **311 tests**、Skill 全量 **63 tests**均通过；修改模块 `py_compile` 与 `git diff --check` 通过。覆盖包括 CLI/Scheduler 两种竞争顺序、两 Scheduler 竞争/续租/epoch、项目隔离、失租后拒绝确认及阻止新的 Herdr 调用、reserved Attempt 完整生命周期确认、Ownership/read-only/配额与只读计划。
+
+**CEO 验收结论：M2-02 完成并关闭。** 已发出的外部 Herdr 调用不能被租约撤销；最后一次租约检查与 Herdr 实际调用之间仍存在极短、无法原子消除的竞争窗口。该边界不提供 exactly-once 保证，歧义结果必须保持 UNKNOWN 并 reconcile。启用 Scheduler dispatch 前须排空仍持有旧 `member:<name>` 租约语义的 M1-07 `teamctl` 进程。Scheduler 提供 caller-driven handoff，不负责 Harness/角色选择策略。后续 M2-03 与 M2-04 可按依赖推进。

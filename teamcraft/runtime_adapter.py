@@ -200,6 +200,79 @@ def project_id_for_root(conn: TeamCraftConnection, root: str) -> str | None:
     return None if row is None else str(row[0])
 
 
+def ensure_project(conn: TeamCraftConnection, root: str, *, clock: Any = None) -> str:
+    """Idempotently ensure the canonical project row for a runtime root."""
+    if not isinstance(root, str) or not root.startswith("/"):
+        raise ValidationError("project root must be an absolute canonical path")
+    with _tx(conn):
+        existing = project_id_for_root(conn, root)
+        if existing is not None:
+            return existing
+        project = domain.create_project(
+            conn, name=Path(root).name or "team", repo_path=root, clock=clock,
+        )
+        return project.id
+
+
+def _project_id_for_member(conn: TeamCraftConnection, member: str,
+                           task_id: str | None = None) -> str:
+    row = conn.execute(
+        "SELECT task_id FROM members WHERE name=?", (member,)
+    ).fetchone()
+    if row is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} is not recorded; refusing project lease scope"
+        )
+    linked_task = str(row[0]) if row[0] is not None else None
+    root = conn.execute("SELECT project_root FROM runtime_meta WHERE id=1").fetchone()
+    runtime_project = project_id_for_root(conn, str(root[0])) if root is not None else None
+    if runtime_project is None:
+        raise RuntimeAdapterError(
+            f"cannot determine runtime project for member {member!r}; refusing unfenced command"
+        )
+    if task_id is not None:
+        task = domain.get_task(conn, task_id)
+        if linked_task is not None and linked_task != task_id:
+            raise RuntimeAdapterError(
+                f"member {member!r} is linked to a different Task; refusing lease scope mismatch"
+            )
+        if task.project_id != runtime_project:
+            raise RuntimeAdapterError(
+                f"Task {task_id!r} belongs to another project; refusing lease scope mismatch"
+            )
+        return runtime_project
+    if linked_task is not None:
+        task_project = domain.get_task(conn, linked_task).project_id
+        if task_project != runtime_project:
+            raise RuntimeAdapterError(
+                f"member {member!r} is linked to a Task in another project"
+            )
+    return runtime_project
+
+
+def _project_id_for_command(conn: TeamCraftConnection, command_id: str) -> str:
+    row = conn.execute(
+        "SELECT evidence_json, payload_json FROM commands WHERE id=?", (command_id,)
+    ).fetchone()
+    if row is None:
+        raise RuntimeAdapterError(f"command not found: {command_id}")
+    try:
+        evidence, payload = json.loads(str(row[0])), json.loads(str(row[1]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeAdapterError(
+            f"command {command_id} has invalid project evidence; refusing lease scope"
+        ) from exc
+    task_id = evidence.get("task_id") if isinstance(evidence, dict) else None
+    member = payload.get("member") if isinstance(payload, dict) else None
+    if not isinstance(member, str) or not member:
+        raise RuntimeAdapterError(
+            f"command {command_id} has no member or Task project binding"
+        )
+    return _project_id_for_member(
+        conn, member, str(task_id) if task_id is not None else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # transactional sync: members + lineage + events in ONE write transaction
 # ---------------------------------------------------------------------------
@@ -250,12 +323,7 @@ def sync_state(conn: TeamCraftConnection, state: dict[str, Any],
                  json.dumps(session, sort_keys=True),
                  int(state.get("created_at") or time.time())),
             )
-            project = domain.create_project(
-                conn,
-                name=Path(str(state["project_root"])).name or "team",
-                repo_path=str(state["project_root"]),
-                clock=clock,
-            )
+            ensure_project(conn, str(state["project_root"]), clock=clock)
         else:
             if str(meta[0]) != str(state["team_id"]):
                 raise RuntimeAdapterError(
@@ -416,6 +484,10 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
                                    expected_version=task.version, clock=clock)
     else:
         task = domain.get_task(conn, task_id)
+        if task.project_id != project_id:
+            raise RuntimeAdapterError(
+                f"member {member.get('name')!r} Task belongs to another project"
+            )
         desired = json.dumps(list(member["ownership"]), ensure_ascii=False)
         if task.ownership_json != desired and member["phase"] == "reserved":
             domain.update_task(conn, task_id, ownership_json=desired,
@@ -441,6 +513,17 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
             attempt_id = attempt.id
     if attempt_id is not None:
         attempt = domain.get_attempt(conn, attempt_id)
+        if attempt.task_id != task_id:
+            raise RuntimeAdapterError(
+                f"member {name!r} Attempt {attempt_id!r} is not bound to Task {task_id!r}"
+            )
+        if before is None and phase == "reserved" and (
+            task.status != "running" or attempt.status != "created"
+        ):
+            raise RuntimeAdapterError(
+                "a pre-reserved member binding requires the Task to be running"
+                " with its reserved Attempt still created"
+            )
         _verify_member_protocol(state, member, attempt)
         if member.get("pane_id") and member.get("session_id") is None:
             native = member.get("agent_session")
@@ -469,6 +552,9 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
                     except IllegalTransitionError:
                         pass  # liveness never resumes by assumption
         attempt = domain.get_attempt(conn, attempt_id)
+        if attempt.status == "created" and phase == "start_requested":
+            domain.transition_attempt(conn, attempt_id, "start", clock=clock)
+            attempt = domain.get_attempt(conn, attempt_id)
         if attempt.status == "starting" and phase == "agent_started":
             domain.transition_attempt(conn, attempt_id, "activated",
                                      clock=clock)
@@ -597,7 +683,8 @@ def stage_claim(
         evidence["attempt_id"] = attempt_id
         evidence["attempt_no"] = attempt.attempt_no
     with _tx(conn):
-        leader.require_lease(conn, lease, clock=clock)
+        project_id = _project_id_for_member(conn, member, task_id)
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
         prior = conn.execute(
             "SELECT COUNT(*) FROM commands WHERE kind = ? AND"
             " json_extract(payload_json, '$.member') = ?",
@@ -639,7 +726,8 @@ def stage_confirm(
 
     payload = {"result": result or {}, "evidence": evidence or {}}
     with _tx(conn):
-        leader.require_lease(conn, lease, clock=clock)
+        project_id = _project_id_for_command(conn, command_id)
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
         return command_core.confirm_command(
             conn, command_id,
             result_json=json.dumps(payload, ensure_ascii=False,
@@ -679,7 +767,8 @@ def stage_reconcile(
 
     audit = f"{note} | evidence={json.dumps(evidence, sort_keys=True, default=str)}"
     with _tx(conn):
-        leader.require_lease(conn, lease, clock=clock)
+        project_id = _project_id_for_command(conn, command_id)
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
         if resolved_ok:
             return command_core.reconcile_command(
                 conn, command_id, outcome="confirmed", note=audit,

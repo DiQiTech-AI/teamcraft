@@ -104,6 +104,19 @@ class CommandTimeout(TeamctlError):
         )
 
 
+def _admit_effect(store: Any, command_id: str, lease: _leader.Lease) -> None:
+    """Apply just-in-time fencing; minimal non-runtime test doubles omit it."""
+    admission = getattr(store, "admit_effect", None)
+    if admission is None:
+        # Small adapter contract tests use an in-memory fake store with no
+        # SQLite Command/lease rows. Every production StateStore implements
+        # this validator, and an actual Lease is never accepted without it.
+        if isinstance(lease, _leader.Lease):
+            raise TeamctlError("runtime store cannot revalidate the project Leader lease")
+        return
+    admission(command_id, lease=lease)
+
+
 def _decode(data: bytes | None, stream: str) -> str:
     try:
         return (data or b"").decode("utf-8")
@@ -238,6 +251,12 @@ class StateStore:
     """
 
     def __init__(self, project_root: Path) -> None:
+        try:
+            project_root = project_root.expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise TeamctlError(f"cannot resolve project directory {project_root}: {exc}") from exc
+        if not project_root.is_dir():
+            raise TeamctlError(f"project directory is not a directory: {project_root}")
         self.project_root = project_root
         self.directory = project_root / RUNTIME_DIRECTORY_NAME
         self.path = self.directory / "state.json"  # legacy attr; NEVER written
@@ -347,11 +366,10 @@ class StateStore:
     ) -> None:
         """Persist the working dict authoritatively, fenced by the lease.
 
-        Member-state changes MUST carry the operation's leader lease (CEO gate
-        D): a stale/expired lease is refused, and when no lease object is
-        passed the write still admits through a short auto-lease on
-        ``member:<name>`` — refused while a foreign holder is live, and
-        released again unless this store already held it.  ``member`` is
+        Member-state changes MUST carry the project's shared Leader lease
+        (CEO gate D): a stale/expired lease is refused, and when no lease
+        object is passed the write admits through a short auto-lease on the
+        canonical project scope. ``member`` is
         REQUIRED (CEO review follow-up): there is no unfenced identity-free
         write path at all, and the named member must be one the written dict
         actually contains.  ``stage_unknown`` style ambiguity records stay
@@ -375,24 +393,24 @@ class StateStore:
                 f"authoritative write member key {member!r} does not match"
                 " the member record identity; refusing a mismatched identity"
             )
-        expected_scope = f"member:{member}"
-        if lease is not None and lease.scope != expected_scope:
-            raise TeamctlError(
-                f"authoritative write for member {member!r} requires lease"
-                f" scope {expected_scope!r}; refusing lease scope {lease.scope!r}"
-            )
         if confirm_command_id is not None and lease is None:
             raise TeamctlError(
                 "confirming an external action and its member state requires"
                 " the operation's leader lease"
             )
         self._ensure_ready()
+        project_id = self.ensure_project()
+        expected_scope = _leader.project_scope(project_id)
+        if lease is not None and lease.scope != expected_scope:
+            raise TeamctlError(
+                f"authoritative write for member {member!r} requires project"
+                f" lease scope {expected_scope!r}; refusing lease scope {lease.scope!r}"
+            )
         conn = self._connect()
         try:
-            scope = f"member:{member}"
             with _adapter.storage.transaction(conn):
                 if lease is not None:
-                    _leader.require_lease(conn, lease)
+                    _leader.require_project_lease(conn, lease, project_id)
                     if confirm_command_id is not None:
                         _adapter.stage_confirm(
                             conn, confirm_command_id, lease=lease,
@@ -400,9 +418,9 @@ class StateStore:
                         )
                     _adapter.sync_state(conn, state)
                     return
-                live = _leader.current_lease(conn, scope)
+                live = _leader.current_lease(conn, expected_scope)
                 admitted = _leader.acquire_or_renew(
-                    conn, scope, self._holder_id, ttl_seconds=30,
+                    conn, expected_scope, self._holder_id, ttl_seconds=30,
                 )
                 _adapter.sync_state(conn, state)
                 if live is None or live.holder_id != self._holder_id:
@@ -410,8 +428,8 @@ class StateStore:
                                    epoch=admitted.epoch)
         except _leader.LeaderBusyError as exc:
             raise TeamctlError(
-                f"another teamctl operation holds the leader lease for member"
-                f" {member} (holder {exc.holder_id}, epoch {exc.epoch},"
+                f"another teamcraft operation holds the project leader lease"
+                f" for {self.project_root} (holder {exc.holder_id}, epoch {exc.epoch},"
                 f" expires {exc.expires_at}); wait for it to finish or expire"
                 " before retrying"
             ) from exc
@@ -462,17 +480,29 @@ class StateStore:
 
     # ----------------------------------------------------------- leases
 
+    def ensure_project(self) -> str:
+        """Provision/reuse this root's Project row before taking its lease."""
+        self._ensure_ready()
+        conn = self._connect()
+        try:
+            return _adapter.ensure_project(conn, str(self.project_root))
+        finally:
+            conn.close()
+
     def acquire_lease(self, name: str, ttl_seconds: int) -> _leader.Lease:
+        # The first CLI operation must establish the project identity before
+        # it can contend with the Scheduler on the shared project scope.
+        project_id = self.ensure_project()
         conn = self._connect()
         try:
             return _leader.acquire_or_renew(
-                conn, f"member:{name}", self._holder_id,
+                conn, _leader.project_scope(project_id), self._holder_id,
                 ttl_seconds=int(ttl_seconds),
             )
         except _leader.LeaderBusyError as exc:
             raise TeamctlError(
-                f"another teamctl operation holds the leader lease for member"
-                f" {name} (holder {exc.holder_id}, epoch {exc.epoch},"
+                f"another teamcraft operation holds the project leader lease"
+                f" for {self.project_root} (holder {exc.holder_id}, epoch {exc.epoch},"
                 f" expires {exc.expires_at}); wait for it to finish or expire"
                 " before retrying"
             ) from exc
@@ -530,6 +560,34 @@ class StateStore:
         conn = self._connect()
         try:
             return _adapter.stage_unknown(conn, command_id, note=note)
+        finally:
+            conn.close()
+
+    def admit_effect(self, command_id: str, *, lease: _leader.Lease) -> None:
+        """Revalidate shared project authority immediately before Herdr I/O.
+
+        The durable stage claim and this read are separate committed steps;
+        this method never keeps a SQLite transaction open over the effect.
+        Once the external call starts, lease fencing cannot cancel it and
+        cannot provide exactly-once effects. A lost response still requires
+        UNKNOWN/reconciliation.
+        """
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("project disappeared after stage claim; refusing Herdr effect")
+            _leader.require_project_lease(conn, lease, project_id)
+        except _leader.StaleLeaderError as exc:
+            self.stage_unknown(
+                command_id,
+                note=f"project lease lost after durable claim and before Herdr admission: {exc}",
+            )
+            raise TeamctlError(
+                "project Leader lease was lost after the durable claim; the Herdr"
+                " call was not invoked by this executor, and the Command is UNKNOWN"
+                " for reconciliation"
+            ) from exc
         finally:
             conn.close()
 
@@ -880,7 +938,10 @@ def split_for_member(
             member["name"], _adapter.STAGE_SPLIT, lease=lease,
             payload={"argv": split_args, "direction": direction},
         )
+        _admit_effect(store, command.id, lease)
         try:
+            # Herdr is outside SQLite. A takeover after admission cannot
+            # cancel an already in-flight split; its result is not exactly-once.
             pane = _herdr_adapter().split_pane(
                 parent_id, direction, member["cwd"], extra=split_args[9:],
             )
@@ -937,7 +998,10 @@ def start_member(
         command = store.stage_claim(
             name, _adapter.STAGE_START, lease=lease, payload={"argv": args},
         )
+        _admit_effect(store, command.id, lease)
         try:
+            # Lease admission is immediately before I/O, but cannot revoke an
+            # external start already in flight or make it exactly-once.
             _herdr_adapter().start_agent(
                 name, member["kind"], pane_id, member["start_timeout_ms"],
                 member.get("agent_args", []),
@@ -1007,7 +1071,10 @@ def prompt_member(
                 ).hexdigest(),
             },
         )
+        _admit_effect(store, command.id, lease)
         try:
+            # Herdr prompt delivery is external and cannot be cancelled once
+            # in flight; ambiguous results always remain UNKNOWN to reconcile.
             _herdr_adapter().prompt_agent(
                 name, prompt_text, wait=wait, timeout_ms=timeout_ms,
             )
@@ -1120,6 +1187,85 @@ def _launch_operation(args: argparse.Namespace) -> int:
         return 0
     finally:
         store.release_lease(lease)
+
+
+def launch_reserved(
+    store: StateStore,
+    session: dict[str, Any],
+    member: dict[str, Any],
+    *,
+    task_id: str,
+    attempt_id: str,
+    lease: _leader.Lease,
+    wait: bool = False,
+    timeout_ms: int = 120_000,
+) -> dict[str, Any]:
+    """Run one Scheduler-reserved Task/Attempt through the member lifecycle.
+
+    This caller-driven handoff consumes the IDs returned by Scheduler
+    dispatch. It never selects an Agent, acquires/releases a lease, or creates
+    a second Task/Attempt. Herdr effects remain outside SQLite transactions.
+    """
+    require_herdr()
+    if timeout_ms <= 0:
+        raise TeamctlError("--timeout-ms must be greater than zero")
+    project_id = store.ensure_project()
+    if lease.scope != _leader.project_scope(project_id):
+        raise TeamctlError("reserved Task launch requires the current project Leader lease")
+    conn = store._connect()
+    try:
+        _leader.require_project_lease(conn, lease, project_id)
+        task_record = _adapter.domain.get_task(conn, task_id)
+        attempt = _adapter.domain.get_attempt(conn, attempt_id)
+        if task_record.project_id != project_id:
+            raise TeamctlError("reserved Task belongs to a different project")
+        if attempt.task_id != task_id:
+            raise TeamctlError("reserved Attempt is not bound to the requested Task")
+        if task_record.status != "running" or attempt.status != "created":
+            raise TeamctlError(
+                "reserved launch requires a running Task and its unstarted created Attempt"
+            )
+        try:
+            task_ownership = json.loads(task_record.ownership_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TeamctlError("reserved Task has invalid ownership_json") from exc
+        if not isinstance(task_ownership, list) or any(
+            not isinstance(claim, str) for claim in task_ownership
+        ):
+            raise TeamctlError("reserved Task has invalid ownership_json")
+        normalized = normalize_ownership(task_ownership, bool(member.get("read_only")))
+        if normalized != task_ownership:
+            raise TeamctlError("reserved Task ownership is not canonical")
+    finally:
+        conn.close()
+
+    assigned = dict(member)
+    name = assigned.get("name")
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise TeamctlError("reserved member name must match [a-z][a-z0-9_-]{0,31}")
+    for field, requested in (("task_id", task_id), ("attempt_id", attempt_id)):
+        if assigned.get(field) not in (None, requested):
+            raise TeamctlError(f"member {field} does not match the reserved ID")
+        assigned[field] = requested
+    assigned["ownership"] = normalized
+    assigned["phase"] = "reserved"
+    assigned["pane_id"] = None
+    assigned["terminal_id"] = None
+    assigned["session_id"] = None
+    assigned["prompt_may_have_been_delivered"] = False
+    preflight_kind(str(assigned["kind"]))
+    ensure_live_name_available(name)
+
+    # Reservation/linkage is written under the same supplied project lease.
+    # RuntimeAdapter validates Task/Attempt identity inside that transaction.
+    with store.member_operation(name):
+        reserve_member(store, session, assigned, lease=lease)
+        assigned = split_for_member(assigned, store, session, lease=lease)
+        assigned = start_member(assigned, store, session, lease=lease)
+        assigned = prompt_member(
+            assigned, store, session, wait=wait, timeout_ms=timeout_ms, lease=lease,
+        )
+    return assigned
 
 
 def load_member_for_mutation(

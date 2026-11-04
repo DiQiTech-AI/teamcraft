@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from teamcraft import scheduler
+
 from test_compat_contract import (
     AGENT_SESSION,
     CHILD_PANE_ID,
@@ -116,6 +118,11 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(member["task_id"])
         self.assertIsNotNone(member["attempt_id"])
         self.assertIsNotNone(member["session_id"])
+        project_id = self.db("SELECT id FROM projects WHERE repo_path=?",
+                             (str(self.root_resolved),))[0][0]
+        self.assertIsNotNone(project_id)
+        rows = self.db("SELECT scope, state FROM leader_lease")
+        self.assertEqual(rows, [(teamctl._leader.project_scope(project_id), "released")])
 
     def test_effect_confirmation_rolls_back_with_member_state_write(self):
         double = HerdrDouble()
@@ -277,10 +284,11 @@ class SqliteRuntimeTests(unittest.TestCase):
     def test_foreign_lease_holder_blocks_launch_without_herdr_effect(self):
         # Provision the runtime first (a brand-new root has no database yet).
         self.store.read_unlocked()
+        project_id = self.store.ensure_project()
         conn = teamctl._adapter.connect_runtime(self.root_resolved)
         try:
             teamctl._adapter.leader.acquire_or_renew(
-                conn, "member:dev", "pid:rival", ttl_seconds=3600)
+                conn, teamctl._leader.project_scope(project_id), "pid:rival", ttl_seconds=3600)
         finally:
             conn.close()
         double = HerdrDouble()
@@ -289,6 +297,147 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertIn("leader lease", err)
         self.assertFalse(any(call[:2] == ["pane", "split"]
                             for call in double.calls))
+
+    def test_scheduler_and_one_shot_share_project_lease_both_orders(self):
+        # Acquire on a fresh root: this must create/reuse the Project before
+        # either executor derives its shared lease scope.
+        project_id = self.store.ensure_project()
+        self.assertEqual(self.db("SELECT COUNT(*) FROM projects WHERE repo_path=?",
+                                 (str(self.root_resolved),))[0][0], 1)
+        conn = self.store._connect()
+        try:
+            sched_first = scheduler.Scheduler(
+                conn, project_id, "scheduler:first", concurrency_limit=2,
+                ttl_seconds=60,
+            )
+            scheduler_lease = sched_first.acquire_or_renew()
+            with self.assertRaises(teamctl.TeamctlError):
+                self.store.acquire_lease("dev", 60)
+            sched_first.release()
+
+            cli_lease = self.store.acquire_lease("dev", 60)
+            sched_second = scheduler.Scheduler(
+                conn, project_id, "scheduler:second", concurrency_limit=2,
+                ttl_seconds=60,
+            )
+            with self.assertRaises(teamctl._leader.LeaderBusyError):
+                sched_second.acquire_or_renew()
+            self.store.release_lease(cli_lease)
+
+            other = teamctl._adapter.domain.create_project(
+                conn, "independent", str(self.root_resolved / "independent-project"),
+            )
+            other_lease = scheduler.Scheduler(
+                conn, other.id, "scheduler:other-project", concurrency_limit=1,
+                ttl_seconds=60,
+            ).acquire_or_renew()
+            self.assertNotEqual(other_lease.scope, scheduler_lease.scope)
+            teamctl._leader.release(conn, other_lease.scope, other_lease.holder_id,
+                                    epoch=other_lease.epoch)
+        finally:
+            conn.close()
+
+    def test_scheduler_lease_flows_through_member_helper_without_release(self):
+        member = make_member(
+            "dev", ["src/api/**"], pane_id=CHILD_PANE_ID,
+            phase="pane_created",
+        )
+        teamctl.reserve_member(self.store, self.session, member)
+        project_id = self.store.ensure_project()
+        conn = self.store._connect()
+        try:
+            service = scheduler.Scheduler(
+                conn, project_id, "scheduler:lifecycle", concurrency_limit=1,
+                ttl_seconds=120,
+            )
+            lease = service.acquire_or_renew()
+            with mock.patch.object(teamctl, "run_herdr", side_effect=HerdrDouble()):
+                result = teamctl.start_member(
+                    member, self.store, self.session, lease=lease,
+                )
+            self.assertEqual(result["phase"], "agent_started")
+            current = teamctl._leader.current_lease(conn, lease.scope)
+            self.assertIsNotNone(current)
+            self.assertEqual(current.epoch, lease.epoch)
+            scopes = self.db("SELECT scope FROM leader_lease")
+            self.assertEqual(scopes, [(lease.scope,)])
+            service.release()
+        finally:
+            conn.close()
+
+    def test_scheduler_reserved_attempt_runs_through_confirmed_member_lifecycle(self):
+        project_id = self.store.ensure_project()
+        conn = self.store._connect()
+        try:
+            task = teamctl._adapter.domain.create_task(
+                conn, project_id, "scheduler-owned task",
+                ownership_json='["src/scheduled/**"]',
+            )
+            task = teamctl._adapter.domain.apply_task_event(
+                conn, task.id, "dependencies_satisfied", expected_version=task.version,
+            )
+            service = scheduler.Scheduler(
+                conn, project_id, "scheduler:dispatch", concurrency_limit=1,
+                ttl_seconds=180,
+            )
+            reserved = service.tick()
+            self.assertEqual(len(reserved.attempts), 1)
+            attempt = reserved.attempts[0]
+            member = make_member("scheduled", ["src/scheduled/**"])
+            with mock.patch.object(teamctl, "run_herdr", side_effect=HerdrDouble()):
+                launched = teamctl.launch_reserved(
+                    self.store, self.session, member, task_id=task.id,
+                    attempt_id=attempt.id, lease=service.lease,
+                    wait=False, timeout_ms=1000,
+                )
+            self.assertEqual((launched["task_id"], launched["attempt_id"]),
+                             (task.id, attempt.id))
+            self.assertEqual(
+                self.db("SELECT COUNT(*) FROM tasks WHERE project_id=?", (project_id,))[0][0],
+                1,
+            )
+            self.assertEqual(
+                self.db("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,))[0][0],
+                1,
+            )
+            self.assertEqual(self.stage_states("pane.split", "scheduled"), ["confirmed"])
+            self.assertEqual(self.stage_states("agent.start", "scheduled"), ["confirmed"])
+            self.assertEqual(self.stage_states("agent.prompt", "scheduled"), ["confirmed"])
+            self.assertEqual(
+                teamctl._adapter.domain.get_attempt(conn, attempt.id).status, "active",
+            )
+            self.assertIsNotNone(teamctl._leader.current_lease(conn, service.lease.scope))
+            service.release()
+        finally:
+            conn.close()
+
+    def test_lease_takeover_after_stage_claim_blocks_herdr_effect(self):
+        self.store.ensure_project()
+        original_claim = teamctl.StateStore.stage_claim
+
+        def claim_then_takeover(store, name, stage, *, lease, payload):
+            command = original_claim(store, name, stage, lease=lease, payload=payload)
+            if stage == "pane.split":
+                conn = store._connect()
+                try:
+                    teamctl._leader.acquire_or_renew(
+                        conn, lease.scope, "pid:takeover", ttl_seconds=3600,
+                        clock=_FarClock(),
+                    )
+                finally:
+                    conn.close()
+            return command
+
+        double = HerdrDouble()
+        with mock.patch.object(teamctl.StateStore, "stage_claim", autospec=True,
+                               side_effect=claim_then_takeover), \
+                mock.patch.object(teamctl, "preflight_kind"), \
+                mock.patch.object(teamctl, "run_herdr", side_effect=double):
+            code, _out, err = self.launch(double)
+        self.assertEqual(code, 1)
+        self.assertIn("Herdr call was not invoked", err)
+        self.assertFalse(any(call[:2] == ["pane", "split"] for call in double.calls))
+        self.assertEqual(self.stage_states("pane.split"), ["unknown"])
 
     def test_stale_leader_success_never_commits_and_records_unknown(self):
         class SplitThenTakeover(HerdrDouble):
@@ -300,7 +449,7 @@ class SqliteRuntimeTests(unittest.TestCase):
                         self.store_ref.root_resolved)
                     try:
                         teamctl._adapter.leader.acquire_or_renew(
-                            conn, "member:dev", "pid:thief", ttl_seconds=60,
+                            conn, teamctl._leader.project_scope(teamctl._adapter.project_id_for_root(conn, str(self.store_ref.root_resolved))), "pid:thief", ttl_seconds=60,
                             clock=_FarClock())
                     finally:
                         conn.close()
@@ -329,7 +478,7 @@ class SqliteRuntimeTests(unittest.TestCase):
         conn = teamctl._adapter.connect_runtime(self.root_resolved)
         try:
             teamctl._adapter.leader.acquire_or_renew(
-                conn, "member:dev", "pid:thief", ttl_seconds=3600,
+                conn, teamctl._leader.project_scope(teamctl._adapter.project_id_for_root(conn, str(self.root_resolved))), "pid:thief", ttl_seconds=3600,
                 clock=_FarClock())
         finally:
             conn.close()
@@ -383,10 +532,17 @@ class SqliteRuntimeTests(unittest.TestCase):
                 self.store.write_unlocked(state, member="dev")
             state["members"]["dev"]["name"] = "dev"
         with self.subTest("lease scope mismatch"):
-            foreign = self.store.acquire_lease("other", 30)
+            conn = self.store._connect()
+            try:
+                foreign = teamctl._leader.acquire_or_renew(
+                    conn, teamctl._leader.project_scope("other-project"),
+                    "foreign", ttl_seconds=30,
+                )
+            finally:
+                conn.close()
             try:
                 with self.assertRaisesRegex(teamctl.TeamctlError,
-                                            "requires lease scope"):
+                                            "requires project lease scope"):
                     self.store.write_unlocked(state, member="dev", lease=foreign)
             finally:
                 self.store.release_lease(foreign)
@@ -424,7 +580,7 @@ class SqliteRuntimeTests(unittest.TestCase):
         conn = teamctl._adapter.connect_runtime(self.root_resolved)
         try:
             teamctl._adapter.leader.acquire_or_renew(
-                conn, "member:dev", "pid:rival", ttl_seconds=3600)
+                conn, teamctl._leader.project_scope(teamctl._adapter.project_id_for_root(conn, str(self.root_resolved))), "pid:rival", ttl_seconds=3600)
         finally:
             conn.close()
         double = HerdrDouble()

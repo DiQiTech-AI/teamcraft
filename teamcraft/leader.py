@@ -95,6 +95,30 @@ class Lease:
     expires_at: str
 
 
+def project_scope(project_id: str) -> str:
+    """Return the canonical Leader scope shared by every executor in a project."""
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValidationError("project_id must not be empty")
+    return f"project:{project_id}"
+
+
+def require_project_lease(
+    conn: TeamCraftConnection,
+    lease: Lease,
+    project_id: str,
+    *,
+    clock: Clock | None = None,
+) -> None:
+    """Fail closed unless a live lease fences the specified project."""
+    scope = project_scope(project_id)
+    if lease.scope != scope:
+        raise StaleLeaderError(
+            f"leader lease scope {lease.scope!r} does not match project scope {scope!r}",
+            scope=lease.scope, epoch=lease.epoch,
+        )
+    require_lease(conn, lease, clock=clock)
+
+
 def _now_iso(clock: Clock | None) -> str:
     source = clock if clock is not None else SystemClock()
     return source.now().astimezone(timezone.utc).isoformat()
