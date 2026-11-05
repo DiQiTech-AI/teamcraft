@@ -128,6 +128,9 @@ class CEOProtocolTests(unittest.TestCase):
                 raw.execute(f"DROP INDEX IF EXISTS {index}")
             for table in storage._V6_TABLES:
                 raw.execute(f"DROP TABLE IF EXISTS {table}")
+            task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
+            if "max_attempts" in task_columns:
+                raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
             raw.execute("DELETE FROM schema_migrations WHERE version >= 5")
             raw.execute("PRAGMA user_version = 4")
             raw.execute("INSERT INTO projects (id,name,repo_path,config_json,created_at) VALUES ('p','p','/p','{}','now')")

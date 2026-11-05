@@ -574,7 +574,7 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 
 ### 12.4 下一任务边界
 
-M1-05、M1-06、M1-07、M1-08、M2-02、M2-03 和 M2-04 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13、12.14 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。M2-05（Reconcile、超时与有界 Attempt）仍待推进；协议初始化 Runtime 仍在 M2-08。
+M1-05、M1-06、M1-07、M1-08、M2-02、M2-03、M2-04 和 M2-05 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13、12.14、12.15 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。协议初始化 Runtime 仍在 M2-08。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -673,3 +673,11 @@ Watcher 使用 caller-driven 低频 polling；校验 pane、terminal、native se
 **独立评审与验证**：DIQI CTO 对初版及修正后工作树进行只读技术评审；Prompt/Brief 漂移、真实 Herdr `agent_status` 映射、循环 activity 去重、空 acceptance synthetic milestone 等发现均已修复并加入回归，最终复评无剩余阻塞问题。Python 3.10.20 下 Core 全量 **330 tests OK**、Skill 全量 **64 tests OK**；还通过 M2 Watcher/Event 定向 **50 tests**、runtime SQLite **22 tests**、teamctl **20 tests**、Brief/WorkerReport 及 deadline 定向测试、`py_compile` 与 `git diff --check`。最终独立 Core/Skill 复跑结果一致。
 
 **CEO 验收结论：M2-03 与 M2-04 完成并关闭。** M2-04 使用 polling fallback；目前不具备已验证的订阅或可恢复事件 cursor，也不声称与订阅等价。默认 deadline 不设值；需由项目策略提供。Prompt acknowledgement 不可由当前 Herdr 证明。阈值升级/Task 状态转换、超时恢复、bounded retry 属 M2-05；Task Verification/Approval 属 M2-06。当前修改仅在本地工作树，未提交或推送。
+
+### 12.15 M2-05 Reconcile、超时与有界 Attempt（已完成并关闭）
+
+**当前实现**：Schema v7 为 Task 持久化 `max_attempts`（默认 3），创建 Attempt 时事务内强制上限；Scheduler 对上限耗尽且已无占位 Attempt 的 Task 写审计事件并升级 NEEDS_HUMAN。新增 Recovery API 与 `teamctl recovery-*` 命令，支持超时评估、Watcher 事件升级、wait/cancel/reconcile 持久 Command、核验后的取消、UNKNOWN 恢复/结算以及有界 retry 审批。超时不会自动停止或重试；UNKNOWN 始终占位；取消需要租约、命令 claim、停止前后 terminal/native-session 身份核验及原子结算。schema 完整性门禁检查 `max_attempts` 类型、NOT NULL、默认值与 CHECK 约束。Runtime 同步已移除按成员 phase 自动把 UNKNOWN 结算为 finished 的旧路径。
+
+**独立评审与验证**：DIQI CTO 多轮只读复核发现并协助定位取消 UNKNOWN 结算、并发重复 stop、未核验 Command 即 claim、Brief 固定版本与 Task 升级冲突，以及不同幂等键并发创建取消命令等问题；均已修复。最终 stop admission 重新校验 Command kind/state、payload/evidence 中 task_id/attempt_id/attempt_no/task_version 的一致性、当前 Task 版本及项目归属、Attempt 占位状态和项目租约；`project_id` 从 evidence.task_id 关联 Tasks 推导。确定未调用 stop 的准入拒绝会记录无副作用结果，不误标 UNKNOWN。DIQI 最终只读复审结论：无阻塞。Python 3.13.11 下定向 Recovery/Schema/Scheduler **19 tests OK**、teamctl **22 tests OK**、Core 全量 **340 tests OK**、Skill 全量 **66 tests OK**；`compileall` 与 `git diff --check` 通过。
+
+**CEO 验收结论：M2-05 完成并关闭。** Timeout 只触发审计与升级，不会自动停止或重试；UNKNOWN Attempt 保持占位，只有经核验、审批的 retry 才能创建新 Attempt。取消在副作用前再次校验 Command、任务版本、Attempt 占位和项目租约，只有确认 stop 及原子结算成功后才结束 Attempt。本次验收未提交或推送。

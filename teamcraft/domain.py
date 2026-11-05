@@ -177,6 +177,10 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("ready", "dispatch_reserved"): ("running",),
     ("running", "worker_reported_done"): ("verifying",),
     ("running", "runtime_unknown"): ("needs_human", "blocked"),
+    ("running", "recovery_escalated"): ("needs_human",),
+    ("running", "attempts_exhausted"): ("needs_human",),
+    ("running", "retry_approved"): ("ready",),
+    ("ready", "attempts_exhausted"): ("needs_human",),
     ("verifying", "verification_passed"): ("ready_to_merge",),
     ("verifying", "verification_failed"): ("blocked", "ready"),
     ("ready_to_merge", "approved_and_delivered"): ("done",),
@@ -220,8 +224,11 @@ _ATTEMPT_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("active", "finish"): ("finished",),
     ("active", "fail"): ("failed",),
     ("active", "runtime_lost"): ("unknown",),
+    ("active", "cancel_confirmed"): ("cancelled",),
+    ("unknown", "reconciled_active"): ("active",),
     ("unknown", "reconciled_finished"): ("finished",),
     ("unknown", "reconciled_failed"): ("failed",),
+    ("unknown", "reconciled_cancelled"): ("cancelled",),
 }
 
 
@@ -282,6 +289,7 @@ class Task:
     status: str
     risk: str
     ownership_json: str
+    max_attempts: int
     version: int
     created_at: str
     updated_at: str
@@ -387,7 +395,7 @@ def _row_to(row: Any, columns: tuple[str, ...]) -> dict[str, Any]:
 
 _TASK_COLUMNS = (
     "id", "project_id", "title", "description", "acceptance_json", "kind",
-    "priority", "status", "risk", "ownership_json", "version", "created_at",
+    "priority", "status", "risk", "ownership_json", "max_attempts", "version", "created_at",
     "updated_at",
 )
 _ATTEMPT_COLUMNS = (
@@ -698,6 +706,7 @@ def create_task(
     acceptance_json: str = "[]",
     ownership_json: str = "[]",
     risk: str = "normal",
+    max_attempts: int = 3,
     id_factory: IdFactory | None = None,
     clock: Clock | None = None,
 ) -> Task:
@@ -706,6 +715,7 @@ def create_task(
     require_head(conn)
     project_id = require_entity_id(project_id)
     _require(bool(title.strip()), "task title must not be blank")
+    _require(isinstance(max_attempts, int) and not isinstance(max_attempts, bool) and max_attempts >= 1, "max_attempts must be an integer >= 1")
     _require(kind in TASK_KINDS, f"kind must be one of {TASK_KINDS}, got {kind!r}")
     _require(
         isinstance(priority, int)
@@ -722,10 +732,10 @@ def create_task(
         try:
             conn.execute(
                 "INSERT INTO tasks (id, project_id, title, description, acceptance_json,"
-                " kind, priority, status, risk, ownership_json, version, created_at,"
-                " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, ?, ?)",
+                " kind, priority, status, risk, ownership_json, max_attempts, version, created_at,"
+                " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?)",
                 (tid, project_id, title, description, acceptance_json, kind, priority,
-                 risk, ownership_json, now, now),
+                 risk, ownership_json, max_attempts, now, now),
             )
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"task insert violated integrity: {tid}") from exc
@@ -1194,6 +1204,8 @@ def create_attempt(
                 found=task.version,
             )
         _require_deps_done(conn, task, "dispatch_reserved")
+        if int(conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task_id,)).fetchone()[0]) >= task.max_attempts:
+            raise IllegalTransitionError("MAX_ATTEMPTS", entity="task", current=task.status, event="dispatch_reserved", reason_code="MAX_ATTEMPTS")
         attempt_no = int(
             conn.execute(
                 "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM attempts WHERE task_id = ?",

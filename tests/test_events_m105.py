@@ -75,6 +75,13 @@ def _shed_v5_protocol_artifacts(conn) -> None:
         if column in columns:
             conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
 
+
+def _shed_v7_max_attempts(conn) -> None:
+    """Remove the v7-only Task column in fixtures claiming schema v1-v6."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "max_attempts" in columns:
+        conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
+
 class FixedClock:
     """Deterministic injectable UTC clock."""
 
@@ -231,6 +238,7 @@ class EventStoreM105Tests(unittest.TestCase):
     def test_event_store_refuses_lagging_schema(self) -> None:
         raw = sqlite3.connect(str(self.db))
         _shed_v5_protocol_artifacts(raw)
+        _shed_v7_max_attempts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")
@@ -1130,6 +1138,7 @@ class CommandServiceM105Tests(unittest.TestCase):
     def test_command_service_refuses_lagging_schema(self) -> None:
         raw = sqlite3.connect(str(self.db))
         _shed_v5_protocol_artifacts(raw)
+        _shed_v7_max_attempts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")

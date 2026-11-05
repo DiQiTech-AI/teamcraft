@@ -59,6 +59,7 @@ def _bootstrap_core() -> None:
 _bootstrap_core()
 
 from teamcraft import leader as _leader  # noqa: E402
+from teamcraft import recovery as _recovery  # noqa: E402
 from teamcraft import runtime_adapter as _adapter  # noqa: E402
 from teamcraft.herdr_adapter import HerdrAdapter, HerdrError  # noqa: E402
 
@@ -1628,6 +1629,302 @@ def finish_member(args: argparse.Namespace) -> int:
         return _finish_member_operation(args)
 
 
+def _recovery_lease(store: StateStore) -> _leader.Lease:
+    """Recovery uses the project fence, never a member-local authority."""
+    return store.acquire_lease("recovery", 60)
+
+
+def _native_session(member: dict[str, Any]) -> str | None:
+    value = member.get("agent_session")
+    if isinstance(value, dict) and isinstance(value.get("value"), str):
+        return value["value"]
+    return value if isinstance(value, str) and value else None
+
+
+def _stop_evidence(member: dict[str, Any], *, require_live_agent: bool) -> dict[str, Any]:
+    """Inspect the recorded occupant, failing closed on any identity ambiguity."""
+    pane, agent = verify_recorded_occupant(member)
+    native, terminal = _native_session(member), member.get("terminal_id")
+    if not isinstance(terminal, str) or not terminal or not native:
+        raise TeamctlError("recorded terminal/native session identity is incomplete")
+    if require_live_agent and agent is None:
+        raise TeamctlError("recorded Agent is not live; refusing stop without a verified target")
+    if not require_live_agent and agent is not None:
+        raise TeamctlError("Agent still appears live after stop; cancellation remains UNKNOWN")
+    if not pane:
+        raise TeamctlError("recorded pane is unavailable; cancellation remains UNKNOWN")
+    return {"identity_verified": True, "process_alive": bool(agent),
+            "pane_id": pane.get("pane_id"), "terminal_id": terminal,
+            "native_session_id": native}
+
+
+def _live_reconcile_evidence(member: dict[str, Any]) -> dict[str, Any]:
+    """Prove that the same recorded native session is still live after UNKNOWN."""
+    pane, agent = verify_recorded_occupant(member)
+    native, terminal = _native_session(member), member.get("terminal_id")
+    if not pane or not agent or not native or not isinstance(terminal, str) or not terminal:
+        raise TeamctlError("live recovery requires a verified pane, terminal, and native Agent session")
+    return {"identity_verified": True, "process_alive": True,
+            "pane_id": pane.get("pane_id"), "terminal_id": terminal,
+            "native_session_id": native}
+
+
+def _claim_recovery(store: StateStore, command_id: str, lease: _leader.Lease) -> Any:
+    conn = store._connect()
+    try:
+        row = conn.execute("SELECT state FROM commands WHERE id = ?", (command_id,)).fetchone()
+        if row is None:
+            raise TeamctlError("recovery command was not found")
+        if str(row[0]) != "pending":
+            raise TeamctlError(f"recovery command is {row[0]!r} and cannot be claimed")
+        claimed = _adapter.claim_recovery_action(conn, command_id, lease=lease)
+        if claimed.state != "running":
+            raise TeamctlError("recovery Command claim did not produce a running claim")
+        return claimed
+    finally:
+        conn.close()
+
+
+def _unknown_recovery(store: StateStore, command_id: str, note: str) -> None:
+    conn = store._connect()
+    try:
+        _adapter.unknown_recovery_action(conn, command_id, note=note)
+    finally:
+        conn.close()
+
+
+def _admit_recovery_effect(store: StateStore, command_id: str, lease: _leader.Lease) -> None:
+    """Revalidate the complete cancellation binding at the stop admission point."""
+    conn = store._connect()
+    try:
+        # Keep persisted Command/Task/Attempt facts and the lease check in one
+        # immediate transaction, directly adjacent to the external stop call.
+        with _adapter.storage.transaction(conn):
+            row = conn.execute(
+                "SELECT kind, state, payload_json, evidence_json FROM commands WHERE id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None:
+                raise TeamctlError("recovery command disappeared before stop admission")
+            if str(row[0]) != "recovery.cancel" or str(row[1]) != "running":
+                raise TeamctlError("stop admission requires a running recovery.cancel Command")
+            try:
+                payload, evidence = json.loads(str(row[2])), json.loads(str(row[3]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise TeamctlError("recovery command has invalid Task/Attempt evidence") from exc
+            if not isinstance(payload, dict) or not isinstance(evidence, dict):
+                raise TeamctlError("recovery Command payload/evidence must be objects")
+            keys = ("task_id", "attempt_id", "attempt_no", "task_version")
+            if any(payload.get(key) != evidence.get(key) for key in keys):
+                raise TeamctlError("recovery Command payload/evidence bindings differ")
+            task_id, attempt_id = payload.get("task_id"), payload.get("attempt_id")
+            attempt_no, task_version = payload.get("attempt_no"), payload.get("task_version")
+            if (not isinstance(task_id, str) or not isinstance(attempt_id, str)
+                    or not isinstance(attempt_no, int) or isinstance(attempt_no, bool)
+                    or not isinstance(task_version, int) or isinstance(task_version, bool)):
+                raise TeamctlError("recovery Command lacks complete Task/Attempt/version binding")
+            task = _adapter.domain.get_task(conn, task_id)
+            attempt = _adapter.domain.get_attempt(conn, attempt_id)
+            project_id = _adapter.project_id_for_root(conn, str(store.project_root))
+            if project_id is None or task.project_id != project_id:
+                raise TeamctlError("recovery Task does not belong to this project")
+            if task.version != task_version:
+                raise TeamctlError("recovery Task version changed before stop admission")
+            if attempt.task_id != task.id or attempt.attempt_no != attempt_no:
+                raise TeamctlError("recovery Command Task/Attempt binding does not match persisted state")
+            if attempt.status not in _adapter.domain.OCCUPYING_ATTEMPT_STATUSES:
+                raise TeamctlError("recovery Attempt is no longer occupying; stop is not admitted")
+            _leader.require_project_lease(conn, lease, project_id)
+    finally:
+        conn.close()
+
+
+def _expire_uninvoked_recovery(store: StateStore, command_id: str,
+                               lease: _leader.Lease, reason: str) -> None:
+    """Record certain pre-effect rejection as expired, never as UNKNOWN."""
+    detail = reason.encode("utf-8")[:700].decode("utf-8", errors="ignore")
+    conn = store._connect()
+    try:
+        _adapter.stage_reconcile(
+            conn, command_id, lease=lease, resolved_ok=False,
+            note=f"stop was not invoked: {detail}",
+            evidence={"effect_invoked": False, "admission_rejected": True},
+        )
+    finally:
+        conn.close()
+
+
+def recovery_request(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        command = _recovery.request_action(conn, task_id=args.task_id, attempt_id=args.attempt_id,
+            action=args.action, actor=args.actor, reason=args.reason,
+            idempotency_key=args.idempotency_key)
+    finally:
+        conn.close()
+    print(json.dumps({"command_id": command.id, "state": command.state, "kind": command.kind}, sort_keys=True))
+    return 0
+
+
+def recovery_timeout(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = _recovery_lease(store)
+    try:
+        conn = store._connect()
+        try:
+            decision = _recovery.evaluate_attempt(conn, args.attempt_id)
+            if decision.action == "escalate":
+                task = _recovery.escalate_threshold(conn, args.attempt_id, args.trigger_event_id,
+                    reason=decision.reason, lease=lease)
+                result: dict[str, Any] = {"decision": decision.action, "reason": decision.reason,
+                                          "task_id": task.id, "task_status": task.status, "task_version": task.version}
+            else:
+                result = {"decision": decision.action, "reason": decision.reason, "attempt_id": decision.attempt_id}
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def recovery_cancel(args: argparse.Namespace) -> int:
+    require_herdr()
+    root = resolve_project_root(args.cwd)
+    store, _, _, member = load_member_for_mutation(root, args.name)
+    if not member.get("task_id") or not member.get("attempt_id"):
+        raise TeamctlError("member has no Task/Attempt recovery binding")
+    lease = _recovery_lease(store)
+    command_id: str | None = None
+    try:
+        conn = store._connect()
+        try:
+            command = _recovery.request_action(conn, task_id=member["task_id"], attempt_id=member["attempt_id"],
+                action="cancel", actor=args.actor, reason=args.reason, idempotency_key=args.idempotency_key)
+            command_id = command.id
+        finally:
+            conn.close()
+        if command.state == "confirmed":
+            result = json.loads(command.result_json or "{}")
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if command.state != "pending":
+            raise TeamctlError(f"recovery Command is {command.state}; inspect/reconcile before another stop")
+        _claim_recovery(store, command_id, lease)
+        try:
+            _stop_evidence(member, require_live_agent=True)  # verify immediately before effect
+            _admit_recovery_effect(store, command_id, lease)
+        except Exception as exc:
+            try:
+                _expire_uninvoked_recovery(store, command_id, lease, str(exc))
+            except Exception as settle_exc:
+                # The effect is certainly absent; if the lease was lost, the
+                # stale holder cannot settle the Command. Leave it RUNNING for
+                # a later fenced reconciliation, and do not mislabel it UNKNOWN.
+                raise TeamctlError(
+                    "stop was not invoked; recovery Command remains RUNNING "
+                    "because its lease could not record the no-effect outcome"
+                ) from settle_exc
+            raise TeamctlError("stop was not invoked; recovery Command is EXPIRED after admission rejection") from exc
+        try:
+            _herdr_adapter().stop_agent(member["name"])
+        except Exception as exc:
+            _unknown_recovery(store, command_id, f"stop outcome ambiguous: {exc}")
+            raise TeamctlError("stop outcome is UNKNOWN; inspect/reconcile and do not retry") from exc
+        try:
+            evidence = _stop_evidence(member, require_live_agent=False)  # re-verify after effect
+        except TeamctlError as exc:
+            _unknown_recovery(store, command_id, str(exc))
+            raise
+        conn = store._connect()
+        try:
+            try:
+                task = _recovery.confirm_cancellation(conn, member["attempt_id"], command_id=command_id,
+                    lease=lease, evidence=evidence)
+            except Exception as exc:
+                _unknown_recovery(store, command_id, f"stop observed but durable cancellation commit failed: {exc}")
+                raise TeamctlError("stop was observed but durable cancellation is UNKNOWN; reconcile before retry") from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({"task_id": task.id, "task_status": task.status, "task_version": task.version, "command_id": command_id}, sort_keys=True))
+    return 0
+
+
+def recovery_reconcile(args: argparse.Namespace) -> int:
+    root = resolve_project_root(args.cwd)
+    store, _, _, member = load_member_for_mutation(root, args.name)
+    if not member.get("attempt_id"):
+        raise TeamctlError("member has no Attempt recovery binding")
+    lease = _recovery_lease(store)
+    try:
+        conn = store._connect()
+        try:
+            command = _recovery.commands.get_command(conn, args.command_id)
+            if command.kind not in {"recovery.reconcile", "recovery.cancel"}:
+                raise TeamctlError("Command kind is not recovery.reconcile or recovery.cancel")
+            try:
+                payload = json.loads(command.payload_json)
+                command_evidence = json.loads(command.evidence_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise TeamctlError("recovery Command payload/evidence is malformed") from exc
+            if not isinstance(payload, dict) or not isinstance(command_evidence, dict):
+                raise TeamctlError("recovery Command payload/evidence must be objects")
+            task_id, attempt_id = member.get("task_id"), member.get("attempt_id")
+            if (not task_id or payload.get("task_id") != task_id or payload.get("attempt_id") != attempt_id
+                    or command_evidence.get("task_id") != task_id):
+                raise TeamctlError("recovery Command is not bound to this member Task/Attempt")
+            task = _adapter.domain.get_task(conn, task_id)
+            attempt = _adapter.domain.get_attempt(conn, attempt_id)
+            project_id = _adapter.project_id_for_root(conn, str(store.project_root))
+            if (payload.get("attempt_no") != attempt.attempt_no
+                    or command_evidence.get("attempt_no") != attempt.attempt_no
+                    or attempt.task_id != task.id or project_id != task.project_id):
+                raise TeamctlError("recovery Command Task/Attempt/project identity does not match persisted state")
+            if (command_evidence.get("attempt_id") != attempt.id
+                    or command_evidence.get("task_id") != task.id
+                    or command_evidence.get("task_version") != payload.get("task_version")):
+                raise TeamctlError("recovery Command evidence envelope does not match payload Attempt/version")
+            if command.state != "confirmed" and payload.get("task_version") != task.version:
+                raise TeamctlError("recovery Command Task version is stale")
+        finally:
+            conn.close()
+        if command.state == "pending":
+            _claim_recovery(store, args.command_id, lease)
+        elif command.state not in {"running", "unknown", "confirmed"}:
+            raise TeamctlError(f"reconcile Command is {command.state}; refusing recovery")
+        evidence = (_live_reconcile_evidence(member) if args.resolution == "active"
+                    else _stop_evidence(member, require_live_agent=False))
+        conn = store._connect()
+        try:
+            attempt = _recovery.resolve_unknown(conn, member["attempt_id"], command_id=args.command_id,
+                lease=lease, resolution=args.resolution, evidence=evidence, actor=args.actor, reason=args.reason)
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({"attempt_id": attempt.id, "attempt_status": attempt.status}, sort_keys=True))
+    return 0
+
+
+def recovery_retry(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = _recovery_lease(store)
+    try:
+        conn = store._connect()
+        try:
+            task = _recovery.approve_retry(conn, args.task_id, actor=args.actor, reason=args.reason,
+                idempotency_key=args.idempotency_key, lease=lease)
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({"task_id": task.id, "task_status": task.status, "task_version": task.version}, sort_keys=True))
+    return 0
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -1681,6 +1978,48 @@ def build_parser() -> argparse.ArgumentParser:
             help="release ownership despite a verified working, blocked, or unknown state",
         )
         finish_parser.set_defaults(handler=finish_member)
+
+    recovery_request_parser = commands.add_parser("recovery-request")
+    add_cwd(recovery_request_parser)
+    recovery_request_parser.add_argument("--task-id", required=True)
+    recovery_request_parser.add_argument("--attempt-id")
+    recovery_request_parser.add_argument("--action", required=True, choices=("wait", "cancel", "reconcile"))
+    recovery_request_parser.add_argument("--actor", required=True)
+    recovery_request_parser.add_argument("--reason", required=True)
+    recovery_request_parser.add_argument("--idempotency-key", required=True)
+    recovery_request_parser.set_defaults(handler=recovery_request)
+
+    timeout_parser = commands.add_parser("recovery-timeout")
+    add_cwd(timeout_parser)
+    timeout_parser.add_argument("--attempt-id", required=True)
+    timeout_parser.add_argument("--trigger-event-id", required=True,
+        help="existing watch.no_progress_threshold or watch.deadline_exceeded event; this is an explicit escalation request")
+    timeout_parser.set_defaults(handler=recovery_timeout)
+
+    cancel_parser = commands.add_parser("recovery-cancel")
+    cancel_parser.add_argument("name")
+    add_cwd(cancel_parser)
+    cancel_parser.add_argument("--actor", required=True)
+    cancel_parser.add_argument("--reason", required=True)
+    cancel_parser.add_argument("--idempotency-key", required=True)
+    cancel_parser.set_defaults(handler=recovery_cancel)
+
+    reconcile_parser = commands.add_parser("recovery-reconcile")
+    reconcile_parser.add_argument("name")
+    add_cwd(reconcile_parser)
+    reconcile_parser.add_argument("--command-id", required=True)
+    reconcile_parser.add_argument("--resolution", required=True, choices=("active", "finished", "failed", "cancelled"))
+    reconcile_parser.add_argument("--actor", required=True)
+    reconcile_parser.add_argument("--reason", required=True)
+    reconcile_parser.set_defaults(handler=recovery_reconcile)
+
+    retry_parser = commands.add_parser("recovery-retry")
+    add_cwd(retry_parser)
+    retry_parser.add_argument("--task-id", required=True)
+    retry_parser.add_argument("--actor", required=True)
+    retry_parser.add_argument("--reason", required=True)
+    retry_parser.add_argument("--idempotency-key", required=True)
+    retry_parser.set_defaults(handler=recovery_retry)
     return parser
 
 

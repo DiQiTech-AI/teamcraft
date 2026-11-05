@@ -1,0 +1,47 @@
+"""M2-05 schema v6 to v7 migration and head validation."""
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from teamcraft import storage
+
+
+class SchemaV7Tests(unittest.TestCase):
+    def test_v6_rows_receive_default_and_v7_constraint_is_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "db.sqlite"
+            storage.migrate_to_head(path)
+            raw = sqlite3.connect(path)
+            raw.execute("INSERT INTO projects(id,name,repo_path,created_at) VALUES('p','p','/p','now')")
+            raw.execute("INSERT INTO tasks(id,project_id,title,status,created_at,updated_at) VALUES('t','p','t','pending','now','now')")
+            raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
+            raw.execute("DELETE FROM schema_migrations WHERE version=7")
+            raw.execute("PRAGMA user_version=6")
+            raw.commit(); raw.close()
+            storage.migrate_to_head(path)
+            conn = storage.connect(path)
+            try:
+                self.assertEqual(conn.execute("SELECT max_attempts FROM tasks WHERE id='t'").fetchone()[0], 3)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with storage.transaction(conn):
+                        conn.execute("UPDATE tasks SET max_attempts=0 WHERE id='t'")
+            finally:
+                conn.close()
+
+    def test_malformed_v7_missing_check_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "db.sqlite"
+            storage.migrate_to_head(path)
+            raw = sqlite3.connect(path)
+            ddl = raw.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()[0]
+            raw.execute("PRAGMA writable_schema=ON")
+            raw.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name='tasks'", (ddl.replace(' CHECK (max_attempts >= 1)', ''),))
+            raw.execute("PRAGMA writable_schema=OFF")
+            raw.commit(); raw.close()
+            report = storage.verify_database(path)
+            self.assertFalse(report["schema_usable"])
+            self.assertIn("tasks.max_attempts:check", report["missing_head_columns"])
+
+
+if __name__ == "__main__": unittest.main()

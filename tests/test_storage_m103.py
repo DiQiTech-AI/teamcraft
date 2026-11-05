@@ -185,6 +185,9 @@ def _shed_v6_m203_artifacts(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP INDEX IF EXISTS {index}")
     for table in storage._V6_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "max_attempts" in task_columns:
+        conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
 # P-fixes 10: backup_database/restore_backup are live public API again —
 # copies happen in a private 0700 staging file, are verified there, and the

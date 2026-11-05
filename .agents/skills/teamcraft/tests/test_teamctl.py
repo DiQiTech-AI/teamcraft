@@ -214,6 +214,28 @@ class TeamctlTests(unittest.TestCase):
         herdr.assert_not_called()
         self.assertIn("--split-action retry", json.loads(output.getvalue())["next_action_required"])
 
+    def test_recovery_reconcile_refuses_unrelated_command_before_claim(self):
+        member = {"name": "worker", "task_id": "task-1", "attempt_id": "attempt-1"}
+        lease = object()
+        store = mock.Mock()
+        command = mock.Mock(kind="task.pause", payload_json="{}", evidence_json="{}", state="pending")
+        args = argparse.Namespace(cwd=str(self.root), name="worker", command_id="unrelated",
+                                  resolution="active", actor="human", reason="inspect")
+        with mock.patch.object(teamctl, "load_member_for_mutation", return_value=(store, None, None, member)), \
+             mock.patch.object(teamctl, "_recovery_lease", return_value=lease), \
+             mock.patch.object(teamctl, "_claim_recovery") as claim, \
+             mock.patch.object(teamctl._recovery.commands, "get_command", return_value=command), \
+             mock.patch.object(teamctl, "resolve_project_root", return_value=self.root):
+            with self.assertRaisesRegex(teamctl.TeamctlError, "Command kind"):
+                teamctl.recovery_reconcile(args)
+        claim.assert_not_called()
+        store.release_lease.assert_called_once_with(lease)
+
+    def test_recovery_cli_required_arguments_are_parse_errors(self):
+        with self.assertRaises(SystemExit) as exc:
+            teamctl.main(["recovery-reconcile", "worker"])
+        self.assertEqual(exc.exception.code, 2)
+
     def test_ambiguous_prompt_is_not_resent_on_default_resume(self):
         agent_session = {"value": "same"}
         teamctl.reserve_member(

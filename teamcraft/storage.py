@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns to attempts and guards their pin with triggers.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -452,6 +452,9 @@ CREATE TABLE worker_reports (
 )""",
     "CREATE INDEX idx_prompt_deliveries_attempt ON prompt_deliveries(attempt_id, state)",
 )
+_V7_TABLES = frozenset()
+_V7_STATEMENTS = ("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1)",)
+_V7_COLUMNS = {"tasks": frozenset({"max_attempts"})}
 
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
@@ -463,6 +466,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (4, _V4_STATEMENTS),
     (5, _V5_STATEMENTS),
     (6, _V6_STATEMENTS),
+    (7, _V7_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -475,6 +479,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     4: _V4_TABLES,
     5: _V5_TABLES,
     6: _V6_TABLES,
+    7: _V7_TABLES,
 }
 
 
@@ -556,6 +561,32 @@ def _required_objects_for(version: int) -> tuple[frozenset[str], frozenset[str]]
             triggers = triggers | step_triggers
             indexes = indexes | step_indexes
     return triggers, indexes
+
+
+def _required_columns_for(version: int) -> dict[str, frozenset[str]]:
+    """Required additive columns for an audited schema version."""
+    return {table: columns for step, mapping in ((7, _V7_COLUMNS),)
+            if step <= version for table, columns in mapping.items()}
+
+
+def _missing_required_columns(conn: sqlite3.Connection, version: int) -> tuple[str, ...]:
+    missing: list[str] = []
+    for table, required in _required_columns_for(version).items():
+        rows = {str(row[1]): row for row in conn.execute(f"PRAGMA table_info({table})")}
+        missing.extend(f"{table}.{column}" for column in sorted(required - set(rows)))
+        if table == "tasks" and "max_attempts" in rows:
+            column = rows["max_attempts"]
+            if str(column[2]).upper() != "INTEGER":
+                missing.append("tasks.max_attempts:type")
+            if int(column[3]) != 1:
+                missing.append("tasks.max_attempts:not_null")
+            if str(column[4]).strip("'\"") != "3":
+                missing.append("tasks.max_attempts:default")
+            ddl_row = conn.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='tasks'").fetchone()
+            ddl = "" if ddl_row is None or ddl_row[0] is None else str(ddl_row[0])
+            if not re.search(r"CHECK\s*\(\s*[`\"\[]?max_attempts[`\"\]]?\s*>=\s*1\s*\)", ddl, re.IGNORECASE):
+                missing.append("tasks.max_attempts:check")
+    return tuple(missing)
 
 
 def _head_objects() -> tuple[frozenset[str], frozenset[str]]:
@@ -1155,6 +1186,13 @@ def _assert_schema_consistent(conn: sqlite3.Connection, stage: str) -> None:
         raise StorageError(
             f"schema is incomplete for ordinary writes at version {version}, "
             f"missing tables: {sorted(missing)}; run "
+            f"teamcraft.migrate_to_head() ({stage})"
+        )
+    missing_columns = _missing_required_columns(conn, version)
+    if missing_columns:
+        raise StorageError(
+            f"schema is incomplete for ordinary writes at version {version}, "
+            f"missing columns: {list(missing_columns)}; run "
             f"teamcraft.migrate_to_head() ({stage})"
         )
     # CEO review M1-05 P1: the append-only triggers and lookup indexes are
@@ -1813,6 +1851,12 @@ def migrate_to_head(
                     )
                 if user_version == SCHEMA_VERSION:
                     missing = _head_tables() - tables
+                    missing_columns = _missing_required_columns(inner, user_version)
+                    if missing_columns:
+                        raise MigrationError(
+                            f"user_version={SCHEMA_VERSION} but columns are missing: "
+                            f"{list(missing_columns)}; refusing to continue"
+                        )
                     if missing:
                         raise MigrationError(
                             f"user_version={SCHEMA_VERSION} but tables are missing: "
@@ -1975,6 +2019,8 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
             integrity = str(row[0]) if row else "unknown"
             tables = _existing_tables_safe(conn)
             triggers, indexes = _existing_objects_safe(conn)
+            missing_columns = _missing_required_columns(conn, version)
+            missing_head_columns = _missing_required_columns(conn, SCHEMA_VERSION)
         except sqlite3.Error as exc:
             raise CorruptDatabaseError(f"integrity check failed to run: {exc}") from exc
         recorded = _migration_record(conn)
@@ -1984,6 +2030,7 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
     # (M1-03 support), but user_version=2 without task_dependencies is
     # inconsistent and must not be reported usable.
     missing_for_version = sorted(_required_tables_for(version) - tables)
+    missing_columns = list(missing_columns)
     # CEO review M1-05 P1: same rule for the recorded version's integrity
     # objects — a v3 claim missing an append-only trigger or a v3 index is
     # NOT schema-usable even though the file itself is integrity-"ok".
@@ -1992,6 +2039,7 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
     missing_indexes = sorted(required_indexes - indexes)
     schema_usable = (
         not missing_for_version
+        and not missing_columns
         and not missing_triggers
         and not missing_indexes
         and recorded is not None
@@ -2013,6 +2061,7 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
         version == SCHEMA_VERSION
         and recorded == SCHEMA_VERSION
         and not missing_head
+        and not missing_head_columns
         and not missing_head_objects
     )
     return {
@@ -2022,9 +2071,11 @@ def verify_database(path: str | os.PathLike[str]) -> dict[str, Any]:
         "tables": sorted(tables),
         "missing_tables": missing,
         "missing_version_tables": missing_for_version,
+        "missing_version_columns": missing_columns,
         "missing_version_triggers": missing_triggers,
         "missing_version_indexes": missing_indexes,
         "missing_head_tables": missing_head,
+        "missing_head_columns": sorted(missing_head_columns),
         "missing_head_objects": missing_head_objects,
         "at_head": at_head,
         "schema_migrations_recorded": recorded,
@@ -2088,9 +2139,10 @@ def _snapshot_versions(path: Path) -> tuple[int, int | None, frozenset[str]]:
         # Completeness for the recorded schema version is a hard consistency
         # requirement for any snapshot we would copy or restore.
         missing = _required_tables_for(user_version) - tables
+        missing = set(missing) | set(_missing_required_columns(conn, user_version))
         required_triggers, required_indexes = _required_objects_for(user_version)
         missing = missing | (required_triggers - triggers) | (required_indexes - indexes)
-    return user_version, recorded, missing
+    return user_version, recorded, frozenset(missing)
 
 
 def _assert_restorable_snapshot(

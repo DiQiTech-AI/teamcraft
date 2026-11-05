@@ -2,7 +2,7 @@
 
 This is the single authoritative path for runtime state in TeamCraft 2.0
 (CEO gate A/B): the CLI's team/member state lives ONLY in
-``.teamcraft/teamcraft.db`` (schema v6).  There is deliberately NO JSON
+``.teamcraft/teamcraft.db`` (schema v7).  There is deliberately NO JSON
 authority, no dual write, no import, no cutover marker, and no rollback:
 ``fresh_start`` keeps failing closed (bytes preserved) on any non-empty
 legacy ``state.json`` it finds.
@@ -40,6 +40,7 @@ from typing import Any, Iterator
 from . import commands as command_core
 from . import briefs
 from . import worker_reports
+from . import recovery
 from . import ceo_protocol
 from . import domain
 from . import fresh_start
@@ -582,8 +583,9 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
                 domain.transition_attempt(conn, attempt_id, "abandon",
                                         clock=clock)
             elif attempt.status == "unknown":
-                domain.transition_attempt(conn, attempt_id,
-                                        "reconciled_finished", clock=clock)
+                # A member phase is not external proof. UNKNOWN may only be
+                # settled by the fenced recovery API after reconciliation.
+                pass
             if phase == "completed":
                 task = domain.get_task(conn, task_id)
                 if task.status == "running":
@@ -896,3 +898,20 @@ def stage_reconcile(
         return command_core.reconcile_command(
             conn, command_id, outcome="expired", note=audit, clock=clock,
         )
+
+
+def claim_recovery_action(conn: TeamCraftConnection, command_id: str, *, lease: leader.Lease, clock: Any = None) -> command_core.Command:
+    """Fenced claim for a recovery Command; CLI must not claim it directly."""
+    with _tx(conn):
+        leader.require_project_lease(conn, lease, _project_id_for_command(conn, command_id), clock=clock)
+        return command_core.claim_command(conn, command_id, clock=clock)
+
+
+def confirm_recovery_action(conn: TeamCraftConnection, command_id: str, *, lease: leader.Lease, result: dict[str, Any], clock: Any = None) -> command_core.Command:
+    with _tx(conn):
+        leader.require_project_lease(conn, lease, _project_id_for_command(conn, command_id), clock=clock)
+        return command_core.confirm_command(conn, command_id, result_json=json.dumps(result, sort_keys=True), clock=clock)
+
+
+def unknown_recovery_action(conn: TeamCraftConnection, command_id: str, *, note: str, clock: Any = None) -> command_core.Command:
+    return stage_unknown(conn, command_id, note=note, clock=clock)

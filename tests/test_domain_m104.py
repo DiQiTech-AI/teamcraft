@@ -96,6 +96,9 @@ def _shed_v6_m203_artifacts(conn) -> None:
         conn.execute(f"DROP INDEX IF EXISTS {index}")
     for table in storage._V6_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "max_attempts" in task_columns:
+        conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
 
 class DomainM104Tests(unittest.TestCase):

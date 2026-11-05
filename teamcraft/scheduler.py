@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 import unicodedata
 
-from . import domain, leader
+from . import domain, leader, recovery
 from .clock import Clock
 from .storage import TeamCraftConnection, transaction
 
@@ -184,6 +184,10 @@ def _plan_snapshot(
     selected: list[domain.Task] = []
     deferred: list[DeferredTask] = []
     for task in queue:
+        attempts_used = int(conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0])
+        if attempts_used >= task.max_attempts:
+            deferred.append(DeferredTask(task.id, "max_attempts_reached"))
+            continue
         claims = _claims(task.ownership_json)
         conflicts = sorted({
             owner for owner, existing in owners
@@ -234,8 +238,18 @@ def dispatch_ready(
         # Recompute under the IMMEDIATE lock. No gap exists between checking
         # quota/ownership and making each reservation.
         leader.require_project_lease(conn, lease, project_id, clock=clock)
+        for task in domain.list_tasks(conn, project_id, status="running"):
+            used = int(conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id = ?", (task.id,)).fetchone()[0])
+            if used >= task.max_attempts and domain.occupying_attempt(conn, task.id) is None:
+                recovery.escalate_attempt_limit(conn, task.id, lease=lease, clock=clock)
         current = _plan_snapshot(conn, project_id, concurrency_limit=concurrency_limit)
         deferred.extend(current.deferred)
+        for item in current.deferred:
+            if item.reason == "max_attempts_reached":
+                task = domain.get_task(conn, item.task_id)
+                leader.require_project_lease(conn, lease, project_id, clock=clock)
+                if task.status == "ready":
+                    recovery.escalate_attempt_limit(conn, task.id, lease=lease, clock=clock)
         for task_id in current.selected_task_ids:
             # The domain API joins this transaction. Fence immediately at the
             # write boundary before each reservation as well as at admission.

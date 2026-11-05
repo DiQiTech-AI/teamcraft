@@ -151,6 +151,29 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual({a.task_id for a in dispatched.attempts}, {first.id, second.id})
         self.assertEqual(domain.get_task(self.conn, first.id).status, "running")
 
+    def test_dispatch_enforces_attempt_cap_and_escalates_ready_and_running(self):
+        ready = self.task("cap-ready")
+        with storage.transaction(self.conn):
+            self.conn.execute("UPDATE tasks SET max_attempts=1 WHERE id=?", (ready.id,))
+            self.conn.execute(
+                "INSERT INTO attempts(id,task_id,attempt_no,status) VALUES('old-ready',?,1,'failed')",
+                (ready.id,),
+            )
+        lease = scheduler.acquire_or_renew(self.conn, self.project.id, "capped", clock=self.clock)
+        result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
+        self.assertEqual(result.attempts, ())
+        self.assertEqual(domain.get_task(self.conn, ready.id).status, "needs_human")
+
+        running = self.task("cap-running")
+        active = domain.create_attempt(self.conn, running.id, expected_version=running.version, clock=self.clock)
+        domain.transition_attempt(self.conn, active.id, "start", clock=self.clock)
+        domain.transition_attempt(self.conn, active.id, "activated", clock=self.clock)
+        domain.transition_attempt(self.conn, active.id, "fail", clock=self.clock)
+        with storage.transaction(self.conn):
+            self.conn.execute("UPDATE tasks SET max_attempts=1 WHERE id=?", (running.id,))
+        result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
+        self.assertEqual(domain.get_task(self.conn, running.id).status, "needs_human")
+
     def test_scheduler_long_lived_acquire_renew_tick_release_interface(self):
         task = self.task("tick", ownership=["src/tick/**"])
         service = scheduler.Scheduler(
