@@ -537,6 +537,20 @@ class StateStore:
         finally:
             conn.close()
 
+    def prepare_prompt_brief(self, name: str) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            brief = _adapter.prepare_attempt_brief(conn, name)
+            view = _adapter.team_view(conn)
+            member = (view or {}).get("members", {}).get(name, {})
+            return {"task_id": brief.task_id, "attempt_id": brief.attempt_id,
+                "session_id": member.get("session_id"), "task_version": brief.task_version,
+                "brief_version": brief.brief_version, "brief_digest": brief.brief_digest,
+                "deadline_at": brief.deadline_at, "no_progress_timeout_seconds": brief.no_progress_timeout_seconds,
+                "poll_interval_seconds": brief.poll_interval_seconds, "content": brief.content}
+        finally:
+            conn.close()
+
     def stage_confirm(self, command_id: str, *, lease: _leader.Lease,
                      evidence: dict[str, Any]) -> Any:
         conn = self._connect()
@@ -563,6 +577,13 @@ class StateStore:
         finally:
             conn.close()
 
+    def record_prompt_delivery(self, command_id: str, state: str, *, note: str | None = None) -> None:
+        conn = self._connect()
+        try:
+            _adapter.record_prompt_delivery(conn, command_id, state, note=note)
+        finally:
+            conn.close()
+
     def admit_effect(self, command_id: str, *, lease: _leader.Lease) -> None:
         """Revalidate shared project authority immediately before Herdr I/O.
 
@@ -578,6 +599,7 @@ class StateStore:
             if project_id is None:
                 raise TeamctlError("project disappeared after stage claim; refusing Herdr effect")
             _leader.require_project_lease(conn, lease, project_id)
+            _adapter.recheck_prompt_binding(conn, command_id)
         except _leader.StaleLeaderError as exc:
             self.stage_unknown(
                 command_id,
@@ -588,6 +610,10 @@ class StateStore:
                 " call was not invoked by this executor, and the Command is UNKNOWN"
                 " for reconciliation"
             ) from exc
+        except _adapter.RuntimeAdapterError as exc:
+            _adapter.stage_unknown(conn, command_id, note=f"pre-effect prompt binding refused: {exc}")
+            _adapter.record_prompt_delivery(conn, command_id, "unknown", note=str(exc))
+            raise TeamctlError(str(exc)) from exc
         finally:
             conn.close()
 
@@ -841,7 +867,7 @@ def live_state(agent: dict[str, Any] | None) -> str:
     return value if value in LIVE_STATES else "unknown"
 
 
-def build_prompt(member: dict[str, Any]) -> str:
+def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None) -> str:
     if member["read_only"]:
         ownership_text = "- Read-only assignment. Do not modify project files."
     elif member["ownership"]:
@@ -864,7 +890,22 @@ def build_prompt(member: dict[str, Any]) -> str:
         "Do not edit any file outside the ownership listed above. If the assignment "
         "requires another path, stop and ask the CEO to change the recorded ownership.",
         "Preserve user and peer changes. Report deliverables, changed files, verification evidence, and remaining risks or blockers.",
+        "Do not claim Task completion from a text response: provide a structured WorkerReport when supported; verification and approval are separate.",
     ]
+    if brief:
+        lines.extend(["", "Versioned execution brief:",
+            f"- Task ID: {brief.get('task_id')}",
+            f"- Attempt ID: {brief.get('attempt_id')}",
+            f"- Session ID: {brief.get('session_id')}",
+            f"- Task version: {brief.get('task_version')}",
+            f"- Brief version: {brief.get('brief_version')}",
+            f"- Brief digest: {brief.get('brief_digest')}",
+            "- Delivery acknowledgement is not inferred from this prompt; report progress with the bound digest."])
+        lines.extend(["", "WorkerReport JSON (one object; text alone is non-authoritative):",
+            '{"schema_version":1,"task_id":"…","attempt_id":"…","task_version":N,"brief_digest":"64-lowercase-hex","report_kind":"progress|final","outcome":"completed|blocked|failed (final only)","milestone_id":"safe-id","summary":"non-empty","artifact_digest":null,"usage":{"total_tokens":null},"report_digest":"optional SHA-256"}',
+            "If report_digest is supplied, it must equal SHA-256 of canonical JSON: sorted keys, compact separators, UTF-8, with report_digest omitted. Unknown usage is null, never zero."])
+        if brief.get("content"):
+            lines.extend(["", "Frozen brief content:", str(brief["content"])])
     if member["role"] == "ceo":
         lines.extend(
             [
@@ -1053,24 +1094,41 @@ def prompt_member(
                                 timeout_ms, wait)
         )
     try:
-        update_member(
+        # Capture the legacy-compatible text as the immutable brief before
+        # effect admission.  The returned command binds its version/digest.
+        prepared_member = update_member(
             store, session, name, lease=lease,
-            phase="prompt_submitting",
-            prompt_may_have_been_delivered=True,
+            phase="prompt_submitting", prompt_may_have_been_delivered=True,
         )
-        prompt_text = build_prompt(member)
-        args = ["agent", "prompt", name, prompt_text]
-        if wait:
-            args.extend(["--wait", "--timeout", str(timeout_ms)])
+        preparer = getattr(store, "prepare_prompt_brief", None)
+        bound_brief = preparer(name) if preparer else {}
+        base_prompt = build_prompt(prepared_member, bound_brief)
         command = store.stage_claim(
             name, _adapter.STAGE_PROMPT, lease=lease,
             payload={
-                "argv_head": args[:3], "wait": wait, "timeout_ms": timeout_ms,
+                "argv_head": ["agent", "prompt", name], "wait": wait, "timeout_ms": timeout_ms,
+                "brief_content": base_prompt,
                 "prompt_sha256": hashlib.sha256(
-                    prompt_text.encode("utf-8")
+                    base_prompt.encode("utf-8")
+                ).hexdigest(),
+                "rendered_prompt_sha256": hashlib.sha256(
+                    base_prompt.encode("utf-8")
                 ).hexdigest(),
             },
         )
+        try:
+            bound = json.loads(command.payload_json)
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            bound = {}
+        # stage_claim only adds bindings; preserve Session and all fields from
+        # the pre-effect preparation, making this byte-identical to base_prompt.
+        rendered_brief = {**bound_brief, **bound}
+        prompt_text = build_prompt(prepared_member, rendered_brief)
+        if hashlib.sha256(prompt_text.encode("utf-8")).hexdigest() != hashlib.sha256(base_prompt.encode("utf-8")).hexdigest():
+            raise TeamctlError("refusing prompt whose rendered binding changed before Herdr effect")
+        args = ["agent", "prompt", name, prompt_text]
+        if wait:
+            args.extend(["--wait", "--timeout", str(timeout_ms)])
         _admit_effect(store, command.id, lease)
         try:
             # Herdr prompt delivery is external and cannot be cancelled once
@@ -1079,6 +1137,9 @@ def prompt_member(
                 name, prompt_text, wait=wait, timeout_ms=timeout_ms,
             )
         except TeamctlError as exc:
+            recorder = getattr(store, "record_prompt_delivery", None)
+            if recorder:
+                recorder(command.id, "unknown", note=f"prompt outcome ambiguous: {exc}")
             store.stage_unknown(
                 command.id, note=f"prompt outcome ambiguous: {exc}"
             )
@@ -1090,7 +1151,18 @@ def prompt_member(
             raise TeamctlError(
                 f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
             ) from exc
-        info = _herdr_adapter().get_agent(name)
+        recorder = getattr(store, "record_prompt_delivery", None)
+        if recorder:
+            # A successful transport response proves submission only.  Agent
+            # idle/done is not a target-session acknowledgement.
+            recorder(command.id, "submitted")
+        try:
+            info = _herdr_adapter().get_agent(name)
+        except TeamctlError as exc:
+            # Transport submission is durable; inspection failed afterwards,
+            # so generic command outcome remains ambiguous/reconcile-first.
+            store.stage_unknown(command.id, note=f"prompt submitted but post-submit inspection failed: {exc}")
+            raise
         return update_member(
             store, session, name, lease=lease,
             phase="prompt_submitted",

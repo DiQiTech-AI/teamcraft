@@ -275,7 +275,7 @@ SQLite Core 仍增加 Schema、Leader 和服务生命周期复杂度，但本路
 
 ### 8.7 ADR-001 扩展：CEO Protocol、Harness 入口与 Wake（分项接受）
 
-**状态：部分接受（2026-11-04）。** Owner 接受并授权 M1-08：本节第 1 项的协议唯一来源/version/hash，以及第 2 项中 Codex/OpenCode 的薄入口和安全安装契约。协议使用 `1.0.0`；外置 `protocol.manifest.json` 保存正文原始 UTF-8 字节 SHA-256，避免自引用；安装器不写 `AGENTS.md`/`CLAUDE.md`，用户自有 CEO Agent 冲突即使 `--force` 也保留并拒绝安装。第 2 项 Claude Code 入口，以及第 3–8 项初始化握手、Prompt、Watcher、Wake 和观测仍为 Proposed，未接受或授权实现。已接受的 8.1–8.6 与 ADR-001 原则边界不变。
+**状态：分项接受（2026-11-04、2026-11-05）。** Owner 接受并授权 M1-08：本节第 1 项的协议唯一来源/version/hash，以及第 2 项中 Codex/OpenCode 的薄入口和安全安装契约。2026-11-05 Owner 进一步授权并行实施 M2-03（第 4 项 Prompt/Brief/报告）与 M2-04（第 5 项确定性 Watcher/进展时钟），按下方边界执行；当前 Herdr 无已验证事件订阅接口，M2-04 使用低频 polling fallback，不宣称订阅/轮询等价。协议使用 `1.0.0`；外置 `protocol.manifest.json` 保存正文原始 UTF-8 字节 SHA-256，避免自引用；安装器不写 `AGENTS.md`/`CLAUDE.md`，用户自有 CEO Agent 冲突即使 `--force` 也保留并拒绝安装。第 2 项 Claude Code 入口，以及第 3、6–8 项 CEO 初始化握手、Wake 和观测仍为 Proposed，未接受或授权实现。已接受的 8.1–8.6 与 ADR-001 原则边界不变。
 
 1. **协议唯一来源**：未来以 `.agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md` 维护唯一 CEO 业务协议，内容覆盖 Discovery、Requirements、Architecture、Planning、Implementation、Verification、Delivery、Recovery 八阶段、责任边界和审批门禁。协议有显式 `protocol_version` 与稳定内容 hash；Attempt 创建时固定版本/hash，运行中不自动切换；旧协议无法恢复时进入 NEEDS_HUMAN，不兼容升级须重新初始化并留下审计记录。相邻 `teamcraft-ceo/SKILL.md` 是薄加载器，不复制协议正文。现有 `.agents/skills/teamcraft/` 继续负责 Herdr/Agent 运行，不更名、不复制 Core 或 Herdr CLI。
 2. **跨 Harness 薄入口**：Codex/OpenCode 共用 `.agents/skills/teamcraft-ceo/`；`AGENTS.md` 只写必要加载规则，OpenCode 可由 `.opencode/agents/` 的薄 CEO 配置适配。Claude Code 通过 `.claude/skills/` 安装受管副本或经目标版本验证的 symlink，并由精简 `CLAUDE.md` 引导；两种方式都必须指向或验证同一协议 version/hash。安装器先探测目标 Harness/版本和冲突，支持 dry-run/no-op，绝不覆盖已有 `AGENTS.md`、`CLAUDE.md` 或 Agent 配置。不兼容时明确降级/fail closed，不维护不同 CEO 业务协议。
@@ -442,11 +442,13 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 10. 每个 PR 小而可回滚，附变更文件、Schema/迁移、测试命令与退出码、失败场景、回滚和未完成项。
 11. **历史方案，已 superseded**：此前 JSON→SQLite 切换要求先部署旧入口 guard；当前 SQLite-only Fresh Start 不做此切换。Runtime Leader fencing 仍用于将来 SQLite 外部副作用执行，不因 Legacy cutover 取消。
 12. SQLite 只运行在单机本地磁盘；WAL 活跃备份不得只复制主 DB；schema 版本过新必须拒绝写入；恢复后先 Reconcile 再派工。
+
 13. Approval 绑定 evidence version；artifact、Commit/Diff、Verifier/config 或 PR head/base 变化必须失效并重新审批。
 14. 未知 Token 保持 NULL，不作为零成本、低成本或仍有完整预算的依据。
 15. CEO Protocol 只维护一份权威正文；Harness 入口只适配发现/加载，必须记录 version/hash，初始化未确认不得派工。
 16. Wake Prompt 只是通知；SQLite Event/Wake 是权威待办。unknown/missing 或投递结果不明先 Reconcile，不自动新建会话或重发。
 17. Mock/Fake 与真实 Harness/Herdr 证据分开报告，不得以模拟通过宣称跨 Harness 端到端兼容。
+18. **M2-03/M2-04 时钟默认策略（2026-11-05）**：Attempt Brief 默认 `poll_interval_seconds=60`、`no_progress_timeout_seconds=3600`；两者均在 Brief digest 中绑定，并可由显式 Brief API 参数覆盖。`deadline_at` 默认空（无截止阈值），仅接受带时区 ISO-8601 值；不得从本地时间或未知预算推断 deadline。Runtime Brief 从 acceptance 生成稳定 `acceptance-<n>` milestones；无 acceptance 时仅允许 final/final 报告，不能用任意 progress 刷新进展时钟。
 
 ## 11. M0 新增风险与决策清单
 
@@ -566,13 +568,13 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 |---|---|---|
 | 设计原则接受 | **已接受（2026-10-23）** | 用户原则接受修订后的 ADR-001 与 M0 退出门禁；约束设计，不证明功能已实现 |
 | CEO Protocol / 跨 Harness / Wake 提议扩展 | **M1-08 部分接受（2026-11-04）；其余仍 Proposed** | 第 8.7 节第 1 项和 Codex/OpenCode 第 2 项子集已接受；初始化/Wake/Claude 等未接受，也未授权 |
-| 任务开工授权 | **M1-01–M1-08 均已获授权；M1-08 实施于 2026-11-04 完成** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。M1-07 的 Python 3.10/Linux/CI 门禁于 2026-11-02 通过（run 41466544296 @ `d7fddcd`，见第 12.7 节）；Runtime 接线随后按 Owner 授权实施，并于 run 41779790463 @ `6638341` 全绿后关闭（见第 12.9 节）。 |
-| 任务完成验收 | **M1-01–M1-07、M2-02 已验收；M1-08 实施/离线验收完成，OpenCode Skill 实机调用待模型路由恢复后复验** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节；M1-08 见第 12.11 节；M2-02 见第 12.13 节。 |
+| 任务开工授权 | **M1-01–M1-08 均已获授权；M1-08 于 2026-11-04 完成；M2-03、M2-04 于 2026-11-05 获并行授权并完成验收** | 2026-11-01 的 M1-06 Legacy 导入排练授权为历史记录，已由 Owner 2026-11-02 SQLite-only Fresh Start 决策取代。M1-07 的 Python 3.10/Linux/CI 门禁于 2026-11-02 通过（run 41466544296 @ `d7fddcd`，见第 12.7 节）；Runtime 接线随后按 Owner 授权实施，并于 run 41779790463 @ `6638341` 全绿后关闭（见第 12.9 节）。 |
+| 任务完成验收 | **M1-01–M1-07、M2-02–M2-04 已验收；M1-08 实施/离线验收完成，OpenCode Skill 实机调用待模型路由恢复后复验** | M1-01 证据为上述 `2087a00c1ee4db77cf199c3212669807c6180e8e` 与 59 项离线测试；M1-02 权威实施 SHA 为 `952b39ef1f4e5d794910f10939ccdd8224a34fb6`，证据为 12.2 的冒烟、68 项回归和独立复核记录；其 Python 3.10/Linux/CI 限制由 run 41466544296 与 41779790463 满足。M1-03、M1-04 的此前独立验收记录保持不变。M1-05 证据登记见第 12.5 节，提交为 `f607b55139ef10dcfd9b2d04a5b49e46bd42b645`；M1-06 实施提交为 `959e1a2b92baf66cee470a4f9b46e26c13057138`，新 Fresh Start 测试及回归证据见第 12.6 节；M1-07 实施及最终门禁证据见第 12.8–12.9 节；M1-08 见第 12.11 节；M2-02 见第 12.13 节；M2-03/M2-04 见第 12.14 节。 |
 | 正式数据迁移 / cutover 审批 | **不适用 / 已从路线取消（2026-11-02）** | Owner 确认无生产旧系统及历史状态；TeamCraft 2.0 不提供生产 JSON→SQLite 迁移、旧 writer 共存或 JSON rollback。遇到旧文件由 Fresh Start 明确拒绝并提示人工处置，不自动读取、修改或删除。该决策不取消 SQLite Schema 升级、数据库备份恢复或 Runtime Leader fencing。 |
 
 ### 12.4 下一任务边界
 
-M1-05、M1-06、M1-07、M1-08 和 M2-02 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。后续可按依赖推进 M2-03 与 M2-04；协议初始化 Runtime 仍在 M2-08。
+M1-05、M1-06、M1-07、M1-08、M2-02、M2-03 和 M2-04 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13、12.14 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。M2-05（Reconcile、超时与有界 Attempt）仍待推进；协议初始化 Runtime 仍在 M2-08。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -661,3 +663,13 @@ M1-05、M1-06、M1-07、M1-08 和 M2-02 已分别通过验收关闭（证据见�
 **验证证据**：DIQI CTO 最终只读复评无可执行代码发现并建议关闭。Python 3.10.20：定向 Leader/Runtime/Scheduler **41 tests**、SQLite 生命周期与 Scheduler 端到端 **21 tests**、Core 全量 **311 tests**、Skill 全量 **63 tests**均通过；修改模块 `py_compile` 与 `git diff --check` 通过。覆盖包括 CLI/Scheduler 两种竞争顺序、两 Scheduler 竞争/续租/epoch、项目隔离、失租后拒绝确认及阻止新的 Herdr 调用、reserved Attempt 完整生命周期确认、Ownership/read-only/配额与只读计划。
 
 **CEO 验收结论：M2-02 完成并关闭。** 已发出的外部 Herdr 调用不能被租约撤销；最后一次租约检查与 Herdr 实际调用之间仍存在极短、无法原子消除的竞争窗口。该边界不提供 exactly-once 保证，歧义结果必须保持 UNKNOWN 并 reconcile。启用 Scheduler dispatch 前须排空仍持有旧 `member:<name>` 租约语义的 M1-07 `teamctl` 进程。Scheduler 提供 caller-driven handoff，不负责 Harness/角色选择策略。后续 M2-03 与 M2-04 可按依赖推进。
+
+### 12.14 M2-03 分层 Prompt/Brief/WorkerReport 与 M2-04 Watcher 验收关闭（2026-11-05）
+
+**实现**：Schema v6 增加不可变 Attempt Brief、append-only WorkerReport 和独立 Prompt delivery 记录。Prompt 包含角色层规则、Task/Attempt/Session、Ownership/read-only、验收条件、允许命令、预算规则和版本化 Brief 正文；最终发送给 Herdr 的 prompt bytes、持久 Brief 正文及 Command 中的两个 SHA-256 绑定一致。Prompt 副作用前重查 Task/Brief/evidence 版本、投递状态和正文摘要；claim 后 Task 漂移会阻止 Herdr 调用并将 Command/delivery 留为 UNKNOWN。Herdr 当前无可验证的目标会话 Prompt receipt，因此状态只记录为 submitted/unknown，不将 idle/done 推断为 acknowledged。WorkerReport 严格校验类型、Task/Attempt/版本/digest 和 Brief milestone；新报告只允许活动 Attempt，重复报告幂等，final 只结束 Attempt 并写 `attempt.execution_finished`，不直接完成 Task。空 acceptance Task 仅可提交 final/final，不允许合成 milestone 被 progress 报告刷新时钟。
+
+Watcher 使用 caller-driven 低频 polling；校验 pane、terminal、native session 和 Agent 身份，分别记录 liveness、activity 和基于有效报告的 progress。默认轮询间隔 60 秒、无进展阈值 3600 秒，均在 Brief digest 中固定且 API 可覆盖；deadline 可空，若配置必须带时区。状态/阈值事件通过稳定 key 幂等持久化，重复状态循环可生成新的 activity 事件；阈值触发只产生审计事件和 `stalled` 派生结果，Task 转 NEEDS_HUMAN、重试、取消和 reconcile 留给 M2-05。Token 用量未知时保持 NULL。
+
+**独立评审与验证**：DIQI CTO 对初版及修正后工作树进行只读技术评审；Prompt/Brief 漂移、真实 Herdr `agent_status` 映射、循环 activity 去重、空 acceptance synthetic milestone 等发现均已修复并加入回归，最终复评无剩余阻塞问题。Python 3.10.20 下 Core 全量 **330 tests OK**、Skill 全量 **64 tests OK**；还通过 M2 Watcher/Event 定向 **50 tests**、runtime SQLite **22 tests**、teamctl **20 tests**、Brief/WorkerReport 及 deadline 定向测试、`py_compile` 与 `git diff --check`。最终独立 Core/Skill 复跑结果一致。
+
+**CEO 验收结论：M2-03 与 M2-04 完成并关闭。** M2-04 使用 polling fallback；目前不具备已验证的订阅或可恢复事件 cursor，也不声称与订阅等价。默认 deadline 不设值；需由项目策略提供。Prompt acknowledgement 不可由当前 Herdr 证明。阈值升级/Task 状态转换、超时恢复、bounded retry 属 M2-05；Task Verification/Approval 属 M2-06。当前修改仅在本地工作树，未提交或推送。

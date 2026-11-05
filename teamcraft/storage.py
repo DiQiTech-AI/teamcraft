@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns to attempts and guards their pin with triggers.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -390,6 +390,69 @@ _V5_STATEMENTS = (
        BEGIN SELECT RAISE(ABORT, 'attempt protocol pin cannot be changed'); END""",
 )
 
+# v6 (M2-03): an Attempt receives one fixed execution brief and may append
+# validated worker reports.  These tables deliberately do not alter the Task,
+# Attempt, Session, or Command state machines: a report is evidence, not an
+# approval or delivery decision.
+_V6_TABLES = frozenset({"attempt_briefs", "worker_reports", "prompt_deliveries"})
+_V6_STATEMENTS = (
+    """
+CREATE TABLE attempt_briefs (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  task_version INTEGER NOT NULL CHECK (task_version >= 0),
+  brief_version INTEGER NOT NULL CHECK (brief_version >= 1),
+  brief_digest TEXT NOT NULL,
+  deadline_at TEXT,
+  no_progress_timeout_seconds INTEGER,
+  poll_interval_seconds INTEGER,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id, brief_version),
+  CHECK (no_progress_timeout_seconds IS NULL OR no_progress_timeout_seconds > 0),
+  CHECK (poll_interval_seconds IS NULL OR poll_interval_seconds > 0)
+)""",
+    "CREATE INDEX idx_attempt_briefs_task ON attempt_briefs(task_id, task_version)",
+    """CREATE TRIGGER trg_attempt_briefs_no_update BEFORE UPDATE ON attempt_briefs
+       BEGIN SELECT RAISE(ABORT, 'attempt briefs are fixed: UPDATE forbidden'); END""",
+    """CREATE TRIGGER trg_attempt_briefs_no_delete BEFORE DELETE ON attempt_briefs
+       BEGIN SELECT RAISE(ABORT, 'attempt briefs are permanent audit records: DELETE forbidden'); END""",
+    """
+CREATE TABLE worker_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  task_version INTEGER NOT NULL CHECK (task_version >= 0),
+  brief_digest TEXT NOT NULL,
+  report_kind TEXT NOT NULL CHECK (report_kind IN ('progress', 'final')),
+  outcome TEXT CHECK (outcome IN ('completed', 'blocked', 'failed')),
+  milestone_id TEXT NOT NULL,
+  report_digest TEXT NOT NULL,
+  artifact_digest TEXT,
+  report_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  UNIQUE(attempt_id, report_digest)
+)""",
+    "CREATE INDEX idx_worker_reports_attempt_id ON worker_reports(attempt_id, id)",
+    """CREATE TRIGGER trg_worker_reports_no_update BEFORE UPDATE ON worker_reports
+       BEGIN SELECT RAISE(ABORT, 'worker reports are append-only: UPDATE forbidden'); END""",
+    """CREATE TRIGGER trg_worker_reports_no_delete BEFORE DELETE ON worker_reports
+       BEGIN SELECT RAISE(ABORT, 'worker reports are permanent audit records: DELETE forbidden'); END""",
+    """CREATE TABLE prompt_deliveries (
+  command_id TEXT PRIMARY KEY REFERENCES commands(id),
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  session_id TEXT REFERENCES sessions(id),
+  task_version INTEGER NOT NULL CHECK (task_version >= 0),
+  brief_version INTEGER NOT NULL CHECK (brief_version >= 1),
+  brief_digest TEXT NOT NULL,
+  evidence_version INTEGER NOT NULL CHECK (evidence_version >= 0),
+  state TEXT NOT NULL CHECK (state IN ('pending','sending','submitted','acknowledged','unknown')),
+  updated_at TEXT NOT NULL,
+  note TEXT
+)""",
+    "CREATE INDEX idx_prompt_deliveries_attempt ON prompt_deliveries(attempt_id, state)",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -399,6 +462,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (3, _V3_STATEMENTS),
     (4, _V4_STATEMENTS),
     (5, _V5_STATEMENTS),
+    (6, _V6_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -410,13 +474,14 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     3: _V3_TABLES,
     4: _V4_TABLES,
     5: _V5_TABLES,
+    6: _V6_TABLES,
 }
 
 
 def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
-    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES
+    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -459,12 +524,19 @@ _V3_INDEXES = frozenset({"idx_events_task_seq", "idx_commands_state"})
 #: v4 lookup index for phase scans (active-member ownership checks).
 _V4_INDEXES = frozenset({"idx_members_phase"})
 
+_V6_TRIGGERS = frozenset({
+    "trg_attempt_briefs_no_update", "trg_attempt_briefs_no_delete",
+    "trg_worker_reports_no_update", "trg_worker_reports_no_delete",
+})
+_V6_INDEXES = frozenset({"idx_attempt_briefs_task", "idx_worker_reports_attempt_id", "idx_prompt_deliveries_attempt"})
+
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
 _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     3: (_V3_TRIGGERS, _V3_INDEXES),
     4: (frozenset(), _V4_INDEXES),
     5: (_V5_TRIGGERS, frozenset()),
+    6: (_V6_TRIGGERS, _V6_INDEXES),
 }
 
 

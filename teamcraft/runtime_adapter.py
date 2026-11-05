@@ -2,7 +2,7 @@
 
 This is the single authoritative path for runtime state in TeamCraft 2.0
 (CEO gate A/B): the CLI's team/member state lives ONLY in
-``.teamcraft/teamcraft.db`` (schema v5).  There is deliberately NO JSON
+``.teamcraft/teamcraft.db`` (schema v6).  There is deliberately NO JSON
 authority, no dual write, no import, no cutover marker, and no rollback:
 ``fresh_start`` keeps failing closed (bytes preserved) on any non-empty
 legacy ``state.json`` it finds.
@@ -30,12 +30,16 @@ synthetic data only.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import time
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from . import commands as command_core
+from . import briefs
+from . import worker_reports
 from . import ceo_protocol
 from . import domain
 from . import fresh_start
@@ -125,6 +129,12 @@ def _tx(conn: TeamCraftConnection) -> Iterator[TeamCraftConnection]:
     else:
         with storage.transaction(conn) as gated:
             yield gated
+
+
+def _utc_iso(clock: Any = None) -> str:
+    if clock is not None:
+        return clock.now().astimezone(timezone.utc).isoformat()
+    return __import__("datetime").datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +566,10 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
             domain.transition_attempt(conn, attempt_id, "start", clock=clock)
             attempt = domain.get_attempt(conn, attempt_id)
         if attempt.status == "starting" and phase == "agent_started":
-            domain.transition_attempt(conn, attempt_id, "activated",
-                                     clock=clock)
+            # Spawned is enough for the historical slot transition, but not
+            # evidence of work. M2-04 alone emits attempt.executing after a
+            # verified working observation.
+            domain.transition_attempt(conn, attempt_id, "activated", clock=clock)
         if attempt.status == "active" and phase.endswith(AMBIGUOUS_SUFFIX):
             domain.transition_attempt(conn, attempt_id, "runtime_lost",
                                      clock=clock)
@@ -633,6 +645,33 @@ def latest_stage_command(conn: TeamCraftConnection, member: str,
     return command_core.get_command(conn, str(row[0]))
 
 
+def prepare_attempt_brief(conn: TeamCraftConnection, member: str, *, clock: Any = None) -> briefs.AttemptBrief:
+    """Create/read the full dispatch brief before a prompt Command is claimed."""
+    row = conn.execute("SELECT task_id, attempt_id, session_id, role, responsibility, ownership_json, read_only, task FROM members WHERE name=?", (member,)).fetchone()
+    if row is None or row[0] is None or row[1] is None:
+        raise RuntimeAdapterError("versioned prompt requires member Task and Attempt")
+    task = domain.get_task(conn, str(row[0]))
+    acceptance = json.loads(task.acceptance_json)
+    milestones = ([{"id": f"acceptance-{i + 1}"} for i, _ in enumerate(acceptance)]
+                  if isinstance(acceptance, list) and acceptance else [{"id": "final"}])
+    content = json.dumps({"task": {"id": task.id, "title": task.title, "description": task.description,
+        "acceptance": acceptance, "version": task.version}, "milestones": milestones,
+        "attempt_id": str(row[1]), "session_id": row[2], "role": row[3],
+        "responsibility": row[4], "ownership": json.loads(str(row[5])),
+        "read_only": bool(row[6]), "assignment": row[7],
+        "allowed_commands": "only project-approved commands; do not broaden ownership",
+        "budget": "usage may be unknown (NULL), never report it as zero"}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    try:
+        brief = briefs.get_attempt_brief(conn, str(row[1]))
+        if domain.get_task(conn, brief.task_id).version != brief.task_version:
+            raise RuntimeAdapterError("Task evidence version changed; version-bound prompt requires a new Attempt")
+        return brief
+    except Exception as exc:
+        from .errors import NotFoundError
+        if not isinstance(exc, NotFoundError): raise
+    return briefs.create_attempt_brief(conn, str(row[1]), content=content, clock=clock)
+
+
 def stage_claim(
     conn: TeamCraftConnection,
     *,
@@ -675,6 +714,27 @@ def stage_claim(
             {"project_root": str(row[0])},
             {"role": str(member_row[0]), "kind": str(member_row[1])}, attempt,
         )
+    prompt_brief = None
+    if stage == STAGE_PROMPT:
+        # Legacy callers may use a generic prompt command before they have
+        # domain lineage.  Preserve that compatibility, but never pretend it
+        # is a version-bound M2-03 delivery.
+        if task_id is not None and attempt_id is not None:
+        # The caller may pass the fully rendered legacy text; it is captured
+        # once and thereafter cannot be silently replaced by a later task edit.
+            try:
+                prompt_brief = briefs.get_attempt_brief(conn, attempt_id)
+            except Exception as exc:
+                from .errors import NotFoundError
+                if not isinstance(exc, NotFoundError): raise
+                content = payload.pop("brief_content", None) or str(payload.get("prompt_text", ""))
+                if not content: content = f"Task {task_id}; member {member}; assignment is recorded in runtime state."
+                prompt_brief = briefs.create_attempt_brief(conn, attempt_id, content=content, clock=clock)
+            payload["attempt_id"] = attempt_id
+            payload["task_version"] = prompt_brief.task_version
+            payload["brief_version"] = prompt_brief.brief_version
+            payload["brief_digest"] = prompt_brief.brief_digest
+            payload["evidence_version"] = prompt_brief.task_version
     if task_id is not None:
         evidence["task_id"] = task_id
         evidence["task_version"] = domain.get_task(conn, task_id).version
@@ -682,6 +742,10 @@ def stage_claim(
         attempt = domain.get_attempt(conn, attempt_id)
         evidence["attempt_id"] = attempt_id
         evidence["attempt_no"] = attempt.attempt_no
+    if prompt_brief is not None:
+        evidence["digest"] = prompt_brief.brief_digest
+        if evidence["task_version"] != prompt_brief.task_version:
+            raise RuntimeAdapterError("Task evidence version changed; refusing stale Brief prompt")
     with _tx(conn):
         project_id = _project_id_for_member(conn, member, task_id)
         leader.require_project_lease(conn, lease, project_id, clock=clock)
@@ -703,7 +767,61 @@ def stage_claim(
         command = submission.command
         if command.state == "pending":
             command = command_core.claim_command(conn, command.id, clock=clock)
+        if prompt_brief is not None:
+            session = conn.execute("SELECT session_id FROM members WHERE name=?", (member,)).fetchone()
+            conn.execute("INSERT INTO prompt_deliveries (command_id, attempt_id, session_id, task_version, brief_version, brief_digest, evidence_version, state, updated_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, 'sending', ?, NULL)",
+                (command.id, attempt_id, None if session is None else session[0], prompt_brief.task_version,
+                 prompt_brief.brief_version, prompt_brief.brief_digest, prompt_brief.task_version,
+                 _utc_iso(clock)))
         return command
+
+
+def record_prompt_delivery(conn: TeamCraftConnection, command_id: str, state: str, *,
+                           note: str | None = None, clock: Any = None) -> bool:
+    """Record delivery facts separately from generic Command execution state.
+
+    Herdr currently exposes no authenticated target-session receipt.  Callers
+    may therefore record ``submitted`` or ``unknown`` but cannot manufacture
+    ``acknowledged`` from an idle/done observation or a prompt return.
+    """
+    if state not in {"pending", "sending", "submitted", "acknowledged", "unknown"}:
+        raise ValidationError("unknown prompt delivery state")
+    if state == "acknowledged":
+        raise ValidationError("Herdr has no verified prompt acknowledgement capability")
+    with _tx(conn):
+        row = conn.execute("SELECT state FROM prompt_deliveries WHERE command_id=?", (command_id,)).fetchone()
+        if row is None:
+            return False  # legacy/generic prompt has no versioned delivery row
+        old = str(row[0])
+        if old in {"submitted", "unknown", "acknowledged"} and old != state:
+            raise RuntimeAdapterError("terminal/ambiguous prompt delivery requires reconciliation")
+        conn.execute("UPDATE prompt_deliveries SET state=?, updated_at=?, note=? WHERE command_id=?", (state, _utc_iso(clock), note, command_id))
+    return True
+
+
+def recheck_prompt_binding(conn: TeamCraftConnection, command_id: str) -> None:
+    """Fail closed immediately before Herdr prompt I/O on stale evidence."""
+    row = conn.execute("SELECT c.payload_json, c.evidence_json, p.attempt_id, p.task_version, p.brief_digest, p.state FROM commands c JOIN prompt_deliveries p ON p.command_id=c.id WHERE c.id=?", (command_id,)).fetchone()
+    if row is None:
+        return  # legacy prompt command has no M2-03 binding
+    try:
+        payload, evidence = json.loads(str(row[0])), json.loads(str(row[1]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeAdapterError("prompt command binding is corrupt") from exc
+    brief = briefs.get_attempt_brief(conn, str(row[2]))
+    task = domain.get_task(conn, brief.task_id)
+    rendered = payload.get("rendered_prompt_sha256")
+    prompt_hash = payload.get("prompt_sha256")
+    content = payload.get("brief_content")
+    content_hash = (hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    if isinstance(content, str) else None)
+    valid = (str(row[5]) == "sending" and task.version == brief.task_version == int(row[3])
+             and brief.brief_digest == str(row[4]) == evidence.get("digest")
+             and payload.get("task_version") == brief.task_version
+             and payload.get("brief_digest") == brief.brief_digest
+             and content_hash == prompt_hash == rendered)
+    if not valid:
+        raise RuntimeAdapterError("prompt Brief/Task binding is stale; reconcile instead of sending")
 
 
 def stage_confirm(

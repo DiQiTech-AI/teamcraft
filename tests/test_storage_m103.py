@@ -176,6 +176,16 @@ def _shed_v5_protocol_artifacts(conn: sqlite3.Connection) -> None:
         if column in columns:
             conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
 
+
+def _shed_v6_m203_artifacts(conn: sqlite3.Connection) -> None:
+    """Strip schema-v6 additions when a fixture claims a v1..v5 head."""
+    for trigger in storage._V6_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V6_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in storage._V6_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
 # P-fixes 10: backup_database/restore_backup are live public API again —
 # copies happen in a private 0700 staging file, are verified there, and the
 # verified inode is published via os.link (EEXIST = never overwrite).  The
@@ -220,6 +230,9 @@ EXPECTED_TABLES = {
     "task_dependencies",
     "events",
     "commands",
+    "attempt_briefs",
+    "worker_reports",
+    "prompt_deliveries",
     # SQLite-internal table materialised by the AUTOINCREMENT DDL of
     # events.seq (M1-05); it appears in sqlite_master from schema creation on.
     "sqlite_sequence",
@@ -3744,6 +3757,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         try:
             raw.execute("PRAGMA busy_timeout=5000")
             _shed_v5_protocol_artifacts(raw)
+            _shed_v6_m203_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS task_dependencies")
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
@@ -3812,8 +3826,8 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertFalse(lagging["at_head"])
         self.assertEqual(lagging["missing_version_tables"], [])
         self.assertEqual(lagging["missing_head_tables"],
-                         ["commands", "events", "leader_lease", "members",
-                          "runtime_meta", "task_dependencies"])
+                         ["attempt_briefs", "commands", "events", "leader_lease", "members",
+                          "prompt_deliveries", "runtime_meta", "task_dependencies", "worker_reports"])
 
     def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
         self._drop_v2_table()
@@ -3867,6 +3881,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         shutil.copyfile(result.backup_path, rogue)
         raw = sqlite3.connect(str(rogue))
         _shed_v5_protocol_artifacts(raw)
+        _shed_v6_m203_artifacts(raw)
         raw.execute("DROP TABLE task_dependencies")
         # head is v3 now: shed v3 artifacts too so the rogue is a *consistent*
         # v2 except for the missing task_dependencies — that single fault is
@@ -3909,6 +3924,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             raw.execute("PRAGMA busy_timeout=5000")
             if back_to_v2:
                 _shed_v5_protocol_artifacts(raw)
+                _shed_v6_m203_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS events")
             raw.execute("DROP TABLE IF EXISTS commands")
             if back_to_v2:

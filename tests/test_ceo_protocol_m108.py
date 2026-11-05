@@ -122,7 +122,13 @@ class CEOProtocolTests(unittest.TestCase):
                 raw.execute(f"DROP TRIGGER {trigger}")
             raw.execute("ALTER TABLE attempts DROP COLUMN protocol_hash")
             raw.execute("ALTER TABLE attempts DROP COLUMN protocol_version")
-            raw.execute("DELETE FROM schema_migrations WHERE version = 5")
+            for trigger in storage._V6_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V6_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in storage._V6_TABLES:
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
+            raw.execute("DELETE FROM schema_migrations WHERE version >= 5")
             raw.execute("PRAGMA user_version = 4")
             raw.execute("INSERT INTO projects (id,name,repo_path,config_json,created_at) VALUES ('p','p','/p','{}','now')")
             raw.execute("INSERT INTO tasks (id,project_id,title,status,created_at,updated_at) VALUES ('t','p','t','running','now','now')")
@@ -130,7 +136,7 @@ class CEOProtocolTests(unittest.TestCase):
             raw.commit()
             raw.close()
             report = storage.migrate_to_head(db)
-            self.assertEqual((report.from_version, report.to_version), (4, 5))
+            self.assertEqual((report.from_version, report.to_version), (4, storage.SCHEMA_VERSION))
             conn = storage.connect(db)
             self.addCleanup(conn.close)
             attempt = domain.get_attempt(conn, "a")

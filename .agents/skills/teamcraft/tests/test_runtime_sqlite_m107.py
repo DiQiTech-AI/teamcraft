@@ -11,6 +11,7 @@ never commit success, and no JSON runtime state is ever created.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import sqlite3
@@ -102,7 +103,8 @@ class SqliteRuntimeTests(unittest.TestCase):
     # ------------------------------------------- durability BEFORE the effect
 
     def test_launch_persists_confirmed_commands_and_never_writes_json(self):
-        code, out, err = self.launch(HerdrDouble())
+        double = HerdrDouble()
+        code, out, err = self.launch(double)
         self.assertEqual(code, 0, err)
         self.assertFalse((self.root_resolved / ".teamcraft"
                          / "state.json").exists())
@@ -110,6 +112,12 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertEqual(self.stage_states("pane.split"), ["confirmed"])
         self.assertEqual(self.stage_states("agent.start"), ["confirmed"])
         self.assertEqual(self.stage_states("agent.prompt"), ["confirmed"])
+        payload = json.loads(self.db("SELECT payload_json FROM commands WHERE kind='agent.prompt'")[0][0])
+        self.assertEqual(hashlib.sha256(payload["brief_content"].encode("utf-8")).hexdigest(), payload["prompt_sha256"])
+        self.assertEqual(payload["prompt_sha256"], payload["rendered_prompt_sha256"])
+        prompt_call = next(call for call in double.calls if call[:2] == ["agent", "prompt"])
+        self.assertEqual(prompt_call[3], payload["brief_content"])
+        self.assertEqual(hashlib.sha256(prompt_call[3].encode("utf-8")).hexdigest(), payload["rendered_prompt_sha256"])
         events = self.db("SELECT COUNT(*) FROM events")[0][0]
         self.assertGreaterEqual(int(events), 6)
         view = self.store.read_unlocked()
@@ -438,6 +446,36 @@ class SqliteRuntimeTests(unittest.TestCase):
         self.assertIn("Herdr call was not invoked", err)
         self.assertFalse(any(call[:2] == ["pane", "split"] for call in double.calls))
         self.assertEqual(self.stage_states("pane.split"), ["unknown"])
+
+    def test_task_edit_between_prompt_claim_and_admission_refuses_herdr_prompt(self):
+        original_admit = teamctl.StateStore.admit_effect
+
+        def edit_then_admit(store, command_id, *, lease):
+            conn = store._connect()
+            try:
+                row = conn.execute("SELECT kind FROM commands WHERE id=?", (command_id,)).fetchone()
+                if row and row[0] == "agent.prompt":
+                    task_id = conn.execute("SELECT task_id FROM members WHERE name='dev'").fetchone()[0]
+                    task = teamctl._adapter.domain.get_task(conn, task_id)
+                    teamctl._adapter.domain.update_task(
+                        conn, task_id, description="edited after prompt claim",
+                        expected_version=task.version,
+                    )
+            finally:
+                conn.close()
+            return original_admit(store, command_id, lease=lease)
+
+        double = HerdrDouble()
+        with mock.patch.object(teamctl.StateStore, "admit_effect", autospec=True,
+                               side_effect=edit_then_admit), \
+                mock.patch.object(teamctl, "preflight_kind"), \
+                mock.patch.object(teamctl, "run_herdr", side_effect=double):
+            code, _out, err = self.launch(double)
+        self.assertEqual(code, 1)
+        self.assertIn("binding is stale", err)
+        self.assertFalse(any(call[:2] == ["agent", "prompt"] for call in double.calls))
+        self.assertEqual(self.stage_states("agent.prompt"), ["unknown"])
+        self.assertEqual(self.db("SELECT state FROM prompt_deliveries"), [("unknown",)])
 
     def test_stale_leader_success_never_commits_and_records_unknown(self):
         class SplitThenTakeover(HerdrDouble):

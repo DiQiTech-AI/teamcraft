@@ -89,6 +89,15 @@ def _shed_v5_protocol_artifacts(conn) -> None:
             conn.execute(f"ALTER TABLE attempts DROP COLUMN {column}")
 
 
+def _shed_v6_m203_artifacts(conn) -> None:
+    for trigger in storage._V6_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V6_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in storage._V6_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 class DomainM104Tests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="teamcraft-m104-")
@@ -201,6 +210,7 @@ class DomainM104Tests(unittest.TestCase):
         # (correctly) treated as an inconsistent schema by the write gate.
         with storage.transaction(self.conn):
             _shed_v5_protocol_artifacts(self.conn)
+            _shed_v6_m203_artifacts(self.conn)
             self.conn.execute("DROP TABLE task_dependencies")
             self.conn.execute("DROP TABLE events")
             self.conn.execute("DROP TABLE commands")
@@ -1174,6 +1184,7 @@ class M104UpgradePathTests(unittest.TestCase):
         try:
             with storage.transaction(conn):
                 _shed_v5_protocol_artifacts(conn)
+                _shed_v6_m203_artifacts(conn)
                 conn.execute("DROP TABLE task_dependencies")
                 conn.execute("DROP TABLE events")
                 conn.execute("DROP TABLE commands")
@@ -1275,8 +1286,8 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertEqual(info["schema_migrations_recorded"], 1)
         self.assertEqual(
             info["missing_head_tables"],
-            ["commands", "events", "leader_lease", "members", "runtime_meta",
-             "task_dependencies"],
+            ["attempt_briefs", "commands", "events", "leader_lease", "members",
+             "prompt_deliveries", "runtime_meta", "task_dependencies", "worker_reports"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)

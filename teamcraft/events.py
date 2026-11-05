@@ -202,6 +202,63 @@ def append_event(
     )
 
 
+def append_event_idempotent(
+    conn: TeamCraftConnection,
+    kind: str,
+    *,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    attempt_id: str | None = None,
+    payload_json: str = "{}",
+    event_id: str,
+    clock: Clock | None = None,
+) -> tuple[Event, bool]:
+    """Append a caller-chosen event exactly once.
+
+    This does not turn the stream into an upsertable store.  A duplicate ID is
+    accepted only when ``kind``, ``project_id``, ``task_id``, ``attempt_id``,
+    and ``payload_json`` match; a different event using the same key fails
+    closed.  ``occurred_at`` is fixed by the first commit and replay returns
+    that original value (the retry clock is intentionally not compared).  It
+    returns ``(event, inserted)`` and joins an enclosing transaction just like
+    :func:`append_event`.
+    """
+
+    _require_head(conn)
+    kind = _validate_kind(kind)
+    payload_json = _validate_json(payload_json)
+    event_id = require_entity_id(event_id)
+    if project_id is not None:
+        project_id = require_entity_id(project_id)
+    if task_id is not None:
+        task_id = require_entity_id(task_id)
+    if attempt_id is not None:
+        attempt_id = require_entity_id(attempt_id)
+    with _tx(conn):
+        row = conn.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is not None:
+            existing = _row_to_event(row)
+            if (
+                existing.kind != kind
+                or existing.project_id != project_id
+                or existing.task_id != task_id
+                or existing.attempt_id != attempt_id
+                or existing.payload_json != payload_json
+            ):
+                raise StorageError(
+                    "deterministic event_id already names a different immutable event"
+                )
+            return existing, False
+        event = append_event(
+            conn, kind, project_id=project_id, task_id=task_id,
+            attempt_id=attempt_id, payload_json=payload_json,
+            event_id=event_id, clock=clock,
+        )
+    return event, True
+
+
 def _row_to_event(row: Any) -> Event:
     return Event(
         seq=int(row[0]),
