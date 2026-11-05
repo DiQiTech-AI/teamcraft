@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns to attempts and guards their pin with triggers.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -456,6 +456,84 @@ _V7_TABLES = frozenset()
 _V7_STATEMENTS = ("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1)",)
 _V7_COLUMNS = {"tasks": frozenset({"max_attempts"})}
 
+# v8 (M2-06): immutable project verifier policy, captured verification
+# artifacts, and append-only human approval decisions.
+_V8_TABLES = frozenset({"verification_configs", "verifications", "approvals"})
+_V8_STATEMENTS = (
+    """CREATE TABLE verification_configs (
+      id TEXT PRIMARY KEY,
+      command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      config_version INTEGER NOT NULL CHECK (config_version >= 1),
+      rules_version TEXT NOT NULL,
+      argv_json TEXT NOT NULL,
+      timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds BETWEEN 1 AND 3600),
+      config_digest TEXT NOT NULL,
+      approved_by TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, config_version)
+    )""",
+    "CREATE INDEX idx_verification_configs_project ON verification_configs(project_id, config_version DESC)",
+    """CREATE TRIGGER trg_verification_configs_no_update BEFORE UPDATE ON verification_configs
+       BEGIN SELECT RAISE(ABORT, 'verification configs are append-only'); END""",
+    """CREATE TRIGGER trg_verification_configs_no_delete BEFORE DELETE ON verification_configs
+       BEGIN SELECT RAISE(ABORT, 'verification configs are permanent audit records'); END""",
+    """CREATE TABLE verifications (
+      id TEXT PRIMARY KEY,
+      command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      attempt_id TEXT NOT NULL REFERENCES attempts(id),
+      attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+      task_version INTEGER NOT NULL CHECK (task_version >= 0),
+      dispatch_task_version INTEGER NOT NULL CHECK (dispatch_task_version >= 0),
+      brief_digest TEXT NOT NULL,
+      worker_report_id INTEGER NOT NULL REFERENCES worker_reports(id),
+      worker_report_digest TEXT NOT NULL,
+      config_version INTEGER NOT NULL CHECK (config_version >= 1),
+      rules_version TEXT NOT NULL,
+      config_digest TEXT NOT NULL,
+      argv_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pass','fail','error','stale')),
+      exit_code INTEGER,
+      artifact BLOB NOT NULL CHECK (length(artifact) <= 2097152),
+      artifact_digest TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX idx_verifications_task ON verifications(task_id, created_at)",
+    "CREATE INDEX idx_verifications_attempt ON verifications(attempt_id, created_at)",
+    """CREATE TRIGGER trg_verifications_no_update BEFORE UPDATE ON verifications
+       BEGIN SELECT RAISE(ABORT, 'verifications and artifacts are immutable'); END""",
+    """CREATE TRIGGER trg_verifications_no_delete BEFORE DELETE ON verifications
+       BEGIN SELECT RAISE(ABORT, 'verifications are permanent audit records'); END""",
+    """CREATE TABLE approvals (
+      id TEXT PRIMARY KEY,
+      command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+      verification_id TEXT NOT NULL UNIQUE REFERENCES verifications(id),
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      attempt_id TEXT NOT NULL REFERENCES attempts(id),
+      attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+      task_version INTEGER NOT NULL CHECK (task_version >= 0),
+      brief_digest TEXT NOT NULL,
+      artifact_digest TEXT NOT NULL,
+      config_version INTEGER NOT NULL CHECK (config_version >= 1),
+      rules_version TEXT NOT NULL,
+      config_digest TEXT NOT NULL,
+      proposed_action TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK (decision IN ('accept','reject')),
+      actor TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX idx_approvals_task ON approvals(task_id, created_at)",
+    """CREATE TRIGGER trg_approvals_no_update BEFORE UPDATE ON approvals
+       BEGIN SELECT RAISE(ABORT, 'approvals are append-only'); END""",
+    """CREATE TRIGGER trg_approvals_no_delete BEFORE DELETE ON approvals
+       BEGIN SELECT RAISE(ABORT, 'approvals are permanent audit records'); END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -467,6 +545,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (5, _V5_STATEMENTS),
     (6, _V6_STATEMENTS),
     (7, _V7_STATEMENTS),
+    (8, _V8_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -480,13 +559,14 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     5: _V5_TABLES,
     6: _V6_TABLES,
     7: _V7_TABLES,
+    8: _V8_TABLES,
 }
 
 
 def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
-    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES
+    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES | _V8_TABLES
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -534,6 +614,15 @@ _V6_TRIGGERS = frozenset({
     "trg_worker_reports_no_update", "trg_worker_reports_no_delete",
 })
 _V6_INDEXES = frozenset({"idx_attempt_briefs_task", "idx_worker_reports_attempt_id", "idx_prompt_deliveries_attempt"})
+_V8_TRIGGERS = frozenset({
+    "trg_verification_configs_no_update", "trg_verification_configs_no_delete",
+    "trg_verifications_no_update", "trg_verifications_no_delete",
+    "trg_approvals_no_update", "trg_approvals_no_delete",
+})
+_V8_INDEXES = frozenset({
+    "idx_verification_configs_project", "idx_verifications_task",
+    "idx_verifications_attempt", "idx_approvals_task",
+})
 
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
@@ -542,6 +631,7 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     4: (frozenset(), _V4_INDEXES),
     5: (_V5_TRIGGERS, frozenset()),
     6: (_V6_TRIGGERS, _V6_INDEXES),
+    8: (_V8_TRIGGERS, _V8_INDEXES),
 }
 
 

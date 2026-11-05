@@ -101,6 +101,16 @@ def _shed_v6_m203_artifacts(conn) -> None:
         conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
 
+def _shed_v8_m206_artifacts(conn) -> None:
+    """Strip schema-v8 additions from fixtures claiming schema v1-v7."""
+    for trigger in storage._V8_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V8_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("approvals", "verifications", "verification_configs"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 class DomainM104Tests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="teamcraft-m104-")
@@ -179,6 +189,16 @@ class DomainM104Tests(unittest.TestCase):
             self.claim_done(task)
         self.assertEqual(ctx.exception.reason_code, reason)
 
+    def verification_service_required(self, task: domain.Task, event: str = "verification_passed") -> domain.Task:
+        before = domain.get_task(self.conn, task.id)
+        with self.assertRaises(IllegalTransitionError) as ctx:
+            domain.apply_task_event(self.conn, task.id, event,
+                expected_version=before.version, clock=self.clock)
+        self.assertEqual(ctx.exception.reason_code, "VERIFICATION_SERVICE_REQUIRED")
+        after = domain.get_task(self.conn, task.id)
+        self.assertEqual((after.status, after.version), (before.status, before.version))
+        return after
+
     def raw_task_update(self, task_id: str, status: str) -> None:
         """Test scaffold: drive a task to a status SQL-directly (simulates
         facts produced by later milestones, e.g. reconcile or delivery)."""
@@ -214,6 +234,7 @@ class DomainM104Tests(unittest.TestCase):
         with storage.transaction(self.conn):
             _shed_v5_protocol_artifacts(self.conn)
             _shed_v6_m203_artifacts(self.conn)
+            _shed_v8_m206_artifacts(self.conn)
             self.conn.execute("DROP TABLE task_dependencies")
             self.conn.execute("DROP TABLE events")
             self.conn.execute("DROP TABLE commands")
@@ -274,18 +295,13 @@ class DomainM104Tests(unittest.TestCase):
             expected_version=task.version, clock=self.clock,
         )
         self.assertEqual(task.status, "verifying")
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "ready_to_merge")
-        task = domain.apply_task_event(
-            self.conn, task.id, "approved_and_delivered",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual((task.status, task.version), ("done", 5))
+        self.verification_service_required(task)
+        with self.assertRaises(IllegalTransitionError) as ctx:
+            domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
+                expected_version=task.version, clock=self.clock)
+        self.assertEqual(ctx.exception.reason_code, "M4_EVIDENCE_REQUIRED")
 
-    def test_scout_verification_passed_completes_task(self) -> None:
+    def test_scout_cannot_bypass_verification_and_human_approval_service(self) -> None:
         task = self.ready_task("scout-docs", kind="scout")
         task = self.run_task(task)
         self.assertEqual(task.status, "running")
@@ -294,11 +310,8 @@ class DomainM104Tests(unittest.TestCase):
             self.conn, task.id, "worker_reported_done",
             expected_version=task.version, clock=self.clock,
         )
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "done")
+        task = self.verification_service_required(task)
+        self.assertEqual(task.status, "verifying")
 
     def test_illegal_task_transitions_are_structured(self) -> None:
         task = self.make_task("nope")  # pending
@@ -373,10 +386,8 @@ class DomainM104Tests(unittest.TestCase):
                     self.conn, task.id, "worker_reported_done",
                     expected_version=task.version, clock=self.clock,
                 )
-                task = domain.apply_task_event(
-                    self.conn, task.id, "verification_failed",
-                    expected_version=task.version, target="blocked", clock=self.clock,
-                )
+                self.raw_task_update(task.id, "blocked")
+                task = domain.get_task(self.conn, task.id)
             elif kind_status == "needs_human":
                 task = self.run_task(task)
                 att = domain.occupying_attempt(self.conn, task.id)
@@ -462,11 +473,8 @@ class DomainM104Tests(unittest.TestCase):
         )
         task = self.claim_done(task)
         self.assertEqual(task.status, "verifying")
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "done")
+        task = self.verification_service_required(task)
+        self.assertEqual(task.status, "verifying")
         self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
 
     def test_ship_completion_chain_requires_finished_attempt(self) -> None:
@@ -476,16 +484,11 @@ class DomainM104Tests(unittest.TestCase):
         self.settle_finished(task.id)
         task = self.claim_done(task)
         self.assertEqual(task.status, "verifying")
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "ready_to_merge")
-        task = domain.apply_task_event(
-            self.conn, task.id, "approved_and_delivered",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual((task.status, task.version), ("done", 5))
+        self.verification_service_required(task)
+        with self.assertRaises(IllegalTransitionError) as ctx:
+            domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
+                expected_version=task.version, clock=self.clock)
+        self.assertEqual(ctx.exception.reason_code, "M4_EVIDENCE_REQUIRED")
 
     def test_active_attempt_cannot_claim_done_and_version_is_untouched(self) -> None:
         task = self.ready_task("active-refusal")
@@ -518,7 +521,7 @@ class DomainM104Tests(unittest.TestCase):
         )
         self.assertEqual(task.status, "cancelled")
 
-    def test_recovery_after_failed_execution_completes_via_new_attempt(self) -> None:
+    def test_recovery_after_failed_execution_reaches_verifying_via_new_attempt(self) -> None:
         task = self.ready_task("recovery")
         task = self.run_task(task)
         att = domain.occupying_attempt(self.conn, task.id)
@@ -545,40 +548,20 @@ class DomainM104Tests(unittest.TestCase):
         self.assertEqual(second.attempt_no, 2)
         self.settle_finished(task.id)
         task = self.claim_done(domain.get_task(self.conn, task.id))
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        task = domain.apply_task_event(
-            self.conn, task.id, "approved_and_delivered",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "done")
+        self.assertEqual(task.status, "verifying")
+        self.verification_service_required(task)
 
-    def test_terminal_done_is_frozen_after_guarded_completion(self) -> None:
+    def test_ship_done_requires_m4_delivery_evidence(self) -> None:
         task = self.ready_task("frozen")
         task = self.run_task(task)
         self.settle_finished(task.id)
         task = self.claim_done(task)
-        task = domain.apply_task_event(
-            self.conn, task.id, "verification_passed",
-            expected_version=task.version, clock=self.clock,
-        )
-        task = domain.apply_task_event(
-            self.conn, task.id, "approved_and_delivered",
-            expected_version=task.version, clock=self.clock,
-        )
-        self.assertEqual(task.status, "done")
-        for event in (
-            "user_cancel", "worker_reported_done", "approved_and_delivered",
-            "dispatch_reserved", "verification_passed",
-        ):
-            with self.assertRaises(IllegalTransitionError):
-                domain.apply_task_event(
-                    self.conn, task.id, event,
-                    expected_version=task.version, clock=self.clock,
-                )
-        self.assertEqual(domain.get_task(self.conn, task.id).version, task.version)
+        self.verification_service_required(task)
+        with self.assertRaises(IllegalTransitionError) as ctx:
+            domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
+                expected_version=task.version, clock=self.clock)
+        self.assertEqual(ctx.exception.reason_code, "M4_EVIDENCE_REQUIRED")
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "verifying")
         self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
 
     def test_outer_storage_transaction_commits_whole_execution_chain(self) -> None:
@@ -597,17 +580,13 @@ class DomainM104Tests(unittest.TestCase):
                 expected_version=running.version, clock=self.clock,
             )
             self.assertEqual(verifying.status, "verifying")
-            merge = domain.apply_task_event(
-                self.conn, task.id, "verification_passed",
-                expected_version=verifying.version, clock=self.clock,
-            )
-            done = domain.apply_task_event(
-                self.conn, task.id, "approved_and_delivered",
-                expected_version=merge.version, clock=self.clock,
-            )
-            self.assertEqual((done.status, done.version), ("done", 5))
+            self.verification_service_required(verifying)
+            with self.assertRaises(IllegalTransitionError) as ctx:
+                domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
+                    expected_version=verifying.version, clock=self.clock)
+            self.assertEqual(ctx.exception.reason_code, "M4_EVIDENCE_REQUIRED")
         after = domain.get_task(self.conn, task.id)
-        self.assertEqual((after.status, after.version), ("done", 5))  # committed
+        self.assertEqual((after.status, after.version), ("verifying", verifying.version))  # committed
         self.assertIsNone(domain.occupying_attempt(self.conn, task.id))
 
     def test_outer_storage_transaction_rolls_back_everything(self) -> None:
@@ -1188,6 +1167,7 @@ class M104UpgradePathTests(unittest.TestCase):
             with storage.transaction(conn):
                 _shed_v5_protocol_artifacts(conn)
                 _shed_v6_m203_artifacts(conn)
+                _shed_v8_m206_artifacts(conn)
                 conn.execute("DROP TABLE task_dependencies")
                 conn.execute("DROP TABLE events")
                 conn.execute("DROP TABLE commands")
@@ -1289,8 +1269,9 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertEqual(info["schema_migrations_recorded"], 1)
         self.assertEqual(
             info["missing_head_tables"],
-            ["attempt_briefs", "commands", "events", "leader_lease", "members",
-             "prompt_deliveries", "runtime_meta", "task_dependencies", "worker_reports"],
+            ["approvals", "attempt_briefs", "commands", "events", "leader_lease", "members",
+             "prompt_deliveries", "runtime_meta", "task_dependencies", "verification_configs",
+             "verifications", "worker_reports"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)

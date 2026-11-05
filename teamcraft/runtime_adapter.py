@@ -2,7 +2,7 @@
 
 This is the single authoritative path for runtime state in TeamCraft 2.0
 (CEO gate A/B): the CLI's team/member state lives ONLY in
-``.teamcraft/teamcraft.db`` (schema v7).  There is deliberately NO JSON
+``.teamcraft/teamcraft.db`` (schema v8).  There is deliberately NO JSON
 authority, no dual write, no import, no cutover marker, and no rollback:
 ``fresh_start`` keeps failing closed (bytes preserved) on any non-empty
 legacy ``state.json`` it finds.

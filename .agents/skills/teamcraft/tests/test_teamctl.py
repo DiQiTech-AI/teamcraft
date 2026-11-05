@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -235,6 +236,86 @@ class TeamctlTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as exc:
             teamctl.main(["recovery-reconcile", "worker"])
         self.assertEqual(exc.exception.code, 2)
+
+    def test_m206_verifier_commands_parse_expected_arguments(self):
+        parser = teamctl.build_parser()
+        configure = parser.parse_args([
+            "verifier-configure", "--cwd", str(self.root), "--executable", "/usr/bin/python3",
+            "--arg=-c", "--arg=print('ok')", "--rules-version", "rules-1",
+            "--timeout-seconds", "30", "--actor", "human", "--idempotency-key", "cfg-1",
+        ])
+        self.assertEqual(configure.handler, teamctl.verification_configure)
+        self.assertEqual([configure.executable, *configure.arg], ["/usr/bin/python3", "-c", "print('ok')"])
+        self.assertEqual(configure.timeout_seconds, 30)
+
+        run = parser.parse_args(["verify", "--attempt-id", "attempt-1", "--idempotency-key", "run-1"])
+        approval = parser.parse_args([
+            "verification-approval", "--verification-id", "verification-1", "--decision", "accept",
+            "--actor", "human", "--reason", "reviewed", "--idempotency-key", "approval-1",
+        ])
+        status = parser.parse_args(["verification-status", "--task-id", "task-1"])
+        artifact = parser.parse_args(["verification-artifact", "--verification-id", "verification-1"])
+        self.assertEqual(run.handler, teamctl.verification_run)
+        self.assertEqual(approval.handler, teamctl.verification_approve)
+        self.assertEqual(status.handler, teamctl.verification_status)
+        self.assertEqual(artifact.handler, teamctl.verification_artifact)
+
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(["verification-approval", "--verification-id", "verification-1",
+                               "--decision", "invalid", "--actor", "human", "--reason", "x",
+                               "--idempotency-key", "approval-2"])
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_verification_status_precomputes_current_flags_before_close_and_serializes_both(self):
+        class GuardedConn:
+            def __init__(self): self.closed = False; self.reads = 0
+            def execute(self, *args, **kwargs):
+                if self.closed: raise AssertionError("SQLite read attempted after connection close")
+                self.reads += 1
+            def close(self): self.closed = True
+
+        conn = GuardedConn()
+        store = mock.Mock()
+        store._connect.return_value = conn
+        verifications = [
+            SimpleNamespace(id="v-yes", command_id="c-1", attempt_id="a-1", status="pass",
+                exit_code=0, artifact_digest="a" * 64, config_version=1, rules_version="r1"),
+            SimpleNamespace(id="v-no", command_id="c-2", attempt_id="a-2", status="stale",
+                exit_code=1, artifact_digest="b" * 64, config_version=1, rules_version="r1"),
+        ]
+        approvals = [
+            SimpleNamespace(id="ap-yes", verification_id="v-yes", decision="accept",
+                current=True, actor="human", reason="ok"),
+            SimpleNamespace(id="ap-no", verification_id="v-no", decision="reject",
+                current=False, actor="human", reason="stale"),
+        ]
+        def read_rows(result):
+            def read(connection, task_id):
+                self.assertFalse(connection.closed, "status reader used a closed connection")
+                connection.execute("SELECT 1")
+                return result
+            return read
+        def is_current(connection, item):
+            self.assertFalse(connection.closed, "current check ran after the connection closed")
+            connection.execute("SELECT 1")
+            return item.id == "v-yes"
+
+        args = argparse.Namespace(cwd=str(self.root), task_id="task-1")
+        output = io.StringIO()
+        with mock.patch.object(teamctl, "StateStore", return_value=store), \
+             mock.patch.object(teamctl, "resolve_project_root", return_value=self.root), \
+             mock.patch.object(teamctl._verification, "list_verifications", side_effect=read_rows(verifications)), \
+             mock.patch.object(teamctl._verification, "verification_is_current", side_effect=is_current), \
+             mock.patch.object(teamctl._verification, "list_approvals", side_effect=read_rows(approvals)), \
+             mock.patch.object(teamctl._verification, "list_verification_commands", side_effect=read_rows([])), \
+             redirect_stdout(output):
+            teamctl.verification_status(args)
+
+        self.assertTrue(conn.closed)
+        self.assertEqual(conn.reads, 5)
+        payload = json.loads(output.getvalue())
+        self.assertEqual([item["current"] for item in payload["verifications"]], [True, False])
+        self.assertEqual([item["current"] for item in payload["approvals"]], [True, False])
 
     def test_ambiguous_prompt_is_not_resent_on_default_resume(self):
         agent_session = {"value": "same"}

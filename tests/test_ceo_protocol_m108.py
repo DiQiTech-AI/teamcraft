@@ -128,6 +128,12 @@ class CEOProtocolTests(unittest.TestCase):
                 raw.execute(f"DROP INDEX IF EXISTS {index}")
             for table in storage._V6_TABLES:
                 raw.execute(f"DROP TABLE IF EXISTS {table}")
+            for trigger in storage._V8_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V8_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("approvals", "verifications", "verification_configs"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
             task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
             if "max_attempts" in task_columns:
                 raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")

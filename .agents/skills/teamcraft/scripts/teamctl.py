@@ -61,6 +61,7 @@ _bootstrap_core()
 from teamcraft import leader as _leader  # noqa: E402
 from teamcraft import recovery as _recovery  # noqa: E402
 from teamcraft import runtime_adapter as _adapter  # noqa: E402
+from teamcraft import verification as _verification  # noqa: E402
 from teamcraft.herdr_adapter import HerdrAdapter, HerdrError  # noqa: E402
 
 
@@ -1925,6 +1926,104 @@ def recovery_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def verification_configure(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = store.ensure_project()
+    lease = store.acquire_lease("verification-config", 60)
+    try:
+        conn = store._connect()
+        try:
+            config = _verification.configure_verifier(
+                conn, project_id, argv=[args.executable, *args.arg],
+                rules_version=args.rules_version, timeout_seconds=args.timeout_seconds,
+                actor=args.actor, idempotency_key=args.idempotency_key, lease=lease,
+            )
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(config, sort_keys=True))
+    return 0
+
+
+def verification_run(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    # Approved verifier timeout is capped at one hour; keep the project lease
+    # live through the subprocess plus the fenced result commit.
+    lease = store.acquire_lease("verification-run", 3700)
+    try:
+        conn = store._connect()
+        try:
+            result = _verification.run_verification(
+                conn, args.attempt_id, idempotency_key=args.idempotency_key, lease=lease,
+            )
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({"verification_id": result.id, "task_id": result.task_id,
+        "attempt_id": result.attempt_id, "status": result.status,
+        "exit_code": result.exit_code, "artifact_digest": result.artifact_digest,
+        "config_version": result.config_version, "rules_version": result.rules_version}, sort_keys=True))
+    return 0
+
+
+def verification_approve(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("verification-approval", 60)
+    try:
+        conn = store._connect()
+        try:
+            approval = _verification.decide_approval(
+                conn, args.verification_id, decision=args.decision, actor=args.actor,
+                reason=args.reason, idempotency_key=args.idempotency_key, lease=lease,
+            )
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({"approval_id": approval.id, "task_id": approval.task_id,
+        "verification_id": approval.verification_id, "decision": approval.decision,
+        "current": approval.current, "task_version": approval.task_version}, sort_keys=True))
+    return 0
+
+
+def verification_status(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        verifications = _verification.list_verifications(conn, args.task_id)
+        verification_rows = [{"id": item.id, "command_id": item.command_id, "attempt_id": item.attempt_id,
+            "status": item.status, "exit_code": item.exit_code,
+            "artifact_digest": item.artifact_digest, "config_version": item.config_version,
+            "rules_version": item.rules_version,
+            "current": _verification.verification_is_current(conn, item)} for item in verifications]
+        approvals = _verification.list_approvals(conn, args.task_id)
+        commands = _verification.list_verification_commands(conn, args.task_id)
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": args.task_id,
+        "verifications": verification_rows,
+        "approvals": [{"id": item.id, "verification_id": item.verification_id,
+            "decision": item.decision, "current": item.current, "actor": item.actor,
+            "reason": item.reason} for item in approvals],
+        "commands": commands}, sort_keys=True))
+    return 0
+
+
+def verification_artifact(args: argparse.Namespace) -> int:
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        result = _verification.get_verification(conn, args.verification_id)
+    finally:
+        conn.close()
+    print(json.dumps({"verification_id": result.id, "status": result.status,
+        "artifact_digest": result.artifact_digest,
+        "artifact": json.loads(result.artifact.decode("utf-8"))}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -2020,6 +2119,43 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--reason", required=True)
     retry_parser.add_argument("--idempotency-key", required=True)
     retry_parser.set_defaults(handler=recovery_retry)
+
+    verifier_config_parser = commands.add_parser("verifier-configure")
+    add_cwd(verifier_config_parser)
+    verifier_config_parser.add_argument("--executable", required=True,
+        help="approved executable path/name; invoked directly, never through a shell")
+    verifier_config_parser.add_argument("--arg", action="append", default=[],
+        help="one additional argv element; repeat to add arguments")
+    verifier_config_parser.add_argument("--rules-version", required=True)
+    verifier_config_parser.add_argument("--timeout-seconds", type=int, default=600)
+    verifier_config_parser.add_argument("--actor", required=True)
+    verifier_config_parser.add_argument("--idempotency-key", required=True)
+    verifier_config_parser.set_defaults(handler=verification_configure)
+
+    verify_parser = commands.add_parser("verify")
+    add_cwd(verify_parser)
+    verify_parser.add_argument("--attempt-id", required=True)
+    verify_parser.add_argument("--idempotency-key", required=True)
+    verify_parser.set_defaults(handler=verification_run)
+
+    approval_parser = commands.add_parser("verification-approval")
+    add_cwd(approval_parser)
+    approval_parser.add_argument("--verification-id", required=True)
+    approval_parser.add_argument("--decision", required=True, choices=("accept", "reject"))
+    approval_parser.add_argument("--actor", required=True)
+    approval_parser.add_argument("--reason", required=True)
+    approval_parser.add_argument("--idempotency-key", required=True)
+    approval_parser.set_defaults(handler=verification_approve)
+
+    verification_status_parser = commands.add_parser("verification-status")
+    add_cwd(verification_status_parser)
+    verification_status_parser.add_argument("--task-id", required=True)
+    verification_status_parser.set_defaults(handler=verification_status)
+
+    artifact_parser = commands.add_parser("verification-artifact")
+    add_cwd(artifact_parser)
+    artifact_parser.add_argument("--verification-id", required=True)
+    artifact_parser.set_defaults(handler=verification_artifact)
     return parser
 
 

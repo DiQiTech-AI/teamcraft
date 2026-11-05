@@ -223,6 +223,25 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 
 `complete` 和 `release` 都不会关闭 pane 或终止 Agent。成员处于 `working`、`blocked` 或 `unknown` 时会拒绝操作；`--force` 只应在人工确认该成员不会继续产生冲突修改后使用。
 
+## Report-only 验证与审批
+
+M2 验证器只执行由人工明确批准并持久化到项目中的 argv。参数按独立 argv 元素配置，不接受 shell 命令字符串；对已完成的 scout Attempt 执行：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py verifier-configure \
+  --executable python3 --arg=-m --arg pytest --arg=-q \
+  --rules-version tests-v1 --actor human --idempotency-key verifier-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verify \
+  --attempt-id ATTEMPT_ID --idempotency-key verify-ATTEMPT_ID-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-status --task-id TASK_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-artifact --verification-id VERIFICATION_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-approval \
+  --verification-id VERIFICATION_ID --decision accept \
+  --actor human --reason "接受报告" --idempotency-key approve-VERIFICATION_ID
+```
+
+执行使用 `shell=False`。有界 stdout/stderr 报告工件及 SHA-256、退出码、argv、规则版本和验证器配置版本以不可变记录保存在 SQLite。项目没有配置验证命令时不会得到 PASS。Brief 和最终 WorkerReport 保留不可变的派发时 Task 版本；Verification 另行记录 `worker_reported_done` 后 Task 的当前版本，以及 Attempt identity、Brief digest、最终 WorkerReport identity/digest。Approval 绑定这组完整证据，并在项目 Leader 事务中复核后才能将 scout Task 置为 DONE。之后 Task、Brief、WorkerReport、报告工件或验证策略发生变化都会使证据过期；已完成 scout 的 Task 证据或验证策略变化会重新打开该任务。同一幂等键的重复决定返回原记录；需要新决定时必须生成新的 Verification。普通 ship 在 M4 Worktree/Commit/Diff 证据完成前保持 VERIFYING/NEEDS_HUMAN，M2 不会把报告当成交付。
+
 ## 使用其他 Harness
 
 角色和 harness 是独立的。将 `--kind opencode` 换成当前 Herdr 支持的其他类型即可，例如：

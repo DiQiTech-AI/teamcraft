@@ -11,7 +11,7 @@ Create a task-specific team in sibling panes while preserving the current tab, p
 
 Before Herdr control, require `HERDR_ENV=1`, then run `herdr --skill` and follow the installed binary's semantics. Do not inspect or control a focused Herdr session from outside Herdr. Do not create a workspace, tab, or worktree unless the user requests that topology.
 
-Use `scripts/teamctl.py` for managed team members. Runtime state lives ONLY in the SQLite database `<project>/.teamcraft/teamcraft.db` (schema v7): ownership and intent are reserved before layout mutation, every persistent Herdr side effect (pane split, agent start, prompt) is recorded as a durable Command claimed **before** it executes, and each later phase is written transactionally together with domain events, scoped to the current Herdr socket session and fenced by a project leader lease. Version-bound prompts additionally carry an immutable Attempt Brief and a distinct delivery record: submitted is not an acknowledgement, and ambiguous delivery must be reconciled rather than resent. CEO Attempts also pin their protocol version and exact content hash. Do not edit this state by hand while a team operation is running.
+Use `scripts/teamctl.py` for managed team members. Runtime state lives ONLY in the SQLite database `<project>/.teamcraft/teamcraft.db` (schema v8): ownership and intent are reserved before layout mutation, every persistent Herdr side effect (pane split, agent start, prompt) is recorded as a durable Command claimed **before** it executes, and each later phase is written transactionally together with domain events, scoped to the current Herdr socket session and fenced by a project leader lease. Version-bound prompts additionally carry an immutable Attempt Brief and a distinct delivery record: submitted is not an acknowledgement, and ambiguous delivery must be reconciled rather than resent. CEO Attempts also pin their protocol version and exact content hash. Verification records distinguish the dispatch-time Task version pinned by Brief/WorkerReport from the completion-time Task version; they bind an immutable report artifact to the Attempt, Brief digest, and final WorkerReport identity/digest. Approval rechecks that complete evidence under the project Leader fence. Do not edit this state by hand while a team operation is running.
 
 The `.teamcraft/` runtime directory contains the SQLite database, locks, and journals and is ignored by version control. JSON is not runtime state: the CLI fails closed — without calling Herdr and without creating, reading, modifying, or deleting any file — when it finds legacy `.herdr-team/state.json` or a non-empty `.teamcraft/state.json`. Resolve such legacy JSON manually before continuing. The importable Python Core (`teamcraft`) ships bundled offline under `scripts/core/`; no network access is ever required at runtime.
 
@@ -109,6 +109,25 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py complete api_dev
 ```
 
 Neither operation closes a pane or terminates an agent. Do not pre-create idle specialists, overlap active edit claims, or infer completion from `unknown`.
+
+## Verify and approve report-only work
+
+For a finished scout Attempt, configure the project's human-approved verifier argv, run it, inspect the immutable artifact digest, and record an explicit accept/reject decision:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py verifier-configure \
+  --executable python3 --arg=-m --arg pytest --arg=-q \
+  --rules-version tests-v1 --actor human --idempotency-key verifier-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verify \
+  --attempt-id ATTEMPT_ID --idempotency-key verify-ATTEMPT_ID-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-status --task-id TASK_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-artifact --verification-id VERIFICATION_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-approval \
+  --verification-id VERIFICATION_ID --decision accept \
+  --actor human --reason "Report accepted" --idempotency-key approve-VERIFICATION_ID
+```
+
+Verifier argv is executed directly with `shell=False`; an absent verifier never means PASS. The artifact, digest, result, rules/config versions, and approval evidence are durable and version-bound. Only a current accepted scout report can reach DONE. Ordinary ship remains VERIFYING/NEEDS_HUMAN until M4 provides Worktree/Commit/Diff evidence; M2 does not implement local snapshots or direct-PR delivery.
 
 Release and completion refuse an agent in `working`, `blocked`, or `unknown` state. Use `--force` only after explicitly deciding that its ownership may be reassigned despite that state. Identity verification still applies.
 

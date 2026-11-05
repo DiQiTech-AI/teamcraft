@@ -82,6 +82,16 @@ def _shed_v7_max_attempts(conn) -> None:
     if "max_attempts" in columns:
         conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
+
+def _shed_v8_verification_artifacts(conn) -> None:
+    """Remove v8-only tables and objects from historical-schema fixtures."""
+    for trigger in storage._V8_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V8_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("approvals", "verifications", "verification_configs"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
 class FixedClock:
     """Deterministic injectable UTC clock."""
 
@@ -239,6 +249,7 @@ class EventStoreM105Tests(unittest.TestCase):
         raw = sqlite3.connect(str(self.db))
         _shed_v5_protocol_artifacts(raw)
         _shed_v7_max_attempts(raw)
+        _shed_v8_verification_artifacts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")
@@ -1139,6 +1150,7 @@ class CommandServiceM105Tests(unittest.TestCase):
         raw = sqlite3.connect(str(self.db))
         _shed_v5_protocol_artifacts(raw)
         _shed_v7_max_attempts(raw)
+        _shed_v8_verification_artifacts(raw)
         raw.execute("DROP TABLE events")
         raw.execute("DROP TABLE commands")
         raw.execute("DELETE FROM schema_migrations WHERE version > 1")

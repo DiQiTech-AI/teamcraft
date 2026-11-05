@@ -27,11 +27,10 @@ Scope (deliberately small, review-first):
   rather than trusting status/queue derivations (CEO review M1-04 #2).
 
 Non-goals for this step (owned by later tasks, intentionally absent):
-append-only events and Commands (M1-05), Scheduler/lease/dispatch mechanics
-(M2), Approval/evidence binding and ``delivery_status`` persistence (M2/M4;
-per M0 review 8.2-4 ``READY_FOR_ACCEPTANCE`` must not be smuggled into the
-Task main-status enum, so nothing here invents it), Watcher/reconcile, and any
-touch of real ``.teamcraft`` runtime state.
+Scheduler/lease/dispatch mechanics (M2), M4 Worktree/Commit/Diff delivery,
+``delivery_status`` persistence (per M0 review 8.2-4
+``READY_FOR_ACCEPTANCE`` must not be smuggled into the Task main-status enum),
+Watcher/reconcile, and any touch of real ``.teamcraft`` runtime state.
 
 Hard invariants pinned by tests (``tests/test_domain_m104.py``):
 
@@ -81,7 +80,7 @@ from dataclasses import dataclass
 from datetime import timezone
 from typing import Any, Iterator
 
-from . import storage
+from . import events, storage
 from .clock import Clock, SystemClock
 from .commands import invalidate_stale_commands_for_task
 from .errors import (
@@ -181,8 +180,8 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("running", "attempts_exhausted"): ("needs_human",),
     ("running", "retry_approved"): ("ready",),
     ("ready", "attempts_exhausted"): ("needs_human",),
-    ("verifying", "verification_passed"): ("ready_to_merge",),
-    ("verifying", "verification_failed"): ("blocked", "ready"),
+    ("verifying", "verification_passed"): ("needs_human",),
+    ("verifying", "verification_failed"): ("needs_human",),
     ("ready_to_merge", "approved_and_delivered"): ("done",),
     ("blocked", "blocked_cleared"): ("pending",),
     ("needs_human", "human_reconciled"): ("blocked", "ready", "failed"),
@@ -192,8 +191,8 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
 #: terminal statuses have no outgoing edges at all.
 _CANCEL_EVENT = "user_cancel"
 
-#: Kind-aware override (PLAN 5.1 note): a scout's passed review completes the
-#: task outright; there is no merge leg to wait for.
+#: Kind-aware state routing: only an approved report-only Scout can finish
+#: before M4; verification itself never completes a task.
 def task_transition_targets(
     status: str, event: str, kind: str = "ship"
 ) -> tuple[str, ...]:
@@ -207,8 +206,10 @@ def task_transition_targets(
         return ()
     if event == _CANCEL_EVENT:
         return ("cancelled",)
-    if kind == "scout" and (status, event) == ("verifying", "verification_passed"):
+    if kind == "scout" and (status, event) == ("verifying", "report_accepted"):
         return ("done",)
+    if (status, event) == ("verifying", "report_accepted"):
+        return ()
     return _TASK_TRANSITIONS.get((status, event), ())
 
 
@@ -539,9 +540,9 @@ def _require_execution_finished(
       the ordinary path (reconcile-class transition first, M0 review 8.2-11);
     * non-success terminal exits (FAILED/CANCELLED) may not leave an attempt
       occupying the slot — settle it first (abandon/fail/reconcile);
-    * everything else (READY claims, retry via verification_failed,
-      needs_human, blocked) is untouched: verification/approval/delivery
-      semantics are unchanged beyond this gate.
+    * everything else (READY claims, retry via explicitly cleared failure,
+      needs_human, blocked) is untouched: verifier evidence and Approval
+      decisions are handled by the M2-06 service boundary.
 
     Runs inside the caller's write transaction; a refusal writes nothing.
     """
@@ -801,6 +802,19 @@ def update_task(
         raise ValidationError("update_task requires at least one field to change")
     with _tx(conn):
         task = _fetch_task(conn, task_id)
+        if task.status == "done" and conn.execute(
+            "SELECT 1 FROM approvals WHERE task_id=? AND decision='accept' LIMIT 1",
+            (task.id,),
+        ).fetchone() is not None:
+            # Any Task version bump invalidates the accepted report evidence.
+            # Reopen in the same CAS so a formerly completed Scout cannot
+            # remain DONE on the strength of stale evidence.
+            reopened = _cas_task(conn, task, status="needs_human",
+                                 expected_version=expected_version, now=_utc_iso(clock), **updates)
+            events.append_event(conn, "verification.approval_invalidated",
+                project_id=task.project_id, task_id=task.id,
+                payload_json='{"reason":"task_evidence_changed"}', clock=clock)
+            return reopened
         return _cas_task(conn, task, expected_version=expected_version, now=_utc_iso(clock), **updates)
 
 
@@ -845,6 +859,67 @@ def apply_task_event(
                 event=event,
                 reason_code="RESERVATION_REQUIRED",
             )
+        if event in {"verification_passed", "verification_failed"}:
+            raise IllegalTransitionError(
+                "Verification results must be written by the Verification service",
+                entity="task", current=task.status, event=event,
+                reason_code="VERIFICATION_SERVICE_REQUIRED",
+            )
+        if event == "approved_and_delivered":
+            raise IllegalTransitionError(
+                "ship delivery requires M4 Worktree/Commit/Diff evidence",
+                entity="task", current=task.status, event=event,
+                reason_code="M4_EVIDENCE_REQUIRED",
+            )
+        if event == "report_accepted":
+            if task.kind != "scout":
+                raise IllegalTransitionError(
+                    "only report-only/scout tasks can be accepted before M4",
+                    entity="task", current=task.status, event=event,
+                    reason_code="M4_EVIDENCE_REQUIRED",
+                )
+            accepted = conn.execute(
+                "SELECT a.task_version, a.attempt_id, a.attempt_no, a.brief_digest, a.artifact_digest, "
+                "a.config_version, a.rules_version, a.config_digest, v.id, "
+                "v.dispatch_task_version, v.worker_report_id, v.worker_report_digest "
+                "FROM approvals a JOIN verifications v ON v.id=a.verification_id "
+                "JOIN verification_configs c ON c.project_id=a.project_id AND c.config_version=a.config_version "
+                "WHERE a.task_id=? AND a.decision='accept' ORDER BY a.created_at DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if accepted is None or int(accepted[0]) != task.version:
+                raise IllegalTransitionError(
+                    "a current accepted Approval is required for this Task evidence version",
+                    entity="task", current=task.status, event=event,
+                    reason_code="APPROVAL_REQUIRED",
+                )
+            if not conn.execute(
+                "SELECT 1 FROM verifications v JOIN attempts a ON a.id=v.attempt_id "
+                "JOIN attempt_briefs b ON b.attempt_id=a.id JOIN worker_reports r ON r.id=v.worker_report_id "
+                "WHERE v.id=? AND v.task_id=? AND v.project_id=? AND v.attempt_id=? AND v.attempt_no=? "
+                "AND v.task_version=? AND v.dispatch_task_version=? AND v.worker_report_id=? "
+                "AND v.worker_report_digest=? AND v.brief_digest=? AND v.artifact_digest=? "
+                "AND v.config_version=? AND v.rules_version=? AND v.config_digest=? "
+                "AND v.status='pass' AND a.status='finished' "
+                "AND b.task_version=v.dispatch_task_version AND b.brief_digest=v.brief_digest "
+                "AND r.report_kind='final' AND r.outcome='completed' AND r.task_id=v.task_id "
+                "AND r.task_version=v.dispatch_task_version AND r.brief_digest=v.brief_digest "
+                "AND r.report_digest=v.worker_report_digest "
+                "AND r.id=(SELECT MAX(r2.id) FROM worker_reports r2 WHERE r2.attempt_id=v.attempt_id AND r2.report_kind='final') "
+                "AND EXISTS (SELECT 1 FROM verification_configs c "
+                "WHERE c.project_id=v.project_id AND c.config_version=v.config_version "
+                "AND c.config_digest=v.config_digest AND c.rules_version=v.rules_version "
+                "AND c.config_version=(SELECT MAX(c2.config_version) FROM verification_configs c2 WHERE c2.project_id=v.project_id)) "
+                "AND v.id=(SELECT v2.id FROM verifications v2 WHERE v2.task_id=v.task_id ORDER BY v2.created_at DESC, v2.id DESC LIMIT 1)",
+                (str(accepted[8]), task.id, task.project_id, str(accepted[1]), int(accepted[2]), int(accepted[0]),
+                 int(accepted[9]), int(accepted[10]), str(accepted[11]), str(accepted[3]), str(accepted[4]),
+                 int(accepted[5]), str(accepted[6]), str(accepted[7])),
+            ).fetchone():
+                raise IllegalTransitionError(
+                    "Approval evidence or verifier configuration is stale",
+                    entity="task", current=task.status, event=event,
+                    reason_code="APPROVAL_STALE",
+                )
         targets = task_transition_targets(task.status, event, task.kind)
         resolved = _resolve_target("task", task.status, event, targets, target)
         if event in _FACT_GUARDED_TASK_EVENTS:

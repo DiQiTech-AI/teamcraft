@@ -15,8 +15,14 @@ class SchemaV7Tests(unittest.TestCase):
             raw = sqlite3.connect(path)
             raw.execute("INSERT INTO projects(id,name,repo_path,created_at) VALUES('p','p','/p','now')")
             raw.execute("INSERT INTO tasks(id,project_id,title,status,created_at,updated_at) VALUES('t','p','t','pending','now','now')")
+            for trigger in storage._V8_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V8_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("approvals", "verifications", "verification_configs"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
             raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
-            raw.execute("DELETE FROM schema_migrations WHERE version=7")
+            raw.execute("DELETE FROM schema_migrations WHERE version>6")
             raw.execute("PRAGMA user_version=6")
             raw.commit(); raw.close()
             storage.migrate_to_head(path)

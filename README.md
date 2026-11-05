@@ -223,6 +223,25 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 
 Neither `complete` nor `release` closes the pane or terminates the agent. They reject members in `working`, `blocked`, or `unknown` state. Use `--force` only after a human confirms that the member will not make further conflicting changes.
 
+## Report-only verification and approval
+
+M2 Verification runs only a project-persisted argv explicitly approved by a human. Configure the argv as separate arguments (never as a shell command string), then run it against a finished scout Attempt:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py verifier-configure \
+  --executable python3 --arg=-m --arg pytest --arg=-q \
+  --rules-version tests-v1 --actor human --idempotency-key verifier-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verify \
+  --attempt-id ATTEMPT_ID --idempotency-key verify-ATTEMPT_ID-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-status --task-id TASK_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-artifact --verification-id VERIFICATION_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py verification-approval \
+  --verification-id VERIFICATION_ID --decision accept \
+  --actor human --reason "Report accepted" --idempotency-key approve-VERIFICATION_ID
+```
+
+The verifier is launched with `shell=False`; its bounded stdout/stderr artifact and SHA-256 digest, exit status, argv, rules version, and verifier config version are stored immutably in SQLite. No configured verifier means no PASS. Brief and final WorkerReport retain their immutable dispatch-time Task version; Verification separately records the Task version after `worker_reported_done`, plus the Attempt identity, Brief digest, and final WorkerReport identity/digest. An Approval is bound to that complete evidence and is rechecked under the project Leader transaction before the scout Task can become DONE. Later Task, Brief, WorkerReport, artifact, or verifier-policy changes make the evidence stale; an already completed scout is reopened if its Task evidence or verifier policy changes. Repeated decisions with the same idempotency key return the recorded decision; a different decision requires a new Verification. Ship Tasks remain in VERIFYING/NEEDS_HUMAN until M4 Worktree/Commit/Diff evidence exists; M2 does not accept a report as ship delivery.
+
 ## Use another harness
 
 Roles and harnesses are independent. Replace `--kind opencode` with another type supported by the active Herdr installation. For example:
