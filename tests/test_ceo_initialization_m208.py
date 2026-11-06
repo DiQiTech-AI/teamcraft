@@ -85,7 +85,7 @@ class CEOInitializationM208Tests(unittest.TestCase):
         finally:
             raw.close()
         result = storage.migrate_to_head(db, allow_unverified_location=True)
-        self.assertEqual((result.from_version, result.to_version, result.applied), (8, 11, (9, 10, 11)))
+        self.assertEqual((result.from_version, result.to_version, result.applied), (8, 12, (9, 10, 11, 12)))
         audit = storage.verify_database(db)
         self.assertTrue(audit["at_head"])
         self.assertIn("ceo_initializations", audit["tables"])
@@ -258,6 +258,57 @@ class CEOInitializationM208Tests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "only pending Wakes"):
             wake.admit_pending_wake(self.conn, self.project_id, item.id, self.lease, clock=self.clock)
         self.assertEqual(self.conn.execute("SELECT state FROM commands WHERE id=?", (admitted.command.id,)).fetchone()[0], "unknown")
+
+    def test_unknown_wake_reconciliation_submitted_never_resends(self):
+        _, nonce = self.issue()
+        init.mark_bootstrap_unknown(self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock)
+        initialized = init.record_bootstrap_submitted_assumed(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        domain.observe_session(self.conn, initialized.teamcraft_session_id, "idle", clock=self.clock)
+        source = events.append_event(self.conn, "task.updated", project_id=self.project_id,
+                                     payload_json='{"dedupe_key":"task:reconcile"}', clock=self.clock)
+        item = wake.ingest_events(self.conn, self.project_id, self.lease, clock=self.clock).wakes[0]
+        admitted = wake.admit_pending_wake(self.conn, self.project_id, item.id, self.lease, clock=self.clock)
+        wake.record_submission_result(self.conn, self.project_id, item.id, self.lease,
+                                      outcome="unknown", detail="Lost Herdr response", clock=self.clock)
+        settled = wake.reconcile_wake_delivery(
+            self.conn, self.project_id, item.id, self.lease, delivered=True,
+            actor="operator", note="Herdr history confirms submission",
+            evidence_json='{"observed_prompt":true}', clock=self.clock,
+        )
+        self.assertEqual(settled.state, "submitted")
+        self.assertEqual(self.conn.execute("SELECT state FROM commands WHERE id=?", (admitted.command.id,)).fetchone()[0], "confirmed")
+        with self.assertRaisesRegex(Exception, "only pending Wakes"):
+            wake.admit_pending_wake(self.conn, self.project_id, item.id, self.lease, clock=self.clock)
+        ack = wake.acknowledge_wake(
+            self.conn, self.project_id, item.id, self.lease,
+            target_session_id=initialized.native_session_id,
+            acknowledged_through_seq=source.seq, clock=self.clock,
+        )
+        self.assertEqual(ack.state, "acknowledged")
+
+    def test_unknown_wake_reconciled_not_delivered_is_blocked_not_requeued(self):
+        _, nonce = self.issue()
+        init.mark_bootstrap_unknown(self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock)
+        initialized = init.record_bootstrap_submitted_assumed(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        domain.observe_session(self.conn, initialized.teamcraft_session_id, "idle", clock=self.clock)
+        events.append_event(self.conn, "task.updated", project_id=self.project_id,
+                            payload_json='{"dedupe_key":"task:not-delivered"}', clock=self.clock)
+        item = wake.ingest_events(self.conn, self.project_id, self.lease, clock=self.clock).wakes[0]
+        admitted = wake.admit_pending_wake(self.conn, self.project_id, item.id, self.lease, clock=self.clock)
+        wake.record_submission_result(self.conn, self.project_id, item.id, self.lease,
+                                      outcome="unknown", detail="Transport interrupted", clock=self.clock)
+        settled = wake.reconcile_wake_delivery(
+            self.conn, self.project_id, item.id, self.lease, delivered=False,
+            actor="operator", note="Inspected session history; no prompt found",
+            evidence_json='{"matching_prompt_found":false}', clock=self.clock,
+        )
+        self.assertEqual(settled.state, "blocked")
+        self.assertEqual(self.conn.execute("SELECT state FROM commands WHERE id=?", (admitted.command.id,)).fetchone()[0], "expired")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0], 1)
 
 
     def test_runtime_skill_drift_before_admitted_bootstrap_fails_closed(self):

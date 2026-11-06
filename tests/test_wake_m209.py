@@ -53,7 +53,7 @@ class WakeM209Tests(unittest.TestCase):
         )
 
     def test_schema_v10_is_complete_and_wake_integrity_triggers_are_present(self):
-        self.assertEqual(storage.SCHEMA_VERSION, 11)
+        self.assertEqual(storage.SCHEMA_VERSION, 12)
         audit = storage.verify_database(self.db)
         self.assertTrue(audit["at_head"])
         self.assertTrue({"wake_cursors", "wakes", "wake_events"} <= set(audit["tables"]))
@@ -64,32 +64,21 @@ class WakeM209Tests(unittest.TestCase):
         self.assertTrue(storage._V10_TRIGGERS <= names)
         self.assertTrue(storage._V10_INDEXES <= names)
 
-    def test_v10_database_migrates_forward_to_v11(self):
+    def test_v11_database_migrates_forward_to_v12(self):
         raw = sqlite3.connect(self.db)
         try:
-            for trigger in storage._V11_TRIGGERS:
-                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            for name in ("trg_ceo_initializations_require_host_receipt",
-                         "trg_ceo_initializations_update_require_host_receipt",
-                         "trg_ceo_initializations_state_machine"):
-                raw.execute(f"DROP TRIGGER IF EXISTS {name}")
-            columns = {row[1] for row in raw.execute("PRAGMA table_info(ceo_initializations)")}
-            if "receipt_source" in columns:
-                raw.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
-            for statement in storage._V9_STATEMENTS:
-                if any(statement.startswith(f"CREATE TRIGGER {name}\n") for name in (
-                    "trg_ceo_initializations_require_host_receipt",
-                    "trg_ceo_initializations_update_require_host_receipt",
-                    "trg_ceo_initializations_state_machine",
-                )):
+            raw.execute("DROP TRIGGER IF EXISTS trg_wakes_state_machine")
+            for statement in storage._V10_STATEMENTS:
+                if statement.startswith("CREATE TRIGGER trg_wakes_state_machine\n"):
                     raw.execute(statement)
-            raw.execute("DELETE FROM schema_migrations WHERE version > 10")
-            raw.execute("PRAGMA user_version=10")
+                    break
+            raw.execute("DELETE FROM schema_migrations WHERE version > 11")
+            raw.execute("PRAGMA user_version=11")
             raw.commit()
         finally:
             raw.close()
         result = storage.migrate_to_head(self.db, allow_unverified_location=True)
-        self.assertEqual((result.from_version, result.to_version, result.applied), (10, 11, (11,)))
+        self.assertEqual((result.from_version, result.to_version, result.applied), (11, 12, (12,)))
         self.assertTrue(storage.verify_database(self.db)["at_head"])
 
     def test_ingest_merges_same_dedupe_window_and_keeps_highest_priority(self):

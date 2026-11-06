@@ -1,4 +1,4 @@
-"""Durable Wake inbox and event aggregation (M2-09 first slice).
+"""Durable Wake inbox, event aggregation, and delivery state (M2-09).
 
 This module consumes the append-only project Event stream under the existing
 Scheduler Leader lease.  It persists deterministic Wake batches and explicit
@@ -382,6 +382,15 @@ def admit_pending_wake(
             # never starts a replacement session.
             return AdmissionResult(item, None, f"ceo_{session.state}")
 
+        active = conn.execute(
+            "SELECT id,state FROM wakes WHERE project_id=? AND target_ceo_name=? "
+            "AND state IN ('sending','submitted','unknown') AND id<>? "
+            "ORDER BY first_seq LIMIT 1",
+            (project_id, item.target_ceo_name, item.id),
+        ).fetchone()
+        if active is not None:
+            return AdmissionResult(item, None, f"wake_{active[1]}:{active[0]}")
+
         now = _iso(_now(clock))
         payload = {
             "action": "wake_ceo",
@@ -463,8 +472,9 @@ def record_submission_result(
         raise leader.StaleLeaderError("lease scope does not match project", scope=lease.scope, epoch=lease.epoch)
     now = _iso(_now(clock))
     with transaction(conn):
-        leader.require_project_lease(conn, lease, project_id, clock=clock)
-        ceo_initialization.require_initialized(conn, project_id)
+        if outcome == "submitted":
+            leader.require_project_lease(conn, lease, project_id, clock=clock)
+            ceo_initialization.require_initialized(conn, project_id)
         row = conn.execute(
             f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=? AND project_id=?",
             (wake_id, project_id),
@@ -506,6 +516,132 @@ def record_submission_result(
         return _row_wake(updated)
 
 
+def recover_interrupted_submissions(
+    conn: TeamCraftConnection,
+    project_id: str,
+    lease: leader.Lease,
+    *,
+    clock: Clock | None = None,
+) -> tuple[Wake, ...]:
+    """Move prior Leader ``sending`` rows to UNKNOWN after lease takeover.
+
+    A current fenced Leader proves the previous executor can no longer own
+    the project. The old external call may nevertheless have completed, so
+    recovery records ambiguity and never retries it.
+    """
+    domain.require_head(conn)
+    if lease.scope != leader.project_scope(project_id):
+        raise leader.StaleLeaderError("lease scope does not match project", scope=lease.scope, epoch=lease.epoch)
+    now = _iso(_now(clock))
+    recovered: list[Wake] = []
+    with transaction(conn):
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        rows = conn.execute(
+            f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE project_id=? AND state='sending' "
+            "ORDER BY first_seq,id",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            item = _row_wake(row)
+            if item.command_id is None:
+                raise storage.StorageError(f"sending Wake {item.id} has no bound Command")
+            command = conn.execute("SELECT state FROM commands WHERE id=?", (item.command_id,)).fetchone()
+            if command is None or str(command[0]) != "running":
+                raise storage.StorageError(f"sending Wake {item.id} has no running Command")
+            note = "prior Leader ended during Wake transport; inspect Herdr before resolving"
+            commands.mark_command_unknown(conn, item.command_id, note=note, clock=clock)
+            conn.execute(
+                "UPDATE wakes SET state='unknown',detail=?,updated_at=? WHERE id=? AND state='sending'",
+                (note, now, item.id),
+            )
+            events.append_event(conn, "wake.unknown", project_id=project_id,
+                payload_json=json.dumps({"wake_id": item.id, "command_id": item.command_id,
+                                         "detail": note, "recovered_after_leader_takeover": True},
+                                        sort_keys=True, separators=(",", ":")), clock=clock)
+            updated = conn.execute(f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=?", (item.id,)).fetchone()
+            assert updated is not None
+            recovered.append(_row_wake(updated))
+    return tuple(recovered)
+
+
+def reconcile_wake_delivery(
+    conn: TeamCraftConnection,
+    project_id: str,
+    wake_id: str,
+    lease: leader.Lease,
+    *,
+    delivered: bool,
+    actor: str,
+    note: str,
+    evidence_json: str,
+    clock: Clock | None = None,
+) -> Wake:
+    """Settle UNKNOWN only from explicit inspection; never resends the prompt.
+
+    A positive finding settles the Command and Wake as submitted. A finding
+    that delivery did not occur expires the Command and blocks the Wake for
+    manual follow-up. Neither result creates a replacement Command.
+    """
+    domain.require_head(conn)
+    if not isinstance(delivered, bool):
+        raise ValidationError("delivered must be a boolean inspection result")
+    if not isinstance(actor, str) or not actor.strip() or len(actor.encode("utf-8")) > 64:
+        raise ValidationError("reconciliation actor must be a non-empty string up to 64 bytes")
+    if not isinstance(note, str) or not note.strip() or len(note.encode("utf-8")) > 256:
+        raise ValidationError("reconciliation note must be a non-empty string up to 256 bytes")
+    if not isinstance(evidence_json, str):
+        raise ValidationError("reconciliation evidence must be a JSON string")
+    try:
+        evidence = json.loads(evidence_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("reconciliation evidence must be valid JSON") from exc
+    if not isinstance(evidence, dict) or len(evidence_json.encode("utf-8")) > 512:
+        raise ValidationError("reconciliation evidence must be an object up to 512 bytes")
+    audit_note = f"actor={actor.strip()}; {note.strip()}; evidence={json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+    if len(audit_note.encode("utf-8")) > commands.MAX_COMMAND_NOTE_BYTES:
+        raise ValidationError("combined reconciliation audit note exceeds the command note limit")
+    if lease.scope != leader.project_scope(project_id):
+        raise leader.StaleLeaderError("lease scope does not match project", scope=lease.scope, epoch=lease.epoch)
+    now = _iso(_now(clock))
+    with transaction(conn):
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        row = conn.execute(
+            f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=? AND project_id=?",
+            (wake_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("Wake not found")
+        item = _row_wake(row)
+        if item.state != "unknown" or item.command_id is None:
+            raise ValidationError("only an UNKNOWN Wake with a bound Command can be reconciled")
+        commands.reconcile_command(
+            conn, item.command_id,
+            outcome="confirmed" if delivered else "expired",
+            note=audit_note,
+            result_json=json.dumps({"reconciled_delivered": True, "evidence": evidence},
+                                   ensure_ascii=False, sort_keys=True, separators=(",", ":")) if delivered else None,
+            clock=clock,
+        )
+        next_state = "submitted" if delivered else "blocked"
+        detail = "reconciled as submitted" if delivered else "reconciled as not submitted; automatic resend prohibited"
+        conn.execute(
+            "UPDATE wakes SET state=?,detail=?,submitted_at=CASE WHEN ?='submitted' THEN ? ELSE submitted_at END,updated_at=? "
+            "WHERE id=? AND state='unknown'",
+            (next_state, detail, next_state, now, now, wake_id),
+        )
+        events.append_event(
+            conn, "wake.reconciled", project_id=project_id,
+            payload_json=json.dumps({"wake_id": item.id, "command_id": item.command_id,
+                                     "state": next_state, "actor": actor.strip(),
+                                     "note": note.strip(), "evidence": evidence},
+                                    ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            clock=clock,
+        )
+        updated = conn.execute(f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=?", (wake_id,)).fetchone()
+        assert updated is not None
+        return _row_wake(updated)
+
+
 def acknowledge_wake(
     conn: TeamCraftConnection,
     project_id: str,
@@ -518,8 +654,8 @@ def acknowledge_wake(
 ) -> Wake:
     """Record explicit CEO acknowledgement; never infer it from idle/done.
 
-    The operation is intentionally unavailable until M2-08 has a trusted host
-    receipt.  Wake delivery itself is added by the next M2-09 integration slice.
+    The CEO initialization policy must pass; transport submission alone is
+    never treated as CEO acknowledgement.
     """
     domain.require_head(conn)
     if lease.scope != leader.project_scope(project_id):
@@ -536,6 +672,10 @@ def acknowledge_wake(
         wake = _row_wake(row)
         if wake.target_session_id != target_session_id or initialization.native_session_id != target_session_id:
             raise ValidationError("Wake acknowledgement session does not match the initialized CEO")
+        if wake.state == "acknowledged":
+            if acknowledged_through_seq == wake.last_seq:
+                return wake
+            raise ValidationError("replayed acknowledgement does not match the Wake event range")
         if wake.state != "submitted":
             raise ValidationError("only a submitted Wake can be acknowledged")
         if acknowledged_through_seq != wake.last_seq:
@@ -591,6 +731,8 @@ def mark_processed(
         if row is None:
             raise NotFoundError("Wake not found")
         wake = _row_wake(row)
+        if wake.state == "processed":
+            return wake
         if wake.state != "acknowledged":
             raise ValidationError("only an acknowledged Wake can be processed")
         now = _iso(_now(clock))

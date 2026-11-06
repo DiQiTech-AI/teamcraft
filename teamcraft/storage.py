@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -765,6 +765,22 @@ _V11_STATEMENTS = (
        BEGIN SELECT RAISE(ABORT, 'CEO receipt source is immutable once recorded'); END""",
 )
 
+# v12 (M2-09): reconciliation may settle an ambiguous Wake as submitted, or
+# block it when inspection establishes that delivery did not occur.  UNKNOWN
+# never returns to pending and therefore cannot trigger an automatic resend.
+_V12_STATEMENTS = (
+    "DROP TRIGGER trg_wakes_state_machine",
+    """CREATE TRIGGER trg_wakes_state_machine
+       BEFORE UPDATE OF state ON wakes
+       WHEN NOT (NEW.state = OLD.state OR
+         (OLD.state='pending' AND NEW.state IN ('sending','blocked','unknown')) OR
+         (OLD.state='sending' AND NEW.state IN ('submitted','unknown')) OR
+         (OLD.state='submitted' AND NEW.state IN ('acknowledged','unknown')) OR
+         (OLD.state='unknown' AND NEW.state IN ('submitted','blocked')) OR
+         (OLD.state='acknowledged' AND NEW.state='processed'))
+       BEGIN SELECT RAISE(ABORT, 'invalid wake state transition'); END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -780,6 +796,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (9, _V9_STATEMENTS),
     (10, _V10_STATEMENTS),
     (11, _V11_STATEMENTS),
+    (12, _V12_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -797,6 +814,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     9: _V9_TABLES,
     10: _V10_TABLES,
     11: frozenset(),
+    12: frozenset(),
 }
 
 
@@ -880,6 +898,7 @@ _V10_TRIGGERS = frozenset({
     "trg_wake_events_pending_only",
 })
 _V11_TRIGGERS = frozenset({"trg_ceo_initializations_receipt_source_fixed"})
+_V12_TRIGGERS = frozenset()
 
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
@@ -892,6 +911,7 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     9: (_V9_TRIGGERS, _V9_INDEXES),
     10: (_V10_TRIGGERS, _V10_INDEXES),
     11: (_V11_TRIGGERS, frozenset()),
+    12: (_V12_TRIGGERS, frozenset()),
 }
 
 

@@ -114,7 +114,7 @@ class VerificationM206Tests(unittest.TestCase):
         finally:
             raw.close()
         migration = storage.migrate_to_head(self.db, allow_unverified_location=True)
-        self.assertEqual((migration.from_version, migration.to_version, migration.applied), (7, 11, (8, 9, 10, 11)))
+        self.assertEqual((migration.from_version, migration.to_version, migration.applied), (7, 12, (8, 9, 10, 11, 12)))
         report = storage.verify_database(self.db)
         self.assertTrue(report["at_head"])
         self.assertTrue(set(storage._V8_TABLES).issubset(set(report["tables"])))

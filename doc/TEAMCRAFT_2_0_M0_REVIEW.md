@@ -347,12 +347,12 @@ flowchart LR
 | **M2-05 Reconcile、超时与有界 Attempt**；依赖 M2-02、M2-04 | 复用 terminal/native-session 核验；交叉检查 DB、Herdr、结果；为等待、取消、人工处理、经批准的新 Attempt 定义 Command；配置 max Attempts 和异常升级路径 | Prompt 回执丢失不重发；Pane 移动可验证恢复；身份不符拒绝接管；达到无进展/任务超时或 max Attempts 时升级，不无限重试；UNKNOWN 不自动重试且未审批不能产生新 Attempt | 证据不足时用户负担；阈值和最大次数设置不当；把活跃误判成进展 |
 | **M2-06 report-only/scout Verification/Approval Gate（已完成，CEO 验收见 12.16）**；依赖 M1-05、M2-03、M2-05 | 建立 Verification/Approval 服务；仅运行项目批准的 argv 验证命令；记录受控报告 artifact/hash、规则/config version 和人类接受；Approval 按 8.2 绑定 evidence version。普通 ship 保留 `VERIFYING` 或转 `NEEDS_HUMAN`，原因标记为等待 M4 Worktree/Commit/Diff evidence；不实现 local-only 快照 | Worker FINISHED 不能直接 DONE；无验证命令不默认 PASS；report-only/scout 仅在 artifact 验证和相同证据版本的人类接受后 DONE；证据变化使 Approval 失效；local-only/direct-PR 在 M4 前不能 DONE；批准/拒绝可审计且重复决定幂等 | artifact 可信边界；审批 TOCTOU；把 M2 报告门禁误用于代码交付 |
 | **M2-07 Core/Runtime/Wake 故障注入**；依赖 M2-03、M2-05、M2-06、M2-08、M2-09 | 覆盖启动响应丢失、Agent 进程退出、进程存活但无进展、活动无产物进展、任务超时、max Attempts、重复 completed、Leader 换届、旧 Leader 在外部 Herdr/GitHub 调用执行期间失租、Watcher/Dispatcher 重启、CEO working 时多事件、Wake 各投递阶段崩溃、CEO 确认前崩溃、协议版本不兼容、Core 重启/事件回放、report Verifier/Approval 写入前后崩溃；Worktree/Git 留给 M4、浏览器一致性留给 M3 | 每场景记录三类信号、阈值、证据、安全动作、人工升级和幂等边界；事件/Wake 可回放且未确认事件保留；受控状态不重复提交，歧义期间不盲目再次创建 Pane、投递 Prompt 或派发 Attempt；未知 Token 维持 NULL；UNKNOWN 不自动重试；外部调用期间失租必须转入 Reconcile，以 Herdr/Git 事实判定且禁止盲目重发或自动确认，不能把 Mock 结果解释成外部副作用 exactly-once；Mock 与真实 Herdr/Harness 结果分栏 | Mock 与实机偏差；故障窗口难稳定复现；阈值需要真实工作负载校准 |
-| **M2-08 CEO 初始化 Runtime**；依赖 M1-08、M2-01、M2-03 | Runtime Adapter 启动/恢复 CEO，发送最短 bootstrap Prompt；由 Core 独立计算协议文件 hash 并验证文件版本，校验绑定 nonce、Session ID、protocol version/hash 的回执及 `teamcraft` 运行 Skill、项目/Task 状态和 Session 身份；持久化 discovered/read/initialized/failed/incompatible，初始化完成前设置 dispatch gate | Skill 缺失、协议不可读/hash 不符/版本不兼容均阻断派工并产事件；发现不等于读取，读取不等于初始化；缺失、重放、过期或 Session/nonce/version/hash 不匹配的回执均拒绝；Agent 自述不能绕过 Core 安全门禁；恢复不创建重复 CEO；Codex/OpenCode 以 Mock + 可用版本实机分别验收 | Harness 无可靠加载确认；Prompt 注入攻击；恢复时协议升级 |
-| **M2-09 Wake Dispatcher**；依赖 M2-08、M2-02、M2-04、M2-05 | 在 Scheduler Leader 内读取 SQLite Events，按 dedupe key、seq、优先级和窗口合并 Wake；持久化 pending/sending/submitted/acknowledged/processed；CEO working 延后普通 Wake，idle/done 且身份有效时用 Herdr prompt 唤醒，unknown/missing 隔离；CEO 明确确认前保留事件；Dormant 支持，auto-start opt-in 默认关闭；预算保守控制 | 多事件只产生一次合并唤醒且不丢高优先级项；重启从 DB 恢复；sending/submitted 结果不明时 Reconcile 不重发；CEO working 不注入普通 Wake；unknown/missing 不启新会话；测试同一事件对同一目标和动作重复生成 CEO Command 时幂等、同一 Task/Attempt 重复派工不产生额外执行、Wake 确认游标单调递增；事件重复处理不得绕过 Approval 与 evidence version 检查；处理确认原子绑定事件游标；不引入第二服务/消息系统，不要求常驻 LLM | 合并延迟紧急事件；CEO ack 语义不统一；外部 Prompt 不具 exactly-once；预算未知导致保守阻塞 |
+| **M2-08 CEO 初始化 Runtime（已完成并关闭；实机验证延期，见 12.17）**；依赖 M1-08、M2-01、M2-03 | Runtime Adapter 启动/恢复 CEO，发送最短 bootstrap Prompt；由 Core 独立计算协议文件 hash 并验证文件版本，校验绑定 nonce、Session ID、protocol version/hash 的回执及 `teamcraft` 运行 Skill、项目/Task 状态和 Session 身份；持久化 discovered/read/initialized/failed/incompatible，初始化完成前设置 dispatch gate | Skill 缺失、协议不可读/hash 不符/版本不兼容均阻断派工并产事件；发现不等于读取，读取不等于初始化；缺失、重放、过期或 Session/nonce/version/hash 不匹配的回执均拒绝；Agent 自述不能绕过 Core 安全门禁；恢复不创建重复 CEO；Codex/OpenCode 以 Mock + 可用版本实机分别验收。**本次按负责人决定关闭实现任务；可信宿主回执和 Codex/OpenCode 实机验证列为后续测试，不计作已通过证据。** | Harness 无可靠加载确认；Prompt 注入攻击；恢复时协议升级 |
+| **M2-09 Wake Dispatcher（已完成并关闭；真实投递/恢复实测延期，见 12.17）**；依赖 M2-08、M2-02、M2-04、M2-05 | 在 Scheduler Leader 内读取 SQLite Events，按 dedupe key、seq、优先级和窗口合并 Wake；持久化 pending/sending/submitted/acknowledged/processed/unknown/blocked；CEO working 延后普通 Wake，idle/done 且身份有效时用 Herdr prompt 唤醒，unknown/missing 隔离；CEO 明确确认前保留事件；auto-start 默认关闭；对提示事件负载设有界预算，未知 Token 用量保持 NULL | 多事件合并且不丢优先级；持久化队列、Command、游标和 CLI 投递/对账入口已实现；UNKNOWN/重启恢复不盲重发；CEO working 不注入普通 Wake；身份核验失败不启动新会话；重复 Command 幂等、确认游标单调递增。真实 Herdr 投递、响应丢失、重启恢复和身份漂移的实机验证延期至后续测试；Dormant CEO auto-start 保持关闭，不声称已完成自动启动路径。 | 合并延迟紧急事件；CEO ack 语义不统一；外部 Prompt 不具 exactly-once；预算未知导致保守阻塞 |
 
-**M2 退出门禁**：所有外部副作用由单一 fenced Leader 执行持久 Command；CEO 只有在协议和运行 Skill 初始化确认后才能派工；Watcher 日常观察不消耗 LLM Token；Wake 可合并、去重、确认、重启恢复，Dormant CEO 不要求常驻且 auto-start 默认关闭。进程存活、Agent 活跃和实际进展可分别查询；无进展阈值、任务超时、max Attempts 和升级路径通过故障测试；未知 Token 保持 NULL 且不作为低成本依据；Herdr 失联、UNKNOWN 或投递歧义不会盲重派/重发。最小 Verification/Approval 已可在 CLI 验收 report-only/scout，Worker 自述不能完成 Task；local-only、direct-PR 和普通 ship 明确停在等待 M4 证据的非终态。浏览器生命周期由 M3-06 验收，脏 Worktree、Commit 回执丢失和 Worktree Verifier 崩溃由 M4 验收。
+**M2 退出门禁**：所有外部副作用由单一 fenced Leader 执行持久 Command；CEO 只有在协议和运行 Skill 初始化确认后才能派工；Watcher 日常观察不消耗 LLM Token；Wake 可合并、去重、确认、重启恢复，Dormant CEO 不要求常驻且 auto-start 默认关闭。进程存活、Agent 活跃和实际进展可分别查询；无进展阈值、任务超时、max Attempts 和升级路径通过故障测试；未知 Token 保持 NULL 且不作为低成本依据；Herdr 失联、UNKNOWN 或投递歧义不会盲重派/重发。最小 Verification/Approval 已可在 CLI 验收 report-only/scout，Worker 自述不能完成 Task；local-only、direct-PR 和普通 ship 明确停在等待 M4 证据的非终态。浏览器生命周期由 M3-06 验收，脏 Worktree、Commit 回执丢失和 Worktree Verifier 崩溃由 M4 验收。M2-08/09 的 owner closure 与延期实机验证按第 12.17 节记录，不代表实机门禁已通过。
 
-**当前实施记录**：M2-08 的真实宿主回执与 M2-09 的真实 Herdr 投递测试暂缓。临时 `assumed_default` 只在 bootstrap Prompt 成功提交且再次核对 CEO live Session 后写入，并在数据库中明确标识为假设；这不满足 M2-08 的最终验收。M2-09 当前完成持久队列、Command 状态和游标基础，CLI 投递及未知结果对账入口仍待开发。详见 [M2-09 Wake Dispatcher 状态记录](M2-09_WAKE_DISPATCH_STATUS.md)。
+**当前实施记录**：M2-08 与 M2-09 已按负责人决定关闭实现任务；可信宿主回执、Codex/OpenCode 实机初始化、真实 Herdr 投递、响应丢失、重启恢复与身份漂移验证暂缓，后续实际测试时补记证据。M2-08 临时 `assumed_default` 只在 bootstrap Prompt 成功提交且再次核对 CEO live Session 后写入，并在数据库明确标识为假设，不得表述为可信宿主回执。M2-09 已有持久队列、Command/游标、CLI 投递、确认、处理和 UNKNOWN 对账入口；auto-start 仍关闭，未实现 Dormant CEO 自动启动路径。详见 [M2-09 Wake Dispatcher 状态记录](M2-09_WAKE_DISPATCH_STATUS.md) 及第 12.17 节。
 
 M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reconcile 边界；真实 GitHub Adapter 尚未出现，须在 M4-05 另行验证，不把 M2 Mock 记作真实 GitHub 集成证据。
 
@@ -471,7 +471,7 @@ Mock/Fake 只能证明领域与 Adapter 契约，不能替代真实 Harness/Herd
 | M2 local-only 快照扩大范围仍不能排除系统外写入 | **Medium** | 当前共享同一 `cwd`（`teamctl.py:507-510`），Ownership 明确不是文件系统隔离（`README.md:168-174`） | 取消 M2 快照；M2/M3 只闭环 report-only/scout；M4 用 Worktree/Commit/完整 Diff 证据 |
 | 迁移或 Core 改造削弱 Ownership、Session 身份和保守恢复 | **High** | 现有 normalize/overlap、session identity、默认 inspect 已有代码和测试（`teamctl.py:109-118`、`:264-332`、`:688-821`；`test_teamctl.py:83-132`、`:218-301`） | 30 项回归保持；M1-01 契约固定语义；各阶段强制门禁 3–4 |
 | CEO Protocol 在 Harness 入口复制或版本漂移 | **High** | 当前没有独立协议或版本字段；CEO 规则散在 Skill、Profile 和 `build_prompt()` | M1-08 单一 `CEO_PROTOCOL.md` + version/hash；入口只加载；M2-08 初始化握手；M6-06 跨 Harness 校验 |
-| Skill 被发现但协议未读取/初始化却开始派工 | **High** | CTO 接线后 active CEO Attempt 的 version/hash 会在每次 runtime 同步和派发 claim 前独立复验；但仍没有 Agent 读取回执、初始化状态或 nonce/Session 绑定 | M2-08 区分 discovered/read/initialized 并验证回执；M2-07 缺失/不兼容故障注入 |
+| Skill 被发现但协议未读取/初始化却开始派工 | **High** | CTO 接线后 active CEO Attempt 的 version/hash 会在每次 runtime 同步和派发 claim 前独立复验；M2-08 已实现状态与 Session/nonce 绑定，但当前 `assumed_default` 不证明宿主真实读取 | 后续实测可信宿主回执来源；M2-07 验证缺失/不兼容故障隔离 |
 | Wake 投递结果不明导致重复 CEO 决策或重复派工 | **Critical** | 当前 prompt 歧义只存 JSON phase，无持久 Event/Wake/Command 对账 | M1-05/M2-03 持久 Command；M2-09 Wake 状态/合并/ack；M2-07 sending/失租/崩溃测试；禁止盲重发 |
 | Harness 官方发现规则或版本变化 | **High** | 本机只有 Codex 0.163.0、OpenCode 2.0.25；Claude 不可用，官方文档不能替代实测 | M1-08/M5-01 能力矩阵；每版本真实冒烟；Claude 延至 M6-06，未测不宣称支持 |
 | CEO 唤醒过频消耗云端 Token | **High** | 当前无 Wake 合并、预算或用量数据 | M2-09 working 延后、合并窗口、优先级、Dormant；M5-03/04 预算和统计；未知用量保守处理 |
@@ -576,7 +576,7 @@ M1-02 实现工作树在 Python 3.13.14 上执行 `.agents/skills/teamcraft/test
 
 ### 12.4 下一任务边界
 
-M1-05、M1-06、M1-07、M1-08、M2-02、M2-03、M2-04、M2-05 和 M2-06 已分别通过验收关闭（证据见第 12.5、12.6、12.9、12.11、12.13、12.14、12.15、12.16 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。协议初始化 Runtime 仍在 M2-08。
+M1-05、M1-06、M1-07、M1-08、M2-02、M2-03、M2-04、M2-05、M2-06、M2-08 和 M2-09 已分别完成并关闭（证据见第 12.5–12.17 节）。M1-08 Codex/OpenCode 入口与协议契约已落地；OpenCode 模型不可用导致本轮实机调用未通过，作为未验证限制记录。生产 JSON→SQLite 迁移已从产品路线取消。M2-08/09 实机验证延期，不代表验证通过。
 
 ### 12.5 M1-05 完成交付与 M1-06 开工记录（2026-11-01）
 
@@ -640,7 +640,7 @@ M1-05、M1-06、M1-07、M1-08、M2-02、M2-03、M2-04、M2-05 和 M2-06 已分�
 
 **Owner 接受与开工授权**：Owner 接受 M1-08 的 CEO Protocol 元数据、Codex/OpenCode 发现与安装契约并授权实施。8.7 第 1 项与第 2 项中的 Codex/OpenCode 子集接受；Claude、CEO 初始化握手、Prompt、Watcher、Wake 与可观测性仍 Proposed，未随本次接受扩大。
 
-**实现**：新增 `.agents/skills/teamcraft-ceo/` 薄 Skill、唯一 `references/CEO_PROTOCOL.md`（`1.0.0`，Discovery→Recovery 八阶段）和 detached `protocol.manifest.json`。Manifest 的 SHA-256 覆盖协议 Markdown 原始 UTF-8 字节；校验器拒绝 symlink、非 UTF-8、缺失、格式错误、版本/hash 漂移和 Attempt pin 不匹配，不可恢复旧 pin 时要求人工处理。Schema v5 为 Attempt 增加成对的 `protocol_version`/`protocol_hash` 字段；创建时可原子设置，DB trigger 禁止其后任何改变（包括从未 pin 改成有 pin）；v4 升级为前向迁移，历史 Attempt 保持 null。CEO 的真实 Attempt 创建、runtime 同步和每个 durable dispatch claim 均已接入协议发现/pin 复验；历史活跃 CEO Attempt 缺 pin 时 fail closed。新 `teamctl` 派发 Prompt 明确加载 CEO Skill 与 Herdr runtime Skill。Agent 读取回执、初始化状态及 nonce/Session 绑定仍留给 M2-08。新增 `.opencode/agents/teamcraft-ceo.md` 作为无重复协议正文的薄入口。安装器将 CEO Skill/入口纳入全量预检、dry-run、幂等安装；从不写 `AGENTS.md`/`CLAUDE.md`；用户自有同名 CEO Agent 冲突即使 `--force` 也在写入前失败，带管理标记的受管入口才可显式更新。README 中英同步说明。
+**实现**：新增 `.agents/skills/teamcraft-ceo/` 薄 Skill、唯一 `references/CEO_PROTOCOL.md`（`1.0.0`，Discovery→Recovery 八阶段）和 detached `protocol.manifest.json`。Manifest 的 SHA-256 覆盖协议 Markdown 原始 UTF-8 字节；校验器拒绝 symlink、非 UTF-8、缺失、格式错误、版本/hash 漂移和 Attempt pin 不匹配，不可恢复旧 pin 时要求人工处理。Schema v5 为 Attempt 增加成对的 `protocol_version`/`protocol_hash` 字段；创建时可原子设置，DB trigger 禁止其后任何改变（包括从未 pin 改成有 pin）；v4 升级为前向迁移，历史 Attempt 保持 null。CEO 的真实 Attempt 创建、runtime 同步和每个 durable dispatch claim 均已接入协议发现/pin 复验；历史活跃 CEO Attempt 缺 pin 时 fail closed。新 `teamctl` 派发 Prompt 明确加载 CEO Skill 与 Herdr runtime Skill。Agent 初始化状态及 nonce/Session 绑定在 M2-08 实现；可信宿主回执实测延期见 12.17。新增 `.opencode/agents/teamcraft-ceo.md` 作为无重复协议正文的薄入口。安装器将 CEO Skill/入口纳入全量预检、dry-run、幂等安装；从不写 `AGENTS.md`/`CLAUDE.md`；用户自有同名 CEO Agent 冲突即使 `--force` 也在写入前失败，带管理标记的受管入口才可显式更新。README 中英同步说明。
 
 **离线验证**：Python 3.10.20 下 CEO protocol/discovery、Attempt pin/升级保持、v4→v5 数据保留、pin 不可改、manifest/hash 与 symlink 路径保护由测试覆盖。完整 `python3.10 -m unittest discover -s tests -q` **298 tests OK**；Skill 回归 **59 tests OK**；`git diff --check` 通过。安装器隔离冒烟实际执行安装后的 `teamcraft.ceo_protocol`，验证已安装副本能读取协议 manifest。
 
@@ -690,4 +690,14 @@ Watcher 使用 caller-driven 低频 polling；校验 pane、terminal、native se
 
 **独立评审与验证**：DIQI CTO 三轮只读复审，修复状态查询关闭连接后访问 SQLite、verifier 输出未有界采集、以及终止清理存在无界进程等待等发现；最终结论无 P0/P1 阻塞。Python 3.13.11 下 M2-06 Verification 定向 **9 tests OK**、teamctl **24 tests OK**、Core 全量 **349 tests OK**、Skill 全量 **68 tests OK**；另外 `compileall` 和 `git diff --check` 通过。覆盖包括 v7→v8 升级、证据版本绑定、lease 丢失、scout 人工接受、ship/M4 阻断、超限输出终止子进程组、有限进程回收和 verification-status 连接生命周期。
 
-**CEO 验收结论：M2-06 完成并关闭。** 非 POSIX 平台目前只终止直接 verifier 子进程，不保证终止其后代；verifier argv 以当前用户权限执行，并不构成沙箱；外部进程启动后租约过期无法撤回已发生的副作用，结果提交仍受 fencing 保护。M2-08 CEO 初始化 Runtime 仍未实现；M2-06 本次实现、测试及验收记录现可提交。
+**CEO 验收结论：M2-06 完成并关闭。** 非 POSIX 平台目前只终止直接 verifier 子进程，不保证终止其后代；verifier argv 以当前用户权限执行，并不构成沙箱；外部进程启动后租约过期无法撤回已发生的副作用，结果提交仍受 fencing 保护。M2-06 本次实现、测试及验收记录现可提交。
+
+### 12.17 M2-08 CEO 初始化 Runtime 与 M2-09 Wake Dispatcher 关闭记录（2026-11-06）
+
+**M2-08 实施与边界**：Core 持久化 CEO 初始化状态、协议 version/hash、nonce 与 native Session 绑定及 dispatch gate；`assumed_default` 作为临时来源显式落库，仅代表 bootstrap Prompt 成功返回且再次核对 CEO live Session，不证明宿主确实加载或读取了 Skill/Protocol。按负责人决定关闭 M2-08 实现任务；可信宿主回执来源验证及 Codex/OpenCode 实机初始化验证留待后续实际测试，本条不把它们记作通过。
+
+**M2-09 实施与边界**：Schema v12 持久化事件聚合、Wake 队列、Command 绑定、事件关联和确认/处理游标。`wake-dispatch`、`wake-status`、`wake-ack`、`wake-process` 与 `wake-reconcile` 提供手动投递和显式对账入口；歧义及重启中断转为 UNKNOWN，不自动重发；明确未投递的对账会阻断该 Wake。auto-start 保持关闭；Dormant CEO 自动启动路径与 Token 用量预算决策不属于本次实际交付。按负责人决定关闭 M2-09 实现任务；真实 Herdr 投递、响应丢失/重启恢复、身份漂移和 CEO 确认流程的实机验证留待后续实际测试。
+
+**本次本地验证**：Python 3.13 相关定向测试 **37 tests OK**，覆盖 Wake、CEO initialization 和 verification migration；`compileall`、CLI `wake-dispatch --help` 及 `git diff --check` 通过。未发送真实 Herdr Prompt；因此上述实机验证仍为待测。
+
+**CEO 验收结论：M2-08 与 M2-09 按负责人决定完成并关闭。** 此关闭记录不将临时回执假设或模拟测试表述为真实宿主/Herdr 验证结果。后续实际验证时更新本节证据与限制。
