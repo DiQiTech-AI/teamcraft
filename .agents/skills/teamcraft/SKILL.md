@@ -110,6 +110,16 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py complete api_dev
 
 Neither operation closes a pane or terminates an agent. Do not pre-create idle specialists, overlap active edit claims, or infer completion from `unknown`.
 
+Reset all TeamCraft runtime records to an empty schema only when explicitly requested:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py reset \
+  --cwd /absolute/project/root \
+  --confirm-project /absolute/project/root
+```
+
+Reset requires the confirmation path to exactly match the resolved project root, refuses while a recorded TeamCraft agent is live, creates a verified online database backup and retains the previous database/WAL artifacts in a unique `.teamcraft/archive-*` directory, then atomically installs a freshly initialized schema. It does not close Herdr panes or modify project files. The operation is destructive to the active TeamCraft records; the archive is the recovery copy.
+
 ## Verify and approve report-only work
 
 For a finished scout Attempt, configure the project's human-approved verifier argv, run it, inspect the immutable artifact digest, and record an explicit accept/reject decision:

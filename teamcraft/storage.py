@@ -2621,6 +2621,41 @@ class BackupResult:
         }
 
 
+def checkpoint_database(
+    database_path: str | os.PathLike[str], *, timeout_seconds: float = 5.0,
+    allow_unverified_location: bool = False,
+) -> tuple[int, int, int]:
+    """Checkpoint a WAL database for an explicit runtime replacement.
+
+    The returned SQLite tuple is ``(busy, log_frames, checkpointed_frames)``.
+    Callers must require ``busy == 0`` before moving or replacing the database.
+    This is a maintenance API; ordinary writes remain behind ``TeamCraftConnection``.
+    """
+    path = _validate_database_path(database_path)
+    if not path.exists():
+        raise BackupError(f"checkpoint source does not exist: {path}")
+    if timeout_seconds <= 0:
+        raise ValidationError("checkpoint timeout must be positive")
+    _ensure_supportable(path.parent, allow_unverified_location=allow_unverified_location)
+    raw: sqlite3.Connection | None = None
+    try:
+        raw = sqlite3.connect(str(path), timeout=timeout_seconds, isolation_level=None)
+        row = raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None or len(row) != 3:
+            raise BackupError("SQLite returned malformed WAL checkpoint evidence")
+        result = tuple(int(value) for value in row)
+        if result[0] != 0:
+            raise BackupError(
+                f"database has active readers or writers; checkpoint refused: {result}"
+            )
+        return result
+    except sqlite3.Error as exc:
+        raise BackupError(f"database checkpoint failed: {exc}") from exc
+    finally:
+        if raw is not None:
+            raw.close()
+
+
 #: Fields every restore must find in a backup manifest (audit completeness).
 _REQUIRED_MANIFEST_FIELDS = (
     "backup_file",

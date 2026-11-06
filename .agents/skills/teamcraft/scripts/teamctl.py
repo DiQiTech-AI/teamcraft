@@ -64,6 +64,8 @@ from teamcraft import recovery as _recovery  # noqa: E402
 from teamcraft import runtime_adapter as _adapter  # noqa: E402
 from teamcraft import verification as _verification  # noqa: E402
 from teamcraft import ceo_initialization as _ceo_initialization  # noqa: E402
+from teamcraft import fresh_start as _fresh_start  # noqa: E402
+from teamcraft import storage as _storage  # noqa: E402
 from teamcraft import wake as _wake  # noqa: E402
 from teamcraft.errors import TeamCraftError as _CoreError  # noqa: E402
 from teamcraft.herdr_adapter import HerdrAdapter, HerdrError  # noqa: E402
@@ -516,6 +518,29 @@ class StateStore:
         if (_native_session(member) != record.native_session_id
                 or member.get("terminal_id") != record.terminal_id):
             raise TeamctlError("initialized CEO native Session/terminal identity drifted; dispatch is blocked")
+
+    def require_ceo_bootstrap_pending(self, name: str) -> None:
+        """Allow recovery only for the sole canonical CEO before any challenge exists."""
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("runtime Project row is missing; CEO recovery is blocked")
+            record = _adapter.ceo_initialization.get_initialization(conn, project_id)
+            if record is not None:
+                raise TeamctlError(
+                    f"CEO initialization is {record.state}; inspect or reconcile it instead of restarting bootstrap"
+                )
+        finally:
+            conn.close()
+        state = self.read_unlocked()
+        members = (state or {}).get("members", {})
+        ceos = [member_name for member_name, item in members.items()
+                if isinstance(item, dict) and item.get("role") == "ceo"]
+        if ceos != [name] or not isinstance(members.get(name), dict):
+            raise TeamctlError(
+                "pre-initialization recovery is allowed only for the project's sole recorded CEO"
+            )
 
     def acquire_lease(self, name: str, ttl_seconds: int) -> _leader.Lease:
         # The first CLI operation must establish the project identity before
@@ -1459,7 +1484,12 @@ def verify_recorded_occupant(
     except HerdrCommandError:
         # A moved pane gets a new public ID. Resolve by the still-unique live name,
         # then require persisted terminal/session identity before adopting it.
-        candidate = _herdr_adapter().get_agent(member["name"])
+        try:
+            candidate = _herdr_adapter().get_agent(member["name"])
+        except TeamctlError as exc:
+            if _herdr_error_code(exc) == "agent_not_found":
+                return {}, None
+            raise
         pane = candidate
     recorded_terminal = member.get("terminal_id")
     if recorded_terminal and pane.get("terminal_id") != recorded_terminal:
@@ -1514,6 +1544,15 @@ def verify_recorded_occupant(
     ):
         raise TeamctlError(f"pane {pane['pane_id']} contains an unrelated foreground process")
     return pane, None
+
+
+def _herdr_error_code(exc: TeamctlError) -> str | None:
+    """Extract a structured Herdr error from the CLI's JSON error payload."""
+    try:
+        payload = json.loads(str(exc))
+        return payload.get("error", {}).get("code")
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return None
 
 
 def _verify_bootstrap_herdr_target(
@@ -1586,7 +1625,17 @@ def _resume_operation(args: argparse.Namespace) -> int:
         # project-wide initialization gate as a fresh launch before any of
         # those lifecycle effects; the supplied lease is the canonical project
         # lease and each effect is separately fenced at its write boundary.
-        store.require_ceo_initialized()
+        try:
+            store.require_ceo_initialized()
+        except TeamctlError:
+            if member.get("role") != "ceo" or args.prompt_action == "skip":
+                raise
+            # The first CEO launch may have created its member/Attempt but
+            # failed before a prompt established the initialization challenge.
+            # Permit inspection/recovery only when no challenge record exists;
+            # prompt_member still creates and consumes the one-use challenge
+            # immediately around the Herdr delivery and identity recheck.
+            store.require_ceo_bootstrap_pending(args.name)
         pane, agent = verify_recorded_occupant(member)
         if pane:
             _reconcile_observed_stage(
@@ -1624,6 +1673,12 @@ def _resume_operation(args: argparse.Namespace) -> int:
             print(json.dumps(output, ensure_ascii=False, sort_keys=True))
             return 0
         if not pane:
+            from_pane = getattr(args, "from_pane", None)
+            if from_pane:
+                # Resolve now so a stale or unrelated pane cannot be persisted
+                # as the parent for a recovery split.
+                resolve_pane(from_pane)
+                member["from_pane_id"] = from_pane
             member = split_for_member(member, store, session, lease=lease)
             pane = _herdr_adapter().get_pane(member["pane_id"])
         if agent is None:
@@ -1706,6 +1761,84 @@ def status(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def reset_runtime(args: argparse.Namespace) -> int:
+    """Archive and replace all TeamCraft runtime data with an empty schema."""
+    require_herdr()
+    root = resolve_project_root(args.cwd)
+    if args.confirm_project != str(root):
+        raise TeamctlError(
+            "reset requires --confirm-project to exactly match the resolved project root"
+        )
+    store = StateStore(root)
+    lease = store.acquire_lease("reset", 3600)
+    swapped = False
+    try:
+        with store.locked() as state:
+            members = (state or {}).get("members", {})
+            live_agents = {str(agent.get("name")): agent
+                           for agent in _herdr_adapter().list_agents()
+                           if isinstance(agent.get("name"), str)}
+            active = sorted(
+                name for name, member in members.items()
+                if isinstance(member, dict)
+                and member.get("phase") not in TERMINAL_PHASES
+                and name in live_agents
+            )
+            if active:
+                raise TeamctlError(
+                    "reset refused while recorded TeamCraft agents are live: "
+                    + ", ".join(active)
+                    + "; settle or close them in Herdr, then retry"
+                )
+
+            runtime_dir = store.directory
+            archive_dir = runtime_dir / f"archive-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            archive_dir.mkdir(mode=0o700)
+            backup = _storage.backup_database(store.db_path, archive_dir)
+
+            stage_root = runtime_dir / f"reset-stage-{uuid.uuid4().hex}"
+            stage_root.mkdir(mode=0o700)
+            _fresh_start.initialize_project_root(stage_root)
+            staged_db = stage_root / _fresh_start.DATABASE_RELATIVE_PATH
+            report = _storage.verify_database(staged_db)
+            if not report.get("ok") or not report.get("schema_usable"):
+                raise TeamctlError(f"fresh runtime database did not verify: {report}")
+            _storage.checkpoint_database(staged_db)
+
+            # Preserve the old main database and any WAL sidecars in the
+            # archive. The verified online backup above is authoritative for
+            # committed WAL content; checkpointing makes the retained main
+            # database independently current before its hard link is made.
+            _storage.checkpoint_database(store.db_path)
+            archived_main = archive_dir / "teamcraft.pre-reset.db"
+            os.link(store.db_path, archived_main)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(store.db_path) + suffix)
+                if sidecar.exists():
+                    os.replace(sidecar, archive_dir / f"teamcraft.pre-reset.db{suffix}")
+            os.replace(staged_db, store.db_path)
+            swapped = True
+
+        print(json.dumps({
+            "status": "reset",
+            "project_root": str(root),
+            "database": str(store.db_path),
+            "backup": backup.as_dict(),
+            "archived_database": str(archived_main),
+            "fresh_schema_version": _storage.SCHEMA_VERSION,
+            "herdr_panes_closed": False,
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (OSError, _CoreError) as exc:
+        raise TeamctlError(f"runtime reset failed safely: {exc}") from exc
+    finally:
+        # A successful swap has a new database with no lease row. Releasing
+        # against it would target the wrong runtime generation. On all earlier
+        # failures the original database is still canonical, so release there.
+        if not swapped:
+            store.release_lease(lease)
 
 
 def _finish_member_operation(args: argparse.Namespace) -> int:
@@ -2474,6 +2607,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser = commands.add_parser("resume")
     resume_parser.add_argument("name")
     add_cwd(resume_parser)
+    resume_parser.add_argument("--from-pane")
     resume_parser.add_argument(
         "--prompt-action", choices=("inspect", "send", "skip"), default="inspect"
     )
@@ -2483,6 +2617,16 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--wait", action="store_true")
     resume_parser.add_argument("--timeout-ms", type=int, default=120_000)
     resume_parser.set_defaults(handler=resume)
+
+    reset_parser = commands.add_parser(
+        "reset", help="archive TeamCraft runtime data and create an empty database"
+    )
+    add_cwd(reset_parser)
+    reset_parser.add_argument(
+        "--confirm-project", required=True,
+        help="must exactly match the resolved project root; this resets all TeamCraft runtime records",
+    )
+    reset_parser.set_defaults(handler=reset_runtime)
 
     status_parser = commands.add_parser("status")
     add_cwd(status_parser)
