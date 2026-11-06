@@ -1,7 +1,5 @@
 """M2-05 schema v6 to v7 migration and head validation."""
 import sqlite3
-import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,33 +58,20 @@ class SchemaV7Tests(unittest.TestCase):
             raw = sqlite3.connect(path)
             ddl = raw.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()[0]
             raw.close()
-            malformed = ddl.replace(' CHECK (max_attempts >= 1)', '')
-            self.assertNotEqual(ddl, malformed)
-            sqlite_cli = shutil.which("sqlite3")
-            if sqlite_cli is None:
-                self.fail(
-                    "sqlite3 CLI is required to build the malformed-schema fixture; "
-                    "install SQLite command-line tools rather than skipping corruption coverage"
-                )
-            # The Python sqlite module in some supported builds enables SQLite's
-            # defensive mode and refuses writable_schema even for this test-only
-            # fixture.  The SQLite CLI exposes the supported pragma directly.
-            # It changes only the tasks DDL, then turns writable_schema back off
-            # before its process exits.
-            script = "\n".join((
-                "PRAGMA writable_schema=ON;",
-                "UPDATE sqlite_master SET sql="
-                + "'" + malformed.replace("'", "''") + "'"
-                + " WHERE type='table' AND name='tasks';",
-                "PRAGMA writable_schema=OFF;",
-            ))
-            subprocess.run(
-                (sqlite_cli, str(path), script),
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            # Python and CLI SQLite builds can both enable defensive mode,
+            # making writable_schema unavailable even in a test process.  The
+            # schema text is stored verbatim in the database page, so replace
+            # the one unique CHECK fragment in-place after every connection is
+            # closed. Equal-length spaces keep the file layout intact while
+            # removing the constraint from the stored DDL.
+            needle = b" CHECK (max_attempts >= 1)"
+            data = path.read_bytes()
+            self.assertEqual(data.count(needle), 1)
+            offset = data.index(needle)
+            with path.open("r+b") as database:
+                database.seek(offset)
+                database.write(b" " * len(needle))
+                database.flush()
             report = storage.verify_database(path)
             self.assertFalse(report["schema_usable"])
             self.assertIn("tasks.max_attempts:check", report["missing_head_columns"])
