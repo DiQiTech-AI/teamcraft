@@ -105,11 +105,12 @@ Beyond the baseline contract, this suite pins the M1-03 review findings:
   still private (integrity_check + v1 completeness + exact version
   agreement), and the public name appears ONLY via os.link — atomic and
   EEXIST-refused — so a pre-existing public file can never be overwritten
-  and a crash before the link leaves NO final name at all.  WAL sources
-  are supported WITHOUT any header rewriting: the page-level copy lands as
-  a self-consistent WAL-marked file (committed frames embedded) that
-  SQLite verifies and restores natively — the module ships no marker
-  patching (pinned structurally in test_destructive_primitives_are_gone).
+  and a crash before the link leaves NO final name at all. WAL sources
+  retain committed frames in the page-level copy; SQLite changes that
+  private copy to DELETE journal mode before verification, so the public
+  main file opens strictly read-only without sidecars. The module ships no
+  raw marker patching (pinned structurally in
+  test_destructive_primitives_are_gone).
   Nothing is ever unlinked or truncated: staging dirs are RETAINED on
   success AND on failure (the published hard link shares the staged
   inode, so success retention costs zero extra data blocks — pinned by
@@ -1799,18 +1800,15 @@ class StorageM103Tests(unittest.TestCase):
         )
 
     def test_wal_sidecars_stay_private_and_publish_ships_verified_bytes(self) -> None:
-        """Native WAL behaviour (P-fixes 14, superseding P-fixes 12's
-        blanket sidecar refusal, which existed only because the abandoned
-        fd-channel could not host sidecars at all): copying a WAL source
-        may leave SQLite's own transient sidecars in the PRIVATE staging
-        directory; publication ships ONLY the verified main inode and
-        sidecars never travel to the public namespace.  The backup
-        SUCCEEDS because the bytes we publish are exactly the bytes our
-        copy wrote and our digest bound — sidecars beside the staged file
-        are neither published nor trusted.  The published file carries
-        NATIVE WAL markers (no header rewriting anywhere) and every
-        committed row — including un-checkpointed WAL frames embedded by
-        the page copy — reads back through the public name."""
+        """A WAL source is copied through SQLite into a standalone backup.
+
+        P-fixes 14 replaced the earlier blanket sidecar refusal. A WAL
+        source may leave SQLite's own transient sidecars in the PRIVATE staging
+        directory; SQLite changes the private main file to DELETE journal
+        mode before it is verified and published. Publication ships ONLY
+        the verified main inode and sidecars never travel to the public
+        namespace. Every committed row, including uncheckpointed source WAL
+        frames, reads through the public strict read-only name."""
         migrate_to_head(self.db)
         backup_dir = self.base / "backups-p14w"
         backup_dir.mkdir()
@@ -1833,8 +1831,9 @@ class StorageM103Tests(unittest.TestCase):
             conn.close()
         published = result.backup_path
         self.assertEqual(storage._sha256(published), result.sha256)
-        # native markers survive verbatim: the library patches no bytes
-        self.assertEqual(published.read_bytes()[18:20], b"\x02\x02")
+        # SQLite, rather than raw byte patching, made the private copy
+        # standalone before publication.
+        self.assertEqual(published.read_bytes()[18:20], b"\x01\x01")
         # nothing sidecar-ish beside the PUBLIC name
         self.assertFalse(Path(str(published) + "-wal").exists())
         self.assertFalse(Path(str(published) + "-shm").exists())
@@ -1853,15 +1852,15 @@ class StorageM103Tests(unittest.TestCase):
             )
         finally:
             probe.close()
-        # transient sidecars (if any) stayed inside the retained private
-        # staging directory — never published, never deleted
+        # DELETE-journal finalization may remove transient private sidecars.
+        # Their absence is valid; the public strict-read-only probe above and
+        # the public-name checks are the delivery contract.
         staging_sidecars = [
             item
             for d in _staging_dirs(backup_dir)
             for item in d.iterdir()
             if item.name.endswith(("-wal", "-shm"))
         ]
-        self.assertTrue(staging_sidecars)  # transient WAL really was private
         for q in staging_sidecars:
             self.assertIn(".tc-staging-", str(q.parent))
 
@@ -2290,6 +2289,16 @@ class StorageM103Tests(unittest.TestCase):
         digest — exactly what the removed fallback produced — would have
         been fooled by the replacement."""
         migrate_to_head(self.db)
+        # Keep this descriptor-binding test separate from WAL finalization:
+        # its hook deliberately renames the staging path during the copy.
+        source_conn = sqlite3.connect(str(self.db), isolation_level=None)
+        try:
+            self.assertEqual(
+                str(source_conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower(),
+                "delete",
+            )
+        finally:
+            source_conn.close()
         target = self.base / "bound-snap.db"
         hidden = self.base / "hidden-real.db"
 
@@ -2419,7 +2428,14 @@ class StorageM103Tests(unittest.TestCase):
             )
         finally:
             probe.close()
-        self.assertEqual(_public_entries(backup_dir), [expected])  # ours absent
+        # The probe above may cause SQLite to create sidecars for the foreign
+        # victim. They are not TeamCraft publications; no backup manifest or
+        # different public database was created by the failed operation.
+        self.assertEqual(
+            set(_public_entries(backup_dir)),
+            {expected, Path(str(expected) + "-wal"), Path(str(expected) + "-shm")}
+            & set(backup_dir.iterdir()),
+        )
         self.assertEqual(len(_staging_dirs(backup_dir)), 1)  # evidence retained
 
     def test_restore_publish_never_overwrites_pivoted_victim_ceo_injection(
@@ -3646,10 +3662,11 @@ class TrustAndRetentionContractTests(unittest.TestCase):
     * the retention policy is pinned: successful staging dirs are RETAINED
       (zero-copy via the published hard link) and plan_retention stays
       dry-run — delete=True is refused;
-    * WAL works through the PUBLIC API natively: live un-checkpointed
-      frames are backed up, the published file keeps SQLite-native WAL
-      markers (no header rewriting), verifies, and restores back to
-      readable rows; occupied public names are never overwritten.
+    * WAL works through the PUBLIC API: live un-checkpointed frames are
+      backed up, SQLite makes the private copy a standalone DELETE-journal
+      database without raw header rewriting, and the published file verifies
+      and restores to readable rows; occupied public names are never
+      overwritten.
     """
 
     def setUp(self) -> None:
@@ -3702,7 +3719,7 @@ class TrustAndRetentionContractTests(unittest.TestCase):
         manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["backup_sha256"], result.sha256)
         self.assertEqual(storage._sha256(result.backup_path), result.sha256)
-        self.assertEqual(result.backup_path.read_bytes()[18:20], b"\x02\x02")
+        self.assertEqual(result.backup_path.read_bytes()[18:20], b"\x01\x01")
         probe = sqlite3.connect(f"file:{result.backup_path}?mode=ro", uri=True)
         try:
             self.assertEqual(
@@ -3866,7 +3883,8 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertEqual(lagging["missing_head_tables"],
                          ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
                           "prompt_deliveries", "runtime_meta", "task_dependencies",
-                          "verification_configs", "verifications", "worker_reports"])
+                          "verification_configs", "verifications", "wake_cursors",
+                          "wake_events", "wakes", "worker_reports"])
 
     def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
         self._drop_v2_table()

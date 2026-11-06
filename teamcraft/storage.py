@@ -1363,17 +1363,18 @@ def _exclusive_online_copy(
     * the source is read through the strict ``mode=ro`` channel, which still
       sees WAL-committed frames, so an un-checkpointed live database backs
       up consistently;
-    * a WAL-sourced page copy lands as a self-consistent WAL-marked file —
-      every committed frame is already embedded in the copied pages — and
-      verifies natively through SQLite (pinned by the WAL roundtrip tests);
-      NO header rewriting is performed anywhere (review P-fixes 14);
+    * a WAL-sourced page copy contains every committed frame.  Before the
+      staged connection closes, SQLite itself switches that private copy to
+      DELETE journal mode.  This leaves one standalone main file that a
+      strict read-only connection can verify after publication; no raw header
+      bytes are edited and no WAL/shm sidecar is published;
     * the copy is BOUND to what the caller verified (reviews P-fixes 2, 8):
-      when ``expect_version``/``expect_sha256`` are given, the source version
-      is re-read through the open source connection and the bytes actually
-      copied are hashed through ``creation_fd`` (after the writing connection
-      closed and flushed) — a digest no path replacement can redirect; any
-      mismatch aborts with :class:`BackupError` instead of reporting success
-      for content nobody verified;
+      when ``expect_version``/``expect_sha256`` are given, the source main
+      file is hashed through no-follow descriptors both immediately before
+      and after SQLite copies it, while the source version is re-read through
+      the open connection. Any mismatch aborts instead of reporting success
+      for content nobody verified. The staged output is independently hashed
+      through ``creation_fd`` after the writing connection closes;
     * failures RETAIN everything (review P-fixes 7): nothing here is ever
       unlinked; the staging leftovers are inert failure evidence, never a
       backup.
@@ -1383,8 +1384,39 @@ def _exclusive_online_copy(
     re-read of any path.
     """
 
+    source_journal: str | None = None
+    source_fd: int | None = None
     try:
+        if expect_sha256 is not None:
+            try:
+                source_fd = os.open(
+                    str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+            except OSError as exc:
+                raise BackupError(
+                    f"cannot open verified copy source {source}: {exc}"
+                ) from exc
+            if _hash_fd(source_fd) != expect_sha256:
+                raise BackupError(
+                    f"copy source {source} no longer matches the verified digest; "
+                    "refusing to copy"
+                )
         with _open_read_connection(source) as src_conn:
+            if source_fd is not None:
+                try:
+                    source_path_stat = os.stat(str(source))
+                except OSError as exc:
+                    raise BackupError(
+                        f"verified copy source disappeared before SQLite opened it: {exc}"
+                    ) from exc
+                source_fd_stat = os.fstat(source_fd)
+                if (source_path_stat.st_dev, source_path_stat.st_ino) != (
+                    source_fd_stat.st_dev, source_fd_stat.st_ino,
+                ):
+                    raise BackupError(
+                        f"SQLite copy source {source} drifted from the verified inode; "
+                        "refusing to copy"
+                    )
             if expect_version is not None:
                 live_version = int(
                     src_conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1395,6 +1427,9 @@ def _exclusive_online_copy(
                         f"at copy time but {expect_version} was verified earlier; "
                         "the file behind this path changed, refusing to copy"
                     )
+            source_journal = str(
+                src_conn.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
             try:
                 # The destination is our private staged path inside the
                 # private 0700 staging dir; public targets are never
@@ -1409,16 +1444,35 @@ def _exclusive_online_copy(
                 if hook is not None:
                     hook(src_conn, dst_conn)
                 src_conn.backup(dst_conn)
+                # sqlite3.backup preserves WAL mode in the copied header. A
+                # published backup deliberately carries only its main file,
+                # so a later strict mode=ro open cannot create required
+                # sidecars on recent SQLite builds. Finalize only the
+                # already-open private destination connection: re-opening
+                # the path would reintroduce a path-swap window.
+                if source_journal == "wal":
+                    journal_row = dst_conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+                    if journal_row is None or str(journal_row[0]).lower() != "delete":
+                        raise BackupError(
+                            "SQLite could not make the staged backup a standalone "
+                            "DELETE-journal database"
+                        )
             finally:
-                # Close BEFORE hashing: flushes every page and checkpoints
-                # any WAL so the bytes visible through the fd are complete.
+                # Close BEFORE hashing so every copied page is durable.
                 dst_conn.close()
+        if source_fd is not None and _hash_fd(source_fd) != expect_sha256:
+            raise BackupError(
+                f"copy source {source} changed while SQLite copied it; refusing"
+            )
     except BaseException as exc:
         # Retain-on-failure (P-fixes 7): the staging file keeps whatever it
         # received; nothing is deleted, and no public name was ever touched.
         if isinstance(exc, sqlite3.Error):
             raise BackupError(f"online backup into staging failed: {exc}") from exc
         raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
     # P-fixes 8: digest OUR inode through the descriptor held since the
     # O_EXCL creation - os.pread on an open fd never re-resolves the name,
     # so this binds the actually-copied bytes; it also replaces the
@@ -1427,16 +1481,6 @@ def _exclusive_online_copy(
     copied_sha = _hash_fd(creation_fd)
     with contextlib.suppress(OSError):
         os.fsync(creation_fd)
-    if expect_sha256 is not None and copied_sha != expect_sha256:
-        # The bytes we just produced are not the bytes that were verified.
-        # Refuse rather than deliver an unverified snapshot (review P-fixes
-        # 2); the mismatched staging copy is RETAINED as failure evidence
-        # (P-fixes 7) and nothing is published.
-        raise BackupError(
-            f"copied snapshot digest {copied_sha} does not match the verified "
-            f"digest {expect_sha256}; the content behind {source} changed "
-            "between verification and copy, refusing to proceed"
-        )
     return copied_sha
 
 
@@ -2096,6 +2140,13 @@ def connect(
                 "network or exotic filesystems are outside the support boundary "
                 "(WAL success is capability evidence, not proof of locality)"
             )
+        # A newly WAL-enabled connection can have only its -shm sidecar until
+        # SQLite performs a database read. The public facade immediately adds
+        # a second strict mode=ro channel; current SQLite rejects that reader
+        # when no -wal sidecar exists. This read has no state effect beyond
+        # letting SQLite create its own empty WAL sidecar before the facade is
+        # exposed.
+        conn.execute("PRAGMA user_version").fetchone()
         conn.execute("PRAGMA foreign_keys=ON")
     except sqlite3.Error as exc:
         conn.close()
@@ -2619,9 +2670,9 @@ def _manifest_integer(
 #: checks below (path identity, st_nlink, post-publish inode+digest proof)
 #: remain because they are cheap accident detection, but safety claims do
 #: NOT rest on them.  Journal/WAL sidecars beside the staged copy are
-#: deliberately tolerated: copying a WAL-marked source legitimately leaves
-#: SQLite's own transient WAL/shm files in the private staging dir, and
-#: what we publish is exactly the main inode we verified and digest-bound
+#: deliberately tolerated: SQLite may retain transient WAL/shm files in the
+#: private staging dir while it makes the copied main database standalone,
+#: and what we publish is exactly the verified, digest-bound main inode
 #: (sidecars are never published).
 #:
 #: Guarantees that hold unconditionally (independent of the trust model):
@@ -2632,10 +2683,10 @@ def _manifest_integer(
 #:   name is ever opened for writing;
 #: * full verification BEFORE publishing: integrity_check, v1 schema
 #:   completeness and exact version agreement run against the staged file
-#:   while it is still private.  WAL sources land as self-consistent
-#:   WAL-marked files (the page-level copy embeds every committed frame)
-#:   and verify natively — NO header rewriting is used anywhere (review
-#:   P-fixes 14);
+#:   while it is still private.  WAL sources include every committed frame;
+#:   SQLite then changes the private copy to DELETE journal mode so the
+#:   published main file verifies without sidecars.  No raw header rewriting
+#:   is used anywhere;
 #: * non-overwriting atomic publish: the final name appears ONLY via
 #:   os.link — the content is already complete in the staged inode, the
 #:   link fails atomically with EEXIST, so a pre-existing public file is
@@ -2727,12 +2778,11 @@ def _assert_staging_intact(staged: Path, expect_inode: tuple[int, int], *, what:
       deleted).
 
     Journal/WAL sidecars beside the staged file are deliberately NOT
-    refused (review P-fixes 14): copying a WAL-marked source legitimately
-    leaves SQLite's own transient WAL/shm files in the private staging
-    directory; publication ships ONLY the main inode we verified through
-    our own descriptor, sidecars included or not.  The same-uid world is
-    declared trusted (:data:`TARGET_PUBLICATION_MECHANISM`); this gate is
-    accident detection, not adversarial proof.
+    refused: SQLite may leave transient WAL/shm files in the private staging
+    directory while making the copied main database standalone. Publication
+    ships ONLY the main inode verified through our own descriptor. The
+    same-uid world is declared trusted (:data:`TARGET_PUBLICATION_MECHANISM`);
+    this gate is accident detection, not adversarial proof.
     """
 
     st = os.stat(str(staged))
@@ -2907,11 +2957,11 @@ def backup_database(
         # for writing (reviews P-fixes 10 + 14; same-uid path games are out
         # of scope under the declared trust model).
         copied_sha = _exclusive_online_copy(source, staged_db, creation_fd=db_fd)
-        # Full verification of the STAGED FILE (still private) BEFORE
-        # anything is published: integrity, v1 completeness and exact
-        # version agreement.  WAL-sourced copies verify natively as
-        # self-consistent WAL files (pinned by the WAL roundtrip tests);
-        # this module contains no header rewriting (review P-fixes 14).
+        # Full verification of the standalone STAGED FILE (still private)
+        # BEFORE anything is published: integrity, v1 completeness and exact
+        # version agreement. WAL sources retain their committed rows, while
+        # SQLite has changed the private copy to DELETE journal mode; this
+        # module contains no raw header rewriting.
         report = verify_database(staged_db)
         if not (report["ok"] and report["schema_usable"]):
             raise BackupError(f"backup failed verification: {report}")
