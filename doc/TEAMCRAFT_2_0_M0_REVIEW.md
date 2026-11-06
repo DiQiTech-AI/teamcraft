@@ -352,6 +352,8 @@ flowchart LR
 
 **M2 退出门禁**：所有外部副作用由单一 fenced Leader 执行持久 Command；CEO 只有在协议和运行 Skill 初始化确认后才能派工；Watcher 日常观察不消耗 LLM Token；Wake 可合并、去重、确认、重启恢复，Dormant CEO 不要求常驻且 auto-start 默认关闭。进程存活、Agent 活跃和实际进展可分别查询；无进展阈值、任务超时、max Attempts 和升级路径通过故障测试；未知 Token 保持 NULL 且不作为低成本依据；Herdr 失联、UNKNOWN 或投递歧义不会盲重派/重发。最小 Verification/Approval 已可在 CLI 验收 report-only/scout，Worker 自述不能完成 Task；local-only、direct-PR 和普通 ship 明确停在等待 M4 证据的非终态。浏览器生命周期由 M3-06 验收，脏 Worktree、Commit 回执丢失和 Worktree Verifier 崩溃由 M4 验收。
 
+**当前实施记录**：M2-08 的真实宿主回执与 M2-09 的真实 Herdr 投递测试暂缓。临时 `assumed_default` 只在 bootstrap Prompt 成功提交且再次核对 CEO live Session 后写入，并在数据库中明确标识为假设；这不满足 M2-08 的最终验收。M2-09 当前完成持久队列、Command 状态和游标基础，CLI 投递及未知结果对账入口仍待开发。详见 [M2-09 Wake Dispatcher 状态记录](M2-09_WAKE_DISPATCH_STATUS.md)。
+
 M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reconcile 边界；真实 GitHub Adapter 尚未出现，须在 M4-05 另行验证，不把 M2 Mock 记作真实 GitHub 集成证据。
 
 ### 9.3 M3 — Web UI 最小控制台

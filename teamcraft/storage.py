@@ -111,8 +111,8 @@ from .errors import (
 #: contract (connect/query/verify/backup/restore) whether or not they have
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
-#: protocol identity columns to attempts and guards their pin with triggers.
-SCHEMA_VERSION = 8
+#: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
+SCHEMA_VERSION = 11
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -534,6 +534,237 @@ _V8_STATEMENTS = (
        BEGIN SELECT RAISE(ABORT, 'approvals are permanent audit records'); END""",
 )
 
+# v9 (M2-08): one project-scoped CEO initialization record. Agent claims are
+# retained only as unverified audit material; no schema/API path treats them
+# as a trusted host receipt or grants initialized state.
+_V9_TABLES = frozenset({"ceo_initializations"})
+_V9_COLUMNS = {"ceo_initializations": frozenset({
+    "project_id", "canonical_ceo_name", "state", "team_id",
+    "teamcraft_session_id", "herdr_session_identity_json", "native_session_id",
+    "terminal_id", "protocol_version", "protocol_hash", "runtime_skill_hash",
+    "snapshot_digest", "nonce_hash", "nonce_expires_at", "nonce_consumed_at",
+    "audit_material_json", "detail", "created_at", "updated_at",
+})}
+_V9_STATEMENTS = (
+    """CREATE TABLE ceo_initializations (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id),
+      canonical_ceo_name TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('discovered','read_unverified','initialized','failed','incompatible','unknown')),
+      team_id TEXT NOT NULL,
+      teamcraft_session_id TEXT REFERENCES sessions(id),
+      herdr_session_identity_json TEXT NOT NULL,
+      native_session_id TEXT,
+      terminal_id TEXT,
+      protocol_version TEXT,
+      protocol_hash TEXT,
+      runtime_skill_hash TEXT,
+      snapshot_digest TEXT,
+      nonce_hash TEXT,
+      nonce_expires_at TEXT,
+      nonce_consumed_at TEXT,
+      audit_material_json TEXT,
+      detail TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK (protocol_hash IS NULL OR length(protocol_hash)=64),
+      CHECK (runtime_skill_hash IS NULL OR length(runtime_skill_hash)=64),
+      CHECK (snapshot_digest IS NULL OR length(snapshot_digest)=64),
+      CHECK (nonce_hash IS NULL OR length(nonce_hash)=64)
+    )""",
+    "CREATE INDEX idx_ceo_initializations_state ON ceo_initializations(state, updated_at)",
+    """CREATE TRIGGER trg_ceo_initializations_require_host_receipt
+       BEFORE INSERT ON ceo_initializations WHEN NEW.state='initialized'
+       BEGIN SELECT RAISE(ABORT, 'initialized CEO requires a host-trusted receipt provider'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_update_require_host_receipt
+       BEFORE UPDATE OF state ON ceo_initializations WHEN NEW.state='initialized'
+       BEGIN SELECT RAISE(ABORT, 'initialized CEO requires a host-trusted receipt provider'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_state_machine
+       BEFORE UPDATE OF state ON ceo_initializations
+       WHEN NOT (NEW.state=OLD.state OR
+         (OLD.state='discovered' AND NEW.state IN ('unknown','read_unverified','failed','incompatible')) OR
+         (OLD.state='unknown' AND NEW.state IN ('read_unverified','failed','incompatible')))
+       BEGIN SELECT RAISE(ABORT, 'invalid CEO initialization state transition'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_binding_fixed
+       BEFORE UPDATE OF canonical_ceo_name, team_id, teamcraft_session_id,
+         herdr_session_identity_json, native_session_id, terminal_id,
+         protocol_version, protocol_hash, runtime_skill_hash, snapshot_digest,
+         nonce_hash, nonce_expires_at, created_at ON ceo_initializations
+       WHEN NEW.canonical_ceo_name IS NOT OLD.canonical_ceo_name OR
+         NEW.team_id IS NOT OLD.team_id OR
+         NEW.teamcraft_session_id IS NOT OLD.teamcraft_session_id OR
+         NEW.herdr_session_identity_json IS NOT OLD.herdr_session_identity_json OR
+         NEW.native_session_id IS NOT OLD.native_session_id OR
+         NEW.terminal_id IS NOT OLD.terminal_id OR
+         NEW.protocol_version IS NOT OLD.protocol_version OR
+         NEW.protocol_hash IS NOT OLD.protocol_hash OR
+         NEW.runtime_skill_hash IS NOT OLD.runtime_skill_hash OR
+         NEW.snapshot_digest IS NOT OLD.snapshot_digest OR
+         NEW.nonce_hash IS NOT OLD.nonce_hash OR
+         NEW.nonce_expires_at IS NOT OLD.nonce_expires_at OR
+         NEW.created_at IS NOT OLD.created_at
+       BEGIN SELECT RAISE(ABORT, 'CEO initialization challenge bindings are immutable'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_consumed_once
+       BEFORE UPDATE OF nonce_consumed_at ON ceo_initializations
+       WHEN OLD.nonce_consumed_at IS NOT NULL AND NEW.nonce_consumed_at IS NOT OLD.nonce_consumed_at
+       BEGIN SELECT RAISE(ABORT, 'CEO initialization nonce is one-use'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_no_delete BEFORE DELETE ON ceo_initializations
+       BEGIN SELECT RAISE(ABORT, 'CEO initialization history is permanent'); END""",
+)
+
+# v10 (M2-09 first slice): durable, project-scoped Wake inbox.  This migration
+# records event aggregation and explicit acknowledgement cursors only; it does
+# not create or send Herdr prompts.  M2-08 remains the mandatory dispatch gate.
+_V10_TABLES = frozenset({"wake_cursors", "wakes", "wake_events"})
+_V10_COLUMNS = {
+    "wake_cursors": frozenset({
+        "project_id", "target_ceo_name", "target_session_id",
+        "scanned_seq", "acknowledged_seq", "processed_seq",
+        "created_at", "updated_at",
+    }),
+    "wakes": frozenset({
+        "id", "project_id", "target_ceo_name", "target_session_id",
+        "dedupe_key", "window_start", "priority", "state",
+        "first_seq", "last_seq", "event_count", "event_digest",
+        "command_id", "detail", "created_at", "updated_at",
+        "submitted_at", "acknowledged_at", "processed_at",
+    }),
+    "wake_events": frozenset({"wake_id", "event_seq", "linked_at"}),
+}
+_V10_STATEMENTS = (
+    "CREATE INDEX idx_events_project_seq ON events(project_id, seq)",
+    """CREATE TABLE wake_cursors (
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      target_ceo_name TEXT NOT NULL,
+      target_session_id TEXT,
+      scanned_seq INTEGER NOT NULL DEFAULT 0 CHECK (scanned_seq >= 0),
+      acknowledged_seq INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged_seq >= 0),
+      processed_seq INTEGER NOT NULL DEFAULT 0 CHECK (processed_seq >= 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (project_id, target_ceo_name),
+      CHECK (processed_seq <= acknowledged_seq),
+      CHECK (acknowledged_seq <= scanned_seq)
+    )""",
+    """CREATE TABLE wakes (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      target_ceo_name TEXT NOT NULL,
+      target_session_id TEXT,
+      dedupe_key TEXT NOT NULL,
+      window_start TEXT NOT NULL,
+      priority INTEGER NOT NULL CHECK (priority BETWEEN 0 AND 100),
+      state TEXT NOT NULL CHECK (state IN
+        ('pending','sending','submitted','acknowledged','processed','unknown','blocked')),
+      first_seq INTEGER NOT NULL REFERENCES events(seq),
+      last_seq INTEGER NOT NULL REFERENCES events(seq),
+      event_count INTEGER NOT NULL CHECK (event_count >= 1),
+      event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+      command_id TEXT REFERENCES commands(id),
+      detail TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      submitted_at TEXT,
+      acknowledged_at TEXT,
+      processed_at TEXT,
+      CHECK (first_seq <= last_seq)
+    )""",
+    """CREATE TABLE wake_events (
+      wake_id TEXT NOT NULL REFERENCES wakes(id),
+      event_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
+      linked_at TEXT NOT NULL,
+      PRIMARY KEY (wake_id, event_seq)
+    )""",
+    "CREATE INDEX idx_wake_queue ON wakes(project_id, target_ceo_name, state, priority DESC, first_seq)",
+    "CREATE UNIQUE INDEX ux_wake_pending_dedupe_window ON wakes(project_id, target_ceo_name, dedupe_key, window_start) WHERE state='pending'",
+    "CREATE INDEX idx_wake_events_wake_seq ON wake_events(wake_id, event_seq)",
+    """CREATE TRIGGER trg_wake_cursors_monotonic
+       BEFORE UPDATE OF scanned_seq, acknowledged_seq, processed_seq ON wake_cursors
+       WHEN NEW.scanned_seq < OLD.scanned_seq OR
+         NEW.acknowledged_seq < OLD.acknowledged_seq OR
+         NEW.processed_seq < OLD.processed_seq OR
+         NEW.processed_seq > NEW.acknowledged_seq OR
+         NEW.acknowledged_seq > NEW.scanned_seq
+       BEGIN SELECT RAISE(ABORT, 'wake cursors must be monotonic and ordered'); END""",
+    """CREATE TRIGGER trg_wake_cursor_identity_fixed
+       BEFORE UPDATE OF project_id, target_ceo_name, created_at ON wake_cursors
+       WHEN NEW.project_id IS NOT OLD.project_id OR
+         NEW.target_ceo_name IS NOT OLD.target_ceo_name OR
+         NEW.created_at IS NOT OLD.created_at
+       BEGIN SELECT RAISE(ABORT, 'wake cursor identity is immutable'); END""",
+    """CREATE TRIGGER trg_wake_cursor_session_fixed
+       BEFORE UPDATE OF target_session_id ON wake_cursors
+       WHEN OLD.target_session_id IS NOT NULL AND NEW.target_session_id IS NOT OLD.target_session_id
+       BEGIN SELECT RAISE(ABORT, 'wake cursor target session is immutable'); END""",
+    """CREATE TRIGGER trg_wakes_state_machine
+       BEFORE UPDATE OF state ON wakes
+       WHEN NOT (NEW.state = OLD.state OR
+         (OLD.state='pending' AND NEW.state IN ('sending','blocked','unknown')) OR
+         (OLD.state='sending' AND NEW.state IN ('submitted','unknown')) OR
+         (OLD.state='submitted' AND NEW.state IN ('acknowledged','unknown')) OR
+         (OLD.state='acknowledged' AND NEW.state='processed'))
+       BEGIN SELECT RAISE(ABORT, 'invalid wake state transition'); END""",
+    """CREATE TRIGGER trg_wakes_pending_only_grows
+       BEFORE UPDATE OF priority, last_seq, event_count, event_digest ON wakes
+       WHEN OLD.state <> 'pending'
+       BEGIN SELECT RAISE(ABORT, 'only pending wakes may be merged'); END""",
+    """CREATE TRIGGER trg_wakes_bindings_fixed
+       BEFORE UPDATE OF id, project_id, target_ceo_name, dedupe_key, window_start,
+         first_seq, created_at ON wakes
+       WHEN NEW.id IS NOT OLD.id OR NEW.project_id IS NOT OLD.project_id OR
+         NEW.target_ceo_name IS NOT OLD.target_ceo_name OR
+         NEW.dedupe_key IS NOT OLD.dedupe_key OR NEW.window_start IS NOT OLD.window_start OR
+         NEW.first_seq IS NOT OLD.first_seq OR NEW.created_at IS NOT OLD.created_at
+       BEGIN SELECT RAISE(ABORT, 'wake bindings are immutable'); END""",
+    """CREATE TRIGGER trg_wakes_session_fixed
+       BEFORE UPDATE OF target_session_id ON wakes
+       WHEN OLD.target_session_id IS NOT NULL AND NEW.target_session_id IS NOT OLD.target_session_id
+       BEGIN SELECT RAISE(ABORT, 'wake target session is immutable'); END""",
+    """CREATE TRIGGER trg_wakes_command_fixed
+       BEFORE UPDATE OF command_id ON wakes
+       WHEN OLD.command_id IS NOT NULL AND NEW.command_id IS NOT OLD.command_id
+       BEGIN SELECT RAISE(ABORT, 'wake command binding is immutable'); END""",
+    """CREATE TRIGGER trg_wakes_no_delete BEFORE DELETE ON wakes
+       BEGIN SELECT RAISE(ABORT, 'wake records are permanent'); END""",
+    """CREATE TRIGGER trg_wake_events_no_update BEFORE UPDATE ON wake_events
+       BEGIN SELECT RAISE(ABORT, 'wake event links are immutable'); END""",
+    """CREATE TRIGGER trg_wake_events_no_delete BEFORE DELETE ON wake_events
+       BEGIN SELECT RAISE(ABORT, 'wake event links are permanent'); END""",
+    """CREATE TRIGGER trg_wake_events_pending_only
+       BEFORE INSERT ON wake_events
+       WHEN (SELECT state FROM wakes WHERE id=NEW.wake_id) <> 'pending'
+       BEGIN SELECT RAISE(ABORT, 'only pending wakes accept source events'); END""",
+)
+
+# v11 (temporary M2-08 receipt assumption): preserve that initialization was
+# accepted under an explicit development assumption rather than mislabeling it
+# as a real host-trusted receipt.  Once a host receipt provider is testable,
+# callers can write ``host_verified``; absent provenance remains unverified.
+_V11_COLUMNS = {"ceo_initializations": frozenset({"receipt_source"})}
+_V11_STATEMENTS = (
+    "ALTER TABLE ceo_initializations ADD COLUMN receipt_source TEXT NOT NULL DEFAULT 'unverified' CHECK (receipt_source IN ('unverified','assumed_default','host_verified'))",
+    "DROP TRIGGER trg_ceo_initializations_require_host_receipt",
+    "DROP TRIGGER trg_ceo_initializations_update_require_host_receipt",
+    "DROP TRIGGER trg_ceo_initializations_state_machine",
+    """CREATE TRIGGER trg_ceo_initializations_require_host_receipt
+       BEFORE INSERT ON ceo_initializations WHEN NEW.state='initialized'
+         AND NEW.receipt_source NOT IN ('assumed_default','host_verified')
+       BEGIN SELECT RAISE(ABORT, 'initialized CEO requires an accepted receipt source'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_update_require_host_receipt
+       BEFORE UPDATE OF state, receipt_source ON ceo_initializations WHEN NEW.state='initialized'
+         AND NEW.receipt_source NOT IN ('assumed_default','host_verified')
+       BEGIN SELECT RAISE(ABORT, 'initialized CEO requires an accepted receipt source'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_state_machine
+       BEFORE UPDATE OF state ON ceo_initializations
+       WHEN NOT (NEW.state=OLD.state OR
+         (OLD.state='discovered' AND NEW.state IN ('unknown','read_unverified','initialized','failed','incompatible')) OR
+         (OLD.state='unknown' AND NEW.state IN ('read_unverified','initialized','failed','incompatible')))
+       BEGIN SELECT RAISE(ABORT, 'invalid CEO initialization state transition'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_receipt_source_fixed
+       BEFORE UPDATE OF receipt_source ON ceo_initializations
+       WHEN OLD.receipt_source <> 'unverified' AND NEW.receipt_source IS NOT OLD.receipt_source
+       BEGIN SELECT RAISE(ABORT, 'CEO receipt source is immutable once recorded'); END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -546,6 +777,9 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (6, _V6_STATEMENTS),
     (7, _V7_STATEMENTS),
     (8, _V8_STATEMENTS),
+    (9, _V9_STATEMENTS),
+    (10, _V10_STATEMENTS),
+    (11, _V11_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -560,13 +794,17 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     6: _V6_TABLES,
     7: _V7_TABLES,
     8: _V8_TABLES,
+    9: _V9_TABLES,
+    10: _V10_TABLES,
+    11: frozenset(),
 }
 
 
 def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
-    return _V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES | _V8_TABLES
+    return (_V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES
+            | _V8_TABLES | _V9_TABLES | _V10_TABLES)
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -623,6 +861,25 @@ _V8_INDEXES = frozenset({
     "idx_verification_configs_project", "idx_verifications_task",
     "idx_verifications_attempt", "idx_approvals_task",
 })
+_V9_INDEXES = frozenset({"idx_ceo_initializations_state"})
+_V9_TRIGGERS = frozenset({
+    "trg_ceo_initializations_require_host_receipt",
+    "trg_ceo_initializations_update_require_host_receipt",
+    "trg_ceo_initializations_state_machine",
+    "trg_ceo_initializations_binding_fixed",
+    "trg_ceo_initializations_consumed_once",
+    "trg_ceo_initializations_no_delete",
+})
+_V10_INDEXES = frozenset({"idx_events_project_seq", "idx_wake_queue", "ux_wake_pending_dedupe_window", "idx_wake_events_wake_seq"})
+_V10_TRIGGERS = frozenset({
+    "trg_wake_cursors_monotonic", "trg_wake_cursor_identity_fixed",
+    "trg_wake_cursor_session_fixed", "trg_wakes_state_machine",
+    "trg_wakes_pending_only_grows", "trg_wakes_bindings_fixed",
+    "trg_wakes_session_fixed", "trg_wakes_command_fixed", "trg_wakes_no_delete",
+    "trg_wake_events_no_update", "trg_wake_events_no_delete",
+    "trg_wake_events_pending_only",
+})
+_V11_TRIGGERS = frozenset({"trg_ceo_initializations_receipt_source_fixed"})
 
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
@@ -632,6 +889,9 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     5: (_V5_TRIGGERS, frozenset()),
     6: (_V6_TRIGGERS, _V6_INDEXES),
     8: (_V8_TRIGGERS, _V8_INDEXES),
+    9: (_V9_TRIGGERS, _V9_INDEXES),
+    10: (_V10_TRIGGERS, _V10_INDEXES),
+    11: (_V11_TRIGGERS, frozenset()),
 }
 
 
@@ -655,7 +915,7 @@ def _required_objects_for(version: int) -> tuple[frozenset[str], frozenset[str]]
 
 def _required_columns_for(version: int) -> dict[str, frozenset[str]]:
     """Required additive columns for an audited schema version."""
-    return {table: columns for step, mapping in ((7, _V7_COLUMNS),)
+    return {table: columns for step, mapping in ((7, _V7_COLUMNS), (9, _V9_COLUMNS), (10, _V10_COLUMNS), (11, _V11_COLUMNS))
             if step <= version for table, columns in mapping.items()}
 
 

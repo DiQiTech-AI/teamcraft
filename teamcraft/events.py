@@ -291,7 +291,8 @@ def get_event(conn: TeamCraftConnection, event_id: str) -> Event:
 
 
 def events_after(
-    conn: TeamCraftConnection, after_seq: int = 0, *, limit: int = 200
+    conn: TeamCraftConnection, after_seq: int = 0, *, limit: int = 200,
+    project_id: str | None = None,
 ) -> tuple[Event, ...]:
     """Read the stream after ``after_seq`` (SSE backfill shape, M3-03).
 
@@ -311,9 +312,17 @@ def events_after(
         raise ValidationError(
             f"limit must be an integer in 1..{MAX_EVENT_PAGE_SIZE}"
         )
-    rows = conn.execute(
-        f"SELECT {_EVENT_COLUMNS} FROM events WHERE seq > ? ORDER BY seq ASC"
-        " LIMIT ?",
-        (after_seq, limit),
-    ).fetchall()
+    if project_id is None:
+        rows = conn.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE seq > ? ORDER BY seq ASC"
+            " LIMIT ?",
+            (after_seq, limit),
+        ).fetchall()
+    else:
+        project_id = require_entity_id(project_id)
+        rows = conn.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE project_id=? AND seq>? "
+            "ORDER BY seq ASC LIMIT ?",
+            (project_id, after_seq, limit),
+        ).fetchall()
     return tuple(_row_to_event(row) for row in rows)

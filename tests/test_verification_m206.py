@@ -92,13 +92,29 @@ class VerificationM206Tests(unittest.TestCase):
                 raw.execute(f"DROP INDEX IF EXISTS {index}")
             for table in ("approvals", "verifications", "verification_configs"):
                 raw.execute(f"DROP TABLE IF EXISTS {table}")
+            for trigger in storage._V9_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V9_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            raw.execute("DROP TABLE IF EXISTS ceo_initializations")
+            for trigger in storage._V10_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V10_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("wake_events", "wakes", "wake_cursors"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
+            for trigger in storage._V11_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            columns = {row[1] for row in raw.execute("PRAGMA table_info(ceo_initializations)")}
+            if "receipt_source" in columns:
+                raw.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
             raw.execute("DELETE FROM schema_migrations WHERE version > 7")
             raw.execute("PRAGMA user_version=7")
             raw.commit()
         finally:
             raw.close()
         migration = storage.migrate_to_head(self.db, allow_unverified_location=True)
-        self.assertEqual((migration.from_version, migration.to_version, migration.applied), (7, 8, (8,)))
+        self.assertEqual((migration.from_version, migration.to_version, migration.applied), (7, 11, (8, 9, 10, 11)))
         report = storage.verify_database(self.db)
         self.assertTrue(report["at_head"])
         self.assertTrue(set(storage._V8_TABLES).issubset(set(report["tables"])))

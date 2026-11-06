@@ -140,10 +140,16 @@ class CompatContractTests(unittest.TestCase):
             },
         )
         self.env.start()
+        # These harness cases assert CLI/lifecycle contracts unrelated to
+        # CEO admission. Real gate behavior is covered by M2-08 acceptance.
+        self.ceo_gate = mock.patch.object(teamctl.StateStore,
+            "require_ceo_initialized", return_value=None)
+        self.ceo_gate.start()
         self.session = teamctl.current_session_identity()
         self.store = teamctl.StateStore(self.root_resolved)
 
     def tearDown(self):
+        self.ceo_gate.stop()
         self.env.stop()
         self.temp.cleanup()
 

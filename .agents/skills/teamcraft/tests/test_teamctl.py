@@ -65,10 +65,16 @@ class TeamctlTests(unittest.TestCase):
             },
         )
         self.env.start()
+        # These in-process lifecycle tests target member behavior. The real
+        # project-wide CEO gate is asserted in the dedicated M2-08 tests.
+        self.ceo_gate = mock.patch.object(teamctl.StateStore,
+            "require_ceo_initialized", return_value=None)
+        self.ceo_gate.start()
         self.session = teamctl.current_session_identity()
         self.store = teamctl.StateStore(self.root)
 
     def tearDown(self):
+        self.ceo_gate.stop()
         self.env.stop()
         self.temp.cleanup()
 
@@ -316,6 +322,172 @@ class TeamctlTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual([item["current"] for item in payload["verifications"]], [True, False])
         self.assertEqual([item["current"] for item in payload["approvals"]], [True, False])
+
+    def test_m208_ordinary_launch_fails_before_reserve_split_start_or_prompt(self):
+        lease = object()
+        class Store:
+            def acquire_lease(self, *args): return lease
+            def require_ceo_initialized(self): raise teamctl.TeamctlError("CEO initialization is not trusted")
+            def release_lease(self, observed): self.asserted_lease = observed
+        store = Store()
+        args = argparse.Namespace(
+            name="worker", start_timeout_ms=30_000, wait=False, timeout_ms=10_000,
+            cwd=str(self.root), from_pane="current", role="developer", kind="codex", read_only=False,
+            ownership=["src/**"], agent_arg=[], direction=None,
+        )
+        with mock.patch.object(teamctl, "require_herdr"), \
+             mock.patch.object(teamctl, "validate_common_launch", return_value=(self.root, "task", "responsibility", ["src/**"])), \
+             mock.patch.object(teamctl, "preflight_kind"), \
+             mock.patch.object(teamctl, "ensure_live_name_available"), \
+             mock.patch.object(teamctl, "resolve_pane", return_value={"pane_id": "w1:p1"}), \
+             mock.patch.object(teamctl, "current_session_identity", return_value=self.session), \
+             mock.patch.object(teamctl, "StateStore", return_value=store), \
+             mock.patch.object(teamctl, "reserve_member") as reserve, \
+             mock.patch.object(teamctl, "split_for_member") as split, \
+             mock.patch.object(teamctl, "start_member") as start, \
+             mock.patch.object(teamctl, "prompt_member") as prompt:
+            with self.assertRaisesRegex(teamctl.TeamctlError, "not trusted"):
+                teamctl._launch_operation(args)
+        reserve.assert_not_called()
+        split.assert_not_called()
+        start.assert_not_called()
+        prompt.assert_not_called()
+        self.assertIs(store.asserted_lease, lease)
+
+    def test_m208_reserved_launch_fails_before_any_herdr_lifecycle_effect(self):
+        class Conn:
+            closed = False
+            def close(self): self.closed = True
+        conn = Conn()
+        class Store:
+            def ensure_project(self): return "project-1"
+            def _connect(self): return conn
+            def require_ceo_initialized(self): raise teamctl.TeamctlError("CEO initialization is not trusted")
+        store = Store()
+        lease = SimpleNamespace(scope=teamctl._leader.project_scope("project-1"), epoch=1)
+        member = make_member("worker", ["src/**"])
+        with mock.patch.object(teamctl, "require_herdr"), \
+             mock.patch.object(teamctl._leader, "require_project_lease"), \
+             mock.patch.object(teamctl, "reserve_member") as reserve, \
+             mock.patch.object(teamctl, "split_for_member") as split, \
+             mock.patch.object(teamctl, "start_member") as start, \
+             mock.patch.object(teamctl, "prompt_member") as prompt:
+            with self.assertRaisesRegex(teamctl.TeamctlError, "not trusted"):
+                teamctl.launch_reserved(store, self.session, member, task_id="task-1",
+                    attempt_id="attempt-1", lease=lease)
+        self.assertTrue(conn.closed)
+        reserve.assert_not_called()
+        split.assert_not_called()
+        start.assert_not_called()
+        prompt.assert_not_called()
+
+    def test_m208_ceo_role_is_the_only_launch_path_that_skips_initialized_gate(self):
+        lease = object()
+        class StopAtReserve(Exception): pass
+        class Store:
+            def acquire_lease(self, *args): return lease
+            def require_ceo_initialized(self): raise AssertionError("CEO bootstrap must be allowed as the initial path")
+            def release_lease(self, observed): self.asserted_lease = observed
+        store = Store()
+        args = argparse.Namespace(
+            name="ceo", start_timeout_ms=30_000, wait=False, timeout_ms=10_000,
+            cwd=str(self.root), from_pane="current", role="ceo", kind="codex", read_only=True,
+            ownership=[], agent_arg=[], direction=None,
+        )
+        with mock.patch.object(teamctl, "require_herdr"), \
+             mock.patch.object(teamctl, "validate_common_launch", return_value=(self.root, "initialize", "lead", [])), \
+             mock.patch.object(teamctl, "preflight_kind"), \
+             mock.patch.object(teamctl, "ensure_live_name_available"), \
+             mock.patch.object(teamctl, "resolve_pane", return_value={"pane_id": "w1:p1"}), \
+             mock.patch.object(teamctl, "current_session_identity", return_value=self.session), \
+             mock.patch.object(teamctl, "StateStore", return_value=store), \
+             mock.patch.object(teamctl, "reserve_member", side_effect=StopAtReserve) as reserve:
+            with self.assertRaises(StopAtReserve):
+                teamctl._launch_operation(args)
+        reserve.assert_called_once()
+        self.assertIs(store.asserted_lease, lease)
+
+    def test_diQi_worker_resume_requires_project_initialization_before_lifecycle_effects(self):
+        member = make_member("worker", ["src/**"], phase="start_ambiguous")
+        lease = object()
+        store = mock.Mock()
+        store.acquire_lease.return_value = lease
+        store.require_ceo_initialized.side_effect = teamctl.TeamctlError("project CEO is uninitialized")
+        state = {"members": {"worker": member}}
+        args = argparse.Namespace(cwd=str(self.root), name="worker", wait=False,
+            timeout_ms=1000, split_action="inspect", prompt_action="inspect")
+        with mock.patch.object(teamctl, "require_herdr"), \
+             mock.patch.object(teamctl, "resolve_project_root", return_value=self.root), \
+             mock.patch.object(teamctl, "load_member_for_mutation", return_value=(store, self.session, state, member)), \
+             mock.patch.object(teamctl, "preflight_kind"), \
+             mock.patch.object(teamctl, "verify_recorded_occupant") as occupant, \
+             mock.patch.object(teamctl, "split_for_member") as split, \
+             mock.patch.object(teamctl, "start_member") as start, \
+             mock.patch.object(teamctl, "prompt_member") as prompt:
+            with self.assertRaisesRegex(teamctl.TeamctlError, "uninitialized"):
+                teamctl._resume_operation(args)
+        store.require_ceo_initialized.assert_called_once_with()
+        occupant.assert_not_called()
+        split.assert_not_called()
+        start.assert_not_called()
+        prompt.assert_not_called()
+        store.release_lease.assert_called_once_with(lease)
+
+    def test_diQi_ceo_bootstrap_checks_every_challenge_bound_occupant_identity_before_prompt(self):
+        class Conn:
+            closed = False
+            def close(self): self.closed = True
+
+        member = make_member("ceo", [], role="ceo", read_only=True,
+            pane_id="pane-1", terminal_id="terminal-1", session_id="tc-session-1",
+            agent_session={"kind": "native", "value": "native-1"},
+            phase="agent_started", live_state="working")
+        challenge = {"nonce": "one-use", "project_id": "p-1", "team_id": "team-1",
+            "teamcraft_session_id": "tc-session-1", "herdr_session_id": "native-1",
+            "terminal_id": "terminal-1", "protocol_version": "1.0.0",
+            "protocol_hash": "a" * 64, "runtime_skill_hash": "b" * 64,
+            "snapshot_digest": "c" * 64}
+        args = ("ceo", "prompt text")
+        pane = {"pane_id": "pane-1", "terminal_id": "terminal-1", "agent": "codex"}
+        agent = {"name": "ceo", "agent": "codex", "pane_id": "pane-1",
+            "terminal_id": "terminal-1", "agent_session": {"kind": "native", "value": "native-1"}}
+
+        # The verifier must reject every challenge-bound drift, including
+        # TeamCraft Session, pane, terminal, member name, Harness kind, and
+        # native Agent Session.
+        drift_cases = (
+            ("teamcraft session", {"session_id": "tc-session-moved"}, {}, {}, False),
+            ("pane", {}, {"pane_id": "pane-moved"}, {"pane_id": "pane-moved"}, True),
+            ("terminal", {}, {"terminal_id": "terminal-moved"}, {"terminal_id": "terminal-moved"}, True),
+            ("name", {}, {}, {"name": "other"}, True),
+            ("kind", {}, {}, {"agent": "opencode"}, True),
+            ("native session", {}, {}, {"agent_session": {"kind": "native", "value": "native-moved"}}, True),
+        )
+        for label, member_delta, pane_delta, agent_delta, should_inspect in drift_cases:
+            with self.subTest(drift=label):
+                conn = Conn()
+                live_pane, live_agent = pane | pane_delta, agent | agent_delta
+                store = mock.Mock()
+                store._connect.return_value = conn
+                store.prepare_prompt_brief.return_value = {}
+                store.stage_claim.return_value = SimpleNamespace(id="cmd-1", payload_json="{}")
+                store.admit_ceo_bootstrap_effect.return_value = None
+                herdr = mock.Mock()
+                occupant = mock.Mock(return_value=(live_pane, live_agent))
+                with mock.patch.object(teamctl, "_adapter") as adapter, \
+                     mock.patch.object(teamctl, "update_member", side_effect=lambda *_a, **_kw: member | member_delta | {"phase": "prompt_submitting"}), \
+                     mock.patch.object(teamctl, "build_prompt", return_value="bootstrap prompt"), \
+                     mock.patch.object(teamctl, "_admit_effect"), \
+                     mock.patch.object(teamctl, "verify_recorded_occupant", occupant), \
+                     mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr):
+                    adapter.team_view.return_value = {"members": {"ceo": member}}
+                    adapter.prepare_ceo_bootstrap.return_value = challenge
+                    with self.assertRaises(teamctl.TeamctlError):
+                        teamctl.prompt_member(member | member_delta, store, self.session,
+                            wait=False, timeout_ms=1000, lease=object())
+                self.assertTrue(conn.closed)
+                self.assertEqual(occupant.called, should_inspect)
+                herdr.prompt_agent.assert_not_called()
 
     def test_ambiguous_prompt_is_not_resent_on_default_resume(self):
         agent_session = {"value": "same"}

@@ -102,13 +102,29 @@ def _shed_v6_m203_artifacts(conn) -> None:
 
 
 def _shed_v8_m206_artifacts(conn) -> None:
-    """Strip schema-v8 additions from fixtures claiming schema v1-v7."""
+    """Strip schema-v8/v9 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     for index in storage._V8_INDEXES:
         conn.execute(f"DROP INDEX IF EXISTS {index}")
     for table in ("approvals", "verifications", "verification_configs"):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for trigger in storage._V9_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V9_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    conn.execute("DROP TABLE IF EXISTS ceo_initializations")
+    for trigger in storage._V10_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V10_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("wake_events", "wakes", "wake_cursors"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for trigger in storage._V11_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    init_columns = {row[1] for row in conn.execute("PRAGMA table_info(ceo_initializations)")}
+    if "receipt_source" in init_columns:
+        conn.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
 
 
 class DomainM104Tests(unittest.TestCase):
@@ -1269,9 +1285,9 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertEqual(info["schema_migrations_recorded"], 1)
         self.assertEqual(
             info["missing_head_tables"],
-            ["approvals", "attempt_briefs", "commands", "events", "leader_lease", "members",
+            ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
              "prompt_deliveries", "runtime_meta", "task_dependencies", "verification_configs",
-             "verifications", "worker_reports"],
+             "verifications", "wake_cursors", "wake_events", "wakes", "worker_reports"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)

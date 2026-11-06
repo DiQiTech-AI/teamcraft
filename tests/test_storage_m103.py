@@ -191,13 +191,29 @@ def _shed_v6_m203_artifacts(conn: sqlite3.Connection) -> None:
 
 
 def _shed_v8_m206_artifacts(conn: sqlite3.Connection) -> None:
-    """Strip schema-v8 additions from fixtures claiming schema v1-v7."""
+    """Strip schema-v8/v9 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     for index in storage._V8_INDEXES:
         conn.execute(f"DROP INDEX IF EXISTS {index}")
     for table in ("approvals", "verifications", "verification_configs"):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for trigger in storage._V9_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V9_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    conn.execute("DROP TABLE IF EXISTS ceo_initializations")
+    for trigger in storage._V10_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V10_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("wake_events", "wakes", "wake_cursors"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for trigger in storage._V11_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    init_columns = {row[1] for row in conn.execute("PRAGMA table_info(ceo_initializations)")}
+    if "receipt_source" in init_columns:
+        conn.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
 
 # P-fixes 10: backup_database/restore_backup are live public API again —
 # copies happen in a private 0700 staging file, are verified there, and the
@@ -250,6 +266,10 @@ EXPECTED_TABLES = {
     "verification_configs",
     "verifications",
     "approvals",
+    # M2-08 schema v9 project-scoped CEO initialization record.
+    "ceo_initializations",
+    # M2-09 schema v10 durable Wake inbox.
+    "wake_cursors", "wakes", "wake_events",
     # SQLite-internal table materialised by the AUTOINCREMENT DDL of
     # events.seq (M1-05); it appears in sqlite_master from schema creation on.
     "sqlite_sequence",
@@ -3844,7 +3864,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertFalse(lagging["at_head"])
         self.assertEqual(lagging["missing_version_tables"], [])
         self.assertEqual(lagging["missing_head_tables"],
-                         ["approvals", "attempt_briefs", "commands", "events", "leader_lease", "members",
+                         ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
                           "prompt_deliveries", "runtime_meta", "task_dependencies",
                           "verification_configs", "verifications", "worker_reports"])
 

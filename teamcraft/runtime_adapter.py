@@ -42,6 +42,7 @@ from . import briefs
 from . import worker_reports
 from . import recovery
 from . import ceo_protocol
+from . import ceo_initialization
 from . import domain
 from . import fresh_start
 from . import leader
@@ -322,6 +323,12 @@ def sync_state(conn: TeamCraftConnection, state: dict[str, Any],
                 f"member {name!r} has unknown phase {phase!r}; allowed:"
                 f" {', '.join(sorted(MEMBER_PHASES))}"
             )
+    ceo_names = sorted(name for name, member in members.items()
+                       if str(member.get("role", "")) == "ceo")
+    if len(ceo_names) > 1:
+        raise RuntimeAdapterError(
+            f"a project may have only one canonical CEO; found {ceo_names!r}"
+        )
     with _tx(conn):
         meta = conn.execute(
             "SELECT team_id, herdr_session_json FROM runtime_meta WHERE id = 1"
@@ -476,6 +483,17 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
     project_id = project_id_for_root(conn, str(state["project_root"]))
     if project_id is None:
         return
+    if member.get("role") == "ceo":
+        other_ceos = conn.execute(
+            "SELECT m.name FROM members m LEFT JOIN tasks t ON t.id=m.task_id "
+            "WHERE m.role='ceo' AND m.name<>? AND (t.project_id=? OR m.task_id IS NULL) ORDER BY m.name",
+            (str(member["name"]), project_id),
+        ).fetchall()
+        if other_ceos:
+            raise RuntimeAdapterError(
+                "project already has a canonical CEO: "
+                + ", ".join(str(row[0]) for row in other_ceos)
+            )
     task_id = member.get("task_id")
     if task_id is None:
         task = domain.create_task(
@@ -623,6 +641,93 @@ def _verify_member_protocol(state: dict[str, Any], member: dict[str, Any], attem
         )
     except ceo_protocol.ProtocolError as exc:
         raise RuntimeAdapterError(f"NEEDS_HUMAN: pinned CEO protocol unavailable: {exc}") from exc
+
+
+def prepare_ceo_bootstrap(conn: TeamCraftConnection, state: dict[str, Any],
+                          member: dict[str, Any], *, clock: Any = None) -> dict[str, str] | None:
+    """Create the one-time project challenge for the canonical CEO prompt.
+
+    A repeated/unknown bootstrap is refused. ``None`` is returned only after a
+    initialized record accepted by the current receipt policy exists. With
+    the temporary ``assumed_default`` mode, the bootstrap challenge is still
+    required and acceptance is recorded only after successful prompt
+    submission plus a live-session identity recheck.
+    """
+    if member.get("role") != "ceo":
+        return None
+    project_id = _project_id_for_member(conn, str(member["name"]), member.get("task_id"))
+    try:
+        record, nonce = ceo_initialization.discover_and_issue(
+            conn, project_id, str(member["name"]), clock=clock,
+        )
+    except TeamCraftError as exc:
+        detail = str(exc)
+        lowered = detail.lower()
+        failure_state = "incompatible" if any(
+            marker in lowered for marker in ("protocol version", "protocol hash", "protocol pin", "incompatible", "pinned", "differs", "sha-256")
+        ) else "failed"
+        ceo_initialization.record_discovery_failure(
+            conn, project_id, str(member["name"]), detail, state=failure_state, clock=clock,
+        )
+        raise RuntimeAdapterError(str(exc)) from exc
+    if record.state == "initialized":
+        return None
+    if nonce is None:
+        raise RuntimeAdapterError(
+            f"CEO initialization is {record.state}; bootstrap will not be resent"
+        )
+    try:
+        return ceo_initialization.bootstrap_prompt_fields(record, nonce)
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def admit_ceo_bootstrap_effect(conn: TeamCraftConnection, project_id: str,
+                               nonce: str, *, lease: leader.Lease,
+                               clock: Any = None) -> None:
+    """Fence and consume the one-use challenge immediately before Herdr prompt."""
+    try:
+        record = ceo_initialization.mark_bootstrap_unknown(
+            conn, project_id, nonce, lease=lease, clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+    if record.state != "unknown":
+        raise RuntimeAdapterError(
+            f"bootstrap challenge is {record.state}; refusing Herdr prompt"
+        )
+
+
+def record_ceo_bootstrap_submission_assumed(
+    conn: TeamCraftConnection, project_id: str, nonce: str, *,
+    lease: leader.Lease, clock: Any = None,
+) -> ceo_initialization.CEOInitialization:
+    """Persist the temporary default assumption after verified prompt submission."""
+    try:
+        return ceo_initialization.record_bootstrap_submitted_assumed(
+            conn, project_id, nonce, lease=lease, clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def record_ceo_agent_claim(conn: TeamCraftConnection, project_id: str,
+                           claim_json: str, *, lease: leader.Lease,
+                           clock: Any = None) -> ceo_initialization.CEOInitialization:
+    """Persist Agent JSON as unverified audit material; never as proof."""
+    try:
+        return ceo_initialization.record_agent_claim(
+            conn, project_id, claim_json, lease=lease, clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def require_ceo_initialized(conn: TeamCraftConnection, project_id: str):
+    try:
+        return ceo_initialization.require_initialized(conn, project_id)
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

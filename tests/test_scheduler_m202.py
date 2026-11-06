@@ -145,8 +145,9 @@ class SchedulerTests(unittest.TestCase):
         p = scheduler.plan(self.conn, self.project.id, concurrency_limit=2)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], before)
         lease = scheduler.acquire_or_renew(self.conn, self.project.id, "sched", clock=self.clock)
-        dispatched = scheduler.dispatch_ready(self.conn, self.project.id, lease,
-                                              concurrency_limit=2, clock=self.clock)
+        with mock.patch.object(scheduler.ceo_initialization, "require_initialized"):
+            dispatched = scheduler.dispatch_ready(self.conn, self.project.id, lease,
+                                                  concurrency_limit=2, clock=self.clock)
         self.assertEqual(len(dispatched.attempts), 2)
         self.assertEqual({a.task_id for a in dispatched.attempts}, {first.id, second.id})
         self.assertEqual(domain.get_task(self.conn, first.id).status, "running")
@@ -160,7 +161,8 @@ class SchedulerTests(unittest.TestCase):
                 (ready.id,),
             )
         lease = scheduler.acquire_or_renew(self.conn, self.project.id, "capped", clock=self.clock)
-        result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
+        with mock.patch.object(scheduler.ceo_initialization, "require_initialized"):
+            result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
         self.assertEqual(result.attempts, ())
         self.assertEqual(domain.get_task(self.conn, ready.id).status, "needs_human")
 
@@ -171,7 +173,8 @@ class SchedulerTests(unittest.TestCase):
         domain.transition_attempt(self.conn, active.id, "fail", clock=self.clock)
         with storage.transaction(self.conn):
             self.conn.execute("UPDATE tasks SET max_attempts=1 WHERE id=?", (running.id,))
-        result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
+        with mock.patch.object(scheduler.ceo_initialization, "require_initialized"):
+            result = scheduler.dispatch_ready(self.conn, self.project.id, lease, concurrency_limit=2, clock=self.clock)
         self.assertEqual(domain.get_task(self.conn, running.id).status, "needs_human")
 
     def test_scheduler_long_lived_acquire_renew_tick_release_interface(self):
@@ -182,7 +185,8 @@ class SchedulerTests(unittest.TestCase):
         )
         first = service.acquire_or_renew()
         self.assertEqual(service.renew().epoch, first.epoch)
-        result = service.tick()
+        with mock.patch.object(scheduler.ceo_initialization, "require_initialized"):
+            result = service.tick()
         self.assertEqual([attempt.task_id for attempt in result.attempts], [task.id])
         self.assertTrue(service.release())
         replacement = scheduler.Scheduler(

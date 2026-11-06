@@ -491,6 +491,28 @@ class StateStore:
         finally:
             conn.close()
 
+    def require_ceo_initialized(self) -> None:
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("runtime Project row is missing; CEO dispatch is blocked")
+            record = _adapter.require_ceo_initialized(conn, project_id)
+        except _adapter.RuntimeAdapterError as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
+        state = self.read_unlocked()
+        member = (state or {}).get("members", {}).get(record.canonical_ceo_name)
+        if not isinstance(member, dict) or member.get("role") != "ceo":
+            raise TeamctlError("initialized canonical CEO member is missing; dispatch is blocked")
+        pane, agent = verify_recorded_occupant(member)
+        if not pane or not agent:
+            raise TeamctlError("initialized CEO is missing or disconnected; dispatch is blocked")
+        if (_native_session(member) != record.native_session_id
+                or member.get("terminal_id") != record.terminal_id):
+            raise TeamctlError("initialized CEO native Session/terminal identity drifted; dispatch is blocked")
+
     def acquire_lease(self, name: str, ttl_seconds: int) -> _leader.Lease:
         # The first CLI operation must establish the project identity before
         # it can contend with the Scheduler on the shared project scope.
@@ -539,6 +561,20 @@ class StateStore:
         finally:
             conn.close()
 
+    def admit_ceo_bootstrap_effect(self, nonce: str, *, lease: _leader.Lease) -> None:
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("runtime Project row is missing for CEO bootstrap")
+            _adapter.admit_ceo_bootstrap_effect(
+                conn, project_id, nonce, lease=lease,
+            )
+        except _adapter.RuntimeAdapterError as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
+
     def prepare_prompt_brief(self, name: str) -> dict[str, Any]:
         conn = self._connect()
         try:
@@ -583,6 +619,19 @@ class StateStore:
         conn = self._connect()
         try:
             _adapter.record_prompt_delivery(conn, command_id, state, note=note)
+        finally:
+            conn.close()
+
+    def record_ceo_bootstrap_submission_assumed(self, nonce: str, *, lease: _leader.Lease) -> None:
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("project disappeared before CEO bootstrap assumption could be recorded")
+            _leader.require_project_lease(conn, lease, project_id)
+            _adapter.record_ceo_bootstrap_submission_assumed(
+                conn, project_id, nonce, lease=lease,
+            )
         finally:
             conn.close()
 
@@ -869,7 +918,8 @@ def live_state(agent: dict[str, Any] | None) -> str:
     return value if value in LIVE_STATES else "unknown"
 
 
-def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None) -> str:
+def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None,
+                 *, ceo_bootstrap: dict[str, str] | None = None) -> str:
     if member["read_only"]:
         ownership_text = "- Read-only assignment. Do not modify project files."
     elif member["ownership"]:
@@ -917,6 +967,13 @@ def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None) ->
                 "Create only needed workers. Give each concrete deliverables, acceptance criteria, and non-overlapping ownership; review evidence before integration.",
             ]
         )
+        if ceo_bootstrap is not None:
+            lines.extend([
+                "", "One-time TeamCraft initialization challenge:",
+                "Read the pinned CEO protocol and TeamCraft runtime Skill, inspect the project/Task state, then return exactly one JSON object with these bound values.",
+                "The runtime currently applies an explicit assumed_default receipt mode after successful prompt submission and a live-session identity recheck. This is a temporary assumption, not a host-trusted receipt.",
+                json.dumps(ceo_bootstrap, ensure_ascii=False, sort_keys=True),
+            ])
     return "\n".join(lines)
 
 
@@ -1096,15 +1153,26 @@ def prompt_member(
                                 timeout_ms, wait)
         )
     try:
-        # Capture the legacy-compatible text as the immutable brief before
-        # effect admission.  The returned command binds its version/digest.
+        # Prepare durable Task evidence and the one-time CEO challenge before
+        # changing the member to a possibly-delivered phase.
+        preparer = getattr(store, "prepare_prompt_brief", None)
+        bound_brief = preparer(name) if preparer else {}
+        ceo_bootstrap = None
+        if member.get("role") == "ceo":
+            conn = store._connect()
+            try:
+                view = _adapter.team_view(conn) or {}
+                ceo_bootstrap = _adapter.prepare_ceo_bootstrap(conn, view, member)
+            except _adapter.RuntimeAdapterError as exc:
+                raise TeamctlError(str(exc)) from exc
+            finally:
+                conn.close()
         prepared_member = update_member(
             store, session, name, lease=lease,
             phase="prompt_submitting", prompt_may_have_been_delivered=True,
         )
-        preparer = getattr(store, "prepare_prompt_brief", None)
-        bound_brief = preparer(name) if preparer else {}
-        base_prompt = build_prompt(prepared_member, bound_brief)
+        base_prompt = build_prompt(prepared_member, bound_brief,
+                                   ceo_bootstrap=ceo_bootstrap)
         command = store.stage_claim(
             name, _adapter.STAGE_PROMPT, lease=lease,
             payload={
@@ -1125,13 +1193,21 @@ def prompt_member(
         # stage_claim only adds bindings; preserve Session and all fields from
         # the pre-effect preparation, making this byte-identical to base_prompt.
         rendered_brief = {**bound_brief, **bound}
-        prompt_text = build_prompt(prepared_member, rendered_brief)
+        prompt_text = build_prompt(prepared_member, rendered_brief,
+                                   ceo_bootstrap=ceo_bootstrap)
         if hashlib.sha256(prompt_text.encode("utf-8")).hexdigest() != hashlib.sha256(base_prompt.encode("utf-8")).hexdigest():
             raise TeamctlError("refusing prompt whose rendered binding changed before Herdr effect")
         args = ["agent", "prompt", name, prompt_text]
         if wait:
             args.extend(["--wait", "--timeout", str(timeout_ms)])
         _admit_effect(store, command.id, lease)
+        if ceo_bootstrap is not None:
+            store.admit_ceo_bootstrap_effect(ceo_bootstrap["nonce"], lease=lease)
+            # The challenge binds the native Session and terminal, while the
+            # Herdr API addresses prompts by member name. Re-resolve that name
+            # against its recorded pane immediately before the external call;
+            # never let a recycled name redirect the CEO bootstrap prompt.
+            _verify_bootstrap_herdr_target(prepared_member, ceo_bootstrap)
         try:
             # Herdr prompt delivery is external and cannot be cancelled once
             # in flight; ambiguous results always remain UNKNOWN to reconcile.
@@ -1165,6 +1241,14 @@ def prompt_member(
             # so generic command outcome remains ambiguous/reconcile-first.
             store.stage_unknown(command.id, note=f"prompt submitted but post-submit inspection failed: {exc}")
             raise
+        if ceo_bootstrap is not None:
+            # The temporary default assumption is recorded only after the
+            # transport returned and the exact challenged live session was
+            # observed again. The persisted source remains ``assumed_default``.
+            _verify_bootstrap_herdr_target(prepared_member, ceo_bootstrap)
+            store.record_ceo_bootstrap_submission_assumed(
+                ceo_bootstrap["nonce"], lease=lease,
+            )
         return update_member(
             store, session, name, lease=lease,
             phase="prompt_submitted",
@@ -1232,6 +1316,8 @@ def _launch_operation(args: argparse.Namespace) -> int:
         _operation_ttl(args.start_timeout_ms, args.timeout_ms, args.wait),
     )
     try:
+        if args.role != "ceo":
+            store.require_ceo_initialized()
         opencode_content = (
             opencode_config_content(root, args.role) if args.kind == "opencode" else None
         )
@@ -1289,6 +1375,7 @@ def launch_reserved(
     conn = store._connect()
     try:
         _leader.require_project_lease(conn, lease, project_id)
+        store.require_ceo_initialized()
         task_record = _adapter.domain.get_task(conn, task_id)
         attempt = _adapter.domain.get_attempt(conn, attempt_id)
         if task_record.project_id != project_id:
@@ -1425,6 +1512,40 @@ def verify_recorded_occupant(
     return pane, None
 
 
+def _verify_bootstrap_herdr_target(
+    member: dict[str, Any], challenge: dict[str, Any],
+) -> None:
+    """Require the live name occupant to remain the challenge-bound target."""
+    name = member.get("name")
+    pane_id = member.get("pane_id")
+    terminal_id = challenge.get("terminal_id")
+    native_session_id = challenge.get("herdr_session_id")
+    teamcraft_session_id = challenge.get("teamcraft_session_id")
+    if not all(isinstance(value, str) and value for value in (
+        name, pane_id, terminal_id, native_session_id, teamcraft_session_id,
+    )):
+        raise TeamctlError("CEO bootstrap target binding is incomplete; refusing Herdr prompt")
+    if member.get("session_id") != teamcraft_session_id:
+        raise TeamctlError("CEO TeamCraft Session drifted before bootstrap prompt")
+    if member.get("terminal_id") != terminal_id:
+        raise TeamctlError("CEO terminal binding drifted before bootstrap prompt")
+    try:
+        pane, agent = verify_recorded_occupant(member)
+    except TeamctlError as exc:
+        raise TeamctlError(f"cannot verify live CEO bootstrap target: {exc}") from exc
+    if not pane or not agent:
+        raise TeamctlError("CEO bootstrap target is not a live Herdr occupant; refusing prompt")
+    live_native = _native_session(agent)
+    if (pane.get("pane_id") != pane_id or agent.get("pane_id") != pane_id
+            or pane.get("terminal_id") != terminal_id
+            or agent.get("terminal_id") != terminal_id
+            or agent.get("name") != name or agent.get("agent") != member.get("kind")
+            or live_native != native_session_id):
+        raise TeamctlError(
+            "live CEO pane, terminal, member, or native Session differs from the challenge; refusing prompt"
+        )
+
+
 def _reconcile_observed_stage(store: StateStore, name: str, stage: str,
                               evidence: dict[str, Any], note: str, *,
                               lease: "_leader.Lease") -> None:
@@ -1457,6 +1578,11 @@ def _resume_operation(args: argparse.Namespace) -> int:
         _operation_ttl(member["start_timeout_ms"], args.timeout_ms, args.wait),
     )
     try:
+        # Resume can split, start, or submit a Worker prompt. Apply the same
+        # project-wide initialization gate as a fresh launch before any of
+        # those lifecycle effects; the supplied lease is the canonical project
+        # lease and each effect is separately fenced at its write boundary.
+        store.require_ceo_initialized()
         pane, agent = verify_recorded_occupant(member)
         if pane:
             _reconcile_observed_stage(

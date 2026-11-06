@@ -61,10 +61,16 @@ class SqliteRuntimeTests(unittest.TestCase):
         # through the per-test run_herdr double and is asserted there.
         self.gate = mock.patch.object(teamctl, "preflight_kind")
         self.gate.start()
+        # These tests target command durability and lifecycle ordering. The
+        # production CEO admission path is exercised separately by M2-08.
+        self.ceo_gate = mock.patch.object(teamctl.StateStore,
+            "require_ceo_initialized", return_value=None)
+        self.ceo_gate.start()
         self.session = teamctl.current_session_identity()
         self.store = teamctl.StateStore(self.root_resolved)
 
     def tearDown(self) -> None:
+        self.ceo_gate.stop()
         self.gate.stop()
         self.env.stop()
         self.temp.cleanup()
@@ -388,7 +394,9 @@ class SqliteRuntimeTests(unittest.TestCase):
                 conn, project_id, "scheduler:dispatch", concurrency_limit=1,
                 ttl_seconds=180,
             )
-            reserved = service.tick()
+            with mock.patch.object(scheduler.ceo_initialization,
+                                   "require_initialized"):
+                reserved = service.tick()
             self.assertEqual(len(reserved.attempts), 1)
             attempt = reserved.attempts[0]
             member = make_member("scheduled", ["src/scheduled/**"])

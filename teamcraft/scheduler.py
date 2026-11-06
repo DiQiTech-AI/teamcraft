@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 import unicodedata
 
-from . import domain, leader, recovery
+from . import ceo_initialization, domain, leader, recovery, wake
 from .clock import Clock
 from .storage import TeamCraftConnection, transaction
 
@@ -238,6 +238,7 @@ def dispatch_ready(
         # Recompute under the IMMEDIATE lock. No gap exists between checking
         # quota/ownership and making each reservation.
         leader.require_project_lease(conn, lease, project_id, clock=clock)
+        ceo_initialization.require_initialized(conn, project_id)
         for task in domain.list_tasks(conn, project_id, status="running"):
             used = int(conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id = ?", (task.id,)).fetchone()[0])
             if used >= task.max_attempts and domain.occupying_attempt(conn, task.id) is None:
@@ -298,8 +299,12 @@ class Scheduler:
         return released
 
     def tick(self) -> DispatchResult:
-        """Renew/admit, then make one atomic reservation pass."""
+        """Renew, persist new event Wakes, then make one reservation pass."""
         lease = self.acquire_or_renew()
+        # Event intake is a local SQLite operation and remains useful while
+        # CEO execution is gated or busy.  It never sends a prompt; delivery
+        # admission is a separate, M2-08-gated operation.
+        wake.ingest_events(self.conn, self.project_id, lease, clock=self.clock)
         return dispatch_ready(
             self.conn, self.project_id, lease,
             concurrency_limit=self.concurrency_limit, clock=self.clock,
