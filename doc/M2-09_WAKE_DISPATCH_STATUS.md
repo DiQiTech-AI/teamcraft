@@ -1,6 +1,6 @@
 # M2-09 Wake Dispatcher closure and deferred verification
 
-Updated: 2026-11-06
+Updated: 2026-11-07
 
 ## Current implementation
 
@@ -21,12 +21,21 @@ Updated: 2026-11-06
   prompt submission and a second live-session identity check, the database
   records the assumption explicitly. It is not evidence that the host verified
   Protocol or Skill loading.
+- Confirmed capability boundary (2026-11-07): the Herdr session API exposes no
+  server generation field, so TeamCraft detects Herdr server/session replacement
+  via socket path plus stat device/inode. Wake admission and delivery always
+  require a native Session ID; a CEO bound in non-portable live-only
+  (`live_process`, schema v14) mode is rejected by the default
+  `require_initialized` gate at admission and again adjacent to Herdr I/O. A
+  process exit, PID start-time fingerprint change, or Herdr socket change
+  therefore blocks Wake continuation instead of silently retargeting.
 
 ## Closure decision and deferred verification
 
-- M2-08 and M2-09 implementation work is closed by owner decision (see
-  `TEAMCRAFT_2_0_M0_REVIEW.md`, section 12.17). Closure does not claim the
-  deferred real-world checks passed.
+- M2-09 implementation work remains closed by owner decision. M2-08 has
+  re-entered focused acceptance for its first-start and live-only identity
+  corrections (see `TEAMCRAFT_2_0_M0_REVIEW.md`, section 12.17); this does not
+  reopen M2-09 or claim that deferred real-world checks passed.
 - Later, test a trusted Codex/OpenCode host receipt source and real Herdr Wake
   submission, lost-response/restart recovery, explicit CEO acknowledgement,
   and identity drift. Do not treat mocks or `assumed_default` as those results.
@@ -40,5 +49,10 @@ Updated: 2026-11-06
 - Python 3.13 targeted suite: 37 tests passed across Wake, CEO initialization,
   and verification migration behavior; `compileall` passed.
 - `wake-dispatch --help` and `git diff --check` passed.
+- 2026-11-07 live-only boundary round: full local suites passed — 387 core tests
+  (`tests/`) and 80 skill tests (`.agents/skills/teamcraft/tests/`), including a
+  new explicit case that Wake admission of a live-only CEO fails closed with no
+  `ceo.wake` command and the Wake left `pending`, and genuine v11→v14 ladder
+  migration coverage. No real Herdr prompt was sent for these.
 - No real Herdr prompt was sent as part of this implementation; actual delivery
   and host-receipt verification remain deferred.

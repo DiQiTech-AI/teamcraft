@@ -153,6 +153,31 @@ class RuntimeAdapterTests(unittest.TestCase):
         ).fetchone()
         self.assertGreaterEqual(int(events[0]), 1)
 
+    def test_team_view_normalizes_core_iso_member_timestamps(self) -> None:
+        state = _state(members={"dev": _member("dev")})
+        ra.sync_state(self.conn, state, clock=_FixedClock())
+        with storage.transaction(self.conn) as writable:
+            writable.execute(
+                "UPDATE members SET created_at=?, updated_at=? WHERE name=?",
+                (
+                    "2026-11-07T13:03:25+00:00",
+                    "2026-11-07T13:03:26.016668+00:00",
+                    "dev",
+                ),
+            )
+
+        member = ra.team_view(self.conn)["members"]["dev"]
+        self.assertEqual(member["created_at"], 1794056605)
+        self.assertEqual(member["updated_at"], 1794056606)
+
+        member["phase"] = "split_requested"
+        state["members"]["dev"] = member
+        ra.sync_state(self.conn, state, clock=_FixedClock(1))
+        self.assertEqual(
+            ra.team_view(self.conn)["members"]["dev"]["phase"],
+            "split_requested",
+        )
+
     def test_sync_rejects_member_map_key_identity_mismatch(self) -> None:
         state = _state(members={"alice": _member("bob")})
         with self.assertRaisesRegex(ra.RuntimeAdapterError,

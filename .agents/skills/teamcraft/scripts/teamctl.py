@@ -81,6 +81,14 @@ LIVE_STATES = {"blocked", "working", "idle", "done", "unknown"}
 MIN_SPLIT_WIDTH = 50
 MIN_SPLIT_HEIGHT = 16
 PREFER_RIGHT_WIDTH = 120
+BOOTSTRAP_NATIVE_SESSION_WAIT_SECONDS = 15.0
+BOOTSTRAP_NATIVE_SESSION_POLL_SECONDS = 0.1
+# These Harnesses have a documented Herdr integration that reports a native
+# Session reference.  A missing reference therefore means "not reported yet"
+# or a failed/missed integration callback; it never authorizes a pane/PID
+# identity fallback.  Other kinds remain unverified and use the same
+# fail-closed requirement until their integration contract is established.
+NATIVE_SESSION_REPORTING_KINDS = frozenset({"codex", "opencode"})
 SKILL_PATH = Path(__file__).resolve().parent.parent / "SKILL.md"
 CEO_SKILL_PATH = SKILL_PATH.parent.parent / "teamcraft-ceo" / "SKILL.md"
 
@@ -222,6 +230,152 @@ def current_session_identity() -> dict[str, Any]:
     else:
         identity.update(socket_device=stat.st_dev, socket_inode=stat.st_ino)
     return identity
+
+
+def _session_identity_hash(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _process_started_at(pid: int) -> str:
+    """Return a stable UTC process-start fingerprint for PID reuse defense."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise TeamctlError("live process PID is invalid")
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="], check=False,
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TeamctlError(f"cannot inspect live process start time: {exc}") from exc
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        raise TeamctlError("live process exited before its start time could be verified")
+    try:
+        local = time.strptime(value, "%a %b %d %H:%M:%S %Y")
+        epoch = time.mktime(local)
+    except (OverflowError, ValueError) as exc:
+        raise TeamctlError("OS returned an invalid process start time") from exc
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def _observe_live_process_identity(
+    member: dict[str, Any], *,
+    expected_herdr_identity_json: str | None = None,
+) -> dict[str, Any]:
+    """Observe the exact non-portable Harness process in a recorded pane."""
+    pane, agent = verify_recorded_occupant(member)
+    if not pane or not agent:
+        raise TeamctlError("live-process CEO pane or Agent is unavailable; NEEDS_HUMAN")
+    if _native_session(agent) is not None:
+        raise TeamctlError(
+            "Herdr now exposes a native Session; use native identity reconciliation"
+        )
+    response = _herdr_adapter().process_info(str(pane["pane_id"]))
+    try:
+        info = response["result"]["process_info"]
+        foreground = info["foreground_processes"]
+    except (KeyError, TypeError) as exc:
+        raise TeamctlError("Herdr process-info response is malformed") from exc
+    candidates = [item for item in foreground if isinstance(item, dict)]
+    if len(candidates) != 1:
+        raise TeamctlError(
+            "live-process identity requires exactly one foreground Harness process"
+        )
+    process = candidates[0]
+    pid = process.get("pid")
+    argv = process.get("argv")
+    if not isinstance(argv, list) or not argv:
+        raise TeamctlError("Herdr did not expose the Harness argv for live-process identity")
+    process_name = str(process.get("name") or "")
+    argv0 = Path(str(process.get("argv0") or argv[0])).name
+    harness = str(agent.get("agent") or "")
+    if process_name != harness or argv0 != harness:
+        raise TeamctlError("foreground process does not match the selected Harness")
+    if str(process.get("cwd") or "") != str(member.get("cwd") or ""):
+        raise TeamctlError("foreground Harness cwd differs from the recorded project root")
+    session_identity = current_session_identity()
+    if expected_herdr_identity_json is not None:
+        try:
+            expected_identity = json.loads(expected_herdr_identity_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TeamctlError("stored Herdr socket identity is malformed") from exc
+        if session_identity != expected_identity:
+            raise TeamctlError(
+                "Herdr socket identity changed; live-process continuation requires NEEDS_HUMAN"
+            )
+    return {
+        "pid": pid,
+        "process_start": _process_started_at(pid),
+        "process_name": process_name,
+        "argv": argv,
+        "cwd": str(process.get("cwd") or ""),
+        "pane_id": str(pane.get("pane_id") or ""),
+        "terminal_id": str(agent.get("terminal_id") or ""),
+        "harness": harness,
+        "herdr_session_identity_hash": _session_identity_hash(session_identity),
+    }
+
+
+def _require_live_process_identity(member: dict[str, Any], record: Any) -> dict[str, Any]:
+    if record.live_process_identity_json is None:
+        raise TeamctlError("live-process CEO binding is missing; dispatch is blocked")
+    try:
+        expected = json.loads(record.live_process_identity_json)
+    except json.JSONDecodeError as exc:
+        raise TeamctlError("live-process CEO binding is malformed; dispatch is blocked") from exc
+    observed = _observe_live_process_identity(
+        member, expected_herdr_identity_json=record.herdr_session_identity_json,
+    )
+    if observed != expected:
+        raise TeamctlError(
+            "CEO PID/start/socket/pane/terminal/Harness identity drifted; "
+            "NEEDS_HUMAN and dispatch is blocked"
+        )
+    return observed
+
+
+def _observe_native_session_identity(
+    member: dict[str, Any], record: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Observe a delayed native Session on the exact challenge-bound CEO."""
+    try:
+        expected_herdr_identity = json.loads(record.herdr_session_identity_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise TeamctlError("stored Herdr socket identity is malformed") from exc
+    observed_herdr_identity = current_session_identity()
+    if observed_herdr_identity != expected_herdr_identity:
+        raise TeamctlError(
+            "Herdr socket identity changed; native-session reconciliation is blocked"
+        )
+    pane, agent = verify_recorded_occupant(member)
+    if not pane or not agent:
+        raise TeamctlError("native-session CEO pane or Agent is unavailable")
+    agent_session = agent.get("agent_session")
+    native_session_id = _native_session(agent)
+    if (not native_session_id or not isinstance(agent_session, dict)
+            or agent_session.get("value") != native_session_id):
+        raise TeamctlError("live CEO did not report a valid native Session identity")
+    if (pane.get("pane_id") != member.get("pane_id")
+            or agent.get("pane_id") != member.get("pane_id")
+            or pane.get("terminal_id") != record.terminal_id
+            or agent.get("terminal_id") != record.terminal_id
+            or agent.get("name") != member.get("name")
+            or agent.get("agent") != member.get("kind")):
+        raise TeamctlError(
+            "live CEO pane, terminal, name, or Harness differs from the initialization binding"
+        )
+    return agent, {
+        "native_session_id": native_session_id,
+        "agent_session": agent_session,
+        "pane_id": str(agent["pane_id"]),
+        "terminal_id": str(agent["terminal_id"]),
+        "harness": str(agent["agent"]),
+        "herdr_session_identity_hash": _session_identity_hash(observed_herdr_identity),
+    }
 
 
 def now_epoch() -> int:
@@ -371,6 +525,7 @@ class StateStore:
         lease: _leader.Lease | None = None,
         confirm_command_id: str | None = None,
         confirmation_evidence: dict[str, Any] | None = None,
+        prompt_delivery_state: str | None = None,
     ) -> None:
         """Persist the working dict authoritatively, fenced by the lease.
 
@@ -406,6 +561,11 @@ class StateStore:
                 "confirming an external action and its member state requires"
                 " the operation's leader lease"
             )
+        if prompt_delivery_state is not None and confirm_command_id is None:
+            raise TeamctlError(
+                "recording Prompt delivery with member state requires the"
+                " matching Command confirmation"
+            )
         self._ensure_ready()
         project_id = self.ensure_project()
         expected_scope = _leader.project_scope(project_id)
@@ -420,6 +580,10 @@ class StateStore:
                 if lease is not None:
                     _leader.require_project_lease(conn, lease, project_id)
                     if confirm_command_id is not None:
+                        if prompt_delivery_state is not None:
+                            _adapter.record_prompt_delivery(
+                                conn, confirm_command_id, prompt_delivery_state,
+                            )
                         _adapter.stage_confirm(
                             conn, confirm_command_id, lease=lease,
                             evidence=confirmation_evidence,
@@ -497,13 +661,15 @@ class StateStore:
         finally:
             conn.close()
 
-    def require_ceo_initialized(self) -> None:
+    def require_ceo_initialized(self) -> Any:
         conn = self._connect()
         try:
             project_id = _adapter.project_id_for_root(conn, str(self.project_root))
             if project_id is None:
                 raise TeamctlError("runtime Project row is missing; CEO dispatch is blocked")
-            record = _adapter.require_ceo_initialized(conn, project_id)
+            record = _adapter.require_ceo_initialized(
+                conn, project_id, allow_live_process=True,
+            )
         except _adapter.RuntimeAdapterError as exc:
             raise TeamctlError(str(exc)) from exc
         finally:
@@ -515,9 +681,63 @@ class StateStore:
         pane, agent = verify_recorded_occupant(member)
         if not pane or not agent:
             raise TeamctlError("initialized CEO is missing or disconnected; dispatch is blocked")
-        if (_native_session(member) != record.native_session_id
-                or member.get("terminal_id") != record.terminal_id):
-            raise TeamctlError("initialized CEO native Session/terminal identity drifted; dispatch is blocked")
+        if member.get("terminal_id") != record.terminal_id:
+            raise TeamctlError("initialized CEO terminal identity drifted; dispatch is blocked")
+        if record.identity_mode == "native":
+            if (_native_session(member) != record.native_session_id
+                    or _native_session(agent) != record.native_session_id):
+                raise TeamctlError(
+                    "initialized CEO native Session identity drifted; dispatch is blocked"
+                )
+        elif record.identity_mode == "live_process":
+            _require_live_process_identity(member, record)
+        else:
+            raise TeamctlError("initialized CEO identity mode is unsupported")
+        return record
+
+    def reconcile_ceo_live_process(
+        self, name: str, *, actor: str, reason: str,
+        live_process_identity: dict[str, Any], session_state: str,
+        lease: _leader.Lease,
+    ) -> Any:
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("runtime Project row is missing")
+            return _adapter.record_ceo_bootstrap_live_process_assumed(
+                conn, project_id, live_process_identity=live_process_identity,
+                session_state=session_state, actor=actor, reason=reason,
+                lease=lease,
+            )
+        except (_adapter.RuntimeAdapterError, _CoreError) as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
+
+    def reconcile_ceo_native_session(
+        self, name: str, *, native_session_id: str,
+        agent_session: dict[str, Any], session_state: str,
+        pane_id: str, terminal_id: str, harness: str,
+        herdr_session_identity_hash: str, actor: str, reason: str,
+        lease: _leader.Lease,
+    ) -> Any:
+        conn = self._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(self.project_root))
+            if project_id is None:
+                raise TeamctlError("runtime Project row is missing")
+            return _adapter.reconcile_ceo_bootstrap_native_session(
+                conn, project_id, native_session_id=native_session_id,
+                agent_session=agent_session, session_state=session_state,
+                pane_id=pane_id, terminal_id=terminal_id, harness=harness,
+                herdr_session_identity_hash=herdr_session_identity_hash,
+                actor=actor, reason=reason, lease=lease,
+            )
+        except (_adapter.RuntimeAdapterError, _CoreError) as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
 
     def require_ceo_bootstrap_pending(self, name: str) -> None:
         """Allow recovery only for the sole canonical CEO before any challenge exists."""
@@ -651,7 +871,11 @@ class StateStore:
         finally:
             conn.close()
 
-    def record_ceo_bootstrap_submission_assumed(self, nonce: str, *, lease: _leader.Lease) -> None:
+    def record_ceo_bootstrap_submission_assumed(
+        self, nonce: str, *, native_session_id: str, agent_session: dict[str, Any],
+        session_state: str,
+        lease: _leader.Lease,
+    ) -> None:
         conn = self._connect()
         try:
             project_id = _adapter.project_id_for_root(conn, str(self.project_root))
@@ -659,8 +883,11 @@ class StateStore:
                 raise TeamctlError("project disappeared before CEO bootstrap assumption could be recorded")
             _leader.require_project_lease(conn, lease, project_id)
             _adapter.record_ceo_bootstrap_submission_assumed(
-                conn, project_id, nonce, lease=lease,
+                conn, project_id, nonce, native_session_id=native_session_id,
+                agent_session=agent_session, session_state=session_state, lease=lease,
             )
+        except (_adapter.RuntimeAdapterError, _leader.StaleLeaderError) as exc:
+            raise TeamctlError(str(exc)) from exc
         finally:
             conn.close()
 
@@ -729,6 +956,22 @@ class StateStore:
         finally:
             conn.close()
 
+    def reconcile_submitted_prompt(
+        self, name: str, command_id: str, *, lease: _leader.Lease,
+        actor: str, reason: str,
+    ) -> Any:
+        """Settle Prompt transport from its durable submitted delivery row."""
+        conn = self._connect()
+        try:
+            return _adapter.reconcile_submitted_prompt(
+                conn, command_id, member=name, lease=lease,
+                actor=actor, reason=reason,
+            )
+        except (_adapter.RuntimeAdapterError, _CoreError) as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
+
 
 def new_state(project_root: Path, session: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -753,6 +996,7 @@ def update_member(
     lease: "_leader.Lease | None" = None,
     confirm_command_id: str | None = None,
     confirmation_evidence: dict[str, Any] | None = None,
+    prompt_delivery_state: str | None = None,
     **changes: Any,
 ) -> dict[str, Any]:
     with store.locked() as state:
@@ -769,6 +1013,7 @@ def update_member(
             state, member=name, lease=lease,
             confirm_command_id=confirm_command_id,
             confirmation_evidence=confirmation_evidence,
+            prompt_delivery_state=prompt_delivery_state,
         )
         return dict(member)
 
@@ -948,7 +1193,7 @@ def live_state(agent: dict[str, Any] | None) -> str:
 
 
 def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None,
-                 *, ceo_bootstrap: dict[str, str] | None = None) -> str:
+                 *, ceo_bootstrap: dict[str, Any] | None = None) -> str:
     if member["read_only"]:
         ownership_text = "- Read-only assignment. Do not modify project files."
     elif member["ownership"]:
@@ -1008,6 +1253,48 @@ def build_prompt(member: dict[str, Any], brief: dict[str, Any] | None = None,
 
 def opencode_profile(role: str) -> str:
     return f"herdr-{role}"
+
+
+def codex_ceo_agent_args(
+    role: str, kind: str, user_args: Sequence[str],
+) -> list[str]:
+    """Grant a Codex CEO access to this Herdr session's exact Unix socket."""
+    args = list(user_args)
+    if role != "ceo" or kind != "codex":
+        return args
+
+    raw_socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    if not raw_socket_path:
+        raise TeamctlError(
+            "HERDR_SOCKET_PATH is required for the Codex CEO socket permission"
+        )
+    socket_path = Path(raw_socket_path).expanduser()
+    if not socket_path.is_absolute():
+        raise TeamctlError(
+            "HERDR_SOCKET_PATH must be absolute for the Codex CEO socket permission"
+        )
+    resolved_socket_path = socket_path.resolve(strict=False)
+    if not resolved_socket_path.is_socket():
+        raise TeamctlError(
+            "HERDR_SOCKET_PATH must identify the live Herdr Unix socket"
+        )
+
+    # Herdr passes these as argv directly, without a shell. JSON's quoted-string
+    # encoding is also valid for a TOML quoted dotted key, including paths that
+    # contain spaces, quotes, or backslashes.
+    quoted_path = json.dumps(str(resolved_socket_path), ensure_ascii=True)
+    permission_profile = (
+        "permissions.teamcraft-ceo={extends=\":workspace\","
+        "network={enabled=true,unix_sockets={"
+        f"{quoted_path}=\"allow\""
+        "}}}"
+    )
+    return [
+        "-c", "features.network_proxy=true",
+        "-c", permission_profile,
+        "-c", 'default_permissions="teamcraft-ceo"',
+        *args,
+    ]
 
 
 def opencode_config_content(project_root: Path, role: str) -> str:
@@ -1230,13 +1517,19 @@ def prompt_member(
         if wait:
             args.extend(["--wait", "--timeout", str(timeout_ms)])
         _admit_effect(store, command.id, lease)
+        pre_submit_agent = None
+        pre_submit_native = None
         if ceo_bootstrap is not None:
             store.admit_ceo_bootstrap_effect(ceo_bootstrap["nonce"], lease=lease)
-            # The challenge binds the native Session and terminal, while the
-            # Herdr API addresses prompts by member name. Re-resolve that name
-            # against its recorded pane immediately before the external call;
-            # never let a recycled name redirect the CEO bootstrap prompt.
-            _verify_bootstrap_herdr_target(prepared_member, ceo_bootstrap)
+            # The challenge binds the terminal and any native Session identity
+            # already exposed, while the Herdr API addresses prompts by member
+            # name. Re-resolve that name against its recorded pane immediately
+            # before the external call; never let a recycled name redirect the
+            # CEO bootstrap prompt.
+            pre_submit_agent = _verify_bootstrap_herdr_target(
+                prepared_member, ceo_bootstrap, require_native_session=False,
+            )
+            pre_submit_native = _native_session(pre_submit_agent)
         try:
             # Herdr prompt delivery is external and cannot be cancelled once
             # in flight; ambiguous results always remain UNKNOWN to reconcile.
@@ -1258,26 +1551,99 @@ def prompt_member(
             raise TeamctlError(
                 f"prompt outcome for {name} is ambiguous; do not resend automatically. Run status, then resume {name} --prompt-action send|skip after inspection. Cause: {exc}"
             ) from exc
-        recorder = getattr(store, "record_prompt_delivery", None)
-        if recorder:
-            # A successful transport response proves submission only.  Agent
-            # idle/done is not a target-session acknowledgement.
-            recorder(command.id, "submitted")
-        try:
-            info = _herdr_adapter().get_agent(name)
-        except TeamctlError as exc:
-            # Transport submission is durable; inspection failed afterwards,
-            # so generic command outcome remains ambiguous/reconcile-first.
-            store.stage_unknown(command.id, note=f"prompt submitted but post-submit inspection failed: {exc}")
-            raise
+        # Prompt transport success and CEO identity initialization are two
+        # independent durable facts.  Confirm the external prompt Command
+        # under the current Leader fence before any post-submit Session
+        # reconciliation.  A crash/stale lease before this transaction leaves
+        # the Command unresolved for reconciliation; a later missing native
+        # Session cannot rewrite a confirmed submission as delivery-ambiguous.
+        submitted_evidence = {
+            "transport": "submitted",
+            "pane_id": (
+                pre_submit_agent.get("pane_id")
+                if pre_submit_agent is not None else member.get("pane_id")
+            ),
+            "terminal_id": (
+                pre_submit_agent.get("terminal_id")
+                if pre_submit_agent is not None else member.get("terminal_id")
+            ),
+            "agent_session": (
+                pre_submit_agent.get("agent_session")
+                if pre_submit_agent is not None else member.get("agent_session")
+            ),
+            "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        }
+        update_member(
+            store, session, name, lease=lease,
+            phase="prompt_submitted",
+            live_state=(
+                live_state(pre_submit_agent)
+                if pre_submit_agent is not None else member.get("live_state", "unknown")
+            ),
+            error=None,
+            prompt_may_have_been_delivered=True,
+            confirm_command_id=command.id,
+            confirmation_evidence=submitted_evidence,
+            prompt_delivery_state="submitted",
+        )
+        info = pre_submit_agent
         if ceo_bootstrap is not None:
             # The temporary default assumption is recorded only after the
             # transport returned and the exact challenged live session was
             # observed again. The persisted source remains ``assumed_default``.
-            _verify_bootstrap_herdr_target(prepared_member, ceo_bootstrap)
-            store.record_ceo_bootstrap_submission_assumed(
-                ceo_bootstrap["nonce"], lease=lease,
-            )
+            try:
+                post_submit_agent = _wait_for_bootstrap_native_session(
+                    prepared_member, ceo_bootstrap,
+                )
+                post_submit_native = _native_session(post_submit_agent)
+                if pre_submit_native is not None and post_submit_native != pre_submit_native:
+                    raise TeamctlError(
+                        "CEO native Session changed across bootstrap prompt submission"
+                    )
+                assert post_submit_native is not None
+                store.record_ceo_bootstrap_submission_assumed(
+                    ceo_bootstrap["nonce"], native_session_id=post_submit_native,
+                    agent_session=post_submit_agent["agent_session"],
+                    session_state=live_state(post_submit_agent), lease=lease,
+                )
+                # The preliminary post-submit get may race the Harness Session
+                # allocation.  Persist the exact, later identity that passed
+                # the target recheck; otherwise Core would bind the Session
+                # while members.agent_session_json remained empty and the
+                # dispatch gate would correctly fail closed on its next read.
+                info = post_submit_agent
+            except TeamctlError as exc:
+                try:
+                    observed = _herdr_adapter().get_agent(name)
+                except TeamctlError:
+                    observed = None
+                update_member(
+                    store, session, name, lease=lease,
+                    phase="prompt_submitted",
+                    live_state=live_state(observed),
+                    error=f"CEO native Session initialization pending: {exc}",
+                    prompt_may_have_been_delivered=True,
+                )
+                raise TeamctlError(
+                    f"prompt was submitted for {name}, but CEO initialization remains UNKNOWN "
+                    "because its native Session could not be bound; do not resend. Inspect and "
+                    "reconcile the existing CEO Session. "
+                    f"Cause: {exc}"
+                ) from exc
+        if info is None:
+            try:
+                info = _herdr_adapter().get_agent(name)
+            except TeamctlError as exc:
+                update_member(
+                    store, session, name, lease=lease,
+                    phase="prompt_submitted", live_state="unknown",
+                    error=f"post-submit live inspection failed: {exc}",
+                    prompt_may_have_been_delivered=True,
+                )
+                raise TeamctlError(
+                    f"prompt was submitted for {name}, but live inspection failed; "
+                    f"do not resend. Cause: {exc}"
+                ) from exc
         return update_member(
             store, session, name, lease=lease,
             phase="prompt_submitted",
@@ -1285,14 +1651,6 @@ def prompt_member(
             agent_session=info.get("agent_session", member.get("agent_session")),
             terminal_id=info.get("terminal_id", member.get("terminal_id")),
             error=None,
-            confirm_command_id=command.id,
-            confirmation_evidence={
-                "pane_id": info.get("pane_id"),
-                "terminal_id": info.get("terminal_id"),
-                "agent_session": info.get("agent_session"),
-                "prompt_sha256": hashlib.sha256(
-                    prompt_text.encode("utf-8")).hexdigest(),
-            },
         )
     finally:
         if own_lease:
@@ -1355,7 +1713,10 @@ def _launch_operation(args: argparse.Namespace) -> int:
             "kind": args.kind, "task": task, "ownership": ownership,
             "read_only": args.read_only, "cwd": str(root),
             "from_pane_id": parent["pane_id"], "pane_id": None, "terminal_id": None,
-            "agent_session": None, "agent_args": list(args.agent_arg),
+            "agent_session": None,
+            "agent_args": codex_ceo_agent_args(
+                args.role, args.kind, args.agent_arg,
+            ),
             "opencode_config_content": opencode_content,
             "direction": args.direction, "start_timeout_ms": args.start_timeout_ms,
             "phase": "reserved", "prompt_may_have_been_delivered": False,
@@ -1556,18 +1917,29 @@ def _herdr_error_code(exc: TeamctlError) -> str | None:
 
 
 def _verify_bootstrap_herdr_target(
-    member: dict[str, Any], challenge: dict[str, Any],
-) -> None:
-    """Require the live name occupant to remain the challenge-bound target."""
+    member: dict[str, Any], challenge: dict[str, Any], *,
+    require_native_session: bool,
+) -> dict[str, Any]:
+    """Require the live name occupant to remain the challenge-bound target.
+
+    The first pre-send check may legitimately observe no native Harness
+    Session yet.  The post-send check requires one and returns the exact live
+    Agent record so both Core and the compatibility member row persist the
+    same identity.
+    """
     name = member.get("name")
     pane_id = member.get("pane_id")
     terminal_id = challenge.get("terminal_id")
     native_session_id = challenge.get("herdr_session_id")
     teamcraft_session_id = challenge.get("teamcraft_session_id")
     if not all(isinstance(value, str) and value for value in (
-        name, pane_id, terminal_id, native_session_id, teamcraft_session_id,
+        name, pane_id, terminal_id, teamcraft_session_id,
     )):
         raise TeamctlError("CEO bootstrap target binding is incomplete; refusing Herdr prompt")
+    if native_session_id is not None and (
+        not isinstance(native_session_id, str) or not native_session_id
+    ):
+        raise TeamctlError("CEO bootstrap native Session binding is malformed")
     if member.get("session_id") != teamcraft_session_id:
         raise TeamctlError("CEO TeamCraft Session drifted before bootstrap prompt")
     if member.get("terminal_id") != terminal_id:
@@ -1583,10 +1955,58 @@ def _verify_bootstrap_herdr_target(
             or pane.get("terminal_id") != terminal_id
             or agent.get("terminal_id") != terminal_id
             or agent.get("name") != name or agent.get("agent") != member.get("kind")
-            or live_native != native_session_id):
+            or (native_session_id is not None and live_native != native_session_id)):
         raise TeamctlError(
             "live CEO pane, terminal, member, or native Session differs from the challenge; refusing prompt"
         )
+    if require_native_session and not live_native:
+        raise TeamctlError(
+            "CEO bootstrap prompt was submitted but Herdr still exposes no native Session ID"
+        )
+    return agent
+
+
+def _native_session_capability(kind: Any) -> str:
+    """Describe the verified Herdr native-Session contract for a Harness."""
+    return (
+        "integration_report_required"
+        if kind in NATIVE_SESSION_REPORTING_KINDS
+        else "unverified"
+    )
+
+
+def _wait_for_bootstrap_native_session(
+    member: dict[str, Any], challenge: dict[str, Any],
+) -> dict[str, Any]:
+    """Boundedly reconcile a delayed Herdr native Session report.
+
+    Herdr exposes ``agent_session`` only after the Harness integration reports
+    it.  Codex/OpenCode can emit that callback slightly after prompt transport
+    returns, so repeatedly inspect the exact challenge-bound target for a short
+    interval.  This is read-only reconciliation: absence, target drift, or an
+    unverified Harness capability still fails closed and never substitutes a
+    pane, terminal, or process identifier for the native Session identity.
+    """
+    deadline = time.monotonic() + BOOTSTRAP_NATIVE_SESSION_WAIT_SECONDS
+    while True:
+        agent = _verify_bootstrap_herdr_target(
+            member, challenge, require_native_session=False,
+        )
+        if _native_session(agent) is not None:
+            return agent
+        if time.monotonic() >= deadline:
+            capability = _native_session_capability(member.get("kind"))
+            if capability == "integration_report_required":
+                raise TeamctlError(
+                    "Herdr did not receive the supported Harness native Session report "
+                    "within the bounded bootstrap reconciliation window; verify the "
+                    f"{member.get('kind')} integration and reconcile without resending"
+                )
+            raise TeamctlError(
+                "the Harness native Session reporting capability is unverified and "
+                "Herdr exposed no native Session ID; reconcile without resending"
+            )
+        time.sleep(BOOTSTRAP_NATIVE_SESSION_POLL_SECONDS)
 
 
 def _reconcile_observed_stage(store: StateStore, name: str, stage: str,
@@ -1883,6 +2303,135 @@ def resume(args: argparse.Namespace) -> int:
     store = StateStore(root)
     with store.member_operation(args.name):
         return _resume_operation(args)
+
+
+def prompt_reconcile_submitted(args: argparse.Namespace) -> int:
+    """Reconcile transport only; never initialize or resend the CEO Prompt."""
+    require_herdr()
+    root = resolve_project_root(args.cwd)
+    store = StateStore(root)
+    with store.member_operation(args.name):
+        store, session, state, member = load_member_for_mutation(root, args.name)
+        lease = store.acquire_lease(args.name, 60)
+        try:
+            command = store.reconcile_submitted_prompt(
+                args.name, args.command_id, lease=lease,
+                actor=args.actor, reason=args.reason,
+            )
+            member = update_member(
+                store, session, args.name, lease=lease,
+                phase="prompt_submitted",
+                prompt_may_have_been_delivered=True,
+                error=(
+                    "Prompt transport is confirmed submitted; native Session "
+                    "identity and CEO initialization remain pending"
+                ),
+            )
+        finally:
+            store.release_lease(lease)
+    output = member_output(state, member)
+    output["prompt_command_id"] = command.id
+    output["prompt_command_state"] = command.state
+    output["initialization_changed"] = False
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def ceo_reconcile_native_session(args: argparse.Namespace) -> int:
+    """Bind a delayed native Session to the already-submitted CEO bootstrap."""
+    require_herdr()
+    root = resolve_project_root(args.cwd)
+    store = StateStore(root)
+    with store.member_operation(args.name):
+        store, session, state, member = load_member_for_mutation(root, args.name)
+        if member.get("role") != "ceo":
+            raise TeamctlError("native-session identity reconciliation is CEO-only")
+        conn = store._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(root))
+            initialization = (
+                None if project_id is None
+                else _adapter.ceo_initialization.get_initialization(conn, project_id)
+            )
+        finally:
+            conn.close()
+        if initialization is None:
+            raise TeamctlError("CEO initialization challenge is missing")
+        lease = store.acquire_lease(args.name, 60)
+        try:
+            agent, identity = _observe_native_session_identity(member, initialization)
+            record = store.reconcile_ceo_native_session(
+                args.name, **identity, session_state=live_state(agent),
+                actor=args.actor, reason=args.reason, lease=lease,
+            )
+            member = update_member(
+                store, session, args.name, lease=lease,
+                phase="prompt_submitted", live_state=live_state(agent), error=None,
+                prompt_may_have_been_delivered=True,
+                agent_session=identity["agent_session"],
+            )
+        finally:
+            store.release_lease(lease)
+    output = member_output(state, member, agent)
+    output.update({
+        "initialization_state": record.state,
+        "identity_mode": record.identity_mode,
+        "native_session_id": record.native_session_id,
+        "portable": True,
+    })
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def ceo_reconcile_live_process(args: argparse.Namespace) -> int:
+    """Bind a submitted bootstrap to the current process lifetime only."""
+    require_herdr()
+    root = resolve_project_root(args.cwd)
+    store = StateStore(root)
+    with store.member_operation(args.name):
+        store, session, state, member = load_member_for_mutation(root, args.name)
+        if member.get("role") != "ceo":
+            raise TeamctlError("live-process identity reconciliation is CEO-only")
+        conn = store._connect()
+        try:
+            project_id = _adapter.project_id_for_root(conn, str(root))
+            initialization = (
+                None if project_id is None
+                else _adapter.ceo_initialization.get_initialization(conn, project_id)
+            )
+        finally:
+            conn.close()
+        if initialization is None:
+            raise TeamctlError("CEO initialization challenge is missing")
+        identity = _observe_live_process_identity(
+            member,
+            expected_herdr_identity_json=initialization.herdr_session_identity_json,
+        )
+        _, agent = verify_recorded_occupant(member)
+        lease = store.acquire_lease(args.name, 60)
+        try:
+            record = store.reconcile_ceo_live_process(
+                args.name, actor=args.actor, reason=args.reason,
+                live_process_identity=identity, session_state=live_state(agent),
+                lease=lease,
+            )
+            member = update_member(
+                store, session, args.name, lease=lease,
+                phase="prompt_submitted", live_state=live_state(agent), error=None,
+                prompt_may_have_been_delivered=True,
+            )
+        finally:
+            store.release_lease(lease)
+    output = member_output(state, member, agent)
+    output.update({
+        "initialization_state": record.state,
+        "identity_mode": record.identity_mode,
+        "portable": False,
+        "process_pid": identity["pid"],
+        "process_start": identity["process_start"],
+    })
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 def finish_member(args: argparse.Namespace) -> int:
@@ -2617,6 +3166,37 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--wait", action="store_true")
     resume_parser.add_argument("--timeout-ms", type=int, default=120_000)
     resume_parser.set_defaults(handler=resume)
+
+    prompt_reconcile_parser = commands.add_parser(
+        "prompt-reconcile-submitted",
+        help="confirm unresolved Prompt transport from its durable submitted delivery evidence",
+    )
+    prompt_reconcile_parser.add_argument("name")
+    add_cwd(prompt_reconcile_parser)
+    prompt_reconcile_parser.add_argument("--command-id", required=True)
+    prompt_reconcile_parser.add_argument("--actor", required=True)
+    prompt_reconcile_parser.add_argument("--reason", required=True)
+    prompt_reconcile_parser.set_defaults(handler=prompt_reconcile_submitted)
+
+    native_session_parser = commands.add_parser(
+        "ceo-reconcile-native-session",
+        help="bind a delayed native Session to a confirmed submitted CEO bootstrap",
+    )
+    native_session_parser.add_argument("name")
+    add_cwd(native_session_parser)
+    native_session_parser.add_argument("--actor", required=True)
+    native_session_parser.add_argument("--reason", required=True)
+    native_session_parser.set_defaults(handler=ceo_reconcile_native_session)
+
+    live_process_parser = commands.add_parser(
+        "ceo-reconcile-live-process",
+        help="bind submitted CEO bootstrap to the current PID/start/socket/pane only",
+    )
+    live_process_parser.add_argument("name")
+    add_cwd(live_process_parser)
+    live_process_parser.add_argument("--actor", required=True)
+    live_process_parser.add_argument("--reason", required=True)
+    live_process_parser.set_defaults(handler=ceo_reconcile_live_process)
 
     reset_parser = commands.add_parser(
         "reset", help="archive TeamCraft runtime data and create an empty database"

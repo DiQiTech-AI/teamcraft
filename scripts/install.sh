@@ -58,6 +58,11 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
         for path in sorted(root.rglob("*")):
             if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"} or path.name == ".DS_Store":
                 continue
+            if path.relative_to(root).parts[:2] == ("scripts", "core"):
+                # Runtime-vendored core staging under scripts/core is generated
+                # from ./teamcraft below; the package copy is the single
+                # canonical core source and must never be dual-sourced here.
+                continue
             if path.is_symlink():
                 raise InstallError(f"source resources must not contain symlinks: {path}")
             if path.is_file():

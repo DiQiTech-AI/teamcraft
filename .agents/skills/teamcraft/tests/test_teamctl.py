@@ -87,6 +87,36 @@ class TeamctlTests(unittest.TestCase):
             self.assertEqual(state["members"]["dev"]["phase"], "reserved")
             self.assertEqual(state["herdr_session"], self.session)
 
+    def test_member_view_accepts_core_iso_timestamps_and_remains_updatable(self):
+        teamctl.reserve_member(
+            self.store, self.session, make_member("dev", ["src/api/**"])
+        )
+        conn = self.store._connect()
+        try:
+            with teamctl._storage.transaction(conn) as writable:
+                writable.execute(
+                    "UPDATE members SET created_at=?, updated_at=? WHERE name=?",
+                    (
+                        "2026-11-07T13:03:25+00:00",
+                        "2026-11-07T13:03:26.016668+00:00",
+                        "dev",
+                    ),
+                )
+        finally:
+            conn.close()
+
+        with self.store.locked() as state:
+            member = state["members"]["dev"]
+            self.assertEqual(member["created_at"], 1794056605)
+            self.assertEqual(member["updated_at"], 1794056606)
+
+        updated = teamctl.update_member(
+            self.store, self.session, "dev", phase="pane_created",
+            pane_id="w1:p2", terminal_id="term-2",
+        )
+        self.assertEqual(updated["phase"], "pane_created")
+        self.assertEqual(updated["pane_id"], "w1:p2")
+
     def test_ownership_conflict_then_release(self):
         teamctl.reserve_member(
             self.store, self.session, make_member("one", ["src/api/**"])
@@ -401,10 +431,13 @@ class TeamctlTests(unittest.TestCase):
              mock.patch.object(teamctl, "resolve_pane", return_value={"pane_id": "w1:p1"}), \
              mock.patch.object(teamctl, "current_session_identity", return_value=self.session), \
              mock.patch.object(teamctl, "StateStore", return_value=store), \
+             mock.patch.object(teamctl, "codex_ceo_agent_args",
+                               return_value=["-c", "socket-allow"]), \
              mock.patch.object(teamctl, "reserve_member", side_effect=StopAtReserve) as reserve:
             with self.assertRaises(StopAtReserve):
                 teamctl._launch_operation(args)
         reserve.assert_called_once()
+        self.assertEqual(reserve.call_args.args[2]["agent_args"], ["-c", "socket-allow"])
         self.assertIs(store.asserted_lease, lease)
 
     def test_diQi_worker_resume_requires_project_initialization_before_lifecycle_effects(self):
@@ -488,6 +521,364 @@ class TeamctlTests(unittest.TestCase):
                 self.assertTrue(conn.closed)
                 self.assertEqual(occupant.called, should_inspect)
                 herdr.prompt_agent.assert_not_called()
+
+    def test_m208_first_prompt_binds_native_session_only_after_submission(self):
+        class Conn:
+            def close(self): pass
+
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, pane_id="pane-1",
+            terminal_id="terminal-1", session_id="tc-session-1",
+            agent_session=None, phase="agent_started", live_state="idle",
+        )
+        challenge = {
+            "nonce": "one-use", "project_id": "p-1", "team_id": "team-1",
+            "teamcraft_session_id": "tc-session-1", "herdr_session_id": None,
+            "terminal_id": "terminal-1", "protocol_version": "1.0.0",
+            "protocol_hash": "a" * 64, "runtime_skill_hash": "b" * 64,
+            "snapshot_digest": "c" * 64,
+        }
+        pane = {"pane_id": "pane-1", "terminal_id": "terminal-1", "agent": "codex"}
+        before = {"name": "ceo", "agent": "codex", "pane_id": "pane-1",
+                  "terminal_id": "terminal-1", "agent_status": "idle"}
+        after = before | {"agent_session": {"kind": "id", "value": "native-after-prompt"}}
+        store = mock.Mock()
+        store._connect.return_value = Conn()
+        store.prepare_prompt_brief.return_value = {}
+        store.stage_claim.return_value = SimpleNamespace(id="cmd-1", payload_json="{}")
+        herdr = mock.Mock()
+        # The first post-submit get races Session allocation; the target
+        # recheck observes the newly allocated identity moments later.
+        herdr.get_agent.return_value = before
+
+        def updated(_store, _session, _name, **changes):
+            return member | changes
+
+        with mock.patch.object(teamctl, "_adapter") as adapter, \
+             mock.patch.object(teamctl, "update_member", side_effect=updated), \
+             mock.patch.object(teamctl, "build_prompt", return_value="bootstrap prompt"), \
+             mock.patch.object(teamctl, "_admit_effect"), \
+             mock.patch.object(teamctl, "verify_recorded_occupant",
+                               side_effect=[(pane, before), (pane, before), (pane, after)]), \
+             mock.patch.object(teamctl, "BOOTSTRAP_NATIVE_SESSION_POLL_SECONDS", 0), \
+             mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr):
+            adapter.team_view.return_value = {"members": {"ceo": member}}
+            adapter.prepare_ceo_bootstrap.return_value = challenge
+            result = teamctl.prompt_member(
+                member, store, self.session, wait=False, timeout_ms=1000,
+                lease=object(),
+            )
+
+        self.assertEqual(result["phase"], "prompt_submitted")
+        self.assertEqual(result["agent_session"], after["agent_session"])
+        herdr.prompt_agent.assert_called_once_with(
+            "ceo", "bootstrap prompt", wait=False, timeout_ms=1000,
+        )
+        store.record_ceo_bootstrap_submission_assumed.assert_called_once_with(
+            "one-use", native_session_id="native-after-prompt",
+            agent_session=after["agent_session"],
+            session_state="idle", lease=mock.ANY,
+        )
+
+    def test_m208_submitted_prompt_without_native_session_confirms_transport_only(self):
+        class Conn:
+            def close(self): pass
+
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, pane_id="pane-1",
+            terminal_id="terminal-1", session_id="tc-session-1",
+            agent_session=None, phase="agent_started", live_state="idle",
+        )
+        challenge = {
+            "nonce": "one-use", "project_id": "p-1", "team_id": "team-1",
+            "teamcraft_session_id": "tc-session-1", "herdr_session_id": None,
+            "terminal_id": "terminal-1", "protocol_version": "1.0.0",
+            "protocol_hash": "a" * 64, "runtime_skill_hash": "b" * 64,
+            "snapshot_digest": "c" * 64,
+        }
+        pane = {"pane_id": "pane-1", "terminal_id": "terminal-1", "agent": "codex"}
+        agent = {"name": "ceo", "agent": "codex", "pane_id": "pane-1",
+                 "terminal_id": "terminal-1", "agent_status": "idle"}
+        store = mock.Mock()
+        store._connect.return_value = Conn()
+        store.prepare_prompt_brief.return_value = {}
+        store.stage_claim.return_value = SimpleNamespace(id="cmd-1", payload_json="{}")
+        herdr = mock.Mock()
+        herdr.get_agent.return_value = agent
+        with mock.patch.object(teamctl, "_adapter") as adapter, \
+             mock.patch.object(teamctl, "update_member",
+                               side_effect=lambda *_a, **changes: member | changes) as update, \
+             mock.patch.object(teamctl, "build_prompt", return_value="bootstrap prompt"), \
+             mock.patch.object(teamctl, "_admit_effect"), \
+             mock.patch.object(teamctl, "verify_recorded_occupant",
+                               side_effect=[(pane, agent), (pane, agent)]), \
+             mock.patch.object(teamctl, "BOOTSTRAP_NATIVE_SESSION_WAIT_SECONDS", 0), \
+             mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr):
+            adapter.team_view.return_value = {"members": {"ceo": member}}
+            adapter.prepare_ceo_bootstrap.return_value = challenge
+            with self.assertRaisesRegex(teamctl.TeamctlError, "do not resend"):
+                teamctl.prompt_member(
+                    member, store, self.session, wait=False, timeout_ms=1000,
+                    lease=object(),
+                )
+        herdr.prompt_agent.assert_called_once()
+        store.record_prompt_delivery.assert_not_called()
+        store.stage_unknown.assert_not_called()
+        store.record_ceo_bootstrap_submission_assumed.assert_not_called()
+        confirmed = [
+            call for call in update.mock_calls
+            if call.kwargs.get("confirm_command_id") == "cmd-1"
+        ]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0].kwargs["phase"], "prompt_submitted")
+        self.assertEqual(
+            confirmed[0].kwargs["prompt_delivery_state"], "submitted",
+        )
+
+    def test_m208_native_session_capability_does_not_enable_weak_identity_fallback(self):
+        member = make_member(
+            "ceo", [], role="ceo", kind="custom-harness", read_only=True,
+            pane_id="pane-1", terminal_id="terminal-1",
+            session_id="tc-session-1", agent_session=None,
+        )
+        challenge = {
+            "teamcraft_session_id": "tc-session-1", "herdr_session_id": None,
+            "terminal_id": "terminal-1",
+        }
+        pane = {"pane_id": "pane-1", "terminal_id": "terminal-1",
+                "agent": "custom-harness"}
+        agent = {"name": "ceo", "agent": "custom-harness", "pane_id": "pane-1",
+                 "terminal_id": "terminal-1", "agent_status": "idle"}
+        with mock.patch.object(teamctl, "verify_recorded_occupant",
+                               return_value=(pane, agent)), \
+             mock.patch.object(teamctl, "BOOTSTRAP_NATIVE_SESSION_WAIT_SECONDS", 0):
+            with self.assertRaisesRegex(
+                teamctl.TeamctlError, "capability is unverified",
+            ):
+                teamctl._wait_for_bootstrap_native_session(member, challenge)
+        self.assertEqual(
+            teamctl._native_session_capability("codex"),
+            "integration_report_required",
+        )
+
+    def test_m208_observes_delayed_native_session_on_exact_ceo(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            pane_id="w1:p2", terminal_id="term-2",
+            session_id="tc-session", agent_session=None,
+        )
+        record = SimpleNamespace(
+            terminal_id="term-2",
+            herdr_session_identity_json=json.dumps(
+                self.session, sort_keys=True, separators=(",", ":"),
+            ),
+        )
+        agent_session = {
+            "agent": "codex", "kind": "id", "source": "herdr:codex",
+            "value": "native-late",
+        }
+        pane = {"pane_id": "w1:p2", "terminal_id": "term-2", "agent": "codex"}
+        agent = {
+            "name": "ceo", "agent": "codex", "pane_id": "w1:p2",
+            "terminal_id": "term-2", "agent_status": "idle",
+            "agent_session": agent_session,
+        }
+        with mock.patch.object(
+            teamctl, "verify_recorded_occupant", return_value=(pane, agent),
+        ):
+            observed_agent, identity = teamctl._observe_native_session_identity(
+                member, record,
+            )
+        self.assertIs(observed_agent, agent)
+        self.assertEqual(identity["native_session_id"], "native-late")
+        self.assertEqual(identity["agent_session"], agent_session)
+        self.assertEqual(identity["pane_id"], "w1:p2")
+        self.assertEqual(
+            identity["herdr_session_identity_hash"],
+            teamctl._session_identity_hash(self.session),
+        )
+
+    def test_m208_delayed_native_session_observation_rejects_drift(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            pane_id="w1:p2", terminal_id="term-2",
+            session_id="tc-session", agent_session=None,
+        )
+        record = SimpleNamespace(
+            terminal_id="term-2",
+            herdr_session_identity_json=json.dumps(
+                self.session, sort_keys=True, separators=(",", ":"),
+            ),
+        )
+        pane = {"pane_id": "w1:p2", "terminal_id": "term-2", "agent": "codex"}
+        agent = {
+            "name": "ceo", "agent": "codex", "pane_id": "w1:p2",
+            "terminal_id": "different-terminal", "agent_status": "idle",
+            "agent_session": {"kind": "id", "value": "native-late"},
+        }
+        with mock.patch.object(
+            teamctl, "verify_recorded_occupant", return_value=(pane, agent),
+        ), self.assertRaisesRegex(teamctl.TeamctlError, "differs"):
+            teamctl._observe_native_session_identity(member, record)
+
+        socket_record = SimpleNamespace(
+            terminal_id="term-2",
+            herdr_session_identity_json=json.dumps(
+                dict(self.session, socket_path="/tmp/different.sock"),
+                sort_keys=True, separators=(",", ":"),
+            ),
+        )
+        with self.assertRaisesRegex(teamctl.TeamctlError, "socket identity changed"):
+            teamctl._observe_native_session_identity(member, socket_record)
+
+    def test_m208_live_process_observation_binds_pid_start_socket_pane_and_harness(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            cwd=str(self.root), pane_id="w1:p2", terminal_id="term-2",
+            session_id="tc-session", agent_session=None,
+        )
+        pane = {"pane_id": "w1:p2", "terminal_id": "term-2", "agent": "codex"}
+        agent = {"name": "ceo", "agent": "codex", "pane_id": "w1:p2",
+                 "terminal_id": "term-2", "agent_status": "idle"}
+        process = {"result": {"process_info": {
+            "pane_id": "w1:p2", "shell_pid": 10,
+            "foreground_processes": [{
+                "pid": 42, "name": "codex", "argv0": "codex",
+                "argv": ["codex", "--model", "test"], "cwd": str(self.root),
+            }],
+        }}}
+        herdr = mock.Mock()
+        herdr.process_info.return_value = process
+        expected_herdr = json.dumps(
+            self.session, sort_keys=True, separators=(",", ":"),
+        )
+        with mock.patch.object(teamctl, "verify_recorded_occupant",
+                               return_value=(pane, agent)), \
+             mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr), \
+             mock.patch.object(teamctl, "_process_started_at",
+                               return_value="2026-11-06T11:00:00+00:00"):
+            observed = teamctl._observe_live_process_identity(
+                member, expected_herdr_identity_json=expected_herdr,
+            )
+        self.assertEqual(observed["pid"], 42)
+        self.assertEqual(observed["process_start"], "2026-11-06T11:00:00+00:00")
+        self.assertEqual(observed["pane_id"], "w1:p2")
+        self.assertEqual(observed["terminal_id"], "term-2")
+        self.assertEqual(observed["harness"], "codex")
+        self.assertEqual(
+            observed["herdr_session_identity_hash"],
+            teamctl._session_identity_hash(self.session),
+        )
+
+    def test_m208_live_process_identity_drift_requires_human(self):
+        base = {
+            "pid": 42, "process_start": "2026-11-06T11:00:00+00:00",
+            "process_name": "codex", "argv": ["codex"], "cwd": str(self.root),
+            "pane_id": "w1:p2", "terminal_id": "term-2", "harness": "codex",
+            "herdr_session_identity_hash": "a" * 64,
+        }
+        record = SimpleNamespace(
+            live_process_identity_json=json.dumps(base, sort_keys=True),
+            herdr_session_identity_json=json.dumps(self.session, sort_keys=True),
+        )
+        member = make_member("ceo", [], role="ceo")
+        for key, replacement in (
+            ("pid", 43),
+            ("process_start", "2026-11-06T11:00:01+00:00"),
+            ("pane_id", "w1:p3"),
+            ("terminal_id", "term-3"),
+            ("harness", "opencode"),
+            ("herdr_session_identity_hash", "b" * 64),
+        ):
+            with self.subTest(key=key):
+                observed = dict(base)
+                observed[key] = replacement
+                with mock.patch.object(
+                    teamctl, "_observe_live_process_identity", return_value=observed,
+                ), self.assertRaisesRegex(teamctl.TeamctlError, "NEEDS_HUMAN"):
+                    teamctl._require_live_process_identity(member, record)
+
+    def test_m208_live_process_socket_or_process_metadata_drift_is_rejected(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            cwd=str(self.root), pane_id="w1:p2", terminal_id="term-2",
+            session_id="tc-session", agent_session=None,
+        )
+        pane = {"pane_id": "w1:p2", "terminal_id": "term-2", "agent": "codex"}
+        agent = {"name": "ceo", "agent": "codex", "pane_id": "w1:p2",
+                 "terminal_id": "term-2", "agent_status": "idle"}
+        herdr = mock.Mock()
+        herdr.process_info.return_value = {"result": {"process_info": {
+            "foreground_processes": [{"pid": 42, "name": "python",
+                "argv0": "python", "argv": ["python"], "cwd": str(self.root)}],
+        }}}
+        with mock.patch.object(teamctl, "verify_recorded_occupant",
+                               return_value=(pane, agent)), \
+             mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr):
+            with self.assertRaisesRegex(teamctl.TeamctlError, "does not match"):
+                teamctl._observe_live_process_identity(member)
+            # Same Harness/process identity; only the Herdr socket differs.
+            herdr.process_info.return_value = {"result": {"process_info": {
+                "foreground_processes": [{"pid": 42, "name": "codex",
+                    "argv0": "codex", "argv": ["codex"], "cwd": str(self.root)}],
+            }}}
+            with self.assertRaisesRegex(teamctl.TeamctlError, "socket identity changed"):
+                teamctl._observe_live_process_identity(
+                    member, expected_herdr_identity_json=json.dumps(
+                        dict(self.session, socket_path="/tmp/different-herdr.sock"),
+                        sort_keys=True, separators=(",", ":"),
+                    ),
+                )
+
+    def test_m208_submitted_prompt_with_post_send_identity_drift_stays_ambiguous(self):
+        class Conn:
+            def close(self): pass
+
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, pane_id="pane-1",
+            terminal_id="terminal-1", session_id="tc-session-1",
+            agent_session=None, phase="agent_started", live_state="idle",
+        )
+        challenge = {
+            "nonce": "one-use", "project_id": "p-1", "team_id": "team-1",
+            "teamcraft_session_id": "tc-session-1", "herdr_session_id": None,
+            "terminal_id": "terminal-1", "protocol_version": "1.0.0",
+            "protocol_hash": "a" * 64, "runtime_skill_hash": "b" * 64,
+            "snapshot_digest": "c" * 64,
+        }
+        before_pane = {"pane_id": "pane-1", "terminal_id": "terminal-1", "agent": "codex"}
+        before_agent = {"name": "ceo", "agent": "codex", "pane_id": "pane-1",
+                        "terminal_id": "terminal-1", "agent_status": "idle"}
+        drifted_pane = before_pane | {"terminal_id": "replacement-terminal"}
+        drifted_agent = before_agent | {
+            "terminal_id": "replacement-terminal",
+            "agent_session": {"kind": "id", "value": "replacement-native"},
+        }
+        store = mock.Mock()
+        store._connect.return_value = Conn()
+        store.prepare_prompt_brief.return_value = {}
+        store.stage_claim.return_value = SimpleNamespace(id="cmd-1", payload_json="{}")
+        herdr = mock.Mock()
+        herdr.get_agent.return_value = drifted_agent
+        with mock.patch.object(teamctl, "_adapter") as adapter, \
+             mock.patch.object(teamctl, "update_member",
+                               side_effect=lambda *_a, **changes: member | changes), \
+             mock.patch.object(teamctl, "build_prompt", return_value="bootstrap prompt"), \
+             mock.patch.object(teamctl, "_admit_effect"), \
+             mock.patch.object(teamctl, "verify_recorded_occupant", side_effect=[
+                 (before_pane, before_agent), (drifted_pane, drifted_agent),
+             ]), \
+             mock.patch.object(teamctl, "_herdr_adapter", return_value=herdr):
+            adapter.team_view.return_value = {"members": {"ceo": member}}
+            adapter.prepare_ceo_bootstrap.return_value = challenge
+            with self.assertRaisesRegex(teamctl.TeamctlError, "do not resend"):
+                teamctl.prompt_member(
+                    member, store, self.session, wait=False, timeout_ms=1000,
+                    lease=object(),
+                )
+        herdr.prompt_agent.assert_called_once()
+        store.stage_unknown.assert_not_called()
+        store.record_ceo_bootstrap_submission_assumed.assert_not_called()
 
     def test_ambiguous_prompt_is_not_resent_on_default_resume(self):
         agent_session = {"value": "same"}
@@ -660,6 +1051,47 @@ class TeamctlTests(unittest.TestCase):
         self.assertEqual(value["default_agent"], "herdr-developer")
         with self.assertRaisesRegex(teamctl.TeamctlError, "profile is missing"):
             teamctl.opencode_config_content(self.root, "tester")
+
+    def test_codex_ceo_agent_args_allow_only_the_live_herdr_socket(self):
+        socket_path = self.root / 'herdr "team".sock'
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": str(socket_path)}, clear=False,
+        ), mock.patch.object(Path, "is_socket", return_value=True):
+            result = teamctl.codex_ceo_agent_args(
+                "ceo", "codex", ["--no-alt-screen"],
+            )
+
+        expected_profile = (
+            'permissions.teamcraft-ceo={extends=":workspace",'
+            'network={enabled=true,unix_sockets={'
+            f'{json.dumps(str(socket_path.resolve(strict=False)))}="allow"'
+            '}}}'
+        )
+        self.assertEqual(result, [
+            "-c", "features.network_proxy=true",
+            "-c", expected_profile,
+            "-c", 'default_permissions="teamcraft-ceo"',
+            "--no-alt-screen",
+        ])
+        self.assertEqual(
+            teamctl.codex_ceo_agent_args("developer", "codex", ["--search"]),
+            ["--search"],
+        )
+        self.assertEqual(
+            teamctl.codex_ceo_agent_args("ceo", "opencode", ["--standalone"]),
+            ["--standalone"],
+        )
+
+    def test_codex_ceo_agent_args_reject_invalid_socket_paths(self):
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": "relative/herdr.sock"}, clear=False,
+        ), self.assertRaisesRegex(teamctl.TeamctlError, "must be absolute"):
+            teamctl.codex_ceo_agent_args("ceo", "codex", [])
+
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": str(self.socket)}, clear=False,
+        ), self.assertRaisesRegex(teamctl.TeamctlError, "live Herdr Unix socket"):
+            teamctl.codex_ceo_agent_args("ceo", "codex", [])
 
     def test_release_working_member_requires_force(self):
         teamctl.reserve_member(

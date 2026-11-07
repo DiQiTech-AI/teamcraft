@@ -53,7 +53,7 @@ class WakeM209Tests(unittest.TestCase):
         )
 
     def test_schema_v10_is_complete_and_wake_integrity_triggers_are_present(self):
-        self.assertEqual(storage.SCHEMA_VERSION, 12)
+        self.assertEqual(storage.SCHEMA_VERSION, 14)
         audit = storage.verify_database(self.db)
         self.assertTrue(audit["at_head"])
         self.assertTrue({"wake_cursors", "wakes", "wake_events"} <= set(audit["tables"]))
@@ -64,22 +64,29 @@ class WakeM209Tests(unittest.TestCase):
         self.assertTrue(storage._V10_TRIGGERS <= names)
         self.assertTrue(storage._V10_INDEXES <= names)
 
-    def test_v11_database_migrates_forward_to_v12(self):
-        raw = sqlite3.connect(self.db)
+    def test_v11_database_migrates_forward_to_head(self):
+        # Build a genuine v11 database by replaying the forward-only ladder,
+        # then prove v12-v14 apply cleanly from true v11 physical state.
+        v11_db = Path(self.tmp.name) / "v11-forward.db"
+        raw = sqlite3.connect(v11_db)
         try:
-            raw.execute("DROP TRIGGER IF EXISTS trg_wakes_state_machine")
-            for statement in storage._V10_STATEMENTS:
-                if statement.startswith("CREATE TRIGGER trg_wakes_state_machine\n"):
-                    raw.execute(statement)
+            for version, statements in storage._MIGRATION_STEPS:
+                if version > 11:
                     break
-            raw.execute("DELETE FROM schema_migrations WHERE version > 11")
-            raw.execute("PRAGMA user_version=11")
+                for statement in statements:
+                    raw.execute(statement)
+                raw.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, "2026-11-06T00:00:00+00:00"),
+                )
+                raw.execute(f"PRAGMA user_version={version}")
             raw.commit()
         finally:
             raw.close()
-        result = storage.migrate_to_head(self.db, allow_unverified_location=True)
-        self.assertEqual((result.from_version, result.to_version, result.applied), (11, 12, (12,)))
-        self.assertTrue(storage.verify_database(self.db)["at_head"])
+        result = storage.migrate_to_head(v11_db, allow_unverified_location=True)
+        self.assertEqual((result.from_version, result.to_version, result.applied),
+                         (11, 14, (12, 13, 14)))
+        self.assertTrue(storage.verify_database(v11_db)["at_head"])
 
     def test_ingest_merges_same_dedupe_window_and_keeps_highest_priority(self):
         first = self.event("watch.task_progress", priority=20, dedupe_key="task:abc")

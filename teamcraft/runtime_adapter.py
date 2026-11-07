@@ -33,7 +33,7 @@ import contextlib
 import hashlib
 import json
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -144,6 +144,31 @@ def _utc_iso(clock: Any = None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _compat_epoch(value: Any, field: str) -> int:
+    """Read legacy epoch or Core ISO timestamps into the frozen CLI shape.
+
+    ``members`` originated as a compatibility table whose timestamps were
+    integer epochs.  Newer Core operations share the row and use the normal
+    UTC ISO representation used by the domain schema.  SQLite accepts both
+    despite the column's INTEGER affinity, so the compatibility reader must
+    normalize either representation rather than failing after a Core update.
+    """
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise RuntimeAdapterError(
+            f"member {field} is neither an epoch nor an ISO timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise RuntimeAdapterError(f"member {field} ISO timestamp lacks a timezone")
+    return int(parsed.timestamp())
+
+
 def _member_view(row: Any) -> dict[str, Any]:
     return {
         "name": str(row[0]), "role": str(row[1]),
@@ -163,7 +188,8 @@ def _member_view(row: Any) -> dict[str, Any]:
         "live_state": _none_or(str, row[18]), "error": _none_or(str, row[19]),
         "task_id": _none_or(str, row[20]), "attempt_id": _none_or(str, row[21]),
         "session_id": _none_or(str, row[22]),
-        "created_at": int(row[23]), "updated_at": int(row[24]),
+        "created_at": _compat_epoch(row[23], "created_at"),
+        "updated_at": _compat_epoch(row[24], "updated_at"),
     }
 
 
@@ -644,7 +670,7 @@ def _verify_member_protocol(state: dict[str, Any], member: dict[str, Any], attem
 
 
 def prepare_ceo_bootstrap(conn: TeamCraftConnection, state: dict[str, Any],
-                          member: dict[str, Any], *, clock: Any = None) -> dict[str, str] | None:
+                          member: dict[str, Any], *, clock: Any = None) -> dict[str, Any] | None:
     """Create the one-time project challenge for the canonical CEO prompt.
 
     A repeated/unknown bootstrap is refused. ``None`` is returned only after a
@@ -700,12 +726,51 @@ def admit_ceo_bootstrap_effect(conn: TeamCraftConnection, project_id: str,
 
 def record_ceo_bootstrap_submission_assumed(
     conn: TeamCraftConnection, project_id: str, nonce: str, *,
+    native_session_id: str, agent_session: Any = None, session_state: str,
     lease: leader.Lease, clock: Any = None,
 ) -> ceo_initialization.CEOInitialization:
-    """Persist the temporary default assumption after verified prompt submission."""
+    """Pin post-prompt Session identity and persist the temporary assumption."""
     try:
         return ceo_initialization.record_bootstrap_submitted_assumed(
-            conn, project_id, nonce, lease=lease, clock=clock,
+            conn, project_id, nonce, native_session_id=native_session_id,
+            agent_session=agent_session, session_state=session_state,
+            lease=lease, clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def record_ceo_bootstrap_live_process_assumed(
+    conn: TeamCraftConnection, project_id: str, *,
+    live_process_identity: dict[str, Any], session_state: str,
+    actor: str, reason: str, lease: leader.Lease, clock: Any = None,
+) -> ceo_initialization.CEOInitialization:
+    """Explicitly bind a submitted CEO bootstrap to this process lifetime."""
+    try:
+        return ceo_initialization.record_bootstrap_submitted_live_process(
+            conn, project_id, live_process_identity=live_process_identity,
+            session_state=session_state, actor=actor, reason=reason,
+            lease=lease, clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def reconcile_ceo_bootstrap_native_session(
+    conn: TeamCraftConnection, project_id: str, *,
+    native_session_id: str, agent_session: Any, session_state: str,
+    pane_id: str, terminal_id: str, harness: str,
+    herdr_session_identity_hash: str, actor: str, reason: str,
+    lease: leader.Lease, clock: Any = None,
+) -> ceo_initialization.CEOInitialization:
+    """Bind a delayed native Session to a confirmed submitted bootstrap."""
+    try:
+        return ceo_initialization.reconcile_bootstrap_submitted_native_session(
+            conn, project_id, native_session_id=native_session_id,
+            agent_session=agent_session, session_state=session_state,
+            pane_id=pane_id, terminal_id=terminal_id, harness=harness,
+            herdr_session_identity_hash=herdr_session_identity_hash,
+            actor=actor, reason=reason, lease=lease, clock=clock,
         )
     except TeamCraftError as exc:
         raise RuntimeAdapterError(str(exc)) from exc
@@ -723,9 +788,14 @@ def record_ceo_agent_claim(conn: TeamCraftConnection, project_id: str,
         raise RuntimeAdapterError(str(exc)) from exc
 
 
-def require_ceo_initialized(conn: TeamCraftConnection, project_id: str):
+def require_ceo_initialized(
+    conn: TeamCraftConnection, project_id: str, *,
+    allow_live_process: bool = False,
+):
     try:
-        return ceo_initialization.require_initialized(conn, project_id)
+        return ceo_initialization.require_initialized(
+            conn, project_id, allow_live_process=allow_live_process,
+        )
     except TeamCraftError as exc:
         raise RuntimeAdapterError(str(exc)) from exc
 
@@ -1002,6 +1072,79 @@ def stage_reconcile(
             )
         return command_core.reconcile_command(
             conn, command_id, outcome="expired", note=audit, clock=clock,
+        )
+
+
+def reconcile_submitted_prompt(
+    conn: TeamCraftConnection,
+    command_id: str,
+    *,
+    member: str,
+    lease: leader.Lease,
+    actor: str,
+    reason: str,
+    clock: Any = None,
+) -> command_core.Command:
+    """Confirm an unresolved Prompt Command from its durable delivery fact.
+
+    This reconciliation is deliberately narrower than generic stage
+    reconciliation: the exact Command must be the member's latest
+    ``agent.prompt`` Command and its version-bound delivery row must already
+    be terminal ``submitted``.  It settles transport only.  CEO initialization
+    and native Session binding are not modified, so the Scheduler gate remains
+    closed while M2-08 identity is UNKNOWN.
+    """
+    if not isinstance(member, str) or not member:
+        raise ValidationError("prompt reconciliation requires a member")
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValidationError("prompt reconciliation requires an actor")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValidationError("prompt reconciliation requires a reason")
+    evidence = {
+        "actor": actor.strip(),
+        "reason": reason.strip(),
+        "durable_delivery_state": "submitted",
+        "initialization_changed": False,
+    }
+    with _tx(conn):
+        project_id = _project_id_for_command(conn, command_id)
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        command = command_core.get_command(conn, command_id)
+        latest = latest_stage_command(conn, member, STAGE_PROMPT)
+        try:
+            payload = json.loads(command.payload_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeAdapterError("prompt Command payload is corrupt") from exc
+        delivery = conn.execute(
+            "SELECT state, note FROM prompt_deliveries WHERE command_id=?",
+            (command_id,),
+        ).fetchone()
+        if (command.kind != STAGE_PROMPT or payload.get("member") != member
+                or latest is None or latest.id != command_id):
+            raise RuntimeAdapterError(
+                "prompt reconciliation requires the member's latest agent.prompt Command"
+            )
+        if delivery is None or str(delivery[0]) != "submitted":
+            raise RuntimeAdapterError(
+                "prompt reconciliation requires durable submitted delivery evidence"
+            )
+        if command.state == "confirmed":
+            return command
+        if command.state not in {"running", "unknown"}:
+            raise RuntimeAdapterError(
+                f"prompt Command in state {command.state!r} cannot be reconciled as submitted"
+            )
+        audit = (
+            "durable prompt delivery proves transport submission; CEO native "
+            f"Session initialization remains independent | evidence={json.dumps(evidence, sort_keys=True)}"
+        )
+        return command_core.reconcile_command(
+            conn, command_id, outcome="confirmed", note=audit,
+            result_json=json.dumps(
+                {"reconciled": True, "transport": "submitted", "evidence": evidence},
+                sort_keys=True,
+            ),
+            clock=clock,
         )
 
 

@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -781,6 +781,109 @@ _V12_STATEMENTS = (
        BEGIN SELECT RAISE(ABORT, 'invalid wake state transition'); END""",
 )
 
+# v13 (M2-08 first-start correction): a Harness may not expose its native
+# Session identity until the first prompt has been submitted.  All discovery
+# bindings remain immutable, except that the one missing native Session ID may
+# be filled exactly once while the admitted UNKNOWN bootstrap is atomically
+# accepted as initialized.  The service layer also pins the corresponding
+# TeamCraft Session row in the same transaction.
+_V13_STATEMENTS = (
+    "DROP TRIGGER trg_ceo_initializations_binding_fixed",
+    """CREATE TRIGGER trg_ceo_initializations_binding_fixed
+       BEFORE UPDATE OF canonical_ceo_name, team_id, teamcraft_session_id,
+         herdr_session_identity_json, native_session_id, terminal_id,
+         protocol_version, protocol_hash, runtime_skill_hash, snapshot_digest,
+         nonce_hash, nonce_expires_at, created_at ON ceo_initializations
+       WHEN NEW.canonical_ceo_name IS NOT OLD.canonical_ceo_name OR
+         NEW.team_id IS NOT OLD.team_id OR
+         NEW.teamcraft_session_id IS NOT OLD.teamcraft_session_id OR
+         NEW.herdr_session_identity_json IS NOT OLD.herdr_session_identity_json OR
+         (NEW.native_session_id IS NOT OLD.native_session_id AND NOT (
+           OLD.native_session_id IS NULL AND NEW.native_session_id IS NOT NULL AND
+           OLD.state='unknown' AND NEW.state='initialized'
+         )) OR
+         NEW.terminal_id IS NOT OLD.terminal_id OR
+         NEW.protocol_version IS NOT OLD.protocol_version OR
+         NEW.protocol_hash IS NOT OLD.protocol_hash OR
+         NEW.runtime_skill_hash IS NOT OLD.runtime_skill_hash OR
+         NEW.snapshot_digest IS NOT OLD.snapshot_digest OR
+         (NEW.nonce_hash IS NOT OLD.nonce_hash AND NOT (
+           OLD.state='discovered' AND NEW.state='discovered' AND
+           OLD.nonce_consumed_at IS NULL AND NEW.nonce_consumed_at IS NULL
+         )) OR
+         (NEW.nonce_expires_at IS NOT OLD.nonce_expires_at AND NOT (
+           OLD.state='discovered' AND NEW.state='discovered' AND
+           OLD.nonce_consumed_at IS NULL AND NEW.nonce_consumed_at IS NULL
+         )) OR
+         NEW.created_at IS NOT OLD.created_at
+       BEGIN SELECT RAISE(ABORT, 'CEO initialization challenge bindings are immutable'); END""",
+)
+
+# v14 (M2-08 live-process identity): when an official Harness integration has
+# not reported a native Session reference, an explicitly reconciled CEO may be
+# admitted only for the lifetime of the exact foreground process.  The JSON
+# binding is intentionally separate from ``native_session_id``: it cannot be
+# used for Herdr/server restore, Wake delivery, or portable Scheduler work.
+_V14_COLUMNS = {"ceo_initializations": frozenset({
+    "identity_mode", "live_process_identity_json",
+})}
+_V14_STATEMENTS = (
+    "ALTER TABLE ceo_initializations ADD COLUMN identity_mode TEXT NOT NULL "
+    "DEFAULT 'native' CHECK (identity_mode IN ('native','live_process'))",
+    "ALTER TABLE ceo_initializations ADD COLUMN live_process_identity_json TEXT",
+    "DROP TRIGGER trg_ceo_initializations_binding_fixed",
+    """CREATE TRIGGER trg_ceo_initializations_binding_fixed
+       BEFORE UPDATE OF canonical_ceo_name, team_id, teamcraft_session_id,
+         herdr_session_identity_json, native_session_id, terminal_id,
+         protocol_version, protocol_hash, runtime_skill_hash, snapshot_digest,
+         nonce_hash, nonce_expires_at, created_at, identity_mode,
+         live_process_identity_json ON ceo_initializations
+       WHEN NEW.canonical_ceo_name IS NOT OLD.canonical_ceo_name OR
+         NEW.team_id IS NOT OLD.team_id OR
+         NEW.teamcraft_session_id IS NOT OLD.teamcraft_session_id OR
+         NEW.herdr_session_identity_json IS NOT OLD.herdr_session_identity_json OR
+         (NEW.native_session_id IS NOT OLD.native_session_id AND NOT (
+           OLD.native_session_id IS NULL AND NEW.native_session_id IS NOT NULL AND
+           OLD.state='unknown' AND NEW.state='initialized' AND NEW.identity_mode='native'
+         )) OR
+         NEW.terminal_id IS NOT OLD.terminal_id OR
+         NEW.protocol_version IS NOT OLD.protocol_version OR
+         NEW.protocol_hash IS NOT OLD.protocol_hash OR
+         NEW.runtime_skill_hash IS NOT OLD.runtime_skill_hash OR
+         NEW.snapshot_digest IS NOT OLD.snapshot_digest OR
+         (NEW.nonce_hash IS NOT OLD.nonce_hash AND NOT (
+           OLD.state='discovered' AND NEW.state='discovered' AND
+           OLD.nonce_consumed_at IS NULL AND NEW.nonce_consumed_at IS NULL
+         )) OR
+         (NEW.nonce_expires_at IS NOT OLD.nonce_expires_at AND NOT (
+           OLD.state='discovered' AND NEW.state='discovered' AND
+           OLD.nonce_consumed_at IS NULL AND NEW.nonce_consumed_at IS NULL
+         )) OR
+         NEW.created_at IS NOT OLD.created_at OR
+         (NEW.identity_mode IS NOT OLD.identity_mode AND NOT (
+           OLD.identity_mode='native' AND NEW.identity_mode='live_process' AND
+           OLD.native_session_id IS NULL AND NEW.native_session_id IS NULL AND
+           OLD.state='unknown' AND NEW.state='initialized'
+         )) OR
+         (NEW.live_process_identity_json IS NOT OLD.live_process_identity_json AND NOT (
+           OLD.live_process_identity_json IS NULL AND
+           NEW.live_process_identity_json IS NOT NULL AND
+           OLD.state='unknown' AND NEW.state='initialized' AND
+           NEW.identity_mode='live_process' AND NEW.native_session_id IS NULL
+         ))
+       BEGIN SELECT RAISE(ABORT, 'CEO initialization challenge bindings are immutable'); END""",
+    """CREATE TRIGGER trg_ceo_initializations_identity_mode_valid
+       BEFORE UPDATE OF state, identity_mode, native_session_id,
+         live_process_identity_json ON ceo_initializations
+       WHEN NEW.state='initialized' AND NOT (
+         (NEW.identity_mode='native' AND NEW.native_session_id IS NOT NULL AND
+          NEW.live_process_identity_json IS NULL) OR
+         (NEW.identity_mode='live_process' AND NEW.native_session_id IS NULL AND
+          NEW.live_process_identity_json IS NOT NULL)
+       )
+       BEGIN SELECT RAISE(ABORT, 'initialized CEO identity mode is inconsistent'); END""",
+)
+
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
@@ -797,6 +900,8 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (10, _V10_STATEMENTS),
     (11, _V11_STATEMENTS),
     (12, _V12_STATEMENTS),
+    (13, _V13_STATEMENTS),
+    (14, _V14_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -815,6 +920,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     10: _V10_TABLES,
     11: frozenset(),
     12: frozenset(),
+    13: frozenset(),
 }
 
 
@@ -899,6 +1005,8 @@ _V10_TRIGGERS = frozenset({
 })
 _V11_TRIGGERS = frozenset({"trg_ceo_initializations_receipt_source_fixed"})
 _V12_TRIGGERS = frozenset()
+_V13_TRIGGERS = frozenset()
+_V14_TRIGGERS = frozenset({"trg_ceo_initializations_identity_mode_valid"})
 
 #: version -> (required triggers, required indexes) added by that step;
 #: cumulative lookups mirror :func:`_required_tables_for`.
@@ -912,6 +1020,8 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     10: (_V10_TRIGGERS, _V10_INDEXES),
     11: (_V11_TRIGGERS, frozenset()),
     12: (_V12_TRIGGERS, frozenset()),
+    13: (_V13_TRIGGERS, frozenset()),
+    14: (_V14_TRIGGERS, frozenset()),
 }
 
 
@@ -935,7 +1045,7 @@ def _required_objects_for(version: int) -> tuple[frozenset[str], frozenset[str]]
 
 def _required_columns_for(version: int) -> dict[str, frozenset[str]]:
     """Required additive columns for an audited schema version."""
-    return {table: columns for step, mapping in ((7, _V7_COLUMNS), (9, _V9_COLUMNS), (10, _V10_COLUMNS), (11, _V11_COLUMNS))
+    return {table: columns for step, mapping in ((7, _V7_COLUMNS), (9, _V9_COLUMNS), (10, _V10_COLUMNS), (11, _V11_COLUMNS), (14, _V14_COLUMNS))
             if step <= version for table, columns in mapping.items()}
 
 
