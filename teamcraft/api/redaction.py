@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import traceback as traceback_module
 from collections.abc import Iterable
+from typing import Any
 
 REDACTION_MARKER = "[REDACTED]"
 
@@ -40,6 +41,32 @@ def redact_secrets(text: str, secrets: Iterable[str]) -> str:
     return result
 
 
+def redact_value(value: Any, secrets: Iterable[str]) -> Any:
+    """Recursively scrub secrets from a JSON-shaped value.
+
+    Keys and string values anywhere inside dicts/lists are passed through
+    :func:`redact_secrets`; other scalars are returned unchanged.  This is
+    the response-side counterpart of the log filter: if a secret somehow
+    reaches a payload (e.g. embedded in historical free text), it leaves the
+    API as ``REDACTION_MARKER`` instead of plaintext.
+    """
+
+    material = [s for s in secrets if isinstance(s, str) and s]
+    if not material:
+        return value
+    if isinstance(value, str):
+        return redact_secrets(value, material)
+    if isinstance(value, dict):
+        return {
+            redact_secrets(key, material) if isinstance(key, str) else key:
+                redact_value(item, material)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_value(item, material) for item in value]
+    return value
+
+
 class SecretRedactingFilter(logging.Filter):
     """Logging filter that erases registered secrets from records."""
 
@@ -49,6 +76,12 @@ class SecretRedactingFilter(logging.Filter):
 
     def register(self, *secrets: str) -> None:
         self._secrets.update(s for s in secrets if isinstance(s, str) and s)
+
+    @property
+    def secrets(self) -> frozenset[str]:
+        """Snapshot of currently registered secret values (for redacting data)."""
+
+        return frozenset(self._secrets)
 
     def clear(self) -> None:
         self._secrets.clear()

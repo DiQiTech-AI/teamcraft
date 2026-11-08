@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ..query import QueryService
 from .config import ApiConfig
 from .errors import (
     INTERNAL_ERROR,
@@ -36,6 +37,7 @@ from .errors import (
 )
 from .health import HealthRegistry, register_health_routes
 from .middleware import RequestIdMiddleware, SecurityMiddleware
+from .query import build_query_router
 from .redaction import install_redaction
 from .request_context import new_request_id
 from .security import SessionTokenStore
@@ -90,6 +92,7 @@ def create_app(
     config: ApiConfig | None = None,
     health_registry: HealthRegistry | None = None,
     static_root: str | os.PathLike[str] | None = None,
+    query_service: QueryService | None = None,
 ) -> FastAPI:
     """Build the guarded API application.
 
@@ -101,6 +104,9 @@ def create_app(
             with an empty registry (``dependencies`` = ``{}``).
         static_root: optional directory exposed under ``/static`` with the
             confinement rules from :mod:`teamcraft.api.static`.
+        query_service: when provided, the M3-02 read-only Query routes are
+            mounted on this same app so they inherit the security guards;
+            omitted, the app stays the M3-01 security shell unchanged.
     """
 
     resolved_config = (config or ApiConfig()).validate()
@@ -146,6 +152,18 @@ def create_app(
 
     register_health_routes(app, registry, secret_provider=_secret_provider)
     register_static_routes(app, static_root)
+
+    if query_service is not None:
+        # M3-02 Query routes ride the same guards (auth/CSRF/request-id) by
+        # being mounted on this app; responses additionally scrub every known
+        # secret (current token plus rotated predecessors the filter holds).
+        app.state.query_service = query_service
+        app.include_router(
+            build_query_router(
+                query_service,
+                secret_provider=lambda: tuple(redactor.secrets | {store.ensure()}),
+            )
+        )
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
