@@ -11,6 +11,10 @@ confined static mount, and log redaction bound to the session token.
 The two ``/api/v1/ping`` / ``/api/v1/_probe`` routes are transport scaffolds
 used to exercise the guards end-to-end; M3-02/M3-04 replace them with real
 Query/Command routes mounted on this same app so they inherit the guards.
+When a ``query_service`` is supplied, the M3-02 Query routes and the M3-03
+read-only SSE stream (``GET /api/v1/events/stream``, durable-seq backed) are
+mounted on this same app and inherit every guard; the SSE router is declared
+first so ``/events/stream`` is not shadowed by ``/events/{event_id}``.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from .redaction import install_redaction
 from .request_context import new_request_id
 from .security import SessionTokenStore
 from .static import register_static_routes
+from .stream import SseConfig, StreamConnectionLimiter, build_events_router
 
 logger = logging.getLogger("teamcraft.api")
 
@@ -93,6 +98,7 @@ def create_app(
     health_registry: HealthRegistry | None = None,
     static_root: str | os.PathLike[str] | None = None,
     query_service: QueryService | None = None,
+    event_stream_config: SseConfig | None = None,
 ) -> FastAPI:
     """Build the guarded API application.
 
@@ -104,9 +110,13 @@ def create_app(
             with an empty registry (``dependencies`` = ``{}``).
         static_root: optional directory exposed under ``/static`` with the
             confinement rules from :mod:`teamcraft.api.static`.
-        query_service: when provided, the M3-02 read-only Query routes are
-            mounted on this same app so they inherit the security guards;
-            omitted, the app stays the M3-01 security shell unchanged.
+        query_service: when provided, the M3-02 read-only Query routes and the
+            M3-03 read-only SSE stream are mounted on this same app so they
+            inherit the security guards; omitted, the app stays the M3-01
+            security shell unchanged.
+        event_stream_config: transport bounds for the M3-03 SSE stream
+            (poll cadence, heartbeats, backfill/connection/frame caps); the
+            :class:`~teamcraft.api.stream.SseConfig` defaults apply otherwise.
     """
 
     resolved_config = (config or ApiConfig()).validate()
@@ -158,10 +168,33 @@ def create_app(
         # being mounted on this app; responses additionally scrub every known
         # secret (current token plus rotated predecessors the filter holds).
         app.state.query_service = query_service
+
+        # M3-03 read-only SSE (durable events.seq, snapshot-required gaps).
+        resolved_stream_config = (event_stream_config or SseConfig()).validate()
+        sse_limiter = StreamConnectionLimiter(
+            resolved_stream_config.max_connections
+        )
+        app.state.sse_config = resolved_stream_config
+        app.state.sse_connection_limiter = sse_limiter
+
+        def _stream_secrets() -> tuple[str, ...]:
+            return tuple(redactor.secrets | {store.ensure()})
+
+        # Registration order matters: Starlette matches routes in declared
+        # order, so the SSE path must precede the Query router's
+        # GET /api/v1/events/{event_id} pattern (M3-03 path note).
+        app.include_router(
+            build_events_router(
+                query_service,
+                secret_provider=_stream_secrets,
+                config=resolved_stream_config,
+                limiter=sse_limiter,
+            )
+        )
         app.include_router(
             build_query_router(
                 query_service,
-                secret_provider=lambda: tuple(redactor.secrets | {store.ensure()}),
+                secret_provider=_stream_secrets,
             )
         )
 
