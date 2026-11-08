@@ -35,7 +35,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Full unittest suite (core, pytest-free)
+      - name: Install project test dependencies
+        run: python -m pip install '.[test]'
+
+      - name: Full unittest suite (core)
         run: python -B -m unittest discover -s tests -v
 
       - name: Skill contract suite

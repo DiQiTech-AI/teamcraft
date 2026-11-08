@@ -21,7 +21,7 @@
 - **状态持久化**：成员、pane 身份、责任范围和执行阶段保存在 SQLite 数据库 `.teamcraft/teamcraft.db`。
 - **安全恢复**：`resume` 会核对 terminal 和原生 Agent session；结果不明确时默认只检查，不自动重复发送任务。
 - **真实状态检查**：`status` 展示 `blocked`、`working`、`idle`、`done`、`unknown` 或 `missing`，避免把缓存状态当成实时状态。
-- **并发保护**：状态写入和成员生命周期操作使用文件锁，降低并发创建或恢复造成的冲突。
+- **并发保护**：运行状态变更在项目级 Leader 租约（含 epoch fencing）下以 SQLite 事务提交；成员生命周期操作另有 flock 守护，进一步降低并发创建或恢复造成的冲突。
 
 ## 团队结构
 
@@ -59,6 +59,7 @@ flowchart TD
 - 已安装 Herdr CLI，并从 Herdr pane 内运行；环境中应有 `HERDR_ENV=1` 和 `HERDR_SOCKET_PATH`。
 - 至少一种 Herdr 支持的 Agent harness，其可执行文件需要位于 `PATH` 中。
 - 使用内置 OpenCode 角色时，需要安装 OpenCode，并准备可用的模型 provider。
+- 可选：仅当需要运行已完成的 M3-01 本地 API 安全壳（`teamcraft/api/`；尚无业务路由）时，需要 `fastapi` 和 `uvicorn`。
 
 仓库中的示例配置使用本地 oMLX：
 
@@ -223,6 +224,81 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 
 `complete` 和 `release` 都不会关闭 pane 或终止 Agent。成员处于 `working`、`blocked` 或 `unknown` 时会拒绝操作；`--force` 只应在人工确认该成员不会继续产生冲突修改后使用。
 
+## 恢复、有界重试与安全重置
+
+对停滞或结果不明的 Task 记录明确的人工决定，任何情况下都不会自动重发：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-request \
+  --task-id TASK_ID --action wait --actor human --reason "等待成员" \
+  --idempotency-key wait-TASK_ID-1
+```
+
+`--action` 支持 `wait`、`cancel`、`reconcile`。针对 Watcher 记录的无进展或超时事件发起升级：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-timeout \
+  --attempt-id ATTEMPT_ID --trigger-event-id EVENT_ID
+```
+
+请求经核验的取消、在核对 Herdr 事实后结算歧义 Command，或申请经批准的有界重试：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-cancel web_dev \
+  --actor human --reason "人工取消" --idempotency-key cancel-web_dev-1
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-reconcile web_dev \
+  --command-id COMMAND_ID --resolution finished \
+  --actor human --reason "已核实 pane 事实"
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-retry \
+  --task-id TASK_ID --actor human --reason "批准重试" \
+  --idempotency-key retry-TASK_ID-1
+```
+
+超时本身不会停止或重启 Agent。`UNKNOWN` Attempt 持续占位，新 Attempt 必须经批准且在 Task 的 `max_attempts`（默认 3）内重试。
+
+若要从干净运行状态重新开始，`reset` 会先用 SQLite 在线备份把当前数据库归档到 `.teamcraft/archive-*`，再创建空数据库。它要求传入精确解析后的项目根，且绝不导入、移动或删除旧 JSON 状态：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py reset \
+  --confirm-project /absolute/path/to/project
+```
+
+## CEO bootstrap 身份对账
+
+若 harness 在 bootstrap Prompt 后的有界核对窗口内未上报 CEO 的 native Session，初始化保持 `UNKNOWN`，派工门禁继续阻断。先检查、再显式选择，任何环节都不会自动重发：
+
+```bash
+# 确认持久化投递记录已显示 submitted 的 Prompt（不重发）
+python3 .agents/skills/teamcraft/scripts/teamctl.py prompt-reconcile-submitted ceo \
+  --command-id COMMAND_ID --actor human --reason "已核对投递证据"
+
+# 绑定 harness 迟到上报的 native Session
+python3 .agents/skills/teamcraft/scripts/teamctl.py ceo-reconcile-native-session ceo \
+  --actor human --reason "native session 已可见"
+
+# 最后手段：显式非可移植 live-process 绑定——同一 pane/terminal、
+# 同一 PID 启动时间指纹、同一 Herdr socket；Scheduler 与 Wake 仍然阻断
+python3 .agents/skills/teamcraft/scripts/teamctl.py ceo-reconcile-live-process ceo \
+  --actor human --reason "操作者已在 pane 内核实当前进程"
+```
+
+## Wake 队列（手动操作）
+
+事件持久化在 SQLite 中并按窗口合并为 Wake 记录；Prompt 只是信号。以下命令用于手动操作队列，CEO 自动启动默认关闭：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-status --state pending
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-dispatch
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-ack \
+  --wake-id WAKE_ID --through-seq SEQ --session-id NATIVE_SESSION_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-process --wake-id WAKE_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-reconcile --wake-id WAKE_ID \
+  --resolution submitted --actor human --note "已核对 pane 记录" \
+  --evidence-json '{"observed": "..."}'
+```
+
+投递结果不明的 Wake 会转为 `unknown`，绝不自动重发；`--resolution not-submitted` 会阻断该 Wake 而不触发重发；确认（ack）必须携带 Wake 提示中打印的 native CEO Session ID，确认游标单调递增。真实 Herdr 投递、重启恢复与身份漂移验证仍延期且未验证，见 [`doc/M2-09_WAKE_DISPATCH_STATUS.md`](doc/M2-09_WAKE_DISPATCH_STATUS.md)。
+
 ## Report-only 验证与审批
 
 M2 验证器只执行由人工明确批准并持久化到项目中的 argv。参数按独立 argv 元素配置，不接受 shell 命令字符串；对已完成的 scout Attempt 执行：
@@ -266,15 +342,27 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 │   ├── scripts/teamctl.py       # 启动、状态、恢复和归档工具
 │   └── tests/test_teamctl.py    # 回归测试
 ├── .opencode/agents/            # CEO、CTO、研发、设计、测试和自定义角色
-├── teamcraft/                    # 无导入副作用的 Python Core 边界（M1-02）
-├── pyproject.toml                # 包元数据与 Python 3.10+ 边界
+├── teamcraft/                    # Python Core 边界（存储、领域、Scheduler、Watcher、验证、Wake）
+│   └── api/                    # 已完成的 M3-01 API 安全壳（仅脚手架路由）
+├── pyproject.toml                # 包元数据、Python 3.10+ 边界与 API 依赖
 ├── examples/team-demo/          # 实机协作示例
 ├── scripts/install.sh           # 项目本地安装脚本
 ├── opencode.example.json        # 可复制的 OpenCode/oMLX 示例配置
 └── PROGRESS.md                  # 实现与实机验证记录
 ```
 
-`.teamcraft/` 是本地运行目录，保存 SQLite 数据库、锁和日志，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。若存在 `.herdr-team/state.json` 或非空 `.teamcraft/state.json`，CLI 会在任何 Herdr 调用或新数据库写入前停止，不会自动迁移、移动或删除旧 JSON。
+`.teamcraft/` 是本地运行目录，保存 SQLite 数据库、锁、日志、reset 归档目录以及 API session token，已被 Git 忽略。状态绑定创建它的 Herdr socket 会话，不会自动迁移到新的 Herdr server session。若存在 `.herdr-team/state.json` 或非空 `.teamcraft/state.json`，CLI 会在任何 Herdr 调用或新数据库写入前停止，不会自动迁移、移动或删除旧 JSON。
+
+## 本地 API 安全壳（M3-01 已完成）
+
+`teamcraft/api/` 提供后续 Query/Command 路由将挂载其上的已完成 HTTP 安全壳。目前尚无业务路由。服务默认绑定 `127.0.0.1:8765`；除非显式传入 `--allow-non-loopback`，其他绑定一律拒绝：
+
+```bash
+pip install -e .
+python3 -m teamcraft.api --project-root /path/to/project --print-token
+```
+
+首次启动会在 `.teamcraft/api/session-token` 生成随机 session token（目录 `0700`、文件 `0600`）。除公开的健康/静态路径外，所有请求必须携带 `Authorization: Bearer <token>`；写方法还要求 `X-CSRF-Token: <token>`，且 `Origin` 需同源或在可重复传入的 `--origin` 白名单内。`GET /api/v1/health`、`/api/v1/health/live`、`/api/v1/health/ready` 无需 token 即可访问，并区分进程存活与依赖就绪：任一注册依赖为 `down` 或 `unknown` 时 readiness 返回 `503`；聚合状态对 down 使用 `degraded`，只有 unknown 而没有 down 时保留明确的 unknown 状态。`--rotate-token` 会更换当前 token（旧 token 立即失效）；经 `--static-root` 提供的静态资源被限制在该目录内（拒绝路径穿越、symlink 越界、隐藏文件与目录浏览）。
 
 ## 验证
 
@@ -285,9 +373,9 @@ python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-Skill 现有 42 项测试，覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并、CLI 契约、输入错误、旧状态安全拒绝和运行目录 symlink 安全等场景。
+Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ownership 预留、成员操作锁、pane 移动、启动失败恢复、任务发送歧义、会话身份检查、OpenCode 配置合并、CLI 契约、输入错误、旧状态安全拒绝、运行目录 symlink 安全，以及 SQLite 运行时与 CEO bootstrap/对账、wake CLI 等场景。
 
-仓库测试包含 21 项安装器测试，覆盖首次安装、重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则和 `teamcraft` Skill 新入口；另有 7 项最小 Python 包边界测试，覆盖 ID、UTC Clock、错误、配置加载和无导入副作用。
+仓库套件现有 468 项测试（同日），其中安装器 25 项覆盖首次/重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则与 `teamcraft` Skill 新入口，包边界 8 项覆盖 ID、UTC Clock、错误、配置加载和无导入副作用，M3-01 API 安全测试 73 项，其余覆盖存储、迁移、领域状态、事件/Command、Leader fencing、Scheduler、Brief/WorkerReport、Watcher、Recovery、Verification/Approval、Wake、CEO 协议/初始化与 Herdr Adapter。上述本地运行使用 Python 3.13.14，全部通过，退出码 0；lint 与本机 loopback HTTP 冒烟也通过。CI 已改为在两条矩阵腿的核心测试前安装 `.[test]`，但本工作树尚未运行 GitHub Actions。
 
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 
@@ -298,5 +386,7 @@ Skill 现有 42 项测试，覆盖状态恢复、并发 ownership 预留、成�
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
+- 已完成的 M3-01 本地 API 安全壳（`teamcraft/api/`）默认仅绑 loopback，带 bearer token、Origin/CSRF、请求关联、健康与静态路径限制等 guards，但目前只有脚手架路由；M3-02/M3-04 落地前没有业务 API。
+- CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
 - 把 Skill 用到其他项目时，需要一并部署角色配置，并按目标机器调整 provider、模型和权限路径。

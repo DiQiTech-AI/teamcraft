@@ -11,7 +11,29 @@ permission:
   grep: allow
   list: allow
   edit: ask
-  bash: ask
+  bash:
+    "*": ask
+    "pwd": allow
+    "pwd *": allow
+    "ls": allow
+    "ls *": allow
+    "rg *": allow
+    "grep *": allow
+    "cat *": allow
+    "head *": allow
+    "tail *": allow
+    "wc *": allow
+    "git status": allow
+    "git status *": allow
+    "git diff": allow
+    "git diff *": allow
+    "git log": allow
+    "git log *": allow
+    "git show": allow
+    "git show *": allow
+    "git rev-parse *": allow
+    "git worktree list": allow
+    "git worktree list *": allow
   external_directory: deny
   webfetch: deny
   websearch: deny

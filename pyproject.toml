@@ -8,7 +8,26 @@ version = "0.2.0.dev0"
 description = "Local-first orchestration boundaries for TeamCraft"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+# M3-01 API security shell: FastAPI serves the guarded HTTP surface and
+# Uvicorn is the default ASGI server (loopback bind enforced in
+# teamcraft/api/config.py + serve.py, not by these libraries).
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    # httpx: local API client + FastAPI TestClient transport (CI runs the
+    # contract tests right after `pip install .`).
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Test-only extras: TestClient needs httpx.
+test = [
+    "pytest>=8",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+teamcraft-api = "teamcraft.api.serve:main"
 
 [tool.setuptools.packages.find]
 include = ["teamcraft*"]

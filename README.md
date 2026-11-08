@@ -21,7 +21,7 @@ Multi-agent development can easily lead to duplicate assignments, overlapping ed
 - **Persistent state:** Members, pane identities, ownership scopes, and execution phases are stored in `.teamcraft/teamcraft.db` (SQLite).
 - **Safe recovery:** `resume` checks the terminal and native agent session. When the outcome is ambiguous, it inspects by default instead of submitting a task again.
 - **Live status checks:** `status` reports `blocked`, `working`, `idle`, `done`, `unknown`, or `missing` rather than treating cached state as live state.
-- **Concurrency protection:** State writes and member lifecycle operations use file locks to reduce conflicts during concurrent launches or recovery.
+- **Concurrency protection:** Runtime state changes commit in SQLite transactions under a project-level leader lease with epoch fencing, while per-member lifecycle operations additionally take flock guards to reduce conflicts during concurrent launches or recovery.
 
 ## Team structure
 
@@ -59,6 +59,7 @@ flowchart TD
 - Herdr CLI installed and commands run from a Herdr pane, with `HERDR_ENV=1` and `HERDR_SOCKET_PATH` available.
 - At least one Herdr-supported agent harness with its executable on `PATH`.
 - OpenCode and a working model provider when using the bundled OpenCode role profiles.
+- Optional: `fastapi` and `uvicorn` only if you want to run the completed M3-01 local API security shell (`teamcraft/api/`; no business routes yet).
 
 The example configuration in this repository uses a local oMLX service:
 
@@ -223,6 +224,81 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py release web_dev
 
 Neither `complete` nor `release` closes the pane or terminates the agent. They reject members in `working`, `blocked`, or `unknown` state. Use `--force` only after a human confirms that the member will not make further conflicting changes.
 
+## Recovery, bounded attempts, and safe reset
+
+Record explicit operator decisions on a stalled or ambiguous Task without resending anything:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-request \
+  --task-id TASK_ID --action wait --actor human --reason "waiting for worker" \
+  --idempotency-key wait-TASK_ID-1
+```
+
+`--action` accepts `wait`, `cancel`, and `reconcile`. Escalate a no-progress or deadline event recorded by the watcher:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-timeout \
+  --attempt-id ATTEMPT_ID --trigger-event-id EVENT_ID
+```
+
+Request a verified cancel, settle an ambiguous command after inspecting Herdr facts, or request an approved bounded retry:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-cancel web_dev \
+  --actor human --reason "operator cancel" --idempotency-key cancel-web_dev-1
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-reconcile web_dev \
+  --command-id COMMAND_ID --resolution finished \
+  --actor human --reason "verified pane facts"
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-retry \
+  --task-id TASK_ID --actor human --reason "approved retry" \
+  --idempotency-key retry-TASK_ID-1
+```
+
+Timeouts never stop or restart agents by themselves. `UNKNOWN` attempts keep their slot, and a new attempt requires an approved retry within the Task's `max_attempts` (default 3).
+
+To start from a clean runtime, `reset` archives the current database with an online SQLite backup into `.teamcraft/archive-*` and creates an empty database. It requires the exact resolved project root and never imports, moves, or deletes legacy JSON state:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py reset \
+  --confirm-project /absolute/path/to/project
+```
+
+## CEO bootstrap identity reconciliation
+
+If the harness has not reported the CEO's native session within the bounded check after the bootstrap prompt, initialization stays `UNKNOWN` and dispatch stays blocked. Inspect first, then choose explicitly; nothing is resent automatically:
+
+```bash
+# confirm a Prompt whose durable delivery record already shows submitted
+python3 .agents/skills/teamcraft/scripts/teamctl.py prompt-reconcile-submitted ceo \
+  --command-id COMMAND_ID --actor human --reason "inspected delivery evidence"
+
+# bind a native session that the harness reported late
+python3 .agents/skills/teamcraft/scripts/teamctl.py ceo-reconcile-native-session ceo \
+  --actor human --reason "native session now visible"
+
+# last-resort, explicitly non-portable live-process binding: same pane/terminal,
+# same PID start-time fingerprint, same Herdr socket; Scheduler and Wake stay blocked
+python3 .agents/skills/teamcraft/scripts/teamctl.py ceo-reconcile-live-process ceo \
+  --actor human --reason "operator verified live process in pane"
+```
+
+## Wake queue (manual operation)
+
+Events are stored durably in SQLite and merged into Wake records; the prompt is only a signal. These commands operate the queue manually, and automatic CEO start is off by default:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-status --state pending
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-dispatch
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-ack \
+  --wake-id WAKE_ID --through-seq SEQ --session-id NATIVE_SESSION_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-process --wake-id WAKE_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py wake-reconcile --wake-id WAKE_ID \
+  --resolution submitted --actor human --note "inspected pane transcript" \
+  --evidence-json '{"observed": "..."}'
+```
+
+Ambiguous deliveries become `unknown` and are never resent automatically; `--resolution not-submitted` blocks the Wake instead of triggering a resend; acknowledgement requires the native CEO session id printed in the Wake prompt and moves the acknowledgement cursor forward monotonically. Real-Herdr delivery, restart recovery, and identity-drift verification are deferred and remain unverified — see [`doc/M2-09_WAKE_DISPATCH_STATUS.md`](doc/M2-09_WAKE_DISPATCH_STATUS.md).
+
 ## Report-only verification and approval
 
 M2 Verification runs only a project-persisted argv explicitly approved by a human. Configure the argv as separate arguments (never as a shell command string), then run it against a finished scout Attempt:
@@ -266,15 +342,27 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 │   ├── scripts/teamctl.py       # Launch, status, recovery, and archival tool
 │   └── tests/test_teamctl.py    # Regression tests
 ├── .opencode/agents/            # CEO, CTO, developer, designer, tester, and custom profiles
-├── teamcraft/                    # Side-effect-free Python core boundaries (M1-02)
-├── pyproject.toml                # Package metadata; Python 3.10+ boundary
+├── teamcraft/                    # Python core boundaries (storage, domain, scheduler, watcher, verification, wake)
+│   └── api/                    # Completed M3-01 API security shell (scaffold routes only)
+├── pyproject.toml                # Package metadata; Python 3.10+ boundary; API dependencies
 ├── examples/team-demo/          # Live collaboration example
 ├── scripts/install.sh           # Project-local installer
 ├── opencode.example.json        # OpenCode/oMLX example configuration
 └── PROGRESS.md                  # Implementation and live verification notes
 ```
 
-`.teamcraft/` is a local runtime directory containing the SQLite database, locks, and journals. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session. If `.herdr-team/state.json` or a non-empty `.teamcraft/state.json` is present, the CLI stops before any Herdr call or new database write; it never migrates, moves, or deletes legacy JSON automatically.
+`.teamcraft/` is a local runtime directory containing the SQLite database, locks, journals, reset archives, and the API session token. It is ignored by Git. Its state is bound to the Herdr socket session that created it and does not migrate automatically to another Herdr server session. If `.herdr-team/state.json` or a non-empty `.teamcraft/state.json` is present, the CLI stops before any Herdr call or new database write; it never migrates, moves, or deletes legacy JSON automatically.
+
+## Local API security shell (M3-01 complete)
+
+`teamcraft/api/` provides the completed HTTP security shell that later Query/Command routes will mount on. It has no business routes yet. The server binds `127.0.0.1:8765` by default and refuses any other bind unless you pass `--allow-non-loopback`:
+
+```bash
+pip install -e .
+python3 -m teamcraft.api --project-root /path/to/project --print-token
+```
+
+On first start it writes a random session token to `.teamcraft/api/session-token` (directory `0700`, file `0600`). Requests outside the public health/static paths require `Authorization: Bearer <token>`, and write methods additionally require `X-CSRF-Token: <token>` plus a same-origin `Origin` (or one listed via repeatable `--origin`). `GET /api/v1/health`, `/api/v1/health/live`, and `/api/v1/health/ready` answer without a token, distinguishing process liveness from dependency readiness. Readiness returns `503` when any registered dependency is `down` or `unknown`; the aggregate reports `degraded` for down dependencies and preserves an explicit unknown state when no dependency is down but at least one remains unknown. `--rotate-token` replaces the active token (old tokens stop verifying immediately), and static assets served via `--static-root` are confined to that directory (traversal, symlink escape, hidden files, and directory browsing are rejected).
 
 ## Verification
 
@@ -285,9 +373,9 @@ python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -v
 python3 -B -m unittest discover -s tests -v
 ```
 
-The current 42 Skill tests cover state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, CLI contracts, invalid input, legacy-state refusal, and runtime symlink safety.
+The Skill suite (89 tests on 2026-11-08) covers state recovery, concurrent ownership reservations, member operation locking, moved panes, recovery from start failures, ambiguous task submission, session identity checks, OpenCode configuration merging, CLI contracts, invalid input, legacy-state refusal, runtime symlink safety, and the SQLite runtime plus CEO bootstrap/reconcile and wake CLI surfaces.
 
-The repository test suite contains 21 installer tests covering first installation, repeated installation, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, Git ignore rules, and the `teamcraft` Skill entry. It also contains 7 tests for the minimal Python package's ID, UTC clock, error, configuration, and side-effect-free import boundaries.
+The repository suite (468 tests on the same date) covers the installer — 25 tests for first/repeat installs, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, Git ignore rules, and the `teamcraft` Skill entry — 8 tests for the Python package's ID, UTC clock, error, configuration, and side-effect-free import boundaries, 73 focused M3-01 API security tests, and the remaining core tests for storage, migrations, domain state, events/commands, leader fencing, the scheduler, briefs/WorkerReports, the watcher, recovery, verification/approval, the wake dispatcher, CEO protocol/initialization, and the Herdr adapter. The recorded local run used Python 3.13.14 and passed with exit code 0; lint checks and a live loopback HTTP smoke also passed. CI now installs `.[test]` before running the core suite on both matrix legs, but GitHub Actions has not yet run against this working tree.
 
 The project has also completed one live OpenCode workflow: the CEO created a developer and a read-only tester, the developer generated [`examples/team-demo/index.html`](examples/team-demo/index.html), and the tester completed acceptance. During that run, the CEO's final polling loop did not converge on its own; the controlling agent stopped the loop manually and completed archival. See [`PROGRESS.md`](PROGRESS.md) for the detailed record.
 
@@ -298,5 +386,7 @@ The project has also completed one live OpenCode workflow: the CEO created a dev
 - Both `idle` and `done` can indicate a completed, settled task; do not wait only for `done`.
 - `unknown` means the live state could not be verified and must not be treated as completion.
 - Ownership provides team coordination, not a security sandbox.
+- The completed M3-01 local API security shell (`teamcraft/api/`) is loopback-by-default with bearer-token, Origin/CSRF, request-correlation, health, and static-path guards, but still has scaffold routes only. There is no business API until M3-02/M3-04 land.
+- Trusted-host receipts for CEO bootstrap, and real-Herdr wake delivery/restart recovery/identity-drift, are deferred and remain unverified; offline/mock regressions do not substitute for them.
 - Use a new member name for a new task after completing or releasing a member. Historical task archival and member reuse are not implemented.
 - Installing the skill into another project also requires the role profiles, with provider, model, and permission paths adjusted for the target machine.

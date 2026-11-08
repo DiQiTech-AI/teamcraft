@@ -1,6 +1,6 @@
 # M2-09 Wake Dispatcher closure and deferred verification
 
-Updated: 2026-11-07
+Updated: 2026-11-08
 
 ## Current implementation
 
@@ -32,10 +32,16 @@ Updated: 2026-11-07
 
 ## Closure decision and deferred verification
 
-- M2-09 implementation work remains closed by owner decision. M2-08 has
+- M2-09 implementation work remains closed by owner decision. M2-08
   re-entered focused acceptance for its first-start and live-only identity
-  corrections (see `TEAMCRAFT_2_0_M0_REVIEW.md`, section 12.17); this does not
+  corrections (see `TEAMCRAFT_2_0_M0_REVIEW.md`, section 12.17); this did not
   reopen M2-09 or claim that deferred real-world checks passed.
+- Owner decision, recorded 2026-11-08: the implementation tasks for M2-07,
+  M2-08, and M2-09 are marked completed (`TEAMCRAFT_2_0_M0_REVIEW.md`,
+  section 12.18). This records implementation scope only. Every deferred
+  real-world check — real Herdr Wake submission, lost-response/restart
+  recovery, identity drift, explicit CEO acknowledgement, and a trusted
+  Codex/OpenCode host receipt — remains **unverified, not passed**.
 - Later, test a trusted Codex/OpenCode host receipt source and real Herdr Wake
   submission, lost-response/restart recovery, explicit CEO acknowledgement,
   and identity drift. Do not treat mocks or `assumed_default` as those results.
@@ -54,5 +60,11 @@ Updated: 2026-11-07
   new explicit case that Wake admission of a live-only CEO fails closed with no
   `ceo.wake` command and the Wake left `pending`, and genuine v11→v14 ladder
   migration coverage. No real Herdr prompt was sent for these.
+- 2026-11-08 re-run on the current working tree (Python 3.13.14): core suite
+  **456 tests OK** and skill suite **89 tests OK**, exit code 0;
+  `git diff --check` clean. The tree carries peer-authored, uncommitted M2-08
+  identity-reconcile test additions; those changes and their acceptance belong
+  to the peer. Everything above is offline/mock evidence — no real Herdr prompt
+  was sent in any of these runs.
 - No real Herdr prompt was sent as part of this implementation; actual delivery
   and host-receipt verification remain deferred.
