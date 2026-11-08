@@ -880,6 +880,172 @@ class TeamctlTests(unittest.TestCase):
         store.stage_unknown.assert_not_called()
         store.record_ceo_bootstrap_submission_assumed.assert_not_called()
 
+    def test_m208_ceo_reconcile_native_session_cli_binds_delayed_identity_and_reports_portable(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            pane_id="w1:p2", terminal_id="term-2", session_id="tc-session-1",
+            agent_session=None, phase="prompt_submitted", live_state="unknown",
+            prompt_may_have_been_delivered=True,
+            error="CEO native Session initialization pending: timed out",
+        )
+        state = {
+            "version": 1, "team_id": "team-1", "project_root": str(self.root),
+            "herdr_session": self.session, "created_at": 1,
+            "members": {"ceo": member},
+        }
+        initialization = SimpleNamespace(
+            state="unknown", receipt_source="unverified", native_session_id=None,
+            terminal_id="term-2",
+            herdr_session_identity_json=json.dumps(
+                self.session, sort_keys=True, separators=(",", ":"),
+            ),
+        )
+        agent = {
+            "name": "ceo", "agent": "codex", "pane_id": "w1:p2",
+            "terminal_id": "term-2", "agent_status": "idle",
+            "agent_session": {"kind": "id", "source": "herdr:codex",
+                             "value": "native-late"},
+        }
+        pane = {"pane_id": "w1:p2", "terminal_id": "term-2", "agent": "codex"}
+        store = mock.Mock()
+        store.reconcile_ceo_native_session.return_value = SimpleNamespace(
+            state="initialized", identity_mode="native",
+            native_session_id="native-late",
+        )
+        lease = store.acquire_lease.return_value
+        args = argparse.Namespace(cwd=str(self.root), name="ceo", actor="operator",
+                                 reason="Herdr reported the delayed native Session")
+        with mock.patch.object(teamctl, "load_member_for_mutation",
+                              return_value=(store, self.session, state, member)), \
+             mock.patch.object(teamctl._adapter, "project_id_for_root",
+                              return_value="p-1"), \
+             mock.patch.object(teamctl._adapter.ceo_initialization, "get_initialization",
+                              return_value=initialization), \
+             mock.patch.object(teamctl, "verify_recorded_occupant",
+                              return_value=(pane, agent)), \
+             mock.patch.object(teamctl, "update_member",
+                              side_effect=lambda *_a, **changes: member | changes) as update:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.assertEqual(teamctl.ceo_reconcile_native_session(args), 0)
+        report = json.loads(buffer.getvalue())
+        self.assertEqual(report["initialization_state"], "initialized")
+        self.assertEqual(report["identity_mode"], "native")
+        self.assertEqual(report["native_session_id"], "native-late")
+        self.assertTrue(report["portable"])
+        self.assertEqual(report["phase"], "prompt_submitted")
+        self.assertEqual(report["agent_state"], "idle")
+        store.acquire_lease.assert_called_once_with("ceo", 60)
+        store.reconcile_ceo_native_session.assert_called_once_with(
+            "ceo", native_session_id="native-late",
+            agent_session=agent["agent_session"], session_state="idle",
+            pane_id="w1:p2", terminal_id="term-2", harness="codex",
+            herdr_session_identity_hash=teamctl._session_identity_hash(self.session),
+            actor="operator", reason=args.reason, lease=lease,
+        )
+        bound = [call for call in update.mock_calls if "agent_session" in call.kwargs]
+        self.assertEqual(len(bound), 1)
+        self.assertEqual(bound[0].kwargs["agent_session"], agent["agent_session"])
+        self.assertIsNone(bound[0].kwargs["error"])
+        self.assertEqual(bound[0].kwargs["phase"], "prompt_submitted")
+        store.release_lease.assert_called_once_with(lease)
+
+    def test_m208_ceo_reconcile_native_session_cli_refuses_non_ceo_before_lease(self):
+        member = make_member(
+            "dev", ["src/a.py"], pane_id="w1:p2", terminal_id="term-2",
+            session_id="tc-session-1", phase="prompt_submitted",
+        )
+        state = {
+            "version": 1, "team_id": "team-1", "project_root": str(self.root),
+            "herdr_session": self.session, "created_at": 1,
+            "members": {"dev": member},
+        }
+        store = mock.Mock()
+        args = argparse.Namespace(cwd=str(self.root), name="dev", actor="operator",
+                                 reason="attempted identity bind")
+        with mock.patch.object(teamctl, "load_member_for_mutation",
+                              return_value=(store, self.session, state, member)):
+            with self.assertRaisesRegex(teamctl.TeamctlError, "CEO-only"):
+                teamctl.ceo_reconcile_native_session(args)
+        store.reconcile_ceo_native_session.assert_not_called()
+        store.acquire_lease.assert_not_called()
+        store.release_lease.assert_not_called()
+
+    def test_m208_prompt_reconcile_cli_reports_transport_confirmed_without_initialization(self):
+        member = make_member(
+            "ceo", [], role="ceo", read_only=True, kind="codex",
+            pane_id="w1:p2", terminal_id="term-2", session_id="tc-session-1",
+            agent_session=None, phase="prompt_ambiguous",
+            prompt_may_have_been_delivered=True, live_state="unknown",
+            error="prompt outcome ambiguous: response lost",
+        )
+        state = {
+            "version": 1, "team_id": "team-1", "project_root": str(self.root),
+            "herdr_session": self.session, "created_at": 1,
+            "members": {"ceo": member},
+        }
+        store = mock.Mock()
+        store.reconcile_submitted_prompt.return_value = SimpleNamespace(
+            id="cmd-1", state="confirmed",
+        )
+        lease = store.acquire_lease.return_value
+        args = argparse.Namespace(cwd=str(self.root), name="ceo", command_id="cmd-1",
+                                 actor="operator",
+                                 reason="durable delivery row proves submission")
+        with mock.patch.object(teamctl, "load_member_for_mutation",
+                              return_value=(store, self.session, state, member)), \
+             mock.patch.object(teamctl, "update_member",
+                              side_effect=lambda *_a, **changes: member | changes) as update:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.assertEqual(teamctl.prompt_reconcile_submitted(args), 0)
+        report = json.loads(buffer.getvalue())
+        self.assertEqual(report["prompt_command_id"], "cmd-1")
+        self.assertEqual(report["prompt_command_state"], "confirmed")
+        # Transport reconciliation must never claim initialization progress.
+        self.assertIs(report["initialization_changed"], False)
+        self.assertEqual(report["phase"], "prompt_submitted")
+        store.reconcile_submitted_prompt.assert_called_once_with(
+            "ceo", "cmd-1", lease=lease, actor="operator", reason=args.reason,
+        )
+        settled = [call for call in update.mock_calls
+                   if call.kwargs.get("phase") == "prompt_submitted"]
+        self.assertEqual(len(settled), 1)
+        self.assertTrue(settled[0].kwargs["prompt_may_have_been_delivered"])
+        self.assertIn("remain pending", settled[0].kwargs["error"])
+        store.release_lease.assert_called_once_with(lease)
+
+    def test_m208_identity_reconcile_commands_parse_required_arguments(self):
+        parser = teamctl.build_parser()
+        native = parser.parse_args([
+            "ceo-reconcile-native-session", "ceo", "--cwd", str(self.root),
+            "--actor", "operator", "--reason", "bind delayed native Session",
+        ])
+        self.assertIs(native.handler, teamctl.ceo_reconcile_native_session)
+        live = parser.parse_args([
+            "ceo-reconcile-live-process", "ceo", "--cwd", str(self.root),
+            "--actor", "operator", "--reason", "bind this process only",
+        ])
+        self.assertIs(live.handler, teamctl.ceo_reconcile_live_process)
+        transport = parser.parse_args([
+            "prompt-reconcile-submitted", "ceo", "--cwd", str(self.root),
+            "--command-id", "cmd-1", "--actor", "operator",
+            "--reason", "durable submitted evidence",
+        ])
+        self.assertIs(transport.handler, teamctl.prompt_reconcile_submitted)
+        # Every explicit reconciliation demands actor and reason.
+        for argv in (
+            ["ceo-reconcile-native-session", "ceo", "--cwd", str(self.root),
+             "--actor", "operator"],
+            ["ceo-reconcile-live-process", "ceo", "--cwd", str(self.root),
+             "--reason", "bind"],
+            ["prompt-reconcile-submitted", "ceo", "--cwd", str(self.root),
+             "--command-id", "cmd-1", "--actor", "operator"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as exc:
+                parser.parse_args(argv)
+            self.assertEqual(exc.exception.code, 2)
+
     def test_ambiguous_prompt_is_not_resent_on_default_resume(self):
         agent_session = {"value": "same"}
         teamctl.reserve_member(

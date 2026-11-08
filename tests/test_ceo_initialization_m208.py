@@ -854,5 +854,191 @@ class CEOInitializationM208Tests(unittest.TestCase):
             scheduler.dispatch_ready(self.conn, self.project_id, lease, concurrency_limit=1, clock=self.clock)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0], before)
 
+    # ------------------------------------------------------------------
+    # M2-08 first-start acceptance slice (section 12.17): submitted
+    # bootstrap with a delayed/missing native Session and the dispatch gate.
+    # ------------------------------------------------------------------
+
+    def socket_hash(self):
+        return hashlib.sha256(
+            json.dumps(self.state["herdr_session"], sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def ready_task(self, title):
+        task = domain.create_task(self.conn, self.project_id, title,
+                                 ownership_json='[]', clock=self.clock)
+        return domain.apply_task_event(self.conn, task.id, "dependencies_satisfied",
+                                      expected_version=task.version, clock=self.clock)
+
+    def late_native_kwargs(self, **overrides):
+        common = {
+            "native_session_id": "native-late",
+            "agent_session": {"kind": "id", "value": "native-late"},
+            "session_state": "idle",
+            "pane_id": "w1:p1",
+            "terminal_id": "terminal-m208",
+            "harness": "codex",
+            "herdr_session_identity_hash": self.socket_hash(),
+            "actor": "owner",
+            "reason": "Herdr reported the delayed native Session",
+            "lease": self.lease,
+            "clock": self.clock,
+        }
+        common.update(overrides)
+        return common
+
+    def test_missing_native_after_bounded_window_keeps_unknown_and_blocks_scheduler_and_wake(self):
+        """Submitted bootstrap + no native report: init stays UNKNOWN and both
+        the Scheduler and Wake gates stay closed with zero side effects."""
+        member, prompt = self.confirmed_submitted_bootstrap()
+        initialization = init.get_initialization(self.conn, self.project_id)
+        self.assertEqual((initialization.state, initialization.native_session_id,
+                         initialization.receipt_source), ("unknown", None, "unverified"))
+        self.assertEqual(str(self.conn.execute(
+            "SELECT state FROM commands WHERE id=?", (prompt.id,)).fetchone()[0]), "confirmed")
+        delivery = self.conn.execute(
+            "SELECT state FROM prompt_deliveries WHERE command_id=?", (prompt.id,),
+        ).fetchone()
+        self.assertEqual(str(delivery[0]), "submitted")
+
+        # A supported Harness that never reported a native Session is NOT an
+        # unsupported-Harness failure; the record must remain UNKNOWN, not
+        # failed/incompatible, so an explicit reconcile remains possible.
+        task = self.ready_task("dispatch after missing native")
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0]
+        with self.assertRaisesRegex(init.CEOInitializationGateClosed, "dispatch is blocked"):
+            scheduler.dispatch_ready(self.conn, self.project_id, self.lease,
+                                    concurrency_limit=2, clock=self.clock)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0], before)
+
+        # Wake admission is closed too.  Make the CEO liveness idle first so a
+        # refusal can only come from the initialization gate, not liveness.
+        domain.observe_session(self.conn, member["session_id"], "idle", clock=self.clock)
+        events.append_event(self.conn, "watch.task_progress", project_id=self.project_id,
+                           payload_json=json.dumps({"dedupe_key": "task:missing-native"}),
+                           clock=self.clock)
+        ingested = wake.ingest_events(self.conn, self.project_id, self.lease, clock=self.clock)
+        self.assertEqual(ingested.created_wakes, 1)
+        wake_id = ingested.wakes[-1].id
+        with self.assertRaisesRegex(init.CEOInitializationGateClosed, "dispatch is blocked"):
+            wake.admit_pending_wake(self.conn, self.project_id, wake_id, self.lease,
+                                   clock=self.clock)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM commands WHERE kind='ceo.wake'").fetchone()[0], 0)
+        self.assertEqual(str(self.conn.execute(
+            "SELECT state FROM wakes WHERE id=?", (wake_id,)).fetchone()[0]), "pending")
+        # Still UNKNOWN afterwards: the refused admission rewrote nothing.
+        again = init.get_initialization(self.conn, self.project_id)
+        self.assertEqual((again.state, again.native_session_id), ("unknown", None))
+
+    def test_late_native_reconcile_rejects_prompt_outside_challenge_lifetime(self):
+        """A confirmed submitted Prompt outside its challenge window cannot be
+        retroactively reconciled onto a late native Session."""
+        self.clear_prebootstrap_native_session()
+        _, nonce = self.issue(ttl=10)
+        init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        # The Prompt is submitted AFTER the challenge expired.
+        self.clock.value += timedelta(seconds=11)
+        member = runtime_adapter.team_view(self.conn)["members"]["ceo"]
+        command = runtime_adapter.stage_claim(
+            self.conn, team_id=self.state["team_id"], member="ceo",
+            stage=runtime_adapter.STAGE_PROMPT, lease=self.lease,
+            task_id=member["task_id"], attempt_id=member["attempt_id"],
+            payload={"brief_content": "bootstrap prompt"}, clock=self.clock,
+        )
+        runtime_adapter.record_prompt_delivery(
+            self.conn, command.id, "submitted", clock=self.clock,
+        )
+        runtime_adapter.stage_confirm(
+            self.conn, command.id, lease=self.lease,
+            evidence={"transport": "submitted"}, clock=self.clock,
+        )
+
+        with self.assertRaisesRegex(init.CEOInitializationGateClosed,
+                                   "not submitted within its challenge lifetime"):
+            init.reconcile_bootstrap_submitted_native_session(
+                self.conn, self.project_id, **self.late_native_kwargs(),
+            )
+        pending = init.get_initialization(self.conn, self.project_id)
+        self.assertEqual((pending.state, pending.native_session_id, pending.nonce_consumed_at),
+                         ("unknown", None, None))
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM commands WHERE kind='ceo.identity.native_session'"
+        ).fetchone()[0], 0)
+        self.assertIsNone(self.conn.execute(
+            "SELECT agent_session_json FROM members WHERE name='ceo'").fetchone()[0])
+        self.assertIsNone(domain.get_session(
+            self.conn, member["session_id"]).native_session_id)
+
+    def test_late_native_reconcile_opens_gate_and_refuses_live_process_rebind(self):
+        """After the delayed native binding completes initialization, the
+        portable gate opens for the Scheduler and a later live-only rebind is
+        refused instead of silently downgrading the identity mode."""
+        member, _ = self.confirmed_submitted_bootstrap()
+        reconciled = init.reconcile_bootstrap_submitted_native_session(
+            self.conn, self.project_id, **self.late_native_kwargs(),
+        )
+        self.assertEqual((reconciled.state, reconciled.identity_mode,
+                         reconciled.native_session_id), ("initialized", "native", "native-late"))
+
+        # The dispatch gate is now open on the default portable path.
+        task = self.ready_task("dispatch after late native binding")
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0]
+        result = scheduler.dispatch_ready(self.conn, self.project_id, self.lease,
+                                         concurrency_limit=2, clock=self.clock)
+        self.assertEqual(len(result.attempts), 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE task_id=?", (task.id,)).fetchone()[0], before + 1)
+
+        # A subsequent explicit live-only bind must be refused: the accepted
+        # native identity can never be swapped for a non-portable one.
+        with self.assertRaisesRegex(runtime_adapter.RuntimeAdapterError,
+                                   "already bound to another identity"):
+            runtime_adapter.record_ceo_bootstrap_live_process_assumed(
+                self.conn, self.project_id, live_process_identity=self.live_identity(),
+                session_state="idle", actor="owner", reason="attempted downgrade",
+                lease=self.lease, clock=self.clock,
+            )
+        current = init.get_initialization(self.conn, self.project_id)
+        self.assertEqual((current.state, current.identity_mode, current.native_session_id,
+                         current.live_process_identity_json),
+                         ("initialized", "native", "native-late", None))
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM commands WHERE kind='ceo.identity.live_process'"
+        ).fetchone()[0], 0)
+
+    def test_live_process_identity_refuses_late_native_reconciliation(self):
+        """Live-only initialization is final for this identity: a late native
+        report cannot silently upgrade it; the DB refuses the mode switch."""
+        member, _ = self.confirmed_submitted_bootstrap()
+        bound = runtime_adapter.record_ceo_bootstrap_live_process_assumed(
+            self.conn, self.project_id, live_process_identity=self.live_identity(),
+            session_state="idle", actor="owner", reason="native hook unavailable",
+            lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual((bound.state, bound.identity_mode), ("initialized", "live_process"))
+
+        with self.assertRaisesRegex(init.CEOInitializationGateClosed, "unconsumed UNKNOWN"):
+            init.reconcile_bootstrap_submitted_native_session(
+                self.conn, self.project_id, **self.late_native_kwargs(),
+            )
+        current = init.get_initialization(self.conn, self.project_id)
+        self.assertEqual((current.state, current.identity_mode, current.native_session_id),
+                         ("initialized", "live_process", None))
+        self.assertIsNotNone(current.live_process_identity_json)
+        self.assertIsNone(self.conn.execute(
+            "SELECT agent_session_json FROM members WHERE name='ceo'").fetchone()[0])
+        self.assertIsNone(domain.get_session(
+            self.conn, member["session_id"]).native_session_id)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM commands WHERE kind='ceo.identity.native_session'"
+        ).fetchone()[0], 0)
+
 
 if __name__ == "__main__": unittest.main()
