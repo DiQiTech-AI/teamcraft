@@ -102,7 +102,7 @@ def _shed_v6_m203_artifacts(conn) -> None:
 
 
 def _shed_v8_m206_artifacts(conn) -> None:
-    """Strip schema-v8/v9 additions from fixtures claiming schema v1-v7."""
+    """Strip schema-v8..v15 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     for index in storage._V8_INDEXES:
@@ -125,6 +125,13 @@ def _shed_v8_m206_artifacts(conn) -> None:
     init_columns = {row[1] for row in conn.execute("PRAGMA table_info(ceo_initializations)")}
     if "receipt_source" in init_columns:
         conn.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
+    # M3-04 (v15): honest pre-v15 fixtures shed the dispatch gate too —
+    # scheduler_controls plus the additive tasks columns.
+    conn.execute("DROP TABLE IF EXISTS scheduler_controls")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    for column in ("paused", "execution_policy_json"):
+        if column in task_columns:
+            conn.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
 
 
 class DomainM104Tests(unittest.TestCase):
@@ -1286,7 +1293,8 @@ class M104UpgradePathTests(unittest.TestCase):
         self.assertEqual(
             info["missing_head_tables"],
             ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
-             "prompt_deliveries", "runtime_meta", "task_dependencies", "verification_configs",
+             "prompt_deliveries", "runtime_meta", "scheduler_controls", "task_dependencies",
+             "verification_configs",
              "verifications", "wake_cursors", "wake_events", "wakes", "worker_reports"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)

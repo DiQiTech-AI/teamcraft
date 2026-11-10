@@ -134,6 +134,12 @@ class CEOInitializationM208Tests(unittest.TestCase):
             raw.execute("DROP TABLE IF EXISTS wake_events")
             raw.execute("DROP TABLE IF EXISTS wakes")
             raw.execute("DROP TABLE IF EXISTS wake_cursors")
+            # M3-04 (v15): honest v8 also sheds the dispatch gate artifacts.
+            raw.execute("DROP TABLE IF EXISTS scheduler_controls")
+            task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
+            for column in ("paused", "execution_policy_json"):
+                if column in task_columns:
+                    raw.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
             raw.execute("DELETE FROM schema_migrations WHERE version > 8")
             raw.execute("PRAGMA user_version=8")
             raw.commit()
@@ -141,7 +147,8 @@ class CEOInitializationM208Tests(unittest.TestCase):
             raw.close()
         result = storage.migrate_to_head(db, allow_unverified_location=True)
         self.assertEqual((result.from_version, result.to_version, result.applied),
-                         (8, 14, (9, 10, 11, 12, 13, 14)))
+                         (8, storage.SCHEMA_VERSION,
+                          tuple(range(9, storage.SCHEMA_VERSION + 1))))
         audit = storage.verify_database(db)
         self.assertTrue(audit["at_head"])
         self.assertIn("ceo_initializations", audit["tables"])

@@ -252,7 +252,8 @@ def _project_dto(row: Any) -> dict[str, Any]:
 
 _TASK_COLUMNS = (
     "id, project_id, title, description, acceptance_json, kind, priority,"
-    " status, risk, ownership_json, max_attempts, version, created_at, updated_at"
+    " status, risk, ownership_json, max_attempts, version, created_at,"
+    " updated_at, paused, execution_policy_json"
 )
 
 
@@ -277,6 +278,10 @@ def _task_dto(row: Any) -> dict[str, Any]:
     dto["ownership"] = ownership if isinstance(ownership, list) else []
     dto["max_attempts"] = int(row[10])
     dto["version"] = int(row[11])
+    # M3-04: durable pause gate + persisted execution policy.
+    dto["paused"] = bool(int(row[14]))
+    policy = _parse_json_container(row[15])
+    dto["execution_policy"] = policy if isinstance(policy, dict) else {}
     return dto
 
 

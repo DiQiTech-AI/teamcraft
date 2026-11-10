@@ -22,6 +22,7 @@ from ..errors import TeamCraftError
 from ..fresh_start import DATABASE_FILENAME
 from ..query import QueryService
 from .app import create_app
+from .command import CommandService
 from .config import DEFAULT_HOST, DEFAULT_PORT, is_loopback_host, load_api_config
 from .security import SessionTokenStore
 
@@ -118,19 +119,24 @@ def make_server(
     # directory (<root>/.teamcraft/teamcraft.db).  Constructing the service
     # touches nothing on disk; unauthenticated reads stay 401 and reads
     # against a not-yet-initialized store return uniform 503s.
+    # M3-04 adds the Command surface on that same file: constructing it is
+    # likewise side-effect free, and every write runs through the Core
+    # Command Service (never prompt/dispatch/Wake/Leader).
     query_service: QueryService | None = None
+    command_service: CommandService | None = None
     if config.token_file is not None:
         # token_file = <root>/.teamcraft/api/session-token, so two levels up
         # is the runtime directory that owns teamcraft.db.
-        query_service = QueryService(
-            config.token_file.parents[1] / DATABASE_FILENAME
-        )
+        runtime_database = config.token_file.parents[1] / DATABASE_FILENAME
+        query_service = QueryService(runtime_database)
+        command_service = CommandService(runtime_database)
 
     app = create_app(
         token_store=store,
         config=config,
         static_root=config.static_root,
         query_service=query_service,
+        command_service=command_service,
     )
     server = uvicorn.Server(
         uvicorn.Config(

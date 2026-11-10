@@ -59,7 +59,7 @@ flowchart TD
 - 已安装 Herdr CLI，并从 Herdr pane 内运行；环境中应有 `HERDR_ENV=1` 和 `HERDR_SOCKET_PATH`。
 - 至少一种 Herdr 支持的 Agent harness，其可执行文件需要位于 `PATH` 中。
 - 使用内置 OpenCode 角色时，需要安装 OpenCode，并准备可用的模型 provider。
-- 可选：仅当需要运行已完成的 M3-01 本地 API 安全壳（`teamcraft/api/`；尚无业务路由）时，需要 `fastapi` 和 `uvicorn`。
+- 可选：仅当需要运行本地 API（`teamcraft/api/`：M3-01 安全壳，及已实现的 M3-02 Query、M3-03 SSE、M3-04 Command 路由）时，需要 `fastapi` 和 `uvicorn`。
 
 仓库中的示例配置使用本地 oMLX：
 
@@ -343,7 +343,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 │   └── tests/test_teamctl.py    # 回归测试
 ├── .opencode/agents/            # CEO、CTO、研发、设计、测试和自定义角色
 ├── teamcraft/                    # Python Core 边界（存储、领域、Scheduler、Watcher、验证、Wake）
-│   └── api/                    # 已完成的 M3-01 API 安全壳（仅脚手架路由）
+│   └── api/                    # M3-01 安全壳，挂载 M3-02 Query、M3-03 SSE、M3-04 Command 路由
 ├── pyproject.toml                # 包元数据、Python 3.10+ 边界与 API 依赖
 ├── examples/team-demo/          # 实机协作示例
 ├── scripts/install.sh           # 项目本地安装脚本
@@ -355,7 +355,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 
 ## 本地 API 安全壳（M3-01 已完成）
 
-`teamcraft/api/` 提供后续 Query/Command 路由将挂载其上的已完成 HTTP 安全壳。目前尚无业务路由。服务默认绑定 `127.0.0.1:8765`；除非显式传入 `--allow-non-loopback`，其他绑定一律拒绝：
+`teamcraft/api/` 是 Query（M3-02）、SSE（M3-03）、Command（M3-04）路由共同挂载的 HTTP 安全壳，所有路由继承同一套 guards。服务默认绑定 `127.0.0.1:8765`；除非显式传入 `--allow-non-loopback`，其他绑定一律拒绝：
 
 ```bash
 pip install -e .
@@ -363,6 +363,20 @@ python3 -m teamcraft.api --project-root /path/to/project --print-token
 ```
 
 首次启动会在 `.teamcraft/api/session-token` 生成随机 session token（目录 `0700`、文件 `0600`）。除公开的健康/静态路径外，所有请求必须携带 `Authorization: Bearer <token>`；写方法还要求 `X-CSRF-Token: <token>`，且 `Origin` 需同源或在可重复传入的 `--origin` 白名单内。`GET /api/v1/health`、`/api/v1/health/live`、`/api/v1/health/ready` 无需 token 即可访问，并区分进程存活与依赖就绪：任一注册依赖为 `down` 或 `unknown` 时 readiness 返回 `503`；聚合状态对 down 使用 `degraded`，只有 unknown 而没有 down 时保留明确的 unknown 状态。`--rotate-token` 会更换当前 token（旧 token 立即失效）；经 `--static-root` 提供的静态资源被限制在该目录内（拒绝路径穿越、symlink 越界、隐藏文件与目录浏览）。
+
+## Command API 与调度闸门（M3-04 — 已实现，经自动化测试验证）
+
+认证写入面（`teamcraft/api/command.py`，由 `python3 -m teamcraft.api` 挂载）暴露的 Task 生命周期与控制操作全部经既有 Core 服务执行——与 CLI 走完全相同的转换：
+
+- **Applied 操作**（`POST /api/v1/tasks`、`PATCH /api/v1/tasks/{id}`、依赖增删、`POST /api/v1/tasks/{id}/commands` 的 `pause`/`resume`/`cancel`（无占用 Attempt 时）/`retry`、`POST /api/v1/tasks/{id}/policy`、`POST /api/v1/scheduler/pause|resume`、`POST /api/v1/verifications/{id}/approvals`）返回 `200` 且 `execution: "applied"`：持久 Command 与状态转换在同一事务内 `confirmed`，每次写入都能沿 Command/Event 追溯。
+- **Recorded 操作**（取消被占用 Attempt、`wait`/`reconcile`、`POST /api/v1/ceo/commands` 手动 CEO Wake 请求）返回 `202`：只落盘带 TTL 的持久 Command 与审计事件，自身绝不发 Prompt、派工或 admit——由带 fencing 的 runtime 消费。排队的 `ceo.wake_request` 事件会在下一次 scheduler tick 被折叠为普通 Wake candidate；API 不可能造成 Wake 风暴。
+- **参与 Leader fencing 而非绕过：** retry/approval 档经正常协议取自身短租约（`teamcraft-api`）；当 live runtime Leader 持有 scope 时请求以 `409` 失败并带 `details.reason_code: "LEADER_BUSY"`（或 `"LEADER_STALE"`），且不写任何数据。Task 与 scheduler 的 pause/resume 完全不触碰 `leader_lease`。
+- **持久 gate（schema v15）：** `tasks.paused` 使任务离开 `ready_queue` 并被 `create_attempt` 硬拒（`TASK_PAUSED`）；`tasks.execution_policy_json` 持久化封闭策略集（`delivery` ∈ report_only/local_only/direct_pr/ship、`router`、`verifier`、`timeout_seconds` 1–3600、`max_attempts` ≥1，且 `max_attempts` 镜像到 dispatcher 实际执行的列）；`scheduler_controls` 在项目级延迟所有 NEW 派工（`scheduler_paused`），但不窃取租约。Task pause 的 CAS `version` bump 会使绑定旧证据的 PENDING command 自动过期。
+- **幂等与统一错误：** 所有写请求要求 `Idempotency-Key`；同 key + 完全相同内容以 `replayed: true` 重放同一 command id，内容不同则 `409` 冲突。错误统一为 `code/message/details/request_id` 结构，覆盖认证、校验、404、版本冲突、环检测与租约竞争。
+
+`teamctl` 对同一数据库以相同的幂等、版本、拒绝与无租约语义覆盖同一组操作：`create-task`、`edit-task`、`set-priority`、`add-dependency`、`remove-dependency`、`task-pause`、`task-resume`、`task-policy`、`scheduler-pause`、`scheduler-resume` 与 `wake-request`（recorded 档；多数另有 `task-*`/`dependency-*`/`ceo-*` 别名）。Command 审计事件全程可按项目追溯：项目级命令携带显式 `project_id` 证据戳（M3-04 起为允许的证据键），因此即便尚未存在 Task 绑定，每条 `command.submitted/claimed/confirmed/expired` 事件都能经项目解析（见 `tests/test_teamctl.py` 与 `tests/test_api_m304.py`）。
+
+未声称的部分：delivery/router 策略的*执行*语义属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；尚无 Web UI（M3-05）；以上全部仅有自动化测试验证——本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
 
 ## 验证
 
@@ -377,6 +391,8 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 
 仓库套件现有 468 项测试（同日），其中安装器 25 项覆盖首次/重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则与 `teamcraft` Skill 新入口，包边界 8 项覆盖 ID、UTC Clock、错误、配置加载和无导入副作用，M3-01 API 安全测试 73 项，其余覆盖存储、迁移、领域状态、事件/Command、Leader fencing、Scheduler、Brief/WorkerReport、Watcher、Recovery、Verification/Approval、Wake、CEO 协议/初始化与 Herdr Adapter。上述本地运行使用 Python 3.13.14，全部通过，退出码 0；lint 与本机 loopback HTTP 冒烟也通过。CI 已改为在两条矩阵腿的核心测试前安装 `.[test]`，但本工作树尚未运行 GitHub Actions。
 
+截至 2026-11-10，仓库套件为 638 项测试——在此前 468 项基线之上新增 M3-02 Query API、M3-03 SSE 断线恢复、67 项 M3-04 Command API 定向测试（`tests/test_api_m304.py`）与 18 项 teamctl CLI 对等与解析器健壮性测试（`tests/test_teamctl.py`）——本地 `python3 -m pytest tests/ -q` 全部通过（2026-11-10 最终运行：638 passed，115 subtests passed，退出码 0）。teamctl 解析器对 Core 版本容错：`--help` 基于规范 Core 常量构建（对 pre-M3-04 离线包回退到封闭集合），需要 v15 API 的命令会以可操作的 reinstall 提示失败，而非 AttributeError。本工作树更早一次运行曾因沙箱 socket 限制使 M3-03 的 uvicorn 测试无法绑定 `127.0.0.1:0`（`[Errno 1] Operation not permitted`）；这些测试未做任何改动即在 2026-11-10 运行中通过，故记录为环境限制而非代码缺陷。
+
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 
 ## 当前边界
@@ -386,7 +402,7 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
-- 已完成的 M3-01 本地 API 安全壳（`teamcraft/api/`）默认仅绑 loopback，带 bearer token、Origin/CSRF、请求关联、健康与静态路径限制等 guards，但目前只有脚手架路由；M3-02/M3-04 落地前没有业务 API。
+- M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复与 M3-04 Command API 均已实现且仅经自动化测试验证：尚无 Web UI（M3-05）；delivery/router 策略的*执行*属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
 - CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
 - 把 Skill 用到其他项目时，需要一并部署角色配置，并按目标机器调整 provider、模型和权限路径。

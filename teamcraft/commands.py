@@ -86,7 +86,11 @@ MAX_COMMAND_NOTE_BYTES = 1024
 MAX_TTL_SECONDS = 30 * 24 * 60 * 60
 
 _EVIDENCE_ALLOWED_KEYS = frozenset(
-    {"task_id", "task_version", "attempt_id", "attempt_no", "digest"}
+    {"task_id", "task_version", "attempt_id", "attempt_no", "digest",
+     # M3-04: project-scoped commands (creates, scheduler gates, manual CEO
+     # requests) carry an explicit project stamp so their Command/Event audit
+     # is project-traceable even before/unless a Task binding exists.
+     "project_id"}
 )
 
 
@@ -202,6 +206,11 @@ def _validate_evidence(evidence_json: str) -> str:
         number = evidence["attempt_no"]
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise ValidationError("evidence attempt_no must be an integer >= 1")
+    if "project_id" in evidence:
+        project = evidence["project_id"]
+        if not isinstance(project, str) or not project.strip():
+            raise ValidationError(
+                "evidence project_id must be a non-empty string")
     if "digest" in evidence and (
         not isinstance(evidence["digest"], str) or not evidence["digest"].strip()
         or len(evidence["digest"]) > 128
@@ -355,22 +364,33 @@ def _evidence_staleness(
 def _associate(conn: TeamCraftConnection, evidence_json: str) -> tuple[str | None, str | None]:
     """Resolve (project_id, task_id) for events from the evidence binding.
 
-    A binding whose Task row does not (or no longer) exists resolves to
-    (None, None) — the events table enforces the foreign key, and the
-    command row itself still records the (possibly vanished) binding for
-    audit.
+    An explicit ``project_id`` in the evidence wins (M3-04: project-scoped
+    commands such as creates, scheduler gates, and manual CEO requests have
+    no Task binding yet — their Command/Event audit must still be traceable
+    through the project).  Otherwise the Task row's project is used.
+    A binding whose Task row does not (or no longer) exists and carries no
+    project resolves to (None, None) — the events table enforces the foreign
+    key, and the command row itself still records the (possibly vanished)
+    binding for audit.
     """
 
     evidence = json.loads(evidence_json)
+    explicit = evidence.get("project_id") if isinstance(evidence, dict) else None
     task_id = evidence.get("task_id") if isinstance(evidence, dict) else None
-    if task_id is None:
+    if task_id is not None:
+        row = conn.execute(
+            "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row[0]), str(task_id)
+        # task vanished (or not yet created): fall back to the explicit
+        # project stamp so the audit trail is never orphaned.
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit, None
         return None, None
-    row = conn.execute(
-        "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return None, None
-    return str(row[0]), str(task_id)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit, None
+    return None, None
 
 
 # ---------------------------------------------------------------------------

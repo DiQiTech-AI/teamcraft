@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..query import QueryService
+from .command import CommandService, build_command_router
 from .config import ApiConfig
 from .errors import (
     INTERNAL_ERROR,
@@ -99,6 +100,7 @@ def create_app(
     static_root: str | os.PathLike[str] | None = None,
     query_service: QueryService | None = None,
     event_stream_config: SseConfig | None = None,
+    command_service: CommandService | None = None,
 ) -> FastAPI:
     """Build the guarded API application.
 
@@ -117,6 +119,11 @@ def create_app(
         event_stream_config: transport bounds for the M3-03 SSE stream
             (poll cadence, heartbeats, backfill/connection/frame caps); the
             :class:`~teamcraft.api.stream.SseConfig` defaults apply otherwise.
+        command_service: when provided, the M3-04 controlled Command routes
+            are mounted on this same app (inheriting every guard) so writes
+            enforce ``Idempotency-Key`` + Task/evidence versions and execute
+            only through existing Core services (never a direct prompt,
+            dispatch, Wake delivery, or Leader touch).
     """
 
     resolved_config = (config or ApiConfig()).validate()
@@ -160,6 +167,14 @@ def create_app(
         except Exception:  # pragma: no cover - defensive for probes path
             return ()
 
+    def _response_secrets() -> tuple[str, ...]:
+        """Current token plus rotated predecessors held by the redactor."""
+
+        try:
+            return tuple(redactor.secrets | {store.ensure()})
+        except Exception:  # pragma: no cover - defensive for stores
+            return ()
+
     register_health_routes(app, registry, secret_provider=_secret_provider)
     register_static_routes(app, static_root)
 
@@ -195,6 +210,19 @@ def create_app(
             build_query_router(
                 query_service,
                 secret_provider=_stream_secrets,
+            )
+        )
+
+    if command_service is not None:
+        # M3-04 Command routes ride the same guards (auth/CSRF/Origin/
+        # request-id) by being mounted on this app; every write additionally
+        # requires Idempotency-Key and executes only through existing Core
+        # services (see teamcraft/api/command.py for the operation map).
+        app.state.command_service = command_service
+        app.include_router(
+            build_command_router(
+                command_service,
+                secret_provider=_response_secrets,
             )
         )
 

@@ -3,22 +3,28 @@
 This subpackage owns the HTTP boundary: transport-level security
 (loopback-only default binding, local session tokens, Origin/CSRF checks,
 request correlation, a uniform error model, static-file path confinement,
-process-vs-dependency health) plus the M3-02 read-only Query routes and the
-M3-03 read-only SSE stream over the durable SQLite ``events.seq``.  Both are
-mounted only when a :class:`teamcraft.query.QueryService` is supplied to
-``create_app``, and they are mounted on the same app instance so they inherit
-the guards; Command routes arrive in M3-04.
+process-vs-dependency health) plus the M3-02 read-only Query routes, the
+M3-03 read-only SSE stream over the durable SQLite ``events.seq``, and the
+M3-04 controlled Command routes.  Query/SSE mount when a
+:class:`teamcraft.query.QueryService` is supplied to ``create_app`` and
+Command routes when a :class:`teamcraft.api.command.CommandService` is
+supplied; both mount on the same app instance so they inherit the guards.
+M3-04 writes enforce ``Idempotency-Key`` + Task/evidence versions through the
+M1-05 Command Service and Core domain/recovery/verification calls, never
+prompting, dispatching, delivering a Wake, or touching the Leader lease.
 
 Importing this package has no filesystem or network side effects; token files
 are created only when a :class:`SessionTokenStore` with a path is explicitly
 asked to ``ensure()`` a token, or when the server is started via
-``teamcraft.api.serve``.  Constructing a ``QueryService`` touches nothing on
-disk either — reads (REST and SSE alike) open strict ``mode=ro`` connections
-lazily, and the stream never mutates state, enqueues a Wake or dispatches.
+``teamcraft.api.serve``.  Constructing a ``QueryService`` or
+``CommandService`` touches nothing on disk either — reads open strict
+``mode=ro`` connections lazily, writes open gated connections per request,
+and the stream never mutates state, enqueues a Wake or dispatches.
 """
 
 from ..query import QueryService, QueryUnavailableError
 from .app import create_app
+from .command import CommandService, build_command_router
 from .config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -63,6 +69,7 @@ __all__ = [
     "STATUS_UNKNOWN",
     "ApiConfig",
     "ApiError",
+    "CommandService",
     "DependencyHealth",
     "DependencyStatus",
     "HealthRegistry",
@@ -74,6 +81,7 @@ __all__ = [
     "StaticPathError",
     "StreamConnectionLimiter",
     "aggregate_status",
+    "build_command_router",
     "build_events_router",
     "build_query_router",
     "create_app",

@@ -192,7 +192,7 @@ def _shed_v6_m203_artifacts(conn: sqlite3.Connection) -> None:
 
 
 def _shed_v8_m206_artifacts(conn: sqlite3.Connection) -> None:
-    """Strip schema-v8/v9 additions from fixtures claiming schema v1-v7."""
+    """Strip schema-v8..v15 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     for index in storage._V8_INDEXES:
@@ -215,6 +215,14 @@ def _shed_v8_m206_artifacts(conn: sqlite3.Connection) -> None:
     init_columns = {row[1] for row in conn.execute("PRAGMA table_info(ceo_initializations)")}
     if "receipt_source" in init_columns:
         conn.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
+    # M3-04 (v15): honest pre-v15 fixtures also shed the dispatch gate —
+    # scheduler_controls plus the additive tasks columns (the migrator
+    # refuses later-step artifacts under an older claimed version).
+    conn.execute("DROP TABLE IF EXISTS scheduler_controls")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    for column in ("paused", "execution_policy_json"):
+        if column in task_columns:
+            conn.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
 
 # P-fixes 10: backup_database/restore_backup are live public API again —
 # copies happen in a private 0700 staging file, are verified there, and the
@@ -271,6 +279,8 @@ EXPECTED_TABLES = {
     "ceo_initializations",
     # M2-09 schema v10 durable Wake inbox.
     "wake_cursors", "wakes", "wake_events",
+    # M3-04 schema v15 durable scheduler dispatch control plane.
+    "scheduler_controls",
     # SQLite-internal table materialised by the AUTOINCREMENT DDL of
     # events.seq (M1-05); it appears in sqlite_master from schema creation on.
     "sqlite_sequence",
@@ -3797,6 +3807,48 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         report = migrate_to_head(self.db)
         self.assertTrue(report.fresh)
 
+    def test_upgrade_refuses_preexisting_v15_columns_under_older_claim(self) -> None:
+        """M3-04: additive-column steps get the same half-state refusal as tables.
+
+        A database claiming v14 that still carries the v15 ``tasks.paused`` /
+        ``tasks.execution_policy_json`` columns is exactly as corrupt as one
+        holding a stray later-step TABLE: the v15 ALTER would die with
+        "duplicate column".  The migrator must refuse the upgrade verbatim
+        instead of adopting or rewriting anything.
+        """
+        raw = sqlite3.connect(str(self.db))
+        try:
+            raw.execute("PRAGMA busy_timeout=5000")
+            raw.execute("DROP TABLE IF EXISTS scheduler_controls")
+            raw.execute("DELETE FROM schema_migrations WHERE version > 14")
+            raw.execute("PRAGMA user_version=14")
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises(MigrationError) as ctx:
+            migrate_to_head(self.db)
+        message = str(ctx.exception)
+        self.assertIn("later-step columns already present", message)
+        self.assertIn("tasks.paused", message)
+        self.assertIn("tasks.execution_policy_json", message)
+        # refusal modified nothing: still claiming v14, columns untouched.
+        info = verify_database(self.db)
+        self.assertTrue(info["ok"])
+        self.assertEqual(info["user_version"], 14)
+        # an honest v14 (columns shed too) upgrades cleanly afterwards.
+        raw = sqlite3.connect(str(self.db))
+        try:
+            columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
+            for column in ("paused", "execution_policy_json"):
+                if column in columns:
+                    raw.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
+            raw.commit()
+        finally:
+            raw.close()
+        report = migrate_to_head(self.db)
+        self.assertEqual((report.from_version, report.to_version),
+                         (14, storage.SCHEMA_VERSION))
+
     def _drop_v2_table(self, *, back_to_v1: bool = False) -> None:
         """Fixture construction via RAW sqlite: after fix 1 the public
         transaction gate correctly refuses to open against an inconsistent
@@ -3882,7 +3934,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertEqual(lagging["missing_version_tables"], [])
         self.assertEqual(lagging["missing_head_tables"],
                          ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
-                          "prompt_deliveries", "runtime_meta", "task_dependencies",
+                          "prompt_deliveries", "runtime_meta", "scheduler_controls", "task_dependencies",
                           "verification_configs", "verifications", "wake_cursors",
                           "wake_events", "wakes", "worker_reports"])
 

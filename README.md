@@ -59,7 +59,7 @@ flowchart TD
 - Herdr CLI installed and commands run from a Herdr pane, with `HERDR_ENV=1` and `HERDR_SOCKET_PATH` available.
 - At least one Herdr-supported agent harness with its executable on `PATH`.
 - OpenCode and a working model provider when using the bundled OpenCode role profiles.
-- Optional: `fastapi` and `uvicorn` only if you want to run the completed M3-01 local API security shell (`teamcraft/api/`; no business routes yet).
+- Optional: `fastapi` and `uvicorn` only if you want to run the local API (`teamcraft/api/` — the M3-01 security shell with the implemented M3-02 query, M3-03 SSE, and M3-04 command routes).
 
 The example configuration in this repository uses a local oMLX service:
 
@@ -343,7 +343,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 │   └── tests/test_teamctl.py    # Regression tests
 ├── .opencode/agents/            # CEO, CTO, developer, designer, tester, and custom profiles
 ├── teamcraft/                    # Python core boundaries (storage, domain, scheduler, watcher, verification, wake)
-│   └── api/                    # Completed M3-01 API security shell (scaffold routes only)
+│   └── api/                    # M3-01 security shell with M3-02 query, M3-03 SSE, and M3-04 command routes
 ├── pyproject.toml                # Package metadata; Python 3.10+ boundary; API dependencies
 ├── examples/team-demo/          # Live collaboration example
 ├── scripts/install.sh           # Project-local installer
@@ -355,7 +355,7 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 
 ## Local API security shell (M3-01 complete)
 
-`teamcraft/api/` provides the completed HTTP security shell that later Query/Command routes will mount on. It has no business routes yet. The server binds `127.0.0.1:8765` by default and refuses any other bind unless you pass `--allow-non-loopback`:
+`teamcraft/api/` is the HTTP surface that the Query (M3-02), SSE (M3-03), and Command (M3-04) routers mount on, so every route inherits the same guards. The server binds `127.0.0.1:8765` by default and refuses any other bind unless you pass `--allow-non-loopback`:
 
 ```bash
 pip install -e .
@@ -363,6 +363,20 @@ python3 -m teamcraft.api --project-root /path/to/project --print-token
 ```
 
 On first start it writes a random session token to `.teamcraft/api/session-token` (directory `0700`, file `0600`). Requests outside the public health/static paths require `Authorization: Bearer <token>`, and write methods additionally require `X-CSRF-Token: <token>` plus a same-origin `Origin` (or one listed via repeatable `--origin`). `GET /api/v1/health`, `/api/v1/health/live`, and `/api/v1/health/ready` answer without a token, distinguishing process liveness from dependency readiness. Readiness returns `503` when any registered dependency is `down` or `unknown`; the aggregate reports `degraded` for down dependencies and preserves an explicit unknown state when no dependency is down but at least one remains unknown. `--rotate-token` replaces the active token (old tokens stop verifying immediately), and static assets served via `--static-root` are confined to that directory (traversal, symlink escape, hidden files, and directory browsing are rejected).
+
+## Command API and dispatch gates (M3-04 — implemented, automated-verified)
+
+The authenticated write surface (`teamcraft/api/command.py`, mounted by `python3 -m teamcraft.api`) exposes Task lifecycle and control operations that execute exclusively through the existing Core services — the same transitions the CLI runs:
+
+- **Applied operations** (`POST /api/v1/tasks`, `PATCH /api/v1/tasks/{id}`, dependency add/remove, `POST /api/v1/tasks/{id}/commands` with `pause`/`resume`/`cancel`(no live attempt)/`retry`, `POST /api/v1/tasks/{id}/policy`, `POST /api/v1/scheduler/pause|resume`, `POST /api/v1/verifications/{id}/approvals`) return `200` with `execution: "applied"`: the durable Command is `confirmed` in the same transaction that ran the transition, and every write is traceable through Command/Event rows.
+- **Recorded operations** (`cancel` of an occupied attempt, `wait`/`reconcile`, and `POST /api/v1/ceo/commands` manual CEO wake requests) return `202`: they persist a durable, TTL-bounded Command plus its audit event and never prompt, dispatch, or admit anything themselves — a fenced runtime consumes them. A queued `ceo.wake_request` event is folded into an ordinary Wake candidate by the next scheduler tick; the API can never fan out a Wake storm.
+- **Leader participation, not bypass:** the retry/approval tier acquires its own short lease (`teamcraft-api`) through the normal fencing protocol; while a live runtime Leader holds the scope the request fails `409` with `details.reason_code: "LEADER_BUSY"` (or `"LEADER_STALE"`) and writes nothing. Task pause/resume and scheduler pause/resume never touch `leader_lease` at all.
+- **Durable gating (schema v15):** `tasks.paused` hides a task from `ready_queue` and hard-refuses `create_attempt` (`TASK_PAUSED`); `tasks.execution_policy_json` persists the closed policy set (`delivery` ∈ report_only/local_only/direct_pr/ship, `router`, `verifier`, `timeout_seconds` 1–3600, `max_attempts` ≥1, with `max_attempts` mirrored onto the enforced column); `scheduler_controls` defers all NEW dispatch project-wide (`scheduler_paused`) without stealing leases. A task pause CAS-bumps `version`, which auto-expires PENDING commands bound to stale evidence.
+- **Idempotency and uniform errors:** every write requires `Idempotency-Key`; same key + identical content replays with `replayed: true` and the same command id, different content conflicts `409`. Errors share one body shape (`code/message/details/request_id`) across auth, validation, 404, version conflicts, cycles, and lease contention.
+
+`teamctl` covers the same operations against the same database with the same idempotency, version, refusal, and lease-free semantics: `create-task`, `edit-task`, `set-priority`, `add-dependency`, `remove-dependency`, `task-pause`, `task-resume`, `task-policy`, `scheduler-pause`, `scheduler-resume`, and `wake-request` (recorded tier; several have `task-*`/`dependency-*`/`ceo-*` aliases). Command audit events are project-traceable end to end: project-scoped commands carry an explicit `project_id` evidence stamp (an allowed evidence key since M3-04), so every `command.submitted/claimed/confirmed/expired` event resolves through the project even before a Task binding exists (see `tests/test_teamctl.py` and `tests/test_api_m304.py`).
+
+Not claimed: delivery/router policy *execution* semantics belong to M4; occupied-attempt cancellation is recorded but performed by the fenced runtime executor; there is no Web UI yet (M3-05); everything above is verified by automated tests only — live browser/E2E and GitHub Actions runs against this tree have not been performed.
 
 ## Verification
 
@@ -377,6 +391,8 @@ The Skill suite (89 tests on 2026-11-08) covers state recovery, concurrent owner
 
 The repository suite (468 tests on the same date) covers the installer — 25 tests for first/repeat installs, configuration preservation, conflicts, dry runs, paths with spaces, symbolic links, Git ignore rules, and the `teamcraft` Skill entry — 8 tests for the Python package's ID, UTC clock, error, configuration, and side-effect-free import boundaries, 73 focused M3-01 API security tests, and the remaining core tests for storage, migrations, domain state, events/commands, leader fencing, the scheduler, briefs/WorkerReports, the watcher, recovery, verification/approval, the wake dispatcher, CEO protocol/initialization, and the Herdr adapter. The recorded local run used Python 3.13.14 and passed with exit code 0; lint checks and a live loopback HTTP smoke also passed. CI now installs `.[test]` before running the core suite on both matrix legs, but GitHub Actions has not yet run against this working tree.
 
+As of 2026-11-10 the repository suite is 638 tests — added since the earlier 468-test baseline are the M3-02 query API, M3-03 SSE reconnect-recovery, 67 focused M3-04 command-API tests (`tests/test_api_m304.py`), and 18 teamctl CLI parity and parser-robustness tests (`tests/test_teamctl.py`) — and `python3 -m pytest tests/ -q` passes locally (638 passed, 115 subtests passed, exit code 0 on the 2026-11-10 final run). The teamctl parser is core-version-tolerant: `--help` builds against canonical Core constants (or a closed fallback for pre-M3-04 offline bundles), and commands requiring v15 APIs fail with an actionable reinstall hint rather than an AttributeError. One earlier run of this tree hit sandbox socket restrictions that made the M3-03 uvicorn tests fail to bind `127.0.0.1:0` (`[Errno 1] Operation not permitted`); those tests passed unchanged in the 2026-11-10 run, so they are recorded as an environment limitation, not a code failure.
+
 The project has also completed one live OpenCode workflow: the CEO created a developer and a read-only tester, the developer generated [`examples/team-demo/index.html`](examples/team-demo/index.html), and the tester completed acceptance. During that run, the CEO's final polling loop did not converge on its own; the controlling agent stopped the loop manually and completed archival. See [`PROGRESS.md`](PROGRESS.md) for the detailed record.
 
 ## Current limits
@@ -386,7 +402,7 @@ The project has also completed one live OpenCode workflow: the CEO created a dev
 - Both `idle` and `done` can indicate a completed, settled task; do not wait only for `done`.
 - `unknown` means the live state could not be verified and must not be treated as completion.
 - Ownership provides team coordination, not a security sandbox.
-- The completed M3-01 local API security shell (`teamcraft/api/`) is loopback-by-default with bearer-token, Origin/CSRF, request-correlation, health, and static-path guards, but still has scaffold routes only. There is no business API until M3-02/M3-04 land.
+- The M3-01 security shell, M3-02 query API, M3-03 SSE resume, and M3-04 command API are implemented and verified by automated tests only: there is no Web UI yet (M3-05), delivery/router policy *execution* belongs to M4, occupied-attempt cancellation is recorded durably but carried out by the fenced runtime executor, and no live browser/E2E or GitHub Actions run has been performed against this working tree.
 - Trusted-host receipts for CEO bootstrap, and real-Herdr wake delivery/restart recovery/identity-drift, are deferred and remain unverified; offline/mock regressions do not substitute for them.
 - Use a new member name for a new task after completing or releasing a member. Historical task archival and member reuse are not implemented.
 - Installing the skill into another project also requires the role profiles, with provider, model, and permission paths adjusted for the target machine.

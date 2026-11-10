@@ -112,7 +112,7 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -887,6 +887,31 @@ _V14_STATEMENTS = (
 #: Ordered migration ladder: version -> DDL statements executed to reach it
 #: from the immediately preceding version.  New entries are appended by
 #: later milestones; entries are never edited or removed (forward-only).
+#:
+#: M3-04 (v15): durable task pause flag + per-task execution policy, and the
+#: scheduler dispatch control plane.  ``tasks.paused`` gates reservation at
+#: the domain boundary (``create_attempt`` refuses) and ``ready_queue`` hides
+#: paused tasks; ``scheduler_controls`` is consulted by every planning
+#: snapshot, so a pause halts NEW dispatch project-wide without ever
+#: touching the Leader lease (fencing stays owned by :mod:`teamcraft.leader`).
+_V15_TABLES = frozenset({"scheduler_controls"})
+_V15_COLUMNS = {"tasks": frozenset({"paused", "execution_policy_json"})}
+_V15_TRIGGERS = frozenset()
+_V15_STATEMENTS = (
+    "ALTER TABLE tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0 "
+    "CHECK (paused IN (0,1))",
+    "ALTER TABLE tasks ADD COLUMN execution_policy_json TEXT NOT NULL "
+    "DEFAULT '{}'",
+    """CREATE TABLE scheduler_controls (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1)),
+  actor TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+  updated_at TEXT NOT NULL
+)""",
+)
+
 _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
@@ -902,6 +927,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (12, _V12_STATEMENTS),
     (13, _V13_STATEMENTS),
     (14, _V14_STATEMENTS),
+    (15, _V15_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -921,6 +947,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     11: frozenset(),
     12: frozenset(),
     13: frozenset(),
+    15: _V15_TABLES,
 }
 
 
@@ -928,7 +955,7 @@ def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
     return (_V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES
-            | _V8_TABLES | _V9_TABLES | _V10_TABLES)
+            | _V8_TABLES | _V9_TABLES | _V10_TABLES | _V15_TABLES)
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -1022,6 +1049,7 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     12: (_V12_TRIGGERS, frozenset()),
     13: (_V13_TRIGGERS, frozenset()),
     14: (_V14_TRIGGERS, frozenset()),
+    15: (_V15_TRIGGERS, frozenset()),
 }
 
 
@@ -1043,9 +1071,22 @@ def _required_objects_for(version: int) -> tuple[frozenset[str], frozenset[str]]
     return triggers, indexes
 
 
+#: Additive-column steps: columns each migration step introduces WITHOUT a
+#: new table.  One source of truth for both "required at version X" checks
+#: and the "later-step columns must not pre-exist" upgrade refusal (M3-04).
+_COLUMNS_BY_VERSION: dict[int, dict[str, frozenset[str]]] = {
+    7: _V7_COLUMNS,
+    9: _V9_COLUMNS,
+    10: _V10_COLUMNS,
+    11: _V11_COLUMNS,
+    14: _V14_COLUMNS,
+    15: _V15_COLUMNS,
+}
+
+
 def _required_columns_for(version: int) -> dict[str, frozenset[str]]:
     """Required additive columns for an audited schema version."""
-    return {table: columns for step, mapping in ((7, _V7_COLUMNS), (9, _V9_COLUMNS), (10, _V10_COLUMNS), (11, _V11_COLUMNS), (14, _V14_COLUMNS))
+    return {table: columns for step, mapping in _COLUMNS_BY_VERSION.items()
             if step <= version for table, columns in mapping.items()}
 
 
@@ -1066,6 +1107,22 @@ def _missing_required_columns(conn: sqlite3.Connection, version: int) -> tuple[s
             ddl = "" if ddl_row is None or ddl_row[0] is None else str(ddl_row[0])
             if not re.search(r"CHECK\s*\(\s*[`\"\[]?max_attempts[`\"\]]?\s*>=\s*1\s*\)", ddl, re.IGNORECASE):
                 missing.append("tasks.max_attempts:check")
+        if table == "tasks" and "paused" in rows:
+            column = rows["paused"]
+            if str(column[2]).upper() != "INTEGER":
+                missing.append("tasks.paused:type")
+            if int(column[3]) != 1:
+                missing.append("tasks.paused:not_null")
+            if str(column[4]).strip("'\"") != "0":
+                missing.append("tasks.paused:default")
+        if table == "tasks" and "execution_policy_json" in rows:
+            column = rows["execution_policy_json"]
+            if str(column[2]).upper() != "TEXT":
+                missing.append("tasks.execution_policy_json:type")
+            if int(column[3]) != 1:
+                missing.append("tasks.execution_policy_json:not_null")
+            if str(column[4]).strip("'\"") != "{}":
+                missing.append("tasks.execution_policy_json:default")
     return tuple(missing)
 
 
@@ -2463,6 +2520,35 @@ def migrate_to_head(
                             f"cannot upgrade from schema version {user_version}: "
                             f"later-step tables already present: {sorted(overlap)}; "
                             "refusing to continue"
+                        )
+                    # M3-04: the same half-applied refusal for ADDITIVE
+                    # COLUMNS (v7/v9/v10/v11/v14/v15 add columns without new
+                    # tables).  A column owned by a later step surviving under
+                    # an older claimed version is exactly as much a corrupt
+                    # intermediate state as a stray table would be, and the
+                    # step's ALTER would die with "duplicate column"; refuse
+                    # instead so nothing is silently adopted or rewritten.
+                    column_overlap: set[str] = set()
+                    for step, mapping in _COLUMNS_BY_VERSION.items():
+                        if not user_version < step <= SCHEMA_VERSION:
+                            continue
+                        for table, columns in mapping.items():
+                            existing_columns = {
+                                str(row[1])
+                                for row in inner.execute(
+                                    f"PRAGMA table_info({table})"
+                                ).fetchall()
+                            }
+                            column_overlap |= {
+                                f"{table}.{column}"
+                                for column in sorted(columns)
+                                if column in existing_columns
+                            }
+                    if column_overlap:
+                        raise MigrationError(
+                            f"cannot upgrade from schema version {user_version}: "
+                            f"later-step columns already present: "
+                            f"{sorted(column_overlap)}; refusing to continue"
                         )
                     applied_upgrade: tuple[int, ...] = ()
                     for version, statements in _MIGRATION_STEPS:

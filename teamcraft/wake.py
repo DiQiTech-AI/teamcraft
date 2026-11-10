@@ -408,7 +408,10 @@ def admit_pending_wake(
             idempotency_key=f"wake:{project_id}:{item.id}:send:v1",
             kind="ceo.wake",
             payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            evidence_json="{}",
+            # M3-04 traceability: project-stamped so the wake Command's audit
+            # events resolve through the project even without a Task binding.
+            evidence_json=json.dumps({"project_id": project_id},
+                                    sort_keys=True, separators=(",", ":")),
             clock=clock,
         )
         command = submission.command
@@ -762,3 +765,90 @@ def mark_processed(
         updated = conn.execute(f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=?", (wake_id,)).fetchone()
         assert updated is not None
         return _row_wake(updated)
+
+
+#: M3-04: default horizon after which an unconsumed manual CEO request is
+#: swept to ``expired`` (TTL) instead of lingering invisibly forever.
+MANUAL_WAKE_REQUEST_TTL_SECONDS = 24 * 3600
+
+
+def request_ceo_attention(
+    conn: TeamCraftConnection,
+    project_id: str,
+    *,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    target_ceo_name: str = "ceo",
+    task_id: str | None = None,
+    task_version: int | None = None,
+    ttl_seconds: int = MANUAL_WAKE_REQUEST_TTL_SECONDS,
+    clock: Clock | None = None,
+) -> tuple[commands.Command, bool]:
+    """Queue a durable manual "ask the CEO to look at this" request.
+
+    This records intent ONLY:
+
+    * one durable ``ceo.wake_request`` Command (idempotency key + bounded
+      TTL, so the request is always visible and can never stay pending
+      forever — the scheduler sweep expires it if the runtime is absent);
+    * one ``ceo.wake_requested`` Event linked to the project (and Task when
+      bound).  The event kind deliberately is NOT on the ingestion ignore
+      list, so the next fenced scheduler tick folds it into an ordinary
+      merged Wake candidate under M2-09's dedupe/window rules — that is the
+      ONLY path to prompt delivery, and it lives exclusively behind the
+      Leader lease plus CEO initialization gates.
+
+    This function never admits, sends, or resumes anything.
+    """
+
+    target = _validate_target(target_ceo_name)
+    if (not isinstance(actor, str) or not actor.strip()
+            or not isinstance(reason, str) or not reason.strip()):
+        raise ValidationError("actor and reason are required")
+    evidence: dict = {"project_id": project_id}
+    if task_id is not None:
+        task = domain.get_task(conn, task_id)
+        if task.project_id != project_id:
+            raise ValidationError("bound task does not belong to this project")
+        evidence = {"project_id": project_id,
+                   "task_id": task.id, "task_version": task_version}
+    payload = {
+        "action": "request_processing",
+        "project_id": project_id,
+        "target_ceo_name": target,
+        "actor": actor.strip(),
+        "reason": reason.strip(),
+        "task_id": task_id,
+        "task_version": task_version,
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+    evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"))
+
+    def _body(conn: TeamCraftConnection) -> tuple[commands.Command, bool]:
+        domain.get_project(conn, project_id)  # uniform NotFound first
+        submission = commands.submit_command(
+            conn, idempotency_key=idempotency_key, kind="ceo.wake_request",
+            payload_json=body, evidence_json=evidence_json,
+            ttl_seconds=ttl_seconds, clock=clock,
+        )
+        if not submission.reused:
+            events.append_event(
+                conn, "ceo.wake_requested", project_id=project_id,
+                task_id=task_id,
+                payload_json=json.dumps({
+                    "command_id": submission.command.id,
+                    "target_ceo_name": target,
+                    "actor": actor.strip(), "reason": reason.strip(),
+                    "task_id": task_id, "task_version": task_version,
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                clock=clock,
+            )
+        return submission.command, submission.reused
+
+    if conn.in_transaction:
+        return _body(conn)
+    with transaction(conn):
+        return _body(conn)

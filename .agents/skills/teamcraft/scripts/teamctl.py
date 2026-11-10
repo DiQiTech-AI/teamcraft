@@ -59,9 +59,12 @@ def _bootstrap_core() -> None:
 
 _bootstrap_core()
 
+from teamcraft import commands as _commands  # noqa: E402
+from teamcraft import domain as _domain  # noqa: E402
 from teamcraft import leader as _leader  # noqa: E402
 from teamcraft import recovery as _recovery  # noqa: E402
 from teamcraft import runtime_adapter as _adapter  # noqa: E402
+from teamcraft import scheduler as _scheduler  # noqa: E402
 from teamcraft import verification as _verification  # noqa: E402
 from teamcraft import ceo_initialization as _ceo_initialization  # noqa: E402
 from teamcraft import fresh_start as _fresh_start  # noqa: E402
@@ -2738,6 +2741,526 @@ def recovery_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dump(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _task_lifecycle(args: argparse.Namespace, action: str) -> int:
+    """task-pause / task-resume: the API applied tier, CLI side.
+
+    Mirrors POST /api/v1/tasks/{id}/commands (pause/resume) exactly: one
+    transaction runs submit -> claim -> :func:`teamcraft.domain.pause_task`/
+    :func:`teamcraft.domain.resume_task` -> confirm under the same durable
+    Command kind (task.pause/task.resume).  Version and lifecycle gates live
+    in Core (single enforcement point); a replay of the same key + identical
+    content returns the stored result and applies nothing again.  These
+    transitions never touch the Leader lease — neither does the API.
+    """
+
+    if args.expected_version < 0:
+        raise TeamctlError("expected_version must be >= 0")
+    if not args.actor.strip() or not args.reason.strip():
+        raise TeamctlError("actor and reason must not be blank")
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        with _storage.transaction(conn):
+            kind = "task.pause" if action == "pause" else "task.resume"
+            try:
+                submission = _commands.submit_command(
+                    conn, idempotency_key=args.idempotency_key, kind=kind,
+                    payload_json=_dump({"action": action, "task_id": args.task_id,
+                        "task_version": args.expected_version,
+                        "actor": args.actor, "reason": args.reason}),
+                    evidence_json=_dump({"task_id": args.task_id,
+                        "task_version": args.expected_version}),
+                )
+                command = submission.command
+                if submission.reused:
+                    stored = json.loads(command.result_json or "{}")
+                    stored.update({"task_id": args.task_id,
+                        "command_id": command.id, "kind": kind,
+                        "state": command.state,
+                        "execution": "applied", "replayed": True})
+                    print(json.dumps(stored, sort_keys=True))
+                    return 0
+                _commands.claim_command(conn, command.id)
+                if action == "pause":
+                    updated = _domain.pause_task(conn, args.task_id,
+                        expected_version=args.expected_version,
+                        actor=args.actor, reason=args.reason)
+                else:
+                    updated = _domain.resume_task(conn, args.task_id,
+                        expected_version=args.expected_version,
+                        actor=args.actor, reason=args.reason)
+                command = _commands.confirm_command(conn, command.id,
+                    result_json=_dump({"task_id": updated.id,
+                        "status": updated.status,
+                        "paused": bool(updated.paused),
+                        "version": updated.version}))
+            except _CoreError as exc:
+                # surface Core's machine-readable reason code too, mirroring
+                # the API error body's details.reason_code
+                reason = getattr(exc, "reason_code", None)
+                raise TeamctlError(
+                    f"{exc} ({reason})" if reason else str(exc)) from exc
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": updated.id, "status": updated.status,
+        "paused": bool(updated.paused), "version": updated.version,
+        "command_id": command.id, "kind": kind, "state": command.state,
+        "execution": "applied", "replayed": False}, sort_keys=True))
+    return 0
+
+
+#: Canonical delivery modes fallback.  The single source of truth remains
+#: ``teamcraft.domain.DELIVERY_MODES``; this copy exists only so parser
+#: construction never hard-crashes when an offline bundle predates that
+#: constant (an older, v14-era ``scripts/core`` copy).  Handlers guard on the
+#: real Core capabilities before they touch any M3-04 API.
+_DELIVERY_MODES_FALLBACK = ("direct_pr", "local_only", "report_only", "ship")
+
+
+def _delivery_choices() -> tuple[str, ...]:
+    """argparse choices for --delivery: Core constant when present, else fallback."""
+
+    modes = getattr(_domain, "DELIVERY_MODES", None)
+    if modes is None:
+        return _DELIVERY_MODES_FALLBACK
+    return tuple(sorted(modes))
+
+
+def _require_m304_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M3-04 APIs.
+
+    ``_bootstrap_core`` may resolve an installed package or the offline
+    bundled copy shipped by ``install.sh``; if that copy is stale (schema v14)
+    the M3-04 transitions simply are not there.  A clear actionable error beats
+    an AttributeError mid-command, and parser construction stays independent of
+    this guard so ``--help`` always works.
+    """
+
+    missing = sorted(
+        name for name in (
+            "pause_task", "resume_task", "set_execution_policy",
+            "add_dependency", "remove_dependency",
+            "pause_schedule", "resume_schedule", "request_ceo_attention",
+        )
+        if not hasattr(_domain, name) and not hasattr(_scheduler, name)
+        and not hasattr(_wake, name)
+    )
+    if missing:
+        raise TeamctlError(
+            "the resolved TeamCraft core is too old for these commands (missing:"
+            f" {', '.join(missing)}); refresh the offline bundle with"
+            " `bash scripts/install.sh` or install the canonical core with"
+            " `pip install -e .`"
+        )
+
+
+def task_pause(args: argparse.Namespace) -> int:
+    _require_m304_core()
+    return _task_lifecycle(args, "pause")
+
+
+def task_resume(args: argparse.Namespace) -> int:
+    _require_m304_core()
+    return _task_lifecycle(args, "resume")
+
+
+def task_policy(args: argparse.Namespace) -> int:
+    """task-policy: same applied tier as POST /api/v1/tasks/{id}/policy.
+
+    Kind task.policy_update; Core's :func:`teamcraft.domain.set_execution_policy`
+    is the single enforcement point for the closed key set and value ranges,
+    mirrors max_attempts onto the enforced column, and CAS-bumps the Task
+    (which auto-expires stale bound commands).
+    """
+
+    _require_m304_core()
+    policy = {}
+    for name, value in (("delivery", args.delivery), ("router", args.router),
+            ("verifier", args.verifier),
+            ("timeout_seconds", args.timeout_seconds),
+            ("max_attempts", args.max_attempts)):
+        if value is not None:
+            policy[name] = value
+    if not policy:
+        raise TeamctlError(
+            "task-policy needs at least one of --delivery/--router/--verifier/"
+            "--timeout-seconds/--max-attempts")
+    if args.expected_version < 0:
+        raise TeamctlError("expected_version must be >= 0")
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        with _storage.transaction(conn):
+            try:
+                submission = _commands.submit_command(
+                    conn, idempotency_key=args.idempotency_key,
+                    kind="task.policy_update",
+                    payload_json=_dump({"action": "update_execution_policy",
+                        "task_id": args.task_id,
+                        "task_version": args.expected_version,
+                        "policy": policy}),
+                    evidence_json=_dump({"task_id": args.task_id,
+                        "task_version": args.expected_version}),
+                )
+                command = submission.command
+                if submission.reused:
+                    stored = json.loads(command.result_json or "{}")
+                    stored.update({"task_id": args.task_id,
+                        "command_id": command.id, "kind": "task.policy_update",
+                        "state": command.state,
+                        "execution": "applied", "replayed": True})
+                    print(json.dumps(stored, sort_keys=True))
+                    return 0
+                _commands.claim_command(conn, command.id)
+                updated = _domain.set_execution_policy(conn, args.task_id,
+                    expected_version=args.expected_version, policy=policy)
+                merged = json.loads(updated.execution_policy_json or "{}")
+                command = _commands.confirm_command(conn, command.id,
+                    result_json=_dump({"task_id": updated.id,
+                        "version": updated.version, "policy": merged}))
+            except _CoreError as exc:
+                raise TeamctlError(str(exc)) from exc
+    finally:
+        conn.close()
+    print(json.dumps({"task_id": updated.id, "status": updated.status,
+        "version": updated.version, "policy": merged, "command_id": command.id,
+        "kind": "task.policy_update", "state": command.state,
+        "execution": "applied", "replayed": False}, sort_keys=True))
+    return 0
+
+
+def _scheduler_control(args: argparse.Namespace, *, paused: bool) -> int:
+    """scheduler-pause / scheduler-resume: durable dispatch gate, lease-free.
+
+    Delegates wholesale to :func:`teamcraft.scheduler.pause_schedule`/
+    :func:`teamcraft.scheduler.resume_schedule` — the same core entry points
+    the API's /scheduler/pause|resume routes call: one transaction writes the
+    Command (scheduler.pause/scheduler.resume) + control row + linked event.
+    The Leader lease table is neither read nor written; pausing withholds NEW
+    dispatch decisions only.
+    """
+
+    if not args.actor.strip() or not args.reason.strip():
+        raise TeamctlError("actor and reason must not be blank")
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = store.ensure_project()
+    conn = store._connect()
+    try:
+        control = (_scheduler.pause_schedule if paused
+                   else _scheduler.resume_schedule)
+        try:
+            state, command, replayed = control(conn, project_id,
+                actor=args.actor, reason=args.reason,
+                idempotency_key=args.idempotency_key)
+        except _CoreError as exc:
+            raise TeamctlError(str(exc)) from exc
+    finally:
+        conn.close()
+    print(json.dumps({"project_id": project_id, "paused": bool(state["paused"]),
+        "version": state["version"], "command_id": command.id,
+        "kind": command.kind, "state": command.state,
+        "execution": "applied", "replayed": replayed}, sort_keys=True))
+    return 0
+
+
+def scheduler_pause(args: argparse.Namespace) -> int:
+    _require_m304_core()
+    return _scheduler_control(args, paused=True)
+
+
+def scheduler_resume(args: argparse.Namespace) -> int:
+    _require_m304_core()
+    return _scheduler_control(args, paused=False)
+
+
+def _task_fields(task: Any) -> dict[str, Any]:
+    """Flat CLI view of a Task — the same facts the API task DTO carries."""
+
+    return {"task_id": task.id, "project_id": task.project_id,
+        "title": task.title, "status": task.status, "version": task.version,
+        "priority": task.priority, "kind": task.kind, "risk": task.risk,
+        "max_attempts": task.max_attempts, "paused": bool(task.paused)}
+
+
+def _core_error(exc: _CoreError) -> TeamctlError:
+    reason = getattr(exc, "reason_code", None)
+    return TeamctlError(f"{exc} ({reason})" if reason else str(exc))
+
+
+def create_task(args: argparse.Namespace) -> int:
+    """create-task: same conversion as POST /api/v1/tasks.
+
+    One transaction: submit task.create (project-stamped evidence) -> claim ->
+    domain.create_task -> dependencies (atomic with creation) -> confirm.
+    Replay of the same key + identical content returns the stored result.
+    """
+
+    if not args.title.strip():
+        raise TeamctlError("title must not be blank")
+    _require_m304_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = args.project_id or store.ensure_project()
+    ownership = list(args.ownership or [])
+    for claim in ownership:
+        try:
+            _scheduler._normalize_claim(claim)
+        except ValueError as exc:
+            raise TeamctlError(f"invalid ownership claim {claim!r}: {exc}") from exc
+    dependencies = list(dict.fromkeys(args.depends_on or []))
+    acceptance = list(args.acceptance or [])
+    conn = store._connect()
+    try:
+        with _storage.transaction(conn):
+            try:
+                _domain.get_project(conn, project_id)  # existence first (API 404)
+                submission = _commands.submit_command(
+                    conn, idempotency_key=args.idempotency_key, kind="task.create",
+                    payload_json=_dump({"action": "create_task",
+                        "project_id": project_id, "title": args.title,
+                        "description": args.description or "",
+                        "kind": args.kind, "priority": args.priority,
+                        "risk": args.risk, "max_attempts": args.max_attempts,
+                        "acceptance": acceptance, "ownership": ownership,
+                        "dependencies": dependencies}),
+                    evidence_json=_dump({"project_id": project_id}),
+                )
+                command = submission.command
+                if submission.reused:
+                    out = {"command_id": command.id, "kind": "task.create",
+                        "state": command.state, "execution": "applied",
+                        "replayed": True}
+                    stored = json.loads(command.result_json or "{}")
+                    created_id = stored.get("task_id")
+                    if isinstance(created_id, str):
+                        live = _domain.get_task(conn, created_id)
+                        out["task"] = _task_fields(live)
+                        out["dependencies"] = _domain.dependencies_of(
+                            conn, created_id)
+                    print(json.dumps(out, sort_keys=True))
+                    return 0
+                _commands.claim_command(conn, command.id)
+                task = _domain.create_task(conn, project_id, args.title,
+                    description=args.description or "", kind=args.kind,
+                    priority=args.priority,
+                    acceptance_json=_dump(acceptance),
+                    ownership_json=_dump(ownership), risk=args.risk,
+                    max_attempts=args.max_attempts)
+                for dep_id in dependencies:
+                    live = _domain.get_task(conn, task.id)
+                    _domain.add_dependency(conn, task.id, dep_id,
+                                          expected_version=live.version)
+                    task = _domain.get_task(conn, task.id)
+                command = _commands.confirm_command(conn, command.id,
+                    result_json=_dump({"task_id": task.id,
+                                      "version": task.version}))
+                out = {"task": _task_fields(task),
+                    "dependencies": _domain.dependencies_of(conn, task.id),
+                    "command_id": command.id, "kind": "task.create",
+                    "state": command.state, "execution": "applied",
+                    "replayed": False}
+            except _CoreError as exc:
+                raise _core_error(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def edit_task(args: argparse.Namespace, *, priority_only: bool = False) -> int:
+    """edit-task / set-priority: same conversion as PATCH /api/v1/tasks/{id}.
+
+    kind task.update; Core's domain.update_task is the CAS and editability
+    enforcement point; the confirmed result carries previous/current versions
+    (the version bump auto-expires PENDING commands bound to old evidence).
+    """
+
+    fields: dict[str, Any] = {}
+    if not priority_only:
+        if args.title is not None:
+            fields["title"] = args.title
+        if args.description is not None:
+            fields["description"] = args.description
+        if args.risk is not None:
+            fields["risk"] = args.risk
+    if args.priority is not None:
+        fields["priority"] = args.priority
+    if not fields:
+        raise TeamctlError(
+            "edit needs at least one of --title/--description/--priority/--risk")
+    _require_m304_core()
+    conn_store = StateStore(resolve_project_root(args.cwd))
+    conn = conn_store._connect()
+    try:
+        with _storage.transaction(conn):
+            try:
+                submission = _commands.submit_command(
+                    conn, idempotency_key=args.idempotency_key,
+                    kind="task.update",
+                    payload_json=_dump({"action": "edit_task",
+                        "task_id": args.task_id,
+                        "task_version": args.expected_version, **fields}),
+                    evidence_json=_dump({"task_id": args.task_id,
+                        "task_version": args.expected_version}),
+                )
+                command = submission.command
+                if submission.reused:
+                    out = {"command_id": command.id, "kind": "task.update",
+                        "state": command.state, "execution": "applied",
+                        "replayed": True}
+                    stored = json.loads(command.result_json or "{}")
+                    edited_id = stored.get("task_id")
+                    if isinstance(edited_id, str):
+                        out["task"] = _task_fields(
+                            _domain.get_task(conn, edited_id))
+                        if "version" in stored:
+                            out["evidence"] = {
+                                "previous_version": stored.get("previous_version"),
+                                "version": stored.get("version")}
+                    print(json.dumps(out, sort_keys=True))
+                    return 0
+                _commands.claim_command(conn, command.id)
+                before = _domain.get_task(conn, args.task_id)
+                updated = _domain.update_task(conn, args.task_id,
+                    expected_version=args.expected_version, **fields)
+                command = _commands.confirm_command(conn, command.id,
+                    result_json=_dump({"task_id": updated.id,
+                        "version": updated.version,
+                        "previous_version": before.version}))
+                out = {"task": _task_fields(updated),
+                    "evidence": {"previous_version": before.version,
+                        "version": updated.version},
+                    "command_id": command.id, "kind": "task.update",
+                    "state": command.state, "execution": "applied",
+                    "replayed": False}
+            except _CoreError as exc:
+                raise _core_error(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def set_priority(args: argparse.Namespace) -> int:
+    return edit_task(args, priority_only=True)
+
+
+def _dependency_change(args: argparse.Namespace, *, add: bool) -> int:
+    """add-dependency / remove-dependency: same conversion as the API routes.
+
+    Kinds task.dependency_add/remove; domain enforces version CAS, editable
+    statuses, self/cycle refusal (with the concrete closed cycle path), and
+    bumps the owning Task version so DAG churn is never invisible.
+    """
+
+    kind = "task.dependency_add" if add else "task.dependency_remove"
+    _require_m304_core()
+    conn_store = StateStore(resolve_project_root(args.cwd))
+    conn = conn_store._connect()
+    try:
+        with _storage.transaction(conn):
+            try:
+                submission = _commands.submit_command(
+                    conn, idempotency_key=args.idempotency_key, kind=kind,
+                    payload_json=_dump({"action": kind.split(".")[-1],
+                        "task_id": args.task_id,
+                        "depends_on_id": args.depends_on_id,
+                        "task_version": args.expected_version}),
+                    evidence_json=_dump({"task_id": args.task_id,
+                        "task_version": args.expected_version}),
+                )
+                command = submission.command
+                if submission.reused:
+                    stored = json.loads(command.result_json or "{}")
+                    out = {"task_id": args.task_id,
+                        "depends_on_id": args.depends_on_id,
+                        "added" if add else "removed": stored.get(
+                            "added" if add else "removed"),
+                        "task": _task_fields(
+                            _domain.get_task(conn, args.task_id)),
+                        "command_id": command.id, "kind": kind,
+                        "state": command.state, "execution": "applied",
+                        "replayed": True}
+                    print(json.dumps(out, sort_keys=True))
+                    return 0
+                _commands.claim_command(conn, command.id)
+                if add:
+                    changed = _domain.add_dependency(conn, args.task_id,
+                        args.depends_on_id,
+                        expected_version=args.expected_version)
+                else:
+                    changed = _domain.remove_dependency(conn, args.task_id,
+                        args.depends_on_id,
+                        expected_version=args.expected_version)
+                updated = _domain.get_task(conn, args.task_id)
+                command = _commands.confirm_command(conn, command.id,
+                    result_json=_dump({
+                        "added" if add else "removed": changed,
+                        "version": updated.version}))
+                out = {"task_id": args.task_id,
+                    "depends_on_id": args.depends_on_id,
+                    "added" if add else "removed": changed,
+                    "task": _task_fields(updated), "command_id": command.id,
+                    "kind": kind, "state": command.state,
+                    "execution": "applied", "replayed": False}
+            except _CoreError as exc:
+                raise _core_error(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def add_dependency(args: argparse.Namespace) -> int:
+    return _dependency_change(args, add=True)
+
+
+def remove_dependency(args: argparse.Namespace) -> int:
+    return _dependency_change(args, add=False)
+
+
+def wake_request(args: argparse.Namespace) -> int:
+    """wake-request: same conversion as POST /api/v1/ceo/commands (recorded).
+
+    Delegates to :func:`teamcraft.wake.request_ceo_attention`: one durable
+    TTL-bounded ceo.wake_request Command + one linked ceo.wake_requested
+    event. Queues intent only — never admits, prompts, or dispatches; the
+    next fenced scheduler tick folds the event into an ordinary Wake
+    candidate.
+    """
+
+    if not args.actor.strip() or not args.reason.strip():
+        raise TeamctlError("actor and reason must not be blank")
+    if (args.task_id is None) != (args.expected_task_version is None):
+        raise TeamctlError(
+            "--task-id and --expected-task-version must be provided together")
+    _require_m304_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = args.project_id or store.ensure_project()
+    conn = store._connect()
+    try:
+        try:
+            command, replayed = _wake.request_ceo_attention(
+                conn, project_id, actor=args.actor, reason=args.reason,
+                idempotency_key=args.idempotency_key,
+                target_ceo_name=args.target_ceo_name or "ceo",
+                task_id=args.task_id,
+                task_version=args.expected_task_version)
+        except _CoreError as exc:
+            raise _core_error(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps({"project_id": project_id,
+        "task_id": args.task_id, "command_id": command.id,
+        "kind": command.kind, "state": command.state,
+        "expires_at": command.expires_at, "execution": "queued",
+        "replayed": replayed}, sort_keys=True))
+    return 0
+
+
 def verification_configure(args: argparse.Namespace) -> int:
     store = StateStore(resolve_project_root(args.cwd))
     project_id = store.ensure_project()
@@ -3262,6 +3785,115 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--reason", required=True)
     retry_parser.add_argument("--idempotency-key", required=True)
     retry_parser.set_defaults(handler=recovery_retry)
+
+    # M3-04 CLI/API parity: task lifecycle + policy + dispatch gate, routed
+    # through the same Core transitions the /api/v1 routes apply.
+    for lifecycle_name, lifecycle_handler in (
+        ("task-pause", task_pause), ("task-resume", task_resume),
+    ):
+        lifecycle_parser = commands.add_parser(lifecycle_name)
+        add_cwd(lifecycle_parser)
+        lifecycle_parser.add_argument("--task-id", required=True)
+        lifecycle_parser.add_argument("--expected-version", required=True, type=int)
+        lifecycle_parser.add_argument("--actor", required=True)
+        lifecycle_parser.add_argument("--reason", required=True)
+        lifecycle_parser.add_argument("--idempotency-key", required=True)
+        lifecycle_parser.set_defaults(handler=lifecycle_handler)
+
+    policy_parser = commands.add_parser("task-policy")
+    add_cwd(policy_parser)
+    policy_parser.add_argument("--task-id", required=True)
+    policy_parser.add_argument("--expected-version", required=True, type=int)
+    policy_parser.add_argument("--delivery",
+        choices=_delivery_choices())
+    policy_parser.add_argument("--router")
+    policy_parser.add_argument("--verifier")
+    policy_parser.add_argument("--timeout-seconds", type=int)
+    policy_parser.add_argument("--max-attempts", type=int)
+    policy_parser.add_argument("--idempotency-key", required=True)
+    policy_parser.set_defaults(handler=task_policy)
+
+    for gate_name, gate_handler in (
+        ("scheduler-pause", scheduler_pause), ("scheduler-resume", scheduler_resume),
+    ):
+        gate_parser = commands.add_parser(gate_name)
+        add_cwd(gate_parser)
+        gate_parser.add_argument("--actor", required=True)
+        gate_parser.add_argument("--reason", required=True)
+        gate_parser.add_argument("--idempotency-key", required=True)
+        gate_parser.set_defaults(handler=gate_handler)
+
+    # M3-04 CLI/API parity, part 2: task CRUD, dependencies, priority, and the
+    # manual CEO wake request — same Core conversions as the API routes.
+    create_parser = commands.add_parser("create-task", aliases=["task-create"])
+    add_cwd(create_parser)
+    create_parser.add_argument("--project-id",
+        help="defaults to this root's Project row")
+    create_parser.add_argument("--title", required=True)
+    create_parser.add_argument("--description", default="")
+    create_parser.add_argument("--kind", default="ship")
+    create_parser.add_argument("--priority", type=int, default=50)
+    create_parser.add_argument("--risk", default="normal")
+    create_parser.add_argument("--max-attempts", type=int, default=3)
+    create_parser.add_argument("--acceptance", action="append", default=[],
+        metavar="ITEM")
+    create_parser.add_argument("--ownership", action="append", default=[],
+        metavar="PATH_OR_GLOB")
+    create_parser.add_argument("--depends-on", action="append", default=[],
+        metavar="TASK_ID")
+    create_parser.add_argument("--idempotency-key", required=True)
+    create_parser.set_defaults(handler=create_task)
+
+    edit_parser = commands.add_parser("edit-task", aliases=["task-edit"])
+    add_cwd(edit_parser)
+    edit_parser.add_argument("--task-id", required=True)
+    edit_parser.add_argument("--expected-version", required=True, type=int)
+    edit_parser.add_argument("--title")
+    edit_parser.add_argument("--description")
+    edit_parser.add_argument("--priority", type=int)
+    edit_parser.add_argument("--risk")
+    edit_parser.add_argument("--idempotency-key", required=True)
+    edit_parser.set_defaults(handler=edit_task)
+
+    priority_parser = commands.add_parser("set-priority",
+        aliases=["task-priority"])
+    add_cwd(priority_parser)
+    priority_parser.add_argument("--task-id", required=True)
+    priority_parser.add_argument("--expected-version", required=True, type=int)
+    priority_parser.add_argument("--priority", required=True, type=int)
+    priority_parser.add_argument("--idempotency-key", required=True)
+    priority_parser.set_defaults(handler=set_priority)
+
+    dep_add_parser = commands.add_parser("add-dependency",
+        aliases=["dependency-add"])
+    add_cwd(dep_add_parser)
+    dep_add_parser.add_argument("--task-id", required=True)
+    dep_add_parser.add_argument("--depends-on-id", required=True)
+    dep_add_parser.add_argument("--expected-version", required=True, type=int)
+    dep_add_parser.add_argument("--idempotency-key", required=True)
+    dep_add_parser.set_defaults(handler=add_dependency)
+
+    dep_rm_parser = commands.add_parser("remove-dependency",
+        aliases=["dependency-remove"])
+    add_cwd(dep_rm_parser)
+    dep_rm_parser.add_argument("--task-id", required=True)
+    dep_rm_parser.add_argument("--depends-on-id", required=True)
+    dep_rm_parser.add_argument("--expected-version", required=True, type=int)
+    dep_rm_parser.add_argument("--idempotency-key", required=True)
+    dep_rm_parser.set_defaults(handler=remove_dependency)
+
+    wake_req_parser = commands.add_parser("wake-request",
+        aliases=["ceo-wake-request"])
+    add_cwd(wake_req_parser)
+    wake_req_parser.add_argument("--project-id",
+        help="defaults to this root's Project row")
+    wake_req_parser.add_argument("--actor", required=True)
+    wake_req_parser.add_argument("--reason", required=True)
+    wake_req_parser.add_argument("--target-ceo-name")
+    wake_req_parser.add_argument("--task-id")
+    wake_req_parser.add_argument("--expected-task-version", type=int)
+    wake_req_parser.add_argument("--idempotency-key", required=True)
+    wake_req_parser.set_defaults(handler=wake_request)
 
     wake_dispatch_parser = commands.add_parser("wake-dispatch")
     add_cwd(wake_dispatch_parser)

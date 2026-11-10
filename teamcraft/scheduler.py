@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import timezone
 from pathlib import PurePosixPath
 import unicodedata
 
-from . import ceo_initialization, domain, leader, recovery, wake
-from .clock import Clock
+from . import ceo_initialization, commands, domain, events, leader, recovery, wake
+from .clock import Clock, SystemClock
+from .ids import require_entity_id
 from .storage import TeamCraftConnection, transaction
 
 ACTIVE_MEMBER_PHASES = frozenset({
@@ -75,6 +77,168 @@ def release(
     """Release a Scheduler lease while retaining its epoch history."""
     return leader.release(conn, lease.scope, lease.holder_id,
                           epoch=lease.epoch, clock=clock)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch control plane (M3-04): durable pause/resume, Leader-fence-neutral
+# ---------------------------------------------------------------------------
+
+
+def _now_iso(clock: Clock | None) -> str:
+    clock = clock if clock is not None else SystemClock()
+    return clock.now().astimezone(timezone.utc).isoformat()
+
+
+def _canonical_json(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+
+
+def scheduler_state(
+    conn: TeamCraftConnection, project_id: str
+) -> dict | None:
+    """Current durable scheduler control state (``None`` = never touched).
+
+    Read-only and lease-free: pausing is a control-plane fact, observable by
+    any caller without contending with the Leader.
+    """
+
+    row = conn.execute(
+        "SELECT paused, actor, reason, version, updated_at FROM scheduler_controls"
+        " WHERE project_id = ?",
+        (require_entity_id(project_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "project_id": project_id,
+        "paused": bool(int(row[0])),
+        "actor": str(row[1]),
+        "reason": str(row[2]),
+        "version": int(row[3]),
+        "updated_at": str(row[4]),
+    }
+
+
+def scheduler_paused(conn: TeamCraftConnection, project_id: str) -> bool:
+    state = scheduler_state(conn, project_id)
+    return bool(state and state["paused"])
+
+
+def _set_paused(
+    conn: TeamCraftConnection,
+    project_id: str,
+    *,
+    paused: bool,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    clock: Clock | None,
+) -> tuple[dict, commands.Command, bool]:
+    """One fenced-agnostic write unit: Command + control row + Event.
+
+    Ordering is deliberate: submit FIRST so a retry of the same key replays
+    even if the control row already flipped; a fresh submit then claims,
+    upserts the durable flag, emits the linked event and confirms — all in
+    the caller's transaction.  The ``leader_lease`` table is never touched:
+    pause withholds NEW dispatch decisions only; it cannot steal, release or
+    renew any Leader's fencing rights.
+    """
+
+    action = "pause" if paused else "resume"
+    project_id = require_entity_id(project_id)
+    now = _now_iso(clock)
+    submission = commands.submit_command(
+        conn,
+        idempotency_key=idempotency_key,
+        kind=f"scheduler.{action}",
+        payload_json=_canonical_json({
+            "action": action, "project_id": project_id,
+            "actor": actor, "reason": reason,
+        }),
+        # M3-04: project-stamped evidence so the Command's own audit events
+        # (submitted/claimed/confirmed) are project-traceable even though no
+        # Task is bound.
+        evidence_json=_canonical_json({"project_id": project_id}),
+        clock=clock,
+    )
+    command = submission.command
+    if submission.reused:
+        return (scheduler_state(conn, project_id)
+                or {"project_id": project_id, "paused": paused,
+                    "actor": actor, "reason": reason, "version": 0,
+                    "updated_at": now}), command, True
+    commands.claim_command(conn, command.id, clock=clock)
+    conn.execute(
+        "INSERT INTO scheduler_controls (project_id, paused, actor, reason,"
+        " version, updated_at) VALUES (?, ?, ?, ?, 1, ?)"
+        " ON CONFLICT(project_id) DO UPDATE SET paused = excluded.paused,"
+        " actor = excluded.actor, reason = excluded.reason,"
+        " version = scheduler_controls.version + 1,"
+        " updated_at = excluded.updated_at",
+        (project_id, 1 if paused else 0, actor, reason, now),
+    )
+    events.append_event(
+        conn, f"scheduler.{action}d", project_id=project_id,
+        payload_json=_canonical_json({
+            "project_id": project_id, "paused": paused,
+            "actor": actor, "reason": reason, "command_id": command.id,
+        }),
+        clock=clock,
+    )
+    state = scheduler_state(conn, project_id)
+    commands.confirm_command(
+        conn, command.id,
+        result_json=_canonical_json({"project_id": project_id,
+                                    "paused": paused}),
+        clock=clock,
+    )
+    # Reload so the returned DTO reflects the CONFIRMED row, not the
+    # pre-claim submit snapshot.
+    command = commands.get_command(conn, command.id)
+    return state, command, False
+
+
+def pause_schedule(
+    conn: TeamCraftConnection,
+    project_id: str,
+    *,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    clock: Clock | None = None,
+) -> tuple[dict, commands.Command, bool]:
+    """Durable project-level dispatch pause (returns state, command, replayed)."""
+
+    if conn.in_transaction:
+        return _set_paused(conn, project_id, paused=True, actor=actor,
+                          reason=reason, idempotency_key=idempotency_key,
+                          clock=clock)
+    with transaction(conn):
+        return _set_paused(conn, project_id, paused=True, actor=actor,
+                          reason=reason, idempotency_key=idempotency_key,
+                          clock=clock)
+
+
+def resume_schedule(
+    conn: TeamCraftConnection,
+    project_id: str,
+    *,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    clock: Clock | None = None,
+) -> tuple[dict, commands.Command, bool]:
+    """Durable project-level dispatch resume (returns state, command, replayed)."""
+
+    if conn.in_transaction:
+        return _set_paused(conn, project_id, paused=False, actor=actor,
+                          reason=reason, idempotency_key=idempotency_key,
+                          clock=clock)
+    with transaction(conn):
+        return _set_paused(conn, project_id, paused=False, actor=actor,
+                          reason=reason, idempotency_key=idempotency_key,
+                          clock=clock)
 
 
 def _normalize_claim(claim: str) -> str:
@@ -174,6 +338,13 @@ def _plan_snapshot(
     if not isinstance(concurrency_limit, int) or isinstance(concurrency_limit, bool) or concurrency_limit <= 0:
         raise ValueError("concurrency_limit must be a positive integer")
     queue = domain.ready_queue(conn, project_id)
+    # M3-04 dispatch gate: while the project's durable control row says
+    # paused, NO task is selected — every otherwise-ready task is deferred
+    # with an explicit reason so the pause is observable, not silent.
+    if scheduler_paused(conn, project_id):
+        return Plan(project_id, (),
+                    tuple(DeferredTask(task.id, "scheduler_paused")
+                          for task in queue))
     owners = _active_owners(conn, project_id)
     occupying = int(conn.execute(
         "SELECT COUNT(*) FROM attempts a JOIN tasks t ON t.id=a.task_id "
@@ -304,6 +475,12 @@ class Scheduler:
         # Event intake is a local SQLite operation and remains useful while
         # CEO execution is gated or busy.  It never sends a prompt; delivery
         # admission is a separate, M2-08-gated operation.
+        # Housekeeping (M3-04): PENDING commands whose TTL elapsed or whose
+        # bound evidence moved on are expired with audit events, so recorded
+        # intents can never linger invisibly forever.  Runs BEFORE wake
+        # intake so housekeeping holds even while initialization gates the
+        # rest of the tick.
+        commands.sweep_stale_commands(self.conn, clock=self.clock)
         wake.ingest_events(self.conn, self.project_id, lease, clock=self.clock)
         return dispatch_ready(
             self.conn, self.project_id, lease,

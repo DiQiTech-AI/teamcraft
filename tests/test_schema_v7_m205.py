@@ -38,6 +38,12 @@ class SchemaV7Tests(unittest.TestCase):
             if "receipt_source" in columns:
                 raw.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
             raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
+            # M3-04 (v15): honest v6 sheds the dispatch gate artifacts too.
+            raw.execute("DROP TABLE IF EXISTS scheduler_controls")
+            task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
+            for column in ("paused", "execution_policy_json"):
+                if column in task_columns:
+                    raw.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
             raw.execute("DELETE FROM schema_migrations WHERE version>6")
             raw.execute("PRAGMA user_version=6")
             raw.commit(); raw.close()

@@ -74,6 +74,7 @@ Hard invariants pinned by tests (``tests/test_domain_m104.py``):
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -127,6 +128,23 @@ TERMINAL_TASK_STATUSES = frozenset({"done", "cancelled", "failed"})
 #: this further with evidence invalidation; refusing in-flight edits early is
 #: the conservative default).
 DEPENDENCY_EDITABLE_STATUSES = frozenset({"pending", "ready", "blocked"})
+
+#: M3-04: statuses a controlled pause may settle from.  RUNNING/VERIFYING
+#: keep their in-flight Attempt; pausing mid-flight would strand the slot, so
+#: pause targets the dispatchable/held set only (cancel covers in-flight via
+#: the recovery request path).
+PAUSABLE_TASK_STATUSES = frozenset({"pending", "ready", "blocked"})
+
+#: M3-04 execution-policy surface (roadmap: delivery/router/verifier/
+#: timeout/max-attempt).  Values persist on the Task; the dispatch-affecting
+#: part (max_attempts) lands on the enforced column, the rest is durable
+#: configuration the M4 executors consume.
+EXECUTION_POLICY_KEYS = frozenset(
+    {"delivery", "router", "verifier", "timeout_seconds", "max_attempts"}
+)
+#: Mirrors PLAN's acceptance modes (report-only / local-only / direct-PR /
+#: ship); anything else is rejected before persistence.
+DELIVERY_MODES = frozenset({"report_only", "local_only", "direct_pr", "ship"})
 
 #: Attempt statuses (PLAN 5.2).  ``unknown`` is non-terminal: only a
 #: reconcile-class event may resolve it, and it keeps the occupying slot.
@@ -294,6 +312,13 @@ class Task:
     version: int
     created_at: str
     updated_at: str
+    #: M3-04 dispatch gate: a paused Task is hidden from ``ready_queue`` and
+    #: ``create_attempt`` refuses it (TASK_PAUSED) until resumed.
+    paused: bool = False
+    #: Canonical JSON object of the per-task execution policy (M3-04):
+    #: delivery/router/verifier/timeout_seconds/max_attempts requests that
+    #: persisted through the optimistic-CAS policy write.
+    execution_policy_json: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -397,7 +422,7 @@ def _row_to(row: Any, columns: tuple[str, ...]) -> dict[str, Any]:
 _TASK_COLUMNS = (
     "id", "project_id", "title", "description", "acceptance_json", "kind",
     "priority", "status", "risk", "ownership_json", "max_attempts", "version", "created_at",
-    "updated_at",
+    "updated_at", "paused", "execution_policy_json",
 )
 _ATTEMPT_COLUMNS = (
     "id", "task_id", "agent_id", "attempt_no", "status", "worktree_path",
@@ -1173,6 +1198,9 @@ def ready_queue(conn: TeamCraftConnection, project_id: str | None = None) -> lis
     require_head(conn)
     where = [
         "t.status = 'ready'",
+        # M3-04: a paused Task is not dispatchable — the queue never shows
+        # it and :func:`create_attempt` refuses it even if a caller insists.
+        "t.paused = 0",
         "NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on_id"
         " WHERE d.task_id = t.id AND p.status <> 'done')",
         "NOT EXISTS (SELECT 1 FROM attempts a WHERE a.task_id = t.id" + _OCCUPYING_SQL + ")",
@@ -1188,6 +1216,201 @@ def ready_queue(conn: TeamCraftConnection, project_id: str | None = None) -> lis
         params,
     ).fetchall()
     return [Task(**_row_to(row, _TASK_COLUMNS)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Task pause / resume / execution policy (M3-04 controlled transitions)
+# ---------------------------------------------------------------------------
+
+
+def _canonical_json(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+
+
+def _version_gate(task: Task, expected_version: int) -> None:
+    if task.version != expected_version:
+        raise VersionConflictError(
+            f"task {task.id} version conflict: expected {expected_version},"
+            f" found {task.version}",
+            entity_id=task.id,
+            expected=expected_version,
+            found=task.version,
+        )
+
+
+def pause_task(
+    conn: TeamCraftConnection,
+    task_id: str,
+    *,
+    expected_version: int,
+    actor: str = "",
+    reason: str = "",
+    clock: Clock | None = None,
+) -> Task:
+    """CAS-pause a dispatchable Task; the pause is durable and enforced.
+
+    Contract (M3-04 roadmap): pause never touches the Leader lease, bumps
+    ``version`` exactly once (so PENDING commands bound to the previous
+    evidence version expire through :func:`_cas_task`'s invalidation), emits
+    ``task.paused`` linked to project+task, and thereafter
+    :func:`ready_queue` hides the task while :func:`create_attempt` refuses
+    it with ``TASK_PAUSED`` regardless of what any caller cached.
+    """
+
+    require_head(conn)
+    task_id = require_entity_id(task_id)
+    now = _utc_iso(clock)
+    with _tx(conn):
+        task = _fetch_task(conn, task_id)
+        if bool(task.paused):
+            raise _illegal("task", task.status, "pause",
+                          reason="TASK_ALREADY_PAUSED")
+        if task.status not in PAUSABLE_TASK_STATUSES:
+            raise _illegal("task", task.status, "pause",
+                          reason="TASK_NOT_PAUSABLE")
+        _version_gate(task, expected_version)
+        updated = _cas_task(conn, task, expected_version=expected_version,
+                            now=now, paused=1)
+        events.append_event(
+            conn, "task.paused", project_id=task.project_id, task_id=task.id,
+            payload_json=_canonical_json({
+                "task_id": task.id, "version": updated.version,
+                "actor": actor, "reason": reason,
+            }),
+            clock=clock,
+        )
+        return updated
+
+
+def resume_task(
+    conn: TeamCraftConnection,
+    task_id: str,
+    *,
+    expected_version: int,
+    actor: str = "",
+    reason: str = "",
+    clock: Clock | None = None,
+) -> Task:
+    """CAS-unpause a paused Task, re-deriving READY from dependency facts.
+
+    The status a paused task *had* is not memorized in a second flag: on
+    resume the hard-dependency fact decides ``pending`` vs ``ready`` exactly
+    like :func:`recompute_ready`, so unpausing can never resurrect a stale
+    READY view.
+    """
+
+    require_head(conn)
+    task_id = require_entity_id(task_id)
+    now = _utc_iso(clock)
+    with _tx(conn):
+        task = _fetch_task(conn, task_id)
+        if not bool(task.paused):
+            raise _illegal("task", task.status, "resume",
+                          reason="TASK_NOT_PAUSED")
+        _version_gate(task, expected_version)
+        target: str | None = None
+        if task.status == "pending":
+            unfinished = int(conn.execute(
+                "SELECT COUNT(*) FROM task_dependencies d"
+                " JOIN tasks p ON p.id = d.depends_on_id"
+                " WHERE d.task_id = ? AND p.status <> 'done'",
+                (task.id,),
+            ).fetchone()[0])
+            if unfinished == 0:
+                target = "ready"
+        updated = _cas_task(conn, task, status=target,
+                            expected_version=expected_version, now=now,
+                            paused=0)
+        events.append_event(
+            conn, "task.resumed", project_id=task.project_id, task_id=task.id,
+            payload_json=_canonical_json({
+                "task_id": task.id, "version": updated.version,
+                "status": updated.status, "actor": actor, "reason": reason,
+            }),
+            clock=clock,
+        )
+        return updated
+
+
+def set_execution_policy(
+    conn: TeamCraftConnection,
+    task_id: str,
+    *,
+    expected_version: int,
+    policy: dict,
+    actor: str = "",
+    reason: str = "",
+    clock: Clock | None = None,
+) -> Task:
+    """Persist the per-task execution policy under optimistic versioning.
+
+    Keys are the closed M3-04 set (delivery/router/verifier/timeout_seconds/
+    max_attempts).  A successful write merges into
+    ``tasks.execution_policy_json``, CAS-bumps ``version`` (which expires any
+    PENDING command bound to the older evidence — policy changes are
+    critical edits), mirrors ``max_attempts`` onto the enforced column the
+    dispatcher already respects, and emits ``task.policy_updated``.
+    """
+
+    require_head(conn)
+    task_id = require_entity_id(task_id)
+    if not isinstance(policy, dict) or not policy:
+        raise ValidationError("execution policy must be a non-empty object")
+    unknown = sorted(set(policy) - set(EXECUTION_POLICY_KEYS))
+    if unknown:
+        raise ValidationError(
+            f"unknown execution-policy keys: {', '.join(unknown)}")
+    if "delivery" in policy and policy["delivery"] not in DELIVERY_MODES:
+        raise ValidationError(
+            "delivery must be one of "
+            + ", ".join(sorted(DELIVERY_MODES)))
+    for name in ("router", "verifier"):
+        if name in policy:
+            value = policy[name]
+            if (not isinstance(value, str) or not value.strip()
+                    or len(value.encode("utf-8")) > 256):
+                raise ValidationError(f"{name} must be a 1..256 byte string")
+    if "timeout_seconds" in policy:
+        value = policy["timeout_seconds"]
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or not 1 <= value <= 3600):
+            raise ValidationError("timeout_seconds must be 1..3600")
+    if "max_attempts" in policy:
+        value = policy["max_attempts"]
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 1):
+            raise ValidationError("max_attempts must be an integer >= 1")
+    now = _utc_iso(clock)
+    with _tx(conn):
+        task = _fetch_task(conn, task_id)
+        if task.status in TERMINAL_TASK_STATUSES:
+            raise _illegal("task", task.status, "update_execution_policy",
+                          reason="TASK_TERMINAL")
+        _version_gate(task, expected_version)
+        try:
+            merged = json.loads(task.execution_policy_json or "{}")
+        except (TypeError, ValueError):
+            merged = {}
+        if not isinstance(merged, dict):
+            merged = {}
+        merged.update(policy)
+        fields: dict[str, Any] = {"execution_policy_json": _canonical_json(merged)}
+        if "max_attempts" in policy:
+            fields["max_attempts"] = int(policy["max_attempts"])
+        updated = _cas_task(conn, task, expected_version=expected_version,
+                            now=now, **fields)
+        events.append_event(
+            conn, "task.policy_updated", project_id=task.project_id,
+            task_id=task.id,
+            payload_json=_canonical_json({
+                "task_id": task.id, "version": updated.version,
+                "policy": merged, "requested": dict(policy),
+                "actor": actor, "reason": reason,
+            }),
+            clock=clock,
+        )
+        return updated
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1493,12 @@ def create_attempt(
         task = _fetch_task(conn, task_id)
         targets = task_transition_targets(task.status, "dispatch_reserved", task.kind)
         _resolve_target("task", task.status, "dispatch_reserved", targets, None)
+        if bool(task.paused):
+            # M3-04 hard gate: pause is honored at the reservation boundary,
+            # not just in advisory queues, so no fenced caller can dispatch a
+            # paused Task regardless of what it saw earlier.
+            raise _illegal("task", task.status, "dispatch_reserved",
+                          reason="TASK_PAUSED")
         if task.version != expected_version:
             raise VersionConflictError(
                 f"task {task.id} version conflict: expected {expected_version},"
@@ -1436,8 +1665,11 @@ def _fetch_session(conn: TeamCraftConnection, session_id: str) -> SessionRecord:
 
 __all__ = [
     "ATTEMPT_STATUSES",
+    "DELIVERY_MODES",
     "DEPENDENCY_EDITABLE_STATUSES",
+    "EXECUTION_POLICY_KEYS",
     "OCCUPYING_ATTEMPT_STATUSES",
+    "PAUSABLE_TASK_STATUSES",
     "PRIORITY_MAX",
     "PRIORITY_MIN",
     "SESSION_STATES",
@@ -1462,10 +1694,13 @@ __all__ = [
     "list_tasks",
     "occupying_attempt",
     "observe_session",
+    "pause_task",
     "ready_queue",
     "recompute_ready",
     "register_session",
     "remove_dependency",
+    "resume_task",
+    "set_execution_policy",
     "require_head",
     "session_transition_targets",
     "task_transition_targets",
