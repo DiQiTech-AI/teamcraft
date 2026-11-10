@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>TeamCraft console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>TeamCraft console</h1>
+  <div class="auth">
+    <label for="token-input">Session token</label>
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false"
+           placeholder="paste the local session token">
+    <button id="token-save" type="button">Save</button>
+    <button id="token-forget" type="button">Forget</button>
+    <span id="conn-state" class="badge b-muted">server: unknown</span>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<nav id="nav" class="nav">
+  <button type="button" class="tab" data-view="overview">Overview</button>
+  <button type="button" class="tab" data-view="tasks">Tasks</button>
+  <button type="button" class="tab" data-view="agents">Agents</button>
+  <button type="button" class="tab" data-view="ceo">CEO</button>
+  <button type="button" class="tab" data-view="events">Events</button>
+  <button type="button" class="tab" data-view="wakes">Wakes</button>
+  <button type="button" class="tab" data-view="approvals">Approvals</button>
+  <button type="button" class="tab" data-view="verifications">Verifications</button>
+  <span class="spacer"></span>
+  <label for="project-select">Project</label>
+  <select id="project-select"></select>
+  <button id="refresh" type="button">Refresh</button>
+</nav>
+
+<main id="main">
+  <section id="gate">
+    <h2>Connect</h2>
+    <p>
+      This console talks only to the local TeamCraft API (Query M3-02, SSE
+      M3-03, Command M3-04). Paste the session token printed by
+      <code>teamcraft-api --print-token</code> above and press Save. The token
+      is kept only in this browser tab (sessionStorage) and is never written
+      to disk or to the URL by this page.
+    </p>
+    <p class="muted">
+      Closing this page does not pause anything: scheduling, tasks and wakes
+      live server-side and continue without any connected client.
+    </p>
+  </section>
+</main>
+
+<section class="logwrap">
+  <h2>Write activity</h2>
+  <div id="result-log" class="resultlog" aria-live="polite"></div>
+</section>
+
+<footer class="foot">
+  Real API only — every value on this page comes from
+  <code>/api/v1</code> responses. Values are rendered as text, never as
+  markup. Unknown values stay unknown; they are never shown as zero.
+</footer>
+
+<script src="app.js" defer></script>
+</body>
+</html>

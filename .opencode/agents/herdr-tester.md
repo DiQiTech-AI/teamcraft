@@ -23,6 +23,7 @@ permission:
     "head *": allow
     "tail *": allow
     "wc *": allow
+    "du -sh *": allow
     "grep *": allow
     "rg *": allow
     "sed -n *": allow
@@ -48,6 +49,7 @@ permission:
     "python3 -B -m unittest *": allow
     "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests": allow
     "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests *": allow
+    "node --check *": allow
   external_directory: deny
   webfetch: deny
   websearch: deny

@@ -31,3 +31,11 @@ teamcraft-api = "teamcraft.api.serve:main"
 
 [tool.setuptools.packages.find]
 include = ["teamcraft*"]
+
+# M3-05 minimal web console: the shell is a data directory (no __init__), so
+# the three bundled assets must be declared explicitly.  Without this the
+# console ships only with editable/source installs; wheel and sdist need the
+# package-data entry so teamcraft/api/serve.py's default WEB_ROOT resolves
+# inside site-packages after a packaged install.
+[tool.setuptools.package-data]
+teamcraft = ["api/web/index.html", "api/web/app.js", "api/web/style.css"]

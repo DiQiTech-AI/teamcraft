@@ -7,6 +7,12 @@
 
 plus the uniform error-model handlers, the public health surface, an optional
 confined static mount, and log redaction bound to the session token.
+When ``static_root`` points at the bundled M3-05 console
+(``teamcraft/api/web/``, served by default from ``serve``), the minimal web
+UI is reachable at ``/static/index.html`` through the exact same
+path-confinement as every other static asset; the console itself holds no
+data — it calls only the Query/SSE/Command routes below and keeps the
+session token in browser sessionStorage.
 
 The two ``/api/v1/ping`` / ``/api/v1/_probe`` routes are transport scaffolds
 used to exercise the guards end-to-end; M3-02/M3-04 replace them with real

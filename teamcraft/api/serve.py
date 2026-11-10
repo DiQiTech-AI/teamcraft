@@ -1,4 +1,4 @@
-"""Uvicorn entrypoint for the TeamCraft API (M3-01).
+"""Uvicorn entrypoint for the TeamCraft API (M3-01, M3-05 web console).
 
 CLI defaults are the safe ones: bind ``127.0.0.1`` on port 8765, persist the
 session token under the project ``.teamcraft`` runtime directory, and refuse a
@@ -9,6 +9,13 @@ non-loopback bind unless the operator passes ``--allow-non-loopback`` (PLAN
 (acceptance risk: "token save/rotation experience"): the token is printed once,
 on stdout, for the operator to hand to the CLI/UI; ``--rotate-token``
 invalidates the previous token before printing the replacement.
+
+M3-05: unless ``--static-root`` is given explicitly (or ``--no-web-ui``
+disables it), the server serves the bundled minimal console shipped at
+``teamcraft/api/web/`` through the SAME path-confinement as every static
+asset (:mod:`teamcraft.api.static`): the entrypoint is
+``http://127.0.0.1:8765/static/index.html``, the console itself contains no
+data, and every value it shows comes from the guarded ``/api/v1`` routes.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from ..errors import TeamCraftError
 from ..fresh_start import DATABASE_FILENAME
@@ -27,6 +35,9 @@ from .config import DEFAULT_HOST, DEFAULT_PORT, is_loopback_host, load_api_confi
 from .security import SessionTokenStore
 
 logger = logging.getLogger("teamcraft.api.serve")
+
+#: M3-05 bundled console directory (static shell only; no data, no tokens).
+WEB_ROOT = Path(__file__).resolve().parent / "web"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -60,7 +71,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--static-root",
         default=None,
-        help="directory served, path-confinement applied, under /static",
+        help="directory served, path-confinement applied, under /static "
+        "(default: the bundled M3-05 console in teamcraft/api/web)",
+    )
+    parser.add_argument(
+        "--no-web-ui",
+        action="store_true",
+        help="do not serve the bundled web console (no static root unless "
+        "--static-root is given)",
     )
     parser.add_argument(
         "--origin",
@@ -100,13 +118,22 @@ def make_server(
     import uvicorn
 
     args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    # M3-05: the bundled console is the default static root so the local UI
+    # is served through the same confined /static route as every other
+    # asset; an explicit --static-root overrides it, --no-web-ui turns it
+    # off entirely.  Nothing about the UI changes the security posture:
+    # /static/ stays public (no secrets, no state changes) and every value
+    # the console displays rides the authenticated /api/v1 routes.
+    static_root = args.static_root
+    if static_root is None and not args.no_web_ui and WEB_ROOT.is_dir():
+        static_root = str(WEB_ROOT)
     config = load_api_config(
         project_root=args.project_root,
         host=args.host,
         port=args.port,
         allow_non_loopback=args.allow_non_loopback,
         extra_origins=tuple(args.origin),
-        static_root=args.static_root,
+        static_root=static_root,
     )
 
     store = SessionTokenStore(config.token_file)
@@ -171,6 +198,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         server.config.port,
         is_loopback_host(server.config.host),
     )
+    if server.config.app.state.api_config.static_root is not None:
+        # M3-05 entrypoint hint (logged, never printed on the token line,
+        # so --print-token output stays a single clean value for tooling).
+        logger.info(
+            "web console: http://%s:%s/static/index.html (paste the "
+            "session token in the page; it is kept in this browser tab only)",
+            server.config.host,
+            server.config.port,
+        )
     try:
         server.run()
     except KeyboardInterrupt:  # pragma: no cover - interactive

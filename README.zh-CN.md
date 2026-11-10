@@ -59,7 +59,7 @@ flowchart TD
 - 已安装 Herdr CLI，并从 Herdr pane 内运行；环境中应有 `HERDR_ENV=1` 和 `HERDR_SOCKET_PATH`。
 - 至少一种 Herdr 支持的 Agent harness，其可执行文件需要位于 `PATH` 中。
 - 使用内置 OpenCode 角色时，需要安装 OpenCode，并准备可用的模型 provider。
-- 可选：仅当需要运行本地 API（`teamcraft/api/`：M3-01 安全壳，及已实现的 M3-02 Query、M3-03 SSE、M3-04 Command 路由）时，需要 `fastapi` 和 `uvicorn`。
+- 可选：仅当需要运行本地 API（`teamcraft/api/`：M3-01 安全壳，及已实现的 M3-02 Query、M3-03 SSE、M3-04 Command 路由与内置 M3-05 Web 控制台）时，需要 `fastapi` 和 `uvicorn`。
 
 仓库中的示例配置使用本地 oMLX：
 
@@ -343,8 +343,8 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 │   └── tests/test_teamctl.py    # 回归测试
 ├── .opencode/agents/            # CEO、CTO、研发、设计、测试和自定义角色
 ├── teamcraft/                    # Python Core 边界（存储、领域、Scheduler、Watcher、验证、Wake）
-│   └── api/                    # M3-01 安全壳，挂载 M3-02 Query、M3-03 SSE、M3-04 Command 路由
-├── pyproject.toml                # 包元数据、Python 3.10+ 边界与 API 依赖
+│   └── api/                    # M3-01 安全壳，挂载 M3-02 Query、M3-03 SSE、M3-04 Command 路由（api/web/ 内置 M3-05 Web 控制台）
+├── pyproject.toml                # 包元数据、Python 3.10+ 边界、API 依赖与随包分发的 Web 控制台资产
 ├── examples/team-demo/          # 实机协作示例
 ├── scripts/install.sh           # 项目本地安装脚本
 ├── opencode.example.json        # 可复制的 OpenCode/oMLX 示例配置
@@ -362,7 +362,7 @@ pip install -e .
 python3 -m teamcraft.api --project-root /path/to/project --print-token
 ```
 
-首次启动会在 `.teamcraft/api/session-token` 生成随机 session token（目录 `0700`、文件 `0600`）。除公开的健康/静态路径外，所有请求必须携带 `Authorization: Bearer <token>`；写方法还要求 `X-CSRF-Token: <token>`，且 `Origin` 需同源或在可重复传入的 `--origin` 白名单内。`GET /api/v1/health`、`/api/v1/health/live`、`/api/v1/health/ready` 无需 token 即可访问，并区分进程存活与依赖就绪：任一注册依赖为 `down` 或 `unknown` 时 readiness 返回 `503`；聚合状态对 down 使用 `degraded`，只有 unknown 而没有 down 时保留明确的 unknown 状态。`--rotate-token` 会更换当前 token（旧 token 立即失效）；经 `--static-root` 提供的静态资源被限制在该目录内（拒绝路径穿越、symlink 越界、隐藏文件与目录浏览）。
+首次启动会在 `.teamcraft/api/session-token` 生成随机 session token（目录 `0700`、文件 `0600`）。除公开的健康/静态路径外，所有请求必须携带 `Authorization: Bearer <token>`；写方法还要求 `X-CSRF-Token: <token>`，且 `Origin` 需同源或在可重复传入的 `--origin` 白名单内。`GET /api/v1/health`、`/api/v1/health/live`、`/api/v1/health/ready` 无需 token 即可访问，并区分进程存活与依赖就绪：任一注册依赖为 `down` 或 `unknown` 时 readiness 返回 `503`；聚合状态对 down 使用 `degraded`，只有 unknown 而没有 down 时保留明确的 unknown 状态。`--rotate-token` 会更换当前 token（旧 token 立即失效）；静态资源默认是内置的 M3-05 Web 控制台（可用 `--static-root` 覆盖目录，`--no-web-ui` 关闭控制台），一律被限制在对应目录内（拒绝路径穿越、symlink 越界、隐藏文件与目录浏览）。
 
 ## Command API 与调度闸门（M3-04 — 已实现，经自动化测试验证）
 
@@ -376,7 +376,26 @@ python3 -m teamcraft.api --project-root /path/to/project --print-token
 
 `teamctl` 对同一数据库以相同的幂等、版本、拒绝与无租约语义覆盖同一组操作：`create-task`、`edit-task`、`set-priority`、`add-dependency`、`remove-dependency`、`task-pause`、`task-resume`、`task-policy`、`scheduler-pause`、`scheduler-resume` 与 `wake-request`（recorded 档；多数另有 `task-*`/`dependency-*`/`ceo-*` 别名）。Command 审计事件全程可按项目追溯：项目级命令携带显式 `project_id` 证据戳（M3-04 起为允许的证据键），因此即便尚未存在 Task 绑定，每条 `command.submitted/claimed/confirmed/expired` 事件都能经项目解析（见 `tests/test_teamctl.py` 与 `tests/test_api_m304.py`）。
 
-未声称的部分：delivery/router 策略的*执行*语义属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；尚无 Web UI（M3-05）；以上全部仅有自动化测试验证——本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
+未声称的部分：delivery/router 策略的*执行*语义属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；以上全部仅有自动化测试验证——本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
+
+## Web 控制台（M3-05 — 已实现，经 API 集成验证）
+
+API 现已通过 `teamcraft/api/web/` 内置一套零依赖的最小 Web 控制台，服务端使用默认静态根时入口为 **`http://127.0.0.1:8765/static/index.html`**（`--static-root` 可覆盖目录，`--no-web-ui` 可关闭）。控制台完全复用既有受限 `/static` 路由——页面本身公开、不含任何数据。
+
+上手方式：用 `python3 -m teamcraft.api --project-root /path/to/project --print-token` 启动服务，打开上述地址，把打印出的 token 粘贴进页面并 Save。token 只保存在该浏览器标签页的 `sessionStorage`——绝不进入 URL、cookie 或页面写下的文件——Forget 只清除标签页本地副本，不影响服务端。
+
+页面只展示来自受守卫路由的真实数据（无任何演示占位数据）：
+
+- **Overview** — 项目快照（Task/Attempt/Session/Wake 计数、durable event seq、Wake 游标、CEO 初始化状态），以及调度闸门状态与 pause/resume 控件（`POST /scheduler/pause|resume`，lease-free 控制行）。
+- **Tasks** — 过滤分页列表（`GET /projects/{id}/tasks`）；详情视图分层展示 attempts → Brief/投递状态/sessions/WorkerReports（`GET /tasks/{id}/attempts`、`GET /attempts/{id}`）、验证、审批与恢复记录。创建/编辑表单、优先级调整、依赖增删（环冲突直接展示具体 `cycle` 路径）与执行策略表单——其 delivery 控件是封闭 `<select>`，仅提供 `report_only`/`local_only`/`direct_pr`/`ship`（与 API 强制的 Core `DELIVERY_MODES` 一致，UI 上无法配置非法自由文本）——分别映射到 `POST /tasks`、`PATCH /tasks/{id}`、依赖路由与 `POST /tasks/{id}/policy`。每次写入都携带 `Idempotency-Key`（按 method+path+body 确定性生成，误触发的相同重复提交会被服务端重放而不是二次写入）、CSRF 头与任务 `expected_version`。
+- **运行中不可变字段** — identity 字段（id、project、kind、acceptance、ownership、`max_attempts`）明确标注为不可变（创建后没有任何 API 路径能修改它们）；任务处于 running/verifying 时，页面明示 title/description/priority/risk 属关键编辑：会 bump Task version 并使绑定旧证据的 PENDING commands 过期。版本过期写入呈现为 `409 VERSION_CONFLICT`（含 `expected`/`found`），且未写入任何数据。
+- **CEO** — 持久初始化记录（state、protocol version/hash、skill hash、`receipt_source`、身份布尔值）与各 Harness 协议可用性；**请求 CEO 处理**（`POST /ceo/commands`）只排队带 TTL 的 `ceo.wake_request`——该页面物理上无法发送 Prompt。
+- **Events** — 基于 durable `events.seq` 的 SSE 实时尾随：客户端按 seq 去重、按游标重连、收到 `snapshot_required` 显式回快照重同步；另有 REST 补拉按钮；超大帧到达时带 `payload_truncated` 标记。
+- **Wakes / Approvals / Verifications** — Wake 生命周期各阶段保持分离（pending→sending→submitted→acknowledged→processed，`unknown`/`blocked` 标记为需人工对账的故障），Wake 游标与恢复记录，审批决策经 `POST /verifications/{id}/approvals` 在 API 自身短租约下执行（`LEADER_BUSY` 有明确解释），验证运行展示 digest 锚定的 artifact 预览与 verifier 配置版本。
+
+状态诚实性：loading、空（"无记录"）、offline（服务不可达——横幅明确说明服务端工作继续、关闭浏览器不会暂停任何任务）、存储不可用（`503`）、认证/CSRF（`401`/`403`）、冲突、截断标记与 null 用量（"unknown"，绝不显示为零）都是彼此可辨的状态。所有服务端文本——标题、日志、payload、reason——仅通过 DOM 文本节点挂载：脚本不含任何 HTML 解析或动态代码汇，也不引用外部资源，恶意 HTML/Markdown/日志内容均为惰性文本（由 `tests/test_web_m305.py` 钉住）。
+
+已验证（2026-11-10，macOS arm64）：`tests/test_web_m305.py` **35 tests OK**（资产安全扫描；策略表单 delivery 控件钉住封闭集 `report_only`/`local_only`/`direct_pr`/`ship`，钉住值与运行时 `domain.DELIVERY_MODES` 比对，并检查 `pyproject.toml` 的 `package-data` 声明；serve 默认/覆盖/关闭接线；受限 `/static` 语义含穿越与隐藏文件拒绝；真实的空/不可用/未认证状态；以控制台完全一致的请求形态（含 `Idempotency-Key` + CSRF + 同源 `Origin`）跑通 Task 创建/重放/冲突/编辑/依赖环/策略/暂停恢复/调度器/CEO 排队全流程；伪造的封闭集外自由文本 delivery 被 `422 VALIDATION_FAILED` 拒绝且零残留（version 不变、无存活 command 行）；恶意文本以 JSON 原样往返；截断标记；按 durable seq 分页；真实 uvicorn 上 SSE 尾随的 id 与 REST seq 一致；token 从不出现在任何响应体；客户端消失后持久 intent 仍可读）；仓库全量套件 **673 passed / 115 subtests / 退出码 0**（`unittest discover -s tests` 两次 OK，最终 `pytest tests/ -q` OK）；以及本机 loopback HTTP 冒烟（`/static/index.html` 以 `text/html` 提供、公开健康检查、bearer 查询返回真实数据、未认证 `401`、带 Origin+CSRF+key 的写入经 Command 面 applied）。打包（2026-11-10）：`pyproject.toml` 已声明 `[tool.setuptools.package-data]` `teamcraft = ["api/web/index.html", "api/web/app.js", "api/web/style.css"]`；用本机 `setuptools.build_meta`（setuptools 78.1.0）不联网构建 wheel 与 sdist——`teamcraft-0.2.0.dev0-py3-none-any.whl`（SHA-256 `4256c31ccf6ea3f7fc0a3e6451f873f0df09b02bcc9308ff993a0706bd630e7f`，46 个文件，`teamcraft/api/web/` 下三个资产齐全且 RECORD 含各自哈希）与 `teamcraft-0.2.0.dev0.tar.gz`（SHA-256 `cdf44c5c722a55b9547e617d0930a83b8c89fe9e1d9484a5976a4f5f33dc5676`，`teamcraft-0.2.0.dev0/teamcraft/api/web/` 下三个资产齐全）；sdist 还可回灌构建出仍含全部三个资产的 wheel（`0f4f36ffa82e3908642f02349f1235ba8c0bb404d94b76c2117b97e79d8bd62c`）；在仓库外解包 wheel 后，默认 `serve.WEB_ROOT` 解析到随包目录 `teamcraft/api/web`：`/static/index.html|app.js|style.css` 全部返回 `200`，而 `/api/v1` 仍受 bearer 守卫（`401`）。未验证：真实浏览器渲染/点击 E2E（属 M3-06）、跨浏览器 `sessionStorage` 行为、本工作树的 GitHub Actions。
 
 ## 验证
 
@@ -391,7 +410,7 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 
 仓库套件现有 468 项测试（同日），其中安装器 25 项覆盖首次/重复安装、配置保留、冲突、预览模式、含空格路径、符号链接、Git 忽略规则与 `teamcraft` Skill 新入口，包边界 8 项覆盖 ID、UTC Clock、错误、配置加载和无导入副作用，M3-01 API 安全测试 73 项，其余覆盖存储、迁移、领域状态、事件/Command、Leader fencing、Scheduler、Brief/WorkerReport、Watcher、Recovery、Verification/Approval、Wake、CEO 协议/初始化与 Herdr Adapter。上述本地运行使用 Python 3.13.14，全部通过，退出码 0；lint 与本机 loopback HTTP 冒烟也通过。CI 已改为在两条矩阵腿的核心测试前安装 `.[test]`，但本工作树尚未运行 GitHub Actions。
 
-截至 2026-11-10，仓库套件为 638 项测试——在此前 468 项基线之上新增 M3-02 Query API、M3-03 SSE 断线恢复、67 项 M3-04 Command API 定向测试（`tests/test_api_m304.py`）与 18 项 teamctl CLI 对等与解析器健壮性测试（`tests/test_teamctl.py`）——本地 `python3 -m pytest tests/ -q` 全部通过（2026-11-10 最终运行：638 passed，115 subtests passed，退出码 0）。teamctl 解析器对 Core 版本容错：`--help` 基于规范 Core 常量构建（对 pre-M3-04 离线包回退到封闭集合），需要 v15 API 的命令会以可操作的 reinstall 提示失败，而非 AttributeError。本工作树更早一次运行曾因沙箱 socket 限制使 M3-03 的 uvicorn 测试无法绑定 `127.0.0.1:0`（`[Errno 1] Operation not permitted`）；这些测试未做任何改动即在 2026-11-10 运行中通过，故记录为环境限制而非代码缺陷。
+截至 2026-11-10，仓库套件为 673 项测试——在此前 468 项基线之上新增 M3-02 Query API、M3-03 SSE 断线恢复、67 项 M3-04 Command API 定向测试（`tests/test_api_m304.py`）、18 项 teamctl CLI 对等与解析器健壮性测试（`tests/test_teamctl.py`）与 35 项 M3-05 Web 控制台集成测试（`tests/test_web_m305.py`）——本地 `python3 -m pytest tests/ -q` 全部通过（2026-11-10 最终运行：673 passed，115 subtests passed，退出码 0）。teamctl 解析器对 Core 版本容错：`--help` 基于规范 Core 常量构建（对 pre-M3-04 离线包回退到封闭集合），需要 v15 API 的命令会以可操作的 reinstall 提示失败，而非 AttributeError。本工作树更早一次运行曾因沙箱 socket 限制使 M3-03 的 uvicorn 测试无法绑定 `127.0.0.1:0`（`[Errno 1] Operation not permitted`）；这些测试未做任何改动即在 2026-11-10 运行中通过，故记录为环境限制而非代码缺陷。`tests/test_api_m303.py::M303GapFallback::test_live_gap_detected_after_backfill`（SSE 缺口检测时序）存在既有的全量运行负载敏感性：2026-11-10 四次全量 pytest 中该测试 2 次失败，而单独运行（3/3）、整文件运行与其余全量运行均通过，当日 `unittest discover -s tests` 两次均 673 OK——记录为既有的 flaky 时序限制，M3-05 打包修复未触及该文件（超出其所有权）。
 
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 
@@ -402,7 +421,7 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
-- M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复与 M3-04 Command API 均已实现且仅经自动化测试验证：尚无 Web UI（M3-05）；delivery/router 策略的*执行*属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
+- M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复、M3-04 Command API 与 M3-05 最小 Web 控制台均已实现，且仅经自动化测试与本机 loopback HTTP 冒烟验证：控制台未在真实浏览器中演练（渲染/E2E 属 M3-06）；delivery/router 策略的*执行*属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；内置控制台随常规 wheel 与 sdist 安装分发（`pyproject.toml` 已声明 `package-data`；两类归档已离线构建并检视，默认安装态 `WEB_ROOT` 已验证可解析并提供三个资产）；本工作树未做真实浏览器/E2E，也未运行 GitHub Actions。
 - CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
 - 把 Skill 用到其他项目时，需要一并部署角色配置，并按目标机器调整 provider、模型和权限路径。
