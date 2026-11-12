@@ -53,7 +53,7 @@ class WakeM209Tests(unittest.TestCase):
         )
 
     def test_schema_v10_is_complete_and_wake_integrity_triggers_are_present(self):
-        self.assertEqual(storage.SCHEMA_VERSION, 15)
+        self.assertEqual(storage.SCHEMA_VERSION, 16)
         audit = storage.verify_database(self.db)
         self.assertTrue(audit["at_head"])
         self.assertTrue({"wake_cursors", "wakes", "wake_events"} <= set(audit["tables"]))
@@ -85,7 +85,7 @@ class WakeM209Tests(unittest.TestCase):
             raw.close()
         result = storage.migrate_to_head(v11_db, allow_unverified_location=True)
         self.assertEqual((result.from_version, result.to_version, result.applied),
-                         (11, storage.SCHEMA_VERSION, (12, 13, 14, 15)))
+                         (11, storage.SCHEMA_VERSION, (12, 13, 14, 15, 16)))
         self.assertTrue(storage.verify_database(v11_db)["at_head"])
 
     def test_ingest_merges_same_dedupe_window_and_keeps_highest_priority(self):

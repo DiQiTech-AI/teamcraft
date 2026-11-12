@@ -71,10 +71,24 @@ function el(tag, opts, children) {
       } else node.setAttribute(key, String(v));
     }
   }
-  for (const child of children || []) {
+  /* children may be an array, a single Node, a string, or a scalar.  A
+     DOM Node/number is not iterable, so normalise first — without this,
+     badge/button/scalar cells threw "children is not iterable" and whole
+     views (overview kv rows, task-list rows) rendered as nothing. */
+  let kids = children;
+  if (kids === null || kids === undefined || kids === false) {
+    kids = [];
+  } else if (typeof kids === "string" ||
+             typeof kids.nodeType === "number" ||
+             typeof kids[Symbol.iterator] !== "function") {
+    kids = [kids];
+  }
+  for (const child of kids) {
     if (child === null || child === undefined || child === false) continue;
-    node.appendChild(typeof child === "string"
-      ? document.createTextNode(child) : child);
+    if (typeof child === "string") node.appendChild(document
+      .createTextNode(child));
+    else if (typeof child.nodeType === "number") node.appendChild(child);
+    else node.appendChild(document.createTextNode(String(child)));
   }
   return node;
 }
@@ -398,6 +412,7 @@ function forgetToken() {
 }
 
 async function loadProjects() {
+  const seq = renderSeq;
   const select = clear(q("project-select"));
   let items;
   try {
@@ -416,7 +431,7 @@ async function loadProjects() {
       text: "(no projects in the store)" }));
     state.projectId = "";
     sessionStorage.removeItem("tc.project");
-    renderView();
+    if (seq === renderSeq) renderView();
     return;
   }
   for (const p of items) {
@@ -428,7 +443,10 @@ async function loadProjects() {
   }
   select.value = state.projectId;
   sessionStorage.setItem("tc.project", state.projectId);
-  renderView();
+  /* If the operator navigated while this fetch was in flight, their
+     navigation already rendered the target view; a late re-render here
+     would rebuild it under the live stream and blank the event list. */
+  if (seq === renderSeq) renderView();
 }
 
 function boot() {
@@ -453,7 +471,14 @@ function setView(view) {
   renderView();
 }
 
+/* Render generation counter.  Async views commit after their fetches;
+   without a freshness check a slower stale render (e.g. the Overview
+   kicked off by project-selection) can overwrite the view the operator
+   navigated to seconds later.  Views commit only while their generation
+   is still the newest. */
+let renderSeq = 0;
 function renderView() {
+  renderSeq += 1;
   const buttons = q("nav").querySelectorAll(".tab");
   for (const b of buttons) {
     b.className = "tab" + (b.getAttribute("data-view") === state.view
@@ -514,6 +539,7 @@ function failInto(node, err, retry) {
  * ------------------------------------------------------------------ */
 
 async function viewOverview(m) {
+  const seq = renderSeq;
   m.appendChild(spinner("Loading project snapshot…"));
   if (!needProject(clear(m))) return;
   const pid = state.projectId;
@@ -525,6 +551,7 @@ async function viewOverview(m) {
   try { sched = (await api("/scheduler/state?project_id=" +
     encodeURIComponent(pid))).data.scheduler; }
   catch (err) { errs.push(err); }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (!snap) {
     for (const err of errs) failInto(m, err, function () {
@@ -649,6 +676,7 @@ function selectOf(values, current, onchange) {
 }
 
 async function viewTasks(m) {
+  const seq = renderSeq;
   if (!needProject(clear(m))) return;
   m.appendChild(spinner("Loading tasks…"));
   const pid = state.projectId;
@@ -662,6 +690,7 @@ async function viewTasks(m) {
     page = (await api("/projects/" + encodeURIComponent(pid) + "/tasks?" +
       qs.join("&"))).data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   m.appendChild(heading("Tasks", [badge(pid, "muted")]));
   if (err) { failInto(m, err, function () { renderView(); }); return; }
@@ -796,6 +825,7 @@ function createTaskForm(pid) {
  * ------------------------------------------------------------------ */
 
 async function viewTaskDetail(m) {
+  const seq = renderSeq;
   const id = state.taskId;
   m.appendChild(spinner("Loading task " + id + "…"));
   const enc = encodeURIComponent(id);
@@ -813,6 +843,7 @@ async function viewTaskDetail(m) {
     deps = results[2].data; verifs = results[3].data;
     approvals = results[4].data; recovery = results[5].data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
 
@@ -1237,6 +1268,7 @@ function renderAttemptDetail(box, a) {
  * ------------------------------------------------------------------ */
 
 async function viewAgents(m) {
+  const seq = renderSeq;
   m.appendChild(spinner("Loading agents and members…"));
   let agents, members, err = null;
   try {
@@ -1245,6 +1277,7 @@ async function viewAgents(m) {
     ]);
     agents = results[0].data; members = results[1].data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
   m.appendChild(heading("Agents and runtime members", []));
@@ -1301,6 +1334,7 @@ async function viewAgents(m) {
  * ------------------------------------------------------------------ */
 
 async function viewCeo(m) {
+  const seq = renderSeq;
   if (!needProject(clear(m))) return;
   m.appendChild(spinner("Loading CEO view…"));
   const pid = state.projectId;
@@ -1308,6 +1342,7 @@ async function viewCeo(m) {
   try {
     ceo = (await api("/projects/" + encodeURIComponent(pid) + "/ceo")).data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
   const init = ceo.initialization;
@@ -1425,12 +1460,21 @@ function parseSse(buffer) {
     buffer = buffer.slice(idx + 2);
     const frame = { event: "message", id: null, data: "", comment: false };
     const dataLines = [];
-    for (const line of raw.split("\n")) {
-      if (line.startsWith(":")) frame.comment = true;
-      else if (line.startsWith("event:")) {
-        frame.event = line.slice(6).trim();
-      } else if (line.startsWith("id:")) frame.id = line.slice(3).trim();
-      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+    for (let line of raw.split("\n")) {
+      if (line.startsWith(":")) { frame.comment = true; continue; }
+      if (line.startsWith("retry:")) continue;
+      const colon = line.indexOf(":");
+      let field = line, value = "";
+      if (colon !== -1) {
+        field = line.slice(0, colon);
+        value = line.slice(colon + 1);
+        /* SSE spec: a single leading space after the colon is part of the
+           framing and must be removed. */
+        if (value.startsWith(" ")) value = value.slice(1);
+      }
+      if (field === "event") frame.event = value.trim();
+      else if (field === "id") frame.id = value.trim();
+      else if (field === "data") dataLines.push(value);
     }
     frame.data = dataLines.join("\n");
     frames.push(frame);
@@ -1458,8 +1502,17 @@ async function viewEvents(m) {
       const page = (await api("/events?project_id=" +
         encodeURIComponent(pid) + "&after_seq=" + state.lastSeq +
         "&limit=100")).data;
-      for (const e of page.items || []) renderEventCard(e);
-      banner("muted", "Backfilled " + (page.items || []).length +
+      const items = page.items || [];
+      for (const e of items) {
+        /* Advance the cursor as REST-delivered events render; otherwise a
+           later SSE (re)connect resumes behind these and every backfilled
+           event lands in the DOM a second time. */
+        if (typeof e.seq === "number" && e.seq > state.lastSeq) {
+          state.lastSeq = e.seq;
+        }
+        renderEventCard(e);
+      }
+      banner("muted", "Backfilled " + items.length +
         " events via REST (has_more=" + fmt(page.page.has_more) + ").");
     } catch (e) {
       reportFailure("events backfill", e);
@@ -1489,7 +1542,19 @@ async function viewEvents(m) {
     banner("muted", "Disconnected from the stream; the store and runtime " +
       "continue untouched.");
   });
-  if (!state.streamActive) openStream(pid, list, null);
+  if (!state.streamActive) {
+    /* Auto-connect on view entry.  streamActive MUST be set before the
+       read loop starts: openStream tails while (state.streamActive), so
+       without this the loop exited instantly and no event ever rendered
+       unless Connect was clicked by hand. */
+    state.streamActive = true;
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    openStream(pid, list, function () {
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+    });
+  }
 }
 
 function renderEventCard(e) {
@@ -1636,6 +1701,7 @@ async function resyncSnapshot(pid) {
  * ------------------------------------------------------------------ */
 
 async function viewWakes(m) {
+  const seq = renderSeq;
   if (!needProject(clear(m))) return;
   const pid = state.projectId;
   m.appendChild(spinner("Loading wakes…"));
@@ -1655,6 +1721,7 @@ async function viewWakes(m) {
     cursor = results[1].data;
     recovery = results[2].data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
   m.appendChild(heading("Wakes", [badge(pid, "muted"),
@@ -1713,6 +1780,7 @@ async function viewWakes(m) {
  * ------------------------------------------------------------------ */
 
 async function viewApprovals(m) {
+  const seq = renderSeq;
   if (!needProject(clear(m))) return;
   const pid = state.projectId;
   m.appendChild(spinner("Loading approvals…"));
@@ -1726,6 +1794,7 @@ async function viewApprovals(m) {
     ]);
     approvals = results[0].data; verifs = results[1].data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
   m.appendChild(heading("Approvals", [badge(pid, "muted")]));
@@ -1738,7 +1807,7 @@ async function viewApprovals(m) {
     return !decided.has(v.id);
   });
   m.appendChild(section("Verifications awaiting a decision",
-    pending.length ? [decisionForms(pending)] : [
+    pending.length ? decisionForms(pending) : [
       emptyNote("verifications awaiting a decision")]));
   m.appendChild(para("Decisions run through the Command API under the " +
     "API's own short Leader lease: while the runtime holds the lease the " +
@@ -1823,6 +1892,7 @@ function approvalTable(items) {
 }
 
 async function viewVerifications(m) {
+  const seq = renderSeq;
   if (!needProject(clear(m))) return;
   m.appendChild(spinner("Loading verifications…"));
   const pid = state.projectId;
@@ -1836,6 +1906,7 @@ async function viewVerifications(m) {
     ]);
     verifs = results[0].data; configs = results[1].data;
   } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
   if (err) { failInto(m, err, function () { renderView(); }); return; }
   m.appendChild(heading("Verifications", [badge(pid, "muted")]));
@@ -1888,6 +1959,35 @@ function verifTable(items) {
   return [el("table", { class: "list" },
     [el("tr", {}, ["id", "status", "exit", "task", "attempt", "argv",
       "artifact", "created", "evidence"].map(function (h) {
+      return el("th", { text: h });
+    }))].concat(rows))];
+}
+
+/* Recovery actions come from the commands table (kind recovery.*); the
+ * row shows the durable request, its command state, and the honest TTL —
+ * never a claim that a retry ran. */
+function recoveryTable(items) {
+  if (!items.length) return emptyNote("recovery actions");
+  const rows = items.map(function (a) {
+    const cells = [
+      el("td", { text: fmt(a.command_id) }),
+      el("td", { text: fmt(a.action) }),
+      el("td", {}, badge(fmt(a.state), statusKind(a.state))),
+      el("td", { text: fmt(a.task_id) }),
+      el("td", { text: "#" + fmt(a.attempt_no) }),
+      el("td", { text: fmt(a.actor) }),
+      el("td", { text: fmt(a.reason) +
+        (a.reason_truncated ? " (truncated)" : "") }),
+      el("td", { class: "muted", text: fmt(a.requested_at) }),
+      el("td", { class: "muted",
+        text: a.expires_at ? "expires " + fmt(a.expires_at)
+                           : "no TTL" }),
+    ];
+    return el("tr", {}, cells);
+  });
+  return [el("table", { class: "list" },
+    [el("tr", {}, ["command", "action", "state", "task", "attempt",
+      "actor", "reason", "requested", "ttl"].map(function (h) {
       return el("th", { text: h });
     }))].concat(rows))];
 }

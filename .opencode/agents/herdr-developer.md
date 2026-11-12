@@ -41,6 +41,34 @@ permission:
     "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests": allow
     "python3 -B -m unittest discover -s .agents/skills/teamcraft/tests *": allow
     "node --check *": allow
+    "python3 --version": allow
+    "python3 -V": allow
+    "python3 -B -m py_compile *": allow
+    "shasum -a 256 *": allow
+    # explicit denies (defense-in-depth on top of "*": ask): no network,
+    # no package installs, no Git mutation, no destructive or elevated
+    # commands.  Read-only inspection, syntax checks, and the project's
+    # own test runners are the entire allowlist above.
+    "pip": deny
+    "pip *": deny
+    "pip3": deny
+    "pip3 *": deny
+    "npm *": deny
+    "npx *": deny
+    "curl *": deny
+    "wget *": deny
+    "git push": deny
+    "git push *": deny
+    "git commit": deny
+    "git commit *": deny
+    "git checkout": deny
+    "git checkout *": deny
+    "git reset": deny
+    "git reset *": deny
+    "sudo": deny
+    "sudo *": deny
+    "rm": deny
+    "rm *": deny
   external_directory: deny
   webfetch: deny
   websearch: deny

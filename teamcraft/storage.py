@@ -112,7 +112,9 @@ from .errors import (
 #: been upgraded, and any schema newer than this build still fails closed
 #: read-only (8.2-13). v4 added runtime authority; v5 (M1-08) adds fixed
 #: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
-SCHEMA_VERSION = 15
+#: v16 (M4-01) pins base-SHA evidence on the append-only ``events`` stream
+#: (binding trigger + indexes; deliberately no new tables/columns).
+SCHEMA_VERSION = 16
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -912,6 +914,42 @@ _V15_STATEMENTS = (
 )""",
 )
 
+#: M4-01 (v16): durable, immutable base-SHA evidence rides the append-only
+#: ``events`` stream (kind ``workspace_base_evidence``).  The v3 no-update/
+#: no-delete triggers already make every event row immutable; v16 adds the
+#: evidence-specific integrity on top of them: a partial UNIQUE index caps an
+#: Attempt at exactly ONE base-evidence record (re-capture can only replay,
+#: never replace) and a binding trigger refuses at the storage boundary any
+#: evidence row that does not bind project/task/attempt or whose payload
+#: lacks base_sha/repo_root/task_version.  This step adds NO tables and NO
+#: columns, so every pre-v16 fixture, table-set contract and upgrade floor
+#: keeps its exact meaning; the DDL is IF-NOT-EXISTS idempotent.
+_V16_TRIGGERS = frozenset({"trg_events_base_evidence_binding"})
+_V16_INDEXES = frozenset({
+    "ux_workspace_base_evidence_attempt",
+    "idx_workspace_base_evidence_task",
+})
+_V16_STATEMENTS = (
+    """CREATE TRIGGER IF NOT EXISTS trg_events_base_evidence_binding
+       BEFORE INSERT ON events
+       WHEN NEW.kind = 'workspace_base_evidence'
+       BEGIN
+         SELECT RAISE(ABORT, 'workspace base evidence must bind project, task and attempt')
+           WHERE NEW.project_id IS NULL OR NEW.task_id IS NULL OR NEW.attempt_id IS NULL;
+         SELECT RAISE(ABORT, 'workspace base evidence payload is missing required fields')
+           WHERE json_valid(NEW.payload_json) = 0
+              OR COALESCE(json_extract(NEW.payload_json, '$.base_sha'), '') = ''
+              OR COALESCE(json_extract(NEW.payload_json, '$.repo_root'), '') = ''
+              OR json_extract(NEW.payload_json, '$.task_version') IS NULL;
+       END""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS ux_workspace_base_evidence_attempt
+       ON events (attempt_id)
+       WHERE kind = 'workspace_base_evidence'""",
+    """CREATE INDEX IF NOT EXISTS idx_workspace_base_evidence_task
+       ON events (task_id)
+       WHERE kind = 'workspace_base_evidence'""",
+)
+
 _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
@@ -928,6 +966,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (13, _V13_STATEMENTS),
     (14, _V14_STATEMENTS),
     (15, _V15_STATEMENTS),
+    (16, _V16_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -1050,6 +1089,7 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     13: (_V13_TRIGGERS, frozenset()),
     14: (_V14_TRIGGERS, frozenset()),
     15: (_V15_TRIGGERS, frozenset()),
+    16: (_V16_TRIGGERS, _V16_INDEXES),
 }
 
 
