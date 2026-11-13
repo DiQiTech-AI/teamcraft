@@ -1581,6 +1581,67 @@ def transition_attempt(
     return get_attempt(conn, attempt_id)
 
 
+def set_attempt_resources(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    worktree_path: str,
+    branch: str,
+) -> Attempt:
+    """Bind the M4-02 resource identity (worktree/branch) onto an Attempt.
+
+    Durable resource identity for the roadmap's "记录资源命名空间": the
+    Attempt row carries the exact workspace its execution was routed into,
+    alongside the immutable allocation event.  Contract:
+
+    * terminal Attempts are refused — history is never rewritten;
+    * an unbound (or provisionally bound: cwd-only, no branch) attempt binds
+      the full identity atomically (guarded compare-and-set);
+    * re-binding the IDENTICAL full identity is an idempotent replay;
+    * re-pointing an Attempt that already carries a FULL resource identity to
+      different resources is a loud :class:`ConflictError` (identity is
+      immutable per Attempt once bound).
+    """
+
+    require_head(conn)
+    attempt_id = require_entity_id(attempt_id)
+    _require(isinstance(worktree_path, str) and worktree_path.startswith("/")
+             and bool(worktree_path.strip("/")),
+             "worktree_path must be an absolute non-blank path")
+    _require(isinstance(branch, str) and bool(branch.strip()),
+             "branch must be a non-blank string")
+    with _tx(conn):
+        attempt = get_attempt(conn, attempt_id)
+        if attempt.status in TERMINAL_ATTEMPT_STATUSES:
+            raise _illegal("attempt", attempt.status, "set_resources",
+                          reason="ATTEMPT_TERMINAL")
+        fully_bound = (attempt.worktree_path is not None
+                       and attempt.branch is not None)
+        if fully_bound:
+            if (attempt.worktree_path == worktree_path
+                    and attempt.branch == branch):
+                return attempt  # replay
+            raise ConflictError(
+                f"attempt {attempt_id} already binds resources"
+                f" (worktree={attempt.worktree_path!r},"
+                f" branch={attempt.branch!r}); refusing to re-point it to"
+                f" ({worktree_path!r}, {branch!r})")
+        cursor = conn.execute(
+            "UPDATE attempts SET worktree_path = ?, branch = ?"
+            " WHERE id = ? AND worktree_path IS ? AND branch IS ?",
+            (worktree_path, branch, attempt_id,
+             attempt.worktree_path, attempt.branch),
+        )
+        if cursor.rowcount != 1:
+            current = get_attempt(conn, attempt_id)
+            if (current.worktree_path == worktree_path
+                    and current.branch == branch):
+                return current
+            raise _illegal("attempt", current.status, "set_resources",
+                          reason="RACE_RETRY")
+    return get_attempt(conn, attempt_id)
+
+
 # ---------------------------------------------------------------------------
 # Sessions (live signals only — never Task completion)
 # ---------------------------------------------------------------------------
@@ -1700,6 +1761,7 @@ __all__ = [
     "register_session",
     "remove_dependency",
     "resume_task",
+    "set_attempt_resources",
     "set_execution_policy",
     "require_head",
     "session_transition_targets",

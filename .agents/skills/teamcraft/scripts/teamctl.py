@@ -73,6 +73,11 @@ from teamcraft import wake as _wake  # noqa: E402
 from teamcraft.errors import TeamCraftError as _CoreError  # noqa: E402
 from teamcraft.herdr_adapter import HerdrAdapter, HerdrError  # noqa: E402
 
+try:  # M4-02 module; a pre-M4-02 bundled core may not carry it.
+    from teamcraft import worktrees as _worktrees  # noqa: E402
+except ImportError:  # pragma: no cover - only with a stale bundled core
+    _worktrees = None
+
 
 STATE_VERSION = 1
 RUNTIME_DIRECTORY_NAME = ".teamcraft"
@@ -3648,6 +3653,87 @@ def wake_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_m402_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M4-02."""
+
+    missing = sorted(name for name in (
+        "route_member_workspace", "mark_member_workspace_cleanable",
+        "member_workspace_status",
+    ) if not hasattr(_adapter, name))
+    if missing or _worktrees is None:
+        raise TeamctlError(
+            "the resolved TeamCraft core predates M4-02 Worktree lifecycle"
+            f" (missing: {', '.join(missing) or 'teamcraft.worktrees'});"
+            " refresh the bundled core with scripts/install.sh or reinstall"
+            " the package")
+
+
+def _core_refusal(exc: _CoreError) -> TeamctlError:
+    reason = getattr(exc, "reason_code", None) or getattr(exc, "kind", None)
+    return TeamctlError(f"{exc} ({reason})" if reason else str(exc))
+
+
+def worktree_allocate(args: argparse.Namespace) -> int:
+    """M4-02: deliver/adopt one member's isolated worktree.
+
+    Writable members are routed into ``<root>/.teamcraft/worktrees/<attempt>``
+    on branch ``tc/<task>/<attempt>``; read-only members are routed to the
+    project root and receive no worktree.  Re-runs adopt the exact recorded
+    identity (restart/retry adoption).
+    """
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m402_core()
+        try:
+            result = _adapter.route_member_workspace(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_mark_cleanable(args: argparse.Namespace) -> int:
+    """Safely ALLOCATED->CLEANABLE for the member's worktree (never deletes).
+
+    Refuses fail closed: non-terminal Attempt, dirty/unmerged workspace, and
+    foreign/identity-ambiguous worktrees are never marked and never removed.
+    """
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m402_core()
+        try:
+            result = _adapter.mark_member_workspace_cleanable(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_status(args: argparse.Namespace) -> int:
+    """Durable + live worktree lifecycle view for one member (discovery)."""
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m402_core()
+        try:
+            result = _adapter.member_workspace_status(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -3970,6 +4056,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_cwd(artifact_parser)
     artifact_parser.add_argument("--verification-id", required=True)
     artifact_parser.set_defaults(handler=verification_artifact)
+
+    worktree_allocate_parser = commands.add_parser("worktree-allocate")
+    add_cwd(worktree_allocate_parser)
+    worktree_allocate_parser.add_argument("--member", required=True)
+    worktree_allocate_parser.set_defaults(handler=worktree_allocate)
+
+    worktree_cleanable_parser = commands.add_parser("worktree-cleanable")
+    add_cwd(worktree_cleanable_parser)
+    worktree_cleanable_parser.add_argument("--member", required=True)
+    worktree_cleanable_parser.set_defaults(handler=worktree_mark_cleanable)
+
+    worktree_status_parser = commands.add_parser("worktree-status")
+    add_cwd(worktree_status_parser)
+    worktree_status_parser.add_argument("--member", required=True)
+    worktree_status_parser.set_defaults(handler=worktree_status)
     return parser
 
 

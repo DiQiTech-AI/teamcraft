@@ -47,6 +47,7 @@ from . import domain
 from . import fresh_start
 from . import leader
 from . import storage
+from . import worktrees
 from .errors import IllegalTransitionError, TeamCraftError, ValidationError
 from .events import append_event
 from .fresh_start import FreshStartReport
@@ -798,6 +799,148 @@ def require_ceo_initialized(
         )
     except TeamCraftError as exc:
         raise RuntimeAdapterError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# M4-02 workspace routing: writable developers into their own worktrees
+# ---------------------------------------------------------------------------
+
+
+def _workspace_member_row(conn: TeamCraftConnection, member: str) -> tuple[str, bool, str | None, str | None]:
+    row = conn.execute(
+        "SELECT role, read_only, task_id, attempt_id FROM members WHERE name = ?",
+        (member,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeAdapterError(f"member {member!r} is not recorded")
+    return (str(row[0]), bool(row[1]),
+            None if row[2] is None else str(row[2]),
+            None if row[3] is None else str(row[3]))
+
+
+def _runtime_root(conn: TeamCraftConnection) -> str:
+    meta = conn.execute(
+        "SELECT project_root FROM runtime_meta WHERE id = 1").fetchone()
+    if meta is None:
+        raise RuntimeAdapterError("no team runtime recorded; cannot route a workspace")
+    return str(meta[0])
+
+
+def _worktree_dict(allocation: "worktrees.WorktreeAllocation", state: str | None,
+                  created: bool) -> dict[str, Any]:
+    return {
+        "allocation_id": allocation.allocation_id,
+        "attempt_id": allocation.attempt_id,
+        "task_id": allocation.task_id,
+        "worktree_path": allocation.worktree_path,
+        "branch": allocation.branch,
+        "base_sha": allocation.base_sha,
+        "state": state,
+        "created": created,
+    }
+
+
+def route_member_workspace(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Deliver/adopt the execution workspace for one member (M4-02 routing).
+
+    * **read-only members stay on the project root** and receive NO writable
+      worktree — no allocation is recorded for them at all;
+    * a writable member is routed into ITS OWN isolated worktree and branch
+      (``<root>/.teamcraft/worktrees/<attempt-id>`` and
+      ``tc/<task-id>/<attempt-id>``) delivered through
+      :func:`teamcraft.worktrees.allocate_attempt_worktree`; two writable
+      members therefore never share an uncommitted workspace.
+
+    The routed ``cwd`` is RETURNED, not silently written into the member row:
+    :func:`sync_state` remains the single authoritative writer of members, so
+    the CLI carries ``cwd`` through the compatibility state dict on the next
+    sync.  Restart/retry re-routes adopt only the exact recorded identity.
+    """
+
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    root = _runtime_root(conn)
+    if read_only:
+        return {"member": member, "role": role, "routed": "project_root",
+                "cwd": root, "worktree": None,
+                "note": "read-only members receive no writable worktree"}
+    if task_id is None or attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Task/Attempt lineage; refusing to "
+            "allocate a workspace for an unbound member")
+    allocation, created = worktrees.allocate_attempt_worktree(
+        conn, task_id=task_id, attempt_id=attempt_id, repo_root=root,
+        run_git=run_git, clock=clock)
+    return {"member": member, "role": role, "routed": "worktree",
+            "cwd": allocation.worktree_path, "created": created,
+            "worktree": _worktree_dict(allocation,
+                                      worktrees.lifecycle_state(conn, attempt_id),
+                                      created)}
+
+
+def mark_member_workspace_cleanable(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Safely transition the member's allocated worktree toward CLEANABLE.
+
+    All safety lives in :func:`teamcraft.worktrees.mark_worktree_cleanable`
+    (terminal Attempt, exact identity, completely clean workspace); read-only
+    members have no writable worktree and are refused here.  NOTHING is
+    deleted — CLEANABLE is a durable marker consumed by later milestones.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no writable worktree "
+            "to mark cleanable")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing is allocated to mark")
+    allocation = worktrees.mark_worktree_cleanable(
+        conn, attempt_id, run_git=run_git, clock=clock)
+    return {"member": member, "role": role,
+            "worktree": _worktree_dict(allocation,
+                                      worktrees.lifecycle_state(conn, attempt_id),
+                                      False)}
+
+
+def member_workspace_status(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+) -> dict[str, Any]:
+    """Durable + live workspace view for one member (restart discovery)."""
+
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    root = _runtime_root(conn)
+    if read_only:
+        return {"member": member, "role": role, "routed": "project_root",
+                "worktree": None}
+    if attempt_id is None:
+        return {"member": member, "role": role, "routed": "unallocated",
+                "worktree": None}
+    state = worktrees.lifecycle_state(conn, attempt_id)
+    if state is None:
+        return {"member": member, "role": role, "routed": "unallocated",
+                "worktree": None}
+    status = worktrees.inspect_worktree(conn, attempt_id, run_git=run_git)
+    allocation = worktrees.require_allocation(conn, attempt_id)
+    view = _worktree_dict(allocation, status.state, False)
+    view.update({"exists": status.exists, "problems": list(status.problems),
+                 "dirty": status.dirty, "change_count": status.change_count})
+    return {"member": member, "role": role, "routed": "worktree",
+            "worktree": view}
 
 
 # ---------------------------------------------------------------------------
