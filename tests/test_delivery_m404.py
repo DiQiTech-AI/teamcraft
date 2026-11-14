@@ -38,7 +38,7 @@ from teamcraft import (
     workspaces,
     worktrees,
 )
-from teamcraft.errors import ConflictError, ValidationError
+from teamcraft.errors import ConflictError, IllegalTransitionError, ValidationError
 
 
 GIT = [
@@ -866,7 +866,7 @@ class LocalDeliveryTests(unittest.TestCase):
 
     # -- concurrency -----------------------------------------------------------------------
 
-    def test_concurrent_creates_produce_exactly_one_commit(self):
+    def test_concurrent_creates_converge_on_exactly_one_commit(self):
         task, attempt, allocation = self.verified(title="race-commit")
         lease = self.lease()
 
@@ -887,11 +887,34 @@ class LocalDeliveryTests(unittest.TestCase):
                     if isinstance(item, delivery.CommitEvidence)]
         failures = [item for item in outcomes
                    if isinstance(item, BaseException)]
-        self.assertEqual(len(successes), 1,
-                         [str(item) for item in outcomes])
-        self.assertEqual(len(failures), 1)
+        # Both schedules are valid.  The second caller may observe the first
+        # Command while it is still running and fail closed, or it may enter
+        # after the receipt settles and replay that exact receipt.  A replay
+        # is an idempotent success, not evidence that Git ran twice.
+        self.assertGreaterEqual(len(successes), 1,
+                                [str(item) for item in outcomes])
+        self.assertEqual(len(successes) + len(failures), 2)
+        self.assertTrue(
+            all(isinstance(item, IllegalTransitionError) for item in failures),
+            [str(item) for item in outcomes],
+        )
+        self.assertTrue(all(item == successes[0] for item in successes),
+                        [str(item) for item in outcomes])
+        self.assertEqual(len({item.command_id for item in successes}), 1)
         self.assertEqual(self.commits_above(allocation), 1)
-        self.assertEqual(len(delivery.list_commit_evidence(self.conn, task.id)), 1)
+        evidence = delivery.list_commit_evidence(self.conn, task.id)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0], successes[0])
+        commands_for_attempt = self.command_rows(
+            delivery.COMMIT_COMMAND_KIND, attempt.id)
+        self.assertEqual(len(commands_for_attempt), 1)
+        self.assertEqual(str(commands_for_attempt[0][0]), successes[0].command_id)
+        self.assertEqual(str(commands_for_attempt[0][1]), "confirmed")
+        recorded = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = ? AND task_id = ?",
+            ("delivery.commit_recorded", task.id),
+        ).fetchone()[0]
+        self.assertEqual(recorded, 1)
 
     def test_concurrent_approves_produce_exactly_one_done_decision(self):
         task, attempt, allocation, commit, ship = self.shipped(title="race-appr")
