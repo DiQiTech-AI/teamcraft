@@ -23,6 +23,8 @@ permission:
     "head *": allow
     "tail *": allow
     "wc *": allow
+    "du -sh *": allow
+    "find .": allow
     "git status": allow
     "git status *": allow
     "git diff": allow
@@ -31,9 +33,16 @@ permission:
     "git log *": allow
     "git show": allow
     "git show *": allow
+    "git grep *": allow
+    "git ls-files": allow
+    "git ls-files *": allow
     "git rev-parse *": allow
     "git worktree list": allow
     "git worktree list *": allow
+    "git --no-pager diff *": allow
+    "git --no-pager log *": allow
+    "git --no-pager show *": allow
+    "git --no-pager status *": allow
     "python3 -B -m pytest": allow
     "python3 -B -m pytest *": allow
     "python3 -B -m unittest": allow
@@ -75,4 +84,4 @@ permission:
   task: deny
 ---
 
-Implement and verify the bounded assignment in the Herdr task prompt. Edit only the recorded ownership paths. Preserve unrelated changes and return changed files, verification evidence, and blockers.
+Implement and verify the bounded assignment in the Herdr task prompt. Edit only the recorded ownership paths. Preserve unrelated changes and return changed files, verification evidence, and blockers. Use built-in read/glob/grep/list tools and the allowlisted read-only bash inspections directly without requesting approval; commands outside the allowlist or with possible side effects remain gated.
