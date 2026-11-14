@@ -668,6 +668,11 @@ class M303GapFallback(StreamScaffold):
         # Backfill closes over seq 1..3 at connect time. Seq 4 lands live,
         # then seq 10 lands: the live poll must detect the jump (the gap
         # did not exist when the stream opened).
+        # Give this timing-sensitive live-path scenario a separate deadline.
+        # The suite-wide 0.4s fast deadline is useful for max-duration tests,
+        # but leaves only 50ms after the delayed gap insert and can expire
+        # first on a loaded CI runner.
+        self.restart_with(fast_config(max_duration_seconds=2.0))
         self.append_later(0.15, kind="watch.after_gap")  # seq 4
         self.insert_event_at_seq(10, delay=0.35)  # gap appears mid-stream
 
