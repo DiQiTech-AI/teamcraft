@@ -49,6 +49,7 @@ from . import leader
 from . import storage
 from . import verification
 from . import worktrees
+from . import delivery
 from .errors import IllegalTransitionError, TeamCraftError, ValidationError
 from .events import append_event
 from .fresh_start import FreshStartReport
@@ -1093,6 +1094,350 @@ def configure_project_verifier_profile(
         timeout_seconds=timeout_seconds, actor=actor,
         idempotency_key=idempotency_key, lease=lease, enabled=enabled,
         clock=clock)
+
+
+# ---------------------------------------------------------------------------
+# M4-04 local delivery: Commit/Diff evidence, ship evidence, local-only approval
+# ---------------------------------------------------------------------------
+#
+# Thin, member-scoped surface over the :mod:`teamcraft.delivery` Core API.  All
+# safety (idempotency keys, fenced project leader leases, exact member/attempt
+# identity, base/verifier/policy drift, protected-branch refusal, report-only
+# refusal, fail-closed staleness) lives in Core; this layer only resolves the
+# member's own Task/Attempt, refuses read-only members where a WRITABLE
+# worktree is required, forwards the fence + key verbatim, and shapes durable
+# evidence into JSON-safe DTOs the CLI prints.  It NEVER pushes, merges, commits
+# on a protected branch, or builds arbitrary git argv.
+
+
+def _commit_evidence_dto(e: "delivery.CommitEvidence") -> dict[str, Any]:
+    return {
+        "commit_evidence_id": e.event_id, "project_id": e.project_id,
+        "task_id": e.task_id, "attempt_id": e.attempt_id,
+        "attempt_no": e.attempt_no, "task_version": e.task_version,
+        "dispatch_task_version": e.dispatch_task_version,
+        "brief_digest": e.brief_digest, "brief_version": e.brief_version,
+        "worker_report_id": e.worker_report_id,
+        "worker_report_digest": e.worker_report_digest,
+        "allocation_id": e.allocation_id, "worktree_path": e.worktree_path,
+        "branch": e.branch, "base_sha": e.base_sha, "parent_sha": e.parent_sha,
+        "commit_sha": e.commit_sha, "diff_digest": e.diff_digest,
+        "file_count": e.file_count, "claims": list(e.claims),
+        "claims_digest": e.claims_digest, "source": e.source,
+        "command_id": e.command_id, "evidence_digest": e.evidence_digest,
+        "occurred_at": e.occurred_at,
+    }
+
+
+def _ship_evidence_dto(e: "delivery.ShipEvidence") -> dict[str, Any]:
+    return {
+        "ship_evidence_id": e.id, "project_id": e.project_id,
+        "task_id": e.task_id, "attempt_id": e.attempt_id,
+        "attempt_no": e.attempt_no, "task_version": e.task_version,
+        "dispatch_task_version": e.dispatch_task_version,
+        "brief_digest": e.brief_digest, "brief_version": e.brief_version,
+        "worker_report_id": e.worker_report_id,
+        "worker_report_digest": e.worker_report_digest,
+        "delivery_mode": e.delivery_mode, "proposed_action": e.proposed_action,
+        "allocation_id": e.allocation_id, "worktree_path": e.worktree_path,
+        "branch": e.branch, "base_sha": e.base_sha, "commit_sha": e.commit_sha,
+        "commit_evidence_id": e.commit_evidence_id,
+        "diff_digest": e.diff_digest, "diff_bytes": e.diff_bytes,
+        "diff_relpath": e.diff_relpath, "file_count": e.file_count,
+        "verifiers": [dict(item) for item in e.verifiers],
+        "verifier_digest": e.verifier_digest, "policy_digest": e.policy_digest,
+        "evidence_digest": e.evidence_digest, "command_id": e.command_id,
+        "occurred_at": e.occurred_at,
+    }
+
+
+def _delivery_approval_dto(a: "delivery.DeliveryApproval") -> dict[str, Any]:
+    return {
+        "approval_id": a.id, "command_id": a.command_id,
+        "ship_evidence_id": a.ship_evidence_id, "project_id": a.project_id,
+        "task_id": a.task_id, "attempt_id": a.attempt_id,
+        "attempt_no": a.attempt_no, "task_version": a.task_version,
+        "commit_sha": a.commit_sha, "branch": a.branch,
+        "diff_digest": a.diff_digest, "evidence_digest": a.evidence_digest,
+        "verifier_digest": a.verifier_digest,
+        "proposed_action": a.proposed_action, "decision": a.decision,
+        "actor": a.actor, "reason": a.reason,
+        "task_status_after": a.task_status_after, "occurred_at": a.occurred_at,
+    }
+
+
+def _freshness_dto(fresh: "delivery.DeliveryFreshness") -> dict[str, Any]:
+    return {"current": bool(fresh.ok), "problems": list(fresh.problems)}
+
+
+def _command_summary(command: Any) -> dict[str, Any]:
+    return {
+        "command_id": command.id, "kind": command.kind, "state": command.state,
+        "idempotency_key": command.idempotency_key,
+    }
+
+
+def create_member_local_commit(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    message: str | None = None,
+    artifact_root: str | None = None,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Create/adopt the local Commit on the member's OWN Attempt worktree (M4-04).
+
+    Read-only members have no writable worktree and are refused before Core is
+    touched.  Everything else — finished Attempt + WorkerReport, allocation and
+    base identity, protected ``tc/<task>/<attempt>`` branch, unowned/empty/drift
+    change sets, report-only policy, idempotency and the fenced project lease —
+    is enforced by :func:`teamcraft.delivery.create_local_commit`.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no writable worktree to"
+            " commit on")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing allocated to commit")
+    evidence = delivery.create_local_commit(
+        conn, attempt_id, idempotency_key=idempotency_key, lease=lease,
+        message=message, artifact_root=artifact_root, run_git=run_git,
+        clock=clock)
+    return {"member": member, "role": role, "source": evidence.source,
+            "commit": _commit_evidence_dto(evidence)}
+
+
+def reconcile_member_commit_receipt(
+    conn: TeamCraftConnection,
+    member: str,
+    command_id: str,
+    *,
+    lease: leader.Lease,
+    actor: str,
+    reason: str,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Reconcile a lost/interrupted Commit receipt for one member (M4-04).
+
+    This layer binds the durable Command's kind and exact
+    project/Task/Attempt identity to the requesting member *before* entering
+    Core, so a stray ``command_id`` can never be reconciled under the wrong
+    member fence.  See :func:`teamcraft.delivery.reconcile_commit_receipt`.
+    """
+
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no commit receipt to"
+            " reconcile")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing to reconcile")
+
+    # Scope the durable Command to the member BEFORE Core is allowed to
+    # inspect Git or settle the Command.  Reconciliation can adopt a commit
+    # and confirm an UNKNOWN Command, so a post-effect identity check would
+    # report an error only after mutating another member's delivery record.
+    command = command_core.get_command(conn, command_id)
+    if command.kind != delivery.COMMIT_COMMAND_KIND:
+        raise RuntimeAdapterError(
+            f"command {command_id!r} is not a local commit Command")
+    try:
+        payload = json.loads(command.payload_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeAdapterError(
+            f"commit command {command_id!r} has malformed payload") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeAdapterError(
+            f"commit command {command_id!r} has malformed payload")
+    project_id = _project_id_for_member(conn, member, task_id)
+    if (payload.get("attempt_id") != attempt_id
+            or payload.get("task_id") != task_id
+            or payload.get("project_id") != project_id):
+        raise RuntimeAdapterError(
+            f"commit command {command_id!r} belongs to another member scope;"
+            f" member {member!r} may not reconcile it")
+
+    result = delivery.reconcile_commit_receipt(
+        conn, command_id, lease=lease, actor=actor, reason=reason,
+        run_git=run_git, clock=clock)
+    evidence = result.get("commit_evidence")
+    # Core also binds its returned evidence.  Keep this defensive assertion,
+    # but it is no longer the first scope check and therefore cannot be the
+    # source of a post-effect refusal.
+    if (evidence is not None
+            and (evidence.attempt_id != attempt_id
+                 or evidence.task_id != task_id
+                 or evidence.project_id != project_id)):
+        raise RuntimeAdapterError(
+            f"commit command {command_id!r} returned foreign evidence;"
+            f" member {member!r} may not reconcile it")
+    return {"member": member, "role": role,
+            "resolution": result["resolution"],
+            "command": _command_summary(result["command"]),
+            "commit": (_commit_evidence_dto(evidence)
+                      if evidence is not None else None)}
+
+
+def record_member_ship_evidence(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Bind immutable ship evidence + PROPOSE local-only acceptance (M4-04).
+
+    Refusals — report-only mode, missing/failed/stale verifier, drifted commit
+    or policy, no durable commit evidence — all fail closed inside
+    :func:`teamcraft.delivery.record_ship_evidence`; nothing is written.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has nothing to ship")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing to ship")
+    evidence = delivery.record_ship_evidence(
+        conn, attempt_id, idempotency_key=idempotency_key, lease=lease,
+        run_git=run_git, clock=clock)
+    return {"member": member, "role": role,
+            "proposed_action": evidence.proposed_action,
+            "ship": _ship_evidence_dto(evidence)}
+
+
+def member_delivery_status(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    live_git: bool = True,
+    run_git: Any = None,
+) -> dict[str, Any]:
+    """Currentness view of a member's commit/ship/approval chain (M4-04 audit).
+
+    Read-only/unbound members yield an empty view.  Every durable record is
+    re-checked against LIVE facts (``live_git`` honoured); ``current=false``
+    plus ``problems`` makes staleness explicit so callers fail closed rather
+    than trusting a settled-but-stale PASS.
+    """
+
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    empty = {"member": member, "role": role, "bound": False, "task_id": None,
+             "attempt_id": None, "commit": None, "ship": None, "approval": None,
+             "proposed_action": None}
+    if read_only or task_id is None or attempt_id is None:
+        return empty
+    view = {"member": member, "role": role, "bound": True, "task_id": task_id,
+            "attempt_id": attempt_id, "commit": None, "ship": None,
+            "approval": None, "proposed_action": None}
+    commit = delivery.load_commit_evidence(conn, attempt_id)
+    if commit is not None:
+        view["commit"] = dict(
+            _commit_evidence_dto(commit),
+            **_freshness_dto(delivery.commit_evidence_is_current(
+                conn, commit, live_git=live_git, run_git=run_git)))
+    ship = delivery.load_ship_evidence(conn, attempt_id)
+    if ship is not None:
+        view["ship"] = dict(
+            _ship_evidence_dto(ship),
+            **_freshness_dto(delivery.ship_evidence_is_current(
+                conn, ship, live_git=live_git, run_git=run_git)))
+        view["proposed_action"] = ship.proposed_action
+        approval = delivery.load_delivery_approval(conn, ship.id)
+        if approval is not None:
+            view["approval"] = dict(
+                _delivery_approval_dto(approval),
+                **_freshness_dto(delivery.delivery_approval_is_current(
+                    conn, approval, live_git=live_git, run_git=run_git)))
+    return view
+
+
+def member_ship_diff(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    ship_evidence_id: str | None = None,
+    artifact_root: str | None = None,
+) -> dict[str, Any]:
+    """Read + integrity-verify the COMPLETE diff artifact for a member (M4-04).
+
+    Without ``ship_evidence_id`` the member's own bound ship evidence is used;
+    with one, it MUST belong to the member's Attempt.  Integrity (size + digest
+    recheck) is enforced by :func:`teamcraft.delivery.read_ship_diff`.
+    """
+
+    _role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or attempt_id is None or task_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no local-only delivery to diff")
+    if ship_evidence_id is None:
+        bound = delivery.load_ship_evidence(conn, attempt_id)
+        if bound is None:
+            raise RuntimeAdapterError(
+                f"member {member!r} has no ship evidence to diff")
+        ship_evidence_id = bound.id
+    evidence = delivery.get_ship_evidence(conn, ship_evidence_id)
+    if evidence.attempt_id != attempt_id:
+        raise RuntimeAdapterError(
+            f"ship evidence {ship_evidence_id!r} belongs to another Attempt;"
+            f" member {member!r} may not read its diff")
+    return delivery.read_ship_diff(conn, ship_evidence_id,
+                                  artifact_root=artifact_root)
+
+
+def decide_member_local_delivery(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    decision: str,
+    ship_evidence_id: str,
+    commit_sha: str | None = None,
+    branch: str | None = None,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Explicitly accept or reject local-only delivery for one member (M4-04).
+
+    The decision is bound to exactly one ship evidence that must belong to the
+    member's Attempt and project; an ``accept`` must echo the exact commit and
+    branch (enforced by Core) and is the ONLY path to DONE for a local-only
+    Task.  A ``reject`` records the decision and leaves the Task VERIFYING so a
+    fix arrives as a fresh bounded Attempt.  Stale/drifted evidence fails closed
+    inside :func:`teamcraft.delivery.approve_local_delivery`.
+    """
+
+    _role, _read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing to accept or reject")
+    evidence = delivery.get_ship_evidence(conn, ship_evidence_id)
+    if evidence.attempt_id != attempt_id:
+        raise RuntimeAdapterError(
+            f"ship evidence {ship_evidence_id!r} belongs to another Attempt;"
+            f" member {member!r} may not decide on it")
+    approval = delivery.approve_local_delivery(
+        conn, ship_evidence_id, decision=decision, commit_sha=commit_sha,
+        branch=branch, actor=actor, reason=reason,
+        idempotency_key=idempotency_key, lease=lease, run_git=run_git,
+        clock=clock)
+    return {"member": member, "decision": approval.decision,
+            "task_status_after": approval.task_status_after,
+            "approval": _delivery_approval_dto(approval)}
 
 
 # ---------------------------------------------------------------------------

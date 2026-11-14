@@ -78,6 +78,11 @@ try:  # M4-02 module; a pre-M4-02 bundled core may not carry it.
 except ImportError:  # pragma: no cover - only with a stale bundled core
     _worktrees = None
 
+try:  # M4-04 module; a pre-M4-04 bundled core may not carry it.
+    from teamcraft import delivery as _delivery  # noqa: E402
+except ImportError:  # pragma: no cover - only with a stale bundled core
+    _delivery = None
+
 
 STATE_VERSION = 1
 RUNTIME_DIRECTORY_NAME = ".teamcraft"
@@ -3881,6 +3886,198 @@ def worktree_verify_artifact(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# M4-04 local delivery CLI (parity with teamcraft.delivery + adapter additions)
+# ---------------------------------------------------------------------------
+
+
+def _require_m404_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M4-04."""
+
+    missing = sorted(name for name in (
+        "create_local_commit", "reconcile_commit_receipt",
+        "record_ship_evidence", "read_ship_diff", "approve_local_delivery",
+    ) if _delivery is None or not hasattr(_delivery, name))
+    missing += sorted(name for name in (
+        "create_member_local_commit", "reconcile_member_commit_receipt",
+        "record_member_ship_evidence", "member_delivery_status",
+        "member_ship_diff", "decide_member_local_delivery",
+    ) if not hasattr(_adapter, name))
+    if missing:
+        raise TeamctlError(
+            "the resolved TeamCraft core is too old for M4-04 local delivery"
+            f" (missing: {', '.join(missing)}); refresh the bundled core with"
+            " scripts/install.sh or reinstall the package")
+
+
+def _delivery_artifact_root(store: StateStore, args: argparse.Namespace) -> str | None:
+    value = getattr(args, "artifact_root", None)
+    if value is None:
+        return None  # core default: <repo>/.teamcraft/deliveries
+    expanded = os.path.expanduser(value)
+    if not os.path.isabs(expanded):
+        expanded = str(store.project_root / expanded)
+    return expanded
+
+
+def commit_create(args: argparse.Namespace) -> int:
+    """Create/adopt the local Commit on the member's own Attempt worktree (M4-04).
+
+    Never pushes or merges; commits only on the isolated ``tc/<task>/<attempt>``
+    branch and only verified-owned changes.  Replay-safe via the idempotency key.
+    """
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("local-commit-create", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.create_member_local_commit(
+                conn, args.member, idempotency_key=args.idempotency_key,
+                lease=lease, message=args.message,
+                artifact_root=_delivery_artifact_root(store, args))
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def commit_reconcile(args: argparse.Namespace) -> int:
+    """Reconcile a lost/interrupted Commit receipt against live Git facts.
+
+    Adopts a proven commit (never a second one) or expires an empty run; an
+    ambiguous scene fails closed and preserves the worktree.
+    """
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("local-commit-reconcile", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.reconcile_member_commit_receipt(
+                conn, args.member, args.command_id, lease=lease,
+                actor=args.actor, reason=args.reason)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def ship_record(args: argparse.Namespace) -> int:
+    """Bind immutable ship evidence and PROPOSE local-only acceptance (M4-04)."""
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("ship-evidence-record", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.record_member_ship_evidence(
+                conn, args.member, idempotency_key=args.idempotency_key,
+                lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def delivery_status(args: argparse.Namespace) -> int:
+    """Currentness view of the member's commit/ship/approval chain (audit).
+
+    ``--offline`` skips the live Git re-check (durable facts only); a stale or
+    failed link is reported as ``current=false`` with ``problems`` so callers
+    fail closed instead of trusting a settled-but-stale PASS.
+    """
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        try:
+            result = _adapter.member_delivery_status(
+                conn, args.member, live_git=not args.offline)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def delivery_diff(args: argparse.Namespace) -> int:
+    """Read + integrity-verify the COMPLETE base..commit diff artifact (M4-04)."""
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        try:
+            result = _adapter.member_ship_diff(
+                conn, args.member, ship_evidence_id=args.ship_evidence_id,
+                artifact_root=_delivery_artifact_root(store, args))
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _local_delivery_decision(args: argparse.Namespace, decision: str) -> int:
+    """Shared accept/reject path bound to an exact commit + branch (M4-04)."""
+
+    _require_m404_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease(f"local-delivery-{decision}", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.decide_member_local_delivery(
+                conn, args.member, decision=decision,
+                ship_evidence_id=args.ship_evidence_id,
+                commit_sha=args.commit_sha, branch=args.branch,
+                actor=args.actor, reason=args.reason,
+                idempotency_key=args.idempotency_key, lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def delivery_accept(args: argparse.Namespace) -> int:
+    """Accept local-only delivery for the EXACT echoed commit and branch.
+
+    This is the only path that moves a local-only Task to DONE; a mismatched or
+    drifted commit/branch is refused fail-closed by the Core gate.
+    """
+
+    return _local_delivery_decision(args, "accept")
+
+
+def delivery_reject(args: argparse.Namespace) -> int:
+    """Reject local-only delivery; the Task stays VERIFYING for a new Attempt."""
+
+    return _local_delivery_decision(args, "reject")
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -4265,6 +4462,77 @@ def build_parser() -> argparse.ArgumentParser:
     wt_artifact_parser.add_argument("--verification-id", required=True)
     wt_artifact_parser.add_argument("--artifact-root", default=None)
     wt_artifact_parser.set_defaults(handler=worktree_verify_artifact)
+
+    commit_create_parser = commands.add_parser(
+        "commit-create", aliases=["delivery-commit"])
+    add_cwd(commit_create_parser)
+    commit_create_parser.add_argument("--member", required=True)
+    commit_create_parser.add_argument("--idempotency-key", required=True)
+    commit_create_parser.add_argument("--message", default=None,
+        help="commit message (default: Core-composed bounded message)")
+    commit_create_parser.add_argument("--artifact-root", default=None,
+        help="delivery artifact root (default <repo>/.teamcraft/deliveries)")
+    commit_create_parser.set_defaults(handler=commit_create)
+
+    commit_reconcile_parser = commands.add_parser(
+        "commit-reconcile", aliases=["delivery-commit-reconcile"])
+    add_cwd(commit_reconcile_parser)
+    commit_reconcile_parser.add_argument("--member", required=True)
+    commit_reconcile_parser.add_argument("--command-id", required=True,
+        help="interrupted local-commit Command whose receipt was lost")
+    commit_reconcile_parser.add_argument("--actor", required=True)
+    commit_reconcile_parser.add_argument("--reason", required=True)
+    commit_reconcile_parser.set_defaults(handler=commit_reconcile)
+
+    ship_record_parser = commands.add_parser(
+        "ship-evidence", aliases=["delivery-ship-evidence"])
+    add_cwd(ship_record_parser)
+    ship_record_parser.add_argument("--member", required=True)
+    ship_record_parser.add_argument("--idempotency-key", required=True)
+    ship_record_parser.set_defaults(handler=ship_record)
+
+    delivery_status_parser = commands.add_parser("delivery-status")
+    add_cwd(delivery_status_parser)
+    delivery_status_parser.add_argument("--member", required=True)
+    delivery_status_parser.add_argument("--offline", action="store_true",
+        help="skip the live Git re-check (durable facts only)")
+    delivery_status_parser.set_defaults(handler=delivery_status)
+
+    delivery_diff_parser = commands.add_parser("delivery-diff")
+    add_cwd(delivery_diff_parser)
+    delivery_diff_parser.add_argument("--member", required=True)
+    delivery_diff_parser.add_argument("--ship-evidence-id", default=None,
+        help="specific ship evidence (default: the member's own bound evidence)")
+    delivery_diff_parser.add_argument("--artifact-root", default=None)
+    delivery_diff_parser.set_defaults(handler=delivery_diff)
+
+    accept_parser = commands.add_parser(
+        "delivery-accept", aliases=["accept-local-delivery"])
+    add_cwd(accept_parser)
+    accept_parser.add_argument("--member", required=True)
+    accept_parser.add_argument("--ship-evidence-id", required=True)
+    accept_parser.add_argument("--commit-sha", required=True,
+        help="EXACT commit SHA the evidence proposes; anything else is refused")
+    accept_parser.add_argument("--branch", required=True,
+        help="EXACT attempt branch the evidence proposes")
+    accept_parser.add_argument("--actor", required=True)
+    accept_parser.add_argument("--reason", required=True)
+    accept_parser.add_argument("--idempotency-key", required=True)
+    accept_parser.set_defaults(handler=delivery_accept)
+
+    reject_parser = commands.add_parser(
+        "delivery-reject", aliases=["reject-local-delivery"])
+    add_cwd(reject_parser)
+    reject_parser.add_argument("--member", required=True)
+    reject_parser.add_argument("--ship-evidence-id", required=True)
+    reject_parser.add_argument("--commit-sha", default=None,
+        help="optional echo of the rejected commit SHA")
+    reject_parser.add_argument("--branch", default=None,
+        help="optional echo of the rejected branch")
+    reject_parser.add_argument("--actor", required=True)
+    reject_parser.add_argument("--reason", required=True)
+    reject_parser.add_argument("--idempotency-key", required=True)
+    reject_parser.set_defaults(handler=delivery_reject)
     return parser
 
 

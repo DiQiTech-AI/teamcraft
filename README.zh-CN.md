@@ -318,6 +318,30 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py verification-approval \
 
 执行使用 `shell=False`。有界 stdout/stderr 报告工件及 SHA-256、退出码、argv、规则版本和验证器配置版本以不可变记录保存在 SQLite。项目没有配置验证命令时不会得到 PASS。Brief 和最终 WorkerReport 保留不可变的派发时 Task 版本；Verification 另行记录 `worker_reported_done` 后 Task 的当前版本，以及 Attempt identity、Brief digest、最终 WorkerReport identity/digest。Approval 绑定这组完整证据，并在项目 Leader 事务中复核后才能将 scout Task 置为 DONE。之后 Task、Brief、WorkerReport、报告工件或验证策略发生变化都会使证据过期；已完成 scout 的 Task 证据或验证策略变化会重新打开该任务。同一幂等键的重复决定返回原记录；需要新决定时必须生成新的 Verification。普通 ship 在 M4 Worktree/Commit/Diff 证据完成前保持 VERIFYING/NEEDS_HUMAN，M2 不会把报告当成交付。
 
+## Local-only Commit/Diff 交付（M4-04 — 2026-11-14 独立验收通过）
+
+对于执行策略为 `delivery=local_only` 且已完成的可写 ship Attempt，M4-04 只会在该 Attempt 已登记的 `tc/<task>/<attempt>` Worktree 中创建本地 Commit。Git 副作用前，Core 先持久化带 fencing 的 Command，并复核 Worktree identity 与完整 Ownership Diff Gate。随后形成的 ship evidence 绑定 Task/Attempt/Brief 与最终 WorkerReport 版本、精确 Commit SHA/分支、base-to-Commit 完整 Diff digest 与有界 artifact，以及当前通过的 M4-03 verifier profile/config 证据。Worker 完成、Verifier PASS、ship evidence 与人工接受仍是相互独立的事实。
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py commit-create \
+  --member DEV_MEMBER --idempotency-key commit-ATTEMPT-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py ship-evidence \
+  --member DEV_MEMBER --idempotency-key ship-ATTEMPT-v1
+python3 .agents/skills/teamcraft/scripts/teamctl.py delivery-status \
+  --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py delivery-diff \
+  --member DEV_MEMBER --ship-evidence-id SHIP_EVIDENCE_ID
+python3 .agents/skills/teamcraft/scripts/teamctl.py delivery-accept \
+  --member DEV_MEMBER --ship-evidence-id SHIP_EVIDENCE_ID \
+  --commit-sha COMMIT_SHA --branch ATTEMPT_BRANCH \
+  --actor human --reason "接受精确的本地 Commit" \
+  --idempotency-key accept-SHIP_EVIDENCE_ID-v1
+```
+
+若 Git 已完成而 Commit 回执丢失，`commit-reconcile --member DEV_MEMBER --command-id COMMAND_ID --actor human --reason "按已观察的 Git 事实对账"` 只会在已登记 Worktree、native Session 与持久 Event 事实能精确证明时收养该 Commit，绝不会再创建一个替代 Commit。`delivery-reject` 记录明确拒绝且不完成 Task。Commit/分支、Task 版本、策略、verifier profile/config、Diff 或 Worktree identity 任一漂移，都会使旧 evidence 或 Approval 失效。只有回显并接受证据绑定的精确 Commit 和分支，才可把 `local_only` Task 从 VERIFYING 转为 DONE。
+
+认证 API 通过 `POST /api/v1/attempts/{attempt_id}/delivery/commit`、`POST /api/v1/attempts/{attempt_id}/delivery/ship-evidence`、`POST /api/v1/commands/{command_id}/delivery/reconcile` 与 `POST /api/v1/ship-evidence/{ship_evidence_id}/approval` 暴露同一套 Core 操作；只读视图为 `GET /api/v1/tasks/{task_id}/delivery`、`GET /api/v1/attempts/{attempt_id}/delivery`、`GET /api/v1/ship-evidence/{id}` 与 `GET /api/v1/ship-evidence/{id}/diff`。写入继续遵守 bearer、Origin/CSRF、`Idempotency-Key`、适用的 expected-version 与短 Leader lease 门禁。请求模型只接受 opaque id、预期 Task 版本、精确 Commit/分支回显与有界文本，客户端无法传入 Git argv、路径或 shell 片段。report-only/scout 审批仍使用 `/api/v1/verifications/{id}/approvals`；direct-PR 继续等待 M4-05。M4-04 不执行 push、merge、部署或 Worktree 删除。
+
 ## 使用其他 Harness
 
 角色和 harness 是独立的。将 `--kind opencode` 换成当前 Herdr 支持的其他类型即可，例如：
@@ -429,6 +453,8 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 
 截至 2026-11-11，仓库套件为 693 项测试——在此前 468 项基线之上新增 M3-02 Query API、M3-03 SSE 断线恢复、67 项 M3-04 Command API 定向测试（`tests/test_api_m304.py`）、18 项 teamctl CLI 对等与解析器健壮性测试（`tests/test_teamctl.py`）、35 项 M3-05 Web 控制台集成测试（`tests/test_web_m305.py`）与 20 项 M3-06 Chromium E2E 测试（`tests/test_web_m306.py`，真实无头 Google Chrome 157.0.8103.50，由纯标准库 CDP 客户端驱动；无 Chromium 时该套件以显式理由自跳，无浏览器机器可用 `--ignore=tests/test_web_m306.py` 排除）——本地 `python3 -B -m pytest tests/ -q` 全部通过（2026-11-11 最终运行：693 passed，115 subtests passed，退出码 0；且 `python3 -B -m pytest tests/test_web_m306.py -q` 独立连续两次绿色、各 20 passed，以证可重复性）。teamctl 解析器对 Core 版本容错：`--help` 基于规范 Core 常量构建（对 pre-M3-04 离线包回退到封闭集合），需要 v15 API 的命令会以可操作的 reinstall 提示失败，而非 AttributeError。本工作树更早一次运行曾因沙箱 socket 限制使 M3-03 的 uvicorn 测试无法绑定 `127.0.0.1:0`（`[Errno 1] Operation not permitted`）；这些测试未做任何改动即在 2026-11-10 运行中通过，故记录为环境限制而非代码缺陷。`tests/test_api_m303.py::M303GapFallback::test_live_gap_detected_after_backfill`（SSE 缺口检测时序）存在既有的全量运行负载敏感性：2026-11-10 四次全量 pytest 中该测试 2 次失败（2026-11-11 排除 E2E 文件的一次全量运行亦失败一次），而单独运行（两日累计 6/6）、整文件运行与其余全量运行均通过——记录为既有的 flaky 时序限制，M3-06 未触及该文件（超出其所有权，且 M3-06 唯一的代码改动 `teamcraft/api/web/app.js` 是该文件从不加载的浏览器端 JS）。
 
+M4-04 验证与独立验收（2026-11-14，macOS 本机）：CEO 全量运行 `python3 -B -m pytest tests -q -p no:cacheprovider`，结果为 **905 passed、131 subtests passed、退出码 0**。独立 tester 另行取得 **M4-04 86 tests + 6 subtests**、**M4-01/M4-02/M4-03 119 tests + 10 subtests**、**M2-06 11 tests**及**相邻回归 424 tests + 95 subtests**。审查发现一项非阻塞的 runtime-adapter scope 顺序问题：Commit reconcile 必须先拒绝 foreign member binding，才可调用 Core。把 guard 移到 Core effect 前后，独立复验通过 **25/25 项 adapter/CLI 定向测试**、**2/2 项 `-k reconcile` 测试**，并以直接 refusal probe 覆盖 foreign Attempt/Task/project binding、畸形/list/缺失 evidence key、错误 Command kind 与只读成员；每项拒绝均观察到 `core_called=False`。tester 随后给出最终 PASS，零阻塞。905 项全量与 tester 的较宽矩阵都早于最后这项窄 guard 补丁，因此不表述为补丁后的全量复跑。SSE/Web 测试需要绑定并访问 `127.0.0.1`，须在允许本机回环网络的执行环境中运行；网络受限沙箱无法提供该证据。本工作树不声称 GitHub Actions 已通过。
+
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 
 ## 当前边界
@@ -438,7 +464,8 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
-- M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复、M3-04 Command API、M3-05 最小 Web 控制台与 M3-06 浏览器 E2E 套件均已实现，且经自动化测试、本机 loopback HTTP 冒烟与可重复的 Fake-Herdr 无头 Chromium E2E 验证（连续两次全量 20 项绿色；`teamcraft/api/web/app.js` 修复 6 个真实控制台缺陷）：delivery/router 策略的*执行*属 M4；取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；内置控制台随常规 wheel 与 sdist 安装分发（`pyproject.toml` 已声明 `package-data`；两类归档已离线构建并检视，默认安装态 `WEB_ROOT` 已验证可解析并提供三个资产）；本工作树未运行 GitHub Actions。Chromium E2E 以真实 Chrome DevTools Protocol 输入驱动控制台，但一切 runtime 场景均为执行同一套 Core 原语的 Fake Herdr：它**不是**真实 Herdr 证据，Safari/Firefox 行为亦未覆盖。
+- M4-04 已实现 Core、CLI、runtime adapter 与认证 API 的 local-only Commit/Diff evidence 和精确 Commit/分支接受，并在上述 reconcile scope 顺序定向复验后于 2026-11-14 通过独立验收；尚不包含 direct-PR、push、merge、部署、清理或 M6-02 的丰富 Diff 页面。本工作树未运行 GitHub Actions。
+- M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复、M3-04 Command API、M3-05 最小 Web 控制台与 M3-06 浏览器 E2E 套件均已实现，且经自动化测试、本机 loopback HTTP 冒烟与可重复的 Fake-Herdr 无头 Chromium E2E 验证（连续两次全量 20 项绿色；`teamcraft/api/web/app.js` 修复 6 个真实控制台缺陷）。取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；内置控制台随常规 wheel 与 sdist 安装分发（`pyproject.toml` 已声明 `package-data`；两类归档已离线构建并检视，默认安装态 `WEB_ROOT` 已验证可解析并提供三个资产）。Chromium E2E 以真实 Chrome DevTools Protocol 输入驱动控制台，但一切 runtime 场景均为执行同一套 Core 原语的 Fake Herdr：它**不是**真实 Herdr 证据，Safari/Firefox 行为亦未覆盖。
 - CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
 - 把 Skill 用到其他项目时，需要一并部署角色配置，并按目标机器调整 provider、模型和权限路径。

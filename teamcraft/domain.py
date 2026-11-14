@@ -74,6 +74,7 @@ Hard invariants pinned by tests (``tests/test_domain_m104.py``):
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 import sqlite3
@@ -186,6 +187,24 @@ DEFAULT_PRIORITY = 50
 # Transition tables
 # ---------------------------------------------------------------------------
 
+# M4-04 local-only delivery: one accepted Commit on the Attempt's own branch
+# is what completes a ``local_only`` ship Task.  The facts ride the durable
+# append-only ``events`` stream (same storage pattern M4-02 used for worktree
+# lifecycle, so no schema step is needed); these constants name the contract
+# shared by :mod:`teamcraft.delivery` and the fact gate below.  ``ship`` (the
+# default policy when no delivery mode is configured) and ``direct_pr`` keep
+# waiting on M4-05/M4-06: only an explicit ``local_only`` policy plus a bound
+# Commit/Diff/Verifier chain may fire ``local_delivery_accepted``.
+LOCAL_DELIVERY_ACCEPT_EVENT = "local_delivery_accepted"
+DELIVERY_CONTRACT_VERSION = 1
+COMMIT_EVIDENCE_EVENT_KIND = "delivery_commit_evidence"
+SHIP_EVIDENCE_EVENT_KIND = "delivery_ship_evidence"
+DELIVERY_APPROVAL_EVENT_KIND = "delivery_approval"
+#: The only proposed/accepted action this milestone understands.
+LOCAL_ONLY_ACCEPT_ACTION = "accept_local_commit"
+#: Branches that local delivery must NEVER commit to or accept on.
+PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})
+
 #: (status, event) -> allowed target tuple.  Multiple targets mean the caller
 #: must choose one (ambiguous events, PLAN 5.1 rows "NEEDS_HUMAN 或 BLOCKED"
 #: and "BLOCKED / READY"); zero targets is an illegal transition.
@@ -200,6 +219,7 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("ready", "attempts_exhausted"): ("needs_human",),
     ("verifying", "verification_passed"): ("needs_human",),
     ("verifying", "verification_failed"): ("needs_human",),
+    ("verifying", LOCAL_DELIVERY_ACCEPT_EVENT): ("done",),
     ("ready_to_merge", "approved_and_delivered"): ("done",),
     ("blocked", "blocked_cleared"): ("pending",),
     ("needs_human", "human_reconciled"): ("blocked", "ready", "failed"),
@@ -228,6 +248,11 @@ def task_transition_targets(
         return ("done",)
     if (status, event) == ("verifying", "report_accepted"):
         return ()
+    if event == LOCAL_DELIVERY_ACCEPT_EVENT:
+        # Local-only acceptance is a ship-kind path only; scouts complete via
+        # report_accepted.  The delivery-mode and evidence facts are re-checked
+        # against durable rows inside apply_task_event (the door below).
+        return ("done",) if kind == "ship" else ()
     return _TASK_TRANSITIONS.get((status, event), ())
 
 
@@ -632,6 +657,246 @@ _UNFINISHED_DEPS_SQL = (
     " WHERE d.task_id = ? AND p.status <> 'done' ORDER BY p.id"
 )
 
+# ---------------------------------------------------------------------------
+# M4-04 — durable local-only delivery facts (Commit/Diff/Verifier/Approval)
+#
+# The gate below is the SINGLE authority that lets ``verifying ->
+# done`` fire via ``local_delivery_accepted``.  It reads only durable facts
+# (append-only ``events`` rows + current Task/Attempt/Brief/WorkerReport/
+# verifier-profile rows) — never caller arguments — and fails closed:
+#
+# * an accept Approval must exist, bound to this Task at its CURRENT version
+#   (any Task/task/policy drift bumps the version and strands the binding);
+# * the Approval chain must reference exactly one ship Verification evidence
+#   row, which references exactly one Commit evidence row, with commit SHA,
+#   branch, base SHA, diff digest and evidence digest agreeing across every
+#   link (a tampered link breaks the recomputed digests and the chain);
+# * delivery mode ``local_only`` and the canonical policy digest must still
+#   match the live Task execution policy;
+# * the bound Attempt must be this Task's latest Attempt, finished, and the
+#   Brief/WorkerReport pins must still equal the durable rows;
+# * every pinned M4-03 verifier profile must still be the current approved
+#   version/config of its profile (verifier/config drift invalidates);
+# * the bound branch is never a protected branch name.
+#
+# Live Git re-verification (HEAD == bound commit, clean worktree, complete
+# diff) happens in :mod:`teamcraft.delivery` at evidence/approval time; the
+# Task machine here is the durable-fact floor, mirroring how ``report_accepted``
+# re-checks scout approvals from the table rows.
+# ---------------------------------------------------------------------------
+
+_LOCAL_ACCEPT_FACTS_SQL = (
+    "SELECT ap.seq, ap.event_id, ap.payload_json,"
+    " se.event_id, se.payload_json, ce.event_id, ce.payload_json"
+    " FROM events ap"
+    " JOIN events se ON se.kind = ?"
+    "   AND se.event_id = json_extract(ap.payload_json, '$.ship_evidence_id')"
+    "   AND se.task_id = ap.task_id AND se.attempt_id = ap.attempt_id"
+    " JOIN events ce ON ce.kind = ?"
+    "   AND ce.event_id = json_extract(se.payload_json, '$.commit_evidence_id')"
+    "   AND ce.task_id = ap.task_id AND ce.attempt_id = ap.attempt_id"
+    " WHERE ap.kind = ? AND ap.task_id = ?"
+    "   AND json_extract(ap.payload_json, '$.schema_version') = ?"
+    "   AND json_extract(ap.payload_json, '$.decision') = 'accept'"
+    "   AND json_extract(ap.payload_json, '$.proposed_action')"
+    "       = 'accept_local_commit'"
+    "   AND json_extract(ap.payload_json, '$.task_version') = ?"
+    "   AND json_extract(se.payload_json, '$.schema_version') = ?"
+    "   AND json_extract(se.payload_json, '$.delivery_mode') = 'local_only'"
+    "   AND json_extract(se.payload_json, '$.proposed_action')"
+    "       = 'accept_local_commit'"
+    "   AND json_extract(se.payload_json, '$.task_version')"
+    "       = json_extract(ap.payload_json, '$.task_version')"
+    "   AND json_extract(se.payload_json, '$.attempt_no')"
+    "       = json_extract(ap.payload_json, '$.attempt_no')"
+    "   AND json_extract(se.payload_json, '$.commit_sha')"
+    "       = json_extract(ap.payload_json, '$.commit_sha')"
+    "   AND json_extract(se.payload_json, '$.branch')"
+    "       = json_extract(ap.payload_json, '$.branch')"
+    "   AND json_extract(se.payload_json, '$.diff_digest')"
+    "       = json_extract(ap.payload_json, '$.diff_digest')"
+    "   AND json_extract(se.payload_json, '$.evidence_digest')"
+    "       = json_extract(ap.payload_json, '$.evidence_digest')"
+    "   AND json_extract(ce.payload_json, '$.schema_version') = ?"
+    "   AND json_extract(ce.payload_json, '$.commit_sha')"
+    "       = json_extract(se.payload_json, '$.commit_sha')"
+    "   AND json_extract(ce.payload_json, '$.branch')"
+    "       = json_extract(se.payload_json, '$.branch')"
+    "   AND json_extract(ce.payload_json, '$.base_sha')"
+    "       = json_extract(se.payload_json, '$.base_sha')"
+    " ORDER BY ap.seq DESC LIMIT 1"
+)
+
+_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_DIGEST64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _delivery_payload_digest(payload: dict) -> str:
+    """SHA-256 over the payload's canonical JSON minus ``evidence_digest``.
+
+    The SAME rule is implemented in :mod:`teamcraft.delivery` (kept local to
+    each layer on purpose, mirroring the documented duplication of
+    ``require_head`` in ``events.py``); the M4-04 acceptance tests prove both
+    recomputations agree, so a payload that any layer accepts is byte-stable.
+    """
+    stripped = {key: value for key, value in payload.items()
+                if key != "evidence_digest"}
+    return hashlib.sha256(
+        json.dumps(stripped, sort_keys=True, separators=(",", ":"),
+                  ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _delivery_json_field(payload: dict, key: str) -> Any:
+    value = payload.get(key)
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    return value
+
+
+def _require_local_delivery_acceptance(
+    conn: TeamCraftConnection, task: Task, event: str
+) -> None:
+    """Fail-closed durable-fact gate for ``local_delivery_accepted``.
+
+    Raises :class:`IllegalTransitionError` with a stable reason code unless
+    every bound fact still holds at the Task's CURRENT version.
+    """
+
+    def refuse(code: str, message: str) -> IllegalTransitionError:
+        return IllegalTransitionError(
+            f"task {task.id} event {event!r}: {message}",
+            entity="task", current=task.status, event=event, reason_code=code,
+        )
+
+    if task.kind != "ship":
+        raise refuse("M4_EVIDENCE_REQUIRED",
+                    "only ship Tasks with local-only Commit delivery can be "
+                    "accepted; scouts complete via report_accepted")
+    try:
+        policy = json.loads(task.execution_policy_json or "{}")
+    except (TypeError, ValueError):
+        policy = None
+    if not isinstance(policy, dict) or policy.get("delivery") != "local_only":
+        raise refuse("LOCAL_DELIVERY_MODE_REQUIRED",
+                    "the Task's live execution policy is not delivery=local_only;"
+                    " direct_pr/ship delivery waits for M4-05/M4-06 and "
+                    "report_only delivers nothing")
+    row = conn.execute(
+        _LOCAL_ACCEPT_FACTS_SQL,
+        (SHIP_EVIDENCE_EVENT_KIND, COMMIT_EVIDENCE_EVENT_KIND,
+         DELIVERY_APPROVAL_EVENT_KIND, task.id, DELIVERY_CONTRACT_VERSION,
+         task.version, DELIVERY_CONTRACT_VERSION, DELIVERY_CONTRACT_VERSION),
+    ).fetchone()
+    if row is None:
+        raise refuse("ACCEPTANCE_FACTS_MISSING",
+                    "no durable accept Approval bound to this Task's current "
+                    "version with a complete ship+commit evidence chain")
+    try:
+        approval = json.loads(str(row[2]))
+        evidence = json.loads(str(row[4]))
+        commit = json.loads(str(row[6]))
+    except (TypeError, ValueError) as exc:
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    f"delivery evidence payload is not valid JSON: {exc}")
+    for name, payload in (("approval", approval), ("ship evidence", evidence),
+                         ("commit evidence", commit)):
+        if not isinstance(payload, dict):
+            raise refuse("ACCEPTANCE_FACTS_STALE",
+                         f"{name} payload is not a JSON object")
+    if _delivery_payload_digest(evidence) != evidence.get("evidence_digest"):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "ship evidence digest does not recompute; the durable "
+                    "delivery evidence was tampered with")
+    if _delivery_payload_digest(commit) != commit.get("evidence_digest"):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "commit evidence digest does not recompute")
+    if approval.get("evidence_digest") != evidence.get("evidence_digest"):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "Approval does not bind the ship evidence's evidence version")
+    branch = str(evidence.get("branch") or "")
+    if branch.lower() in PROTECTED_BRANCH_NAMES or not branch.startswith("tc/"):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    f"bound branch {branch!r} is not the isolated Attempt "
+                    "branch; local delivery never commits to protected branches")
+    policy_digest = hashlib.sha256(
+        json.dumps(policy, sort_keys=True, separators=(",", ":"),
+                  ensure_ascii=False).encode("utf-8")).hexdigest()
+    if policy_digest != evidence.get("policy_digest"):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "the Task execution policy changed after the ship "
+                    "evidence was formed")
+    attempt_id = str(evidence.get("attempt_id") or "")
+    attempt = conn.execute(
+        "SELECT id, status, attempt_no FROM attempts WHERE task_id = ?"
+        " ORDER BY attempt_no DESC LIMIT 1", (task.id,),
+    ).fetchone()
+    if (attempt is None or str(attempt[0]) != attempt_id
+            or str(attempt[1]) != "finished"
+            or int(attempt[2]) != int(evidence.get("attempt_no") or -1)):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "the bound Attempt is not this Task's latest finished "
+                    "Attempt; stale-attempt acceptance is refused")
+    brief = conn.execute(
+        "SELECT task_version, brief_version, brief_digest FROM attempt_briefs"
+        " WHERE attempt_id = ?", (attempt_id,),
+    ).fetchone()
+    if (brief is None or int(brief[0]) != int(evidence.get("dispatch_task_version") or -1)
+            or int(brief[1]) != int(evidence.get("brief_version") or -1)
+            or str(brief[2]) != evidence.get("brief_digest")):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "the Brief bound into the ship evidence no longer matches "
+                    "the durable Attempt Brief")
+    report = conn.execute(
+        "SELECT id, task_version, brief_digest, report_digest, outcome, task_id"
+        " FROM worker_reports WHERE attempt_id = ? AND report_kind = 'final'"
+        " ORDER BY id DESC LIMIT 1", (attempt_id,),
+    ).fetchone()
+    if (report is None or int(report[0]) != int(evidence.get("worker_report_id") or -1)
+            or int(report[1]) != int(evidence.get("dispatch_task_version") or -1)
+            or str(report[2]) != evidence.get("brief_digest")
+            or str(report[3]) != evidence.get("worker_report_digest")
+            or str(report[4]) != "completed" or str(report[5]) != task.id):
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "the WorkerReport bound into the ship evidence is no "
+                    "longer the latest final completed report")
+    verifiers = _delivery_json_field(evidence, "verifiers_json")
+    if not isinstance(verifiers, list) or not verifiers:
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "ship evidence carries no verifier profile bindings")
+    pinned: dict[str, tuple[int, str]] = {}
+    for entry in verifiers:
+        if not isinstance(entry, dict):
+            raise refuse("ACCEPTANCE_FACTS_STALE",
+                        "verifier binding entry is malformed")
+        profile = str(entry.get("profile") or "")
+        version = entry.get("profile_version")
+        digest = str(entry.get("config_digest") or "")
+        if (entry.get("status") != "pass" or not profile
+                or isinstance(version, bool) or not isinstance(version, int)
+                or not _DIGEST64_RE.match(digest)):
+            raise refuse("ACCEPTANCE_FACTS_STALE",
+                        f"verifier profile {profile!r} binding is not a "
+                        "passing versioned configuration")
+        pinned[profile] = (int(version), digest)
+    current = conn.execute(
+        "SELECT profile, profile_version, config_digest, enabled"
+        " FROM verifier_profiles p WHERE p.project_id = ? AND profile_version ="
+        " (SELECT MAX(p2.profile_version) FROM verifier_profiles p2"
+        "   WHERE p2.project_id = p.project_id AND p2.profile = p.profile)",
+        (task.project_id,),
+    ).fetchall()
+    current_required = {str(r[0]): (int(r[1]), str(r[2])) for r in current
+                        if int(r[3]) == 1}
+    if current_required != pinned:
+        raise refuse("ACCEPTANCE_FACTS_STALE",
+                    "the approved verifier profile configuration changed after "
+                    "the ship evidence was formed (pinned"
+                    f" {sorted(pinned.items())} vs current"
+                    f" {sorted(current_required.items())})")
+
 
 def _require_deps_done(
     conn: TeamCraftConnection, task: Task, event: str
@@ -840,6 +1105,25 @@ def update_task(
                 project_id=task.project_id, task_id=task.id,
                 payload_json='{"reason":"task_evidence_changed"}', clock=clock)
             return reopened
+        if task.status == "done" and conn.execute(
+            "SELECT 1 FROM events WHERE kind = ? AND task_id = ?"
+            " AND json_extract(payload_json, '$.decision') = 'accept' LIMIT 1",
+            (DELIVERY_APPROVAL_EVENT_KIND, task.id),
+        ).fetchone() is not None:
+            # M4-04: a locally accepted ship Task is DONE only on the strength
+            # of its bound Commit/Diff/Verifier evidence.  ANY later Task
+            # mutation (title, priority, policy, dependencies...) invalidates
+            # that evidence version; reopen in the same CAS so the old
+            # approval can never carry a drifted Task to DONE again.
+            reopened = _cas_task(conn, task, status="needs_human",
+                                 expected_version=expected_version, now=_utc_iso(clock), **updates)
+            events.append_event(conn, "delivery.approval_invalidated",
+                project_id=task.project_id, task_id=task.id,
+                payload_json=_canonical_json(
+                    {"reason": "task_evidence_changed",
+                     "next": "new bounded Attempt with fresh commit/ship evidence"}),
+                clock=clock)
+            return reopened
         return _cas_task(conn, task, expected_version=expected_version, now=_utc_iso(clock), **updates)
 
 
@@ -945,6 +1229,12 @@ def apply_task_event(
                     entity="task", current=task.status, event=event,
                     reason_code="APPROVAL_STALE",
                 )
+        if event == LOCAL_DELIVERY_ACCEPT_EVENT:
+            # M4-04: the ONLY path to DONE for a local-only ship Task.  All
+            # facts (Approval chain, commit/diff digests, Brief/WorkerReport
+            # pins, verifier profile currency, policy digest, protected branch)
+            # are re-derived from durable rows — never from the caller.
+            _require_local_delivery_acceptance(conn, task, event)
         targets = task_transition_targets(task.status, event, task.kind)
         resolved = _resolve_target("task", task.status, event, targets, target)
         if event in _FACT_GUARDED_TASK_EVENTS:
@@ -1726,14 +2016,21 @@ def _fetch_session(conn: TeamCraftConnection, session_id: str) -> SessionRecord:
 
 __all__ = [
     "ATTEMPT_STATUSES",
+    "COMMIT_EVIDENCE_EVENT_KIND",
+    "DELIVERY_APPROVAL_EVENT_KIND",
+    "DELIVERY_CONTRACT_VERSION",
     "DELIVERY_MODES",
     "DEPENDENCY_EDITABLE_STATUSES",
     "EXECUTION_POLICY_KEYS",
+    "LOCAL_DELIVERY_ACCEPT_EVENT",
+    "LOCAL_ONLY_ACCEPT_ACTION",
     "OCCUPYING_ATTEMPT_STATUSES",
     "PAUSABLE_TASK_STATUSES",
+    "PROTECTED_BRANCH_NAMES",
     "PRIORITY_MAX",
     "PRIORITY_MIN",
     "SESSION_STATES",
+    "SHIP_EVIDENCE_EVENT_KIND",
     "TASK_STATUSES",
     "TERMINAL_ATTEMPT_STATUSES",
     "TERMINAL_TASK_STATUSES",

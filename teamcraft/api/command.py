@@ -81,6 +81,49 @@ Three execution tiers, all durable through the M1-05 Command Service
   Wake candidate — the only path to a prompt, gated by CEO initialization
   and lease fencing exactly like every automated Wake.
 
+M4-04 (phase C) adds the local-only Commit/Diff delivery tier on top of the
+same guards, adapters over :mod:`teamcraft.delivery` — again NO new state
+machine here, HTTP translates to exactly these Core calls:
+
+==========================================  ==========================================
+M4-04 operation                            Core interface used
+==========================================  ==========================================
+Fenced idempotent Commit creation          ``delivery.create_local_commit``
+(durable Command BEFORE any Git effect,     (lease-fenced; Git effect is
+full Diff Gate + identity proof first)     Core-built plumbing only)
+Commit receipt reconciliation              ``delivery.reconcile_commit_receipt``
+(adopts an existing commit Git proves,     (settles running/unknown
+or expires it when Git shows nothing)      ``delivery.local_commit`` Commands)
+Ship-evidence recording                    ``delivery.record_ship_evidence``
+(complete base→Commit diff digest +        (verifier/config currency pinned)
+artifact, verifier bindings, policy)
+Exact Commit/branch local-only             ``delivery.approve_local_delivery``
+accept/reject (accept must echo the        (CAS verifying→done through the
+bound commit_sha AND branch; DONE)        durable-fact domain gate)
+Current evidence reads                     see ``teamcraft.api.query``
+(commit/ship/approval + bounded           (ro channel over the same store)
+complete diff artifact)
+==========================================  ==========================================
+
+M4-04 hard rules, mirroring the M3-04 envelope: every write still requires
+``Idempotency-Key`` (delivery keys are additionally capped at Core's 200-char
+bound so a refusal never lands mid-flow) and, where the operation binds Task
+evidence, ``expected_task_version``; fresh submissions gate against the live
+Task version BEFORE any effect and replays/settled evidence keep converging
+after the world moved on (nothing new is written).  API clients can NEVER
+provide arbitrary Git argv, a repository/worktree path, an artifact root, or a
+shell: the request models are ``extra="forbid"``, every request field is an
+opaque id/digest/plain-text within fixed caps, and Core's audited runner
+(``FORBIDDEN_GIT_VERBS``) is what actually executes — push/merge/reset/clean
+and friends never appear.  Commit-scoped reconcile is anchored to the Command
+row's own state machine (an already-settled Command replays its resolution),
+and the three delivery Command kinds plus their durable evidence events make
+every effect traceable via ``GET /commands/{command_id}``.  The pre-existing
+``POST /verifications/{id}/approvals`` (report-only/scout approval) is
+retained unchanged; local-only acceptance is a SEPARATE exact-echo route, and
+``direct_pr`` remains gated out (Core's ship evidence is ``local_only``-only
+until M4-05 exists).
+
 Hard rules pinned here (M0 review M3-04 row; PLAN §8.5):
 
 * every write requires the ``Idempotency-Key`` header (uniform 422 refusal
@@ -112,6 +155,7 @@ Hard rules pinned here (M0 review M3-04 row; PLAN §8.5):
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -124,6 +168,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import commands as commands_core
+from .. import delivery as delivery_core
 from .. import domain, fresh_start, leader, recovery, scheduler, verification, wake
 from ..errors import (
     AttemptSlotOccupiedError,
@@ -146,6 +191,11 @@ from .errors import (
     SERVICE_UNAVAILABLE,
     VALIDATION_FAILED,
     ApiError,
+)
+from .query import (
+    commit_evidence_dto,
+    delivery_approval_dto,
+    ship_evidence_dto,
 )
 from .redaction import redact_value
 
@@ -200,6 +250,20 @@ _RECOVERY_PASSTHROUGH_ACTIONS = frozenset({"cancel", "wait", "reconcile"})
 APPROVAL_DECISIONS = frozenset({"accept", "reject"})
 CEO_ACTIONS = frozenset({"request_processing"})
 TASK_STATUSES_TERMINAL = domain.TERMINAL_TASK_STATUSES
+
+#: M4-04: :mod:`teamcraft.delivery` enforces a tighter idempotency-key bound
+#: than the generic M3-04 header rule; refuse oversized keys at the edge so
+#: the request never dies mid-flow inside Core.
+MAX_DELIVERY_IDEMPOTENCY_KEY_LENGTH = 200
+#: Commit-message cap at the API edge (Core additionally enforces its own cap
+#: and refuses blank text; the edge check just keeps the failure uniform).
+MAX_COMMIT_MESSAGE_BYTES = 1024
+#: Approval echo shape: exactly a lowercase Git commit digest (SHA-1/SHA-256).
+#: The authoritative check is the equality against the bound evidence commit
+#: inside Core; this is only the well-formedness gate.
+_COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+#: Branch echo cap (no whitespace; Core re-pins the exact bound branch).
+MAX_BRANCH_BYTES = 256
 
 #: Generic, uniform failure texts (identical across all routes; identifiers
 #: ride only in structured ``details``).
@@ -292,6 +356,24 @@ def _idempotency_key(request: Request) -> str:
             details={
                 "field": IDEMPOTENCY_HEADER,
                 "constraint": f"at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters",
+            },
+        )
+    return key
+
+
+def _delivery_idempotency_key(request: Request) -> str:
+    """M4-04 writes: uniform key rule tightened to Core's 200-char bound."""
+
+    key = _idempotency_key(request)
+    if len(key) > MAX_DELIVERY_IDEMPOTENCY_KEY_LENGTH:
+        raise ApiError(
+            422,
+            VALIDATION_FAILED,
+            _IDEMPOTENCY_REQUIRED_MESSAGE,
+            details={
+                "field": IDEMPOTENCY_HEADER,
+                "constraint": (
+                    f"at most {MAX_DELIVERY_IDEMPOTENCY_KEY_LENGTH} characters"),
             },
         )
     return key
@@ -478,6 +560,46 @@ class ApprovalDecisionRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=1024)
     reason: str = Field(min_length=1, max_length=1024)
     expected_task_version: int = Field(ge=0)
+
+
+# ---------------------------------------------------------------------------
+# M4-04 delivery request models.  ``extra="forbid"`` is the injection gate:
+# there is NO field through which a client could name a Git argv verb, a
+# repository/worktree path, an artifact root, or a shell fragment — every
+# accepted field is an opaque id, a digest echo, a version pin, or bounded
+# plain text, and Core builds (and audits) every Git argv itself.
+# ---------------------------------------------------------------------------
+
+
+class DeliveryCommitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_task_version: int = Field(ge=0)
+    message: str | None = Field(default=None, max_length=1024)
+
+
+class DeliveryShipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_task_version: int = Field(ge=0)
+
+
+class DeliveryReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(min_length=1, max_length=1024)
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class DeliveryApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    actor: str = Field(min_length=1, max_length=1024)
+    reason: str = Field(min_length=1, max_length=1024)
+    expected_task_version: int = Field(ge=0)
+    commit_sha: str | None = Field(default=None, max_length=128)
+    branch: str | None = Field(default=None, max_length=MAX_BRANCH_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -1466,6 +1588,266 @@ class CommandService:
                 "replayed": replayed,
             }, replayed
 
+    # -- M4-04 local-only delivery (Commit/Diff evidence + exact acceptance) ------
+
+    @staticmethod
+    def _delivery_key_replay(conn: TeamCraftConnection, event_kind: str,
+                             command_kind: str, key: str) -> bool:
+        """Whether ``key`` already owns the durable record of this effect.
+
+        Same probe shape Core uses for its own replay short-circuit
+        (evidence event joined to the Command it was formed under): only the
+        three delivery command kinds and their evidence event kinds are
+        consulted, read-only, inside the caller's transaction.
+        """
+
+        row = conn.execute(
+            "SELECT 1 FROM events e JOIN commands c"
+            " ON c.id = json_extract(e.payload_json, '$.command_id')"
+            " WHERE e.kind = ? AND c.kind = ? AND c.idempotency_key = ?",
+            (event_kind, command_kind, key),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _delivery_settled(conn: TeamCraftConnection, event_kind: str,
+                         attempt_id: str) -> bool:
+        """Whether this Attempt's evidence of ``event_kind`` is already final
+        (one durable record per Attempt — any later call converges onto it)."""
+
+        row = conn.execute(
+            "SELECT 1 FROM events WHERE kind = ? AND attempt_id = ?",
+            (event_kind, attempt_id),
+        ).fetchone()
+        return row is not None
+
+    def delivery_commit(
+        self, attempt_id: str, payload: DeliveryCommitRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        """Fenced, idempotent local Commit creation via Core.
+
+        Order belongs to :func:`teamcraft.delivery.create_local_commit`:
+        durable ``delivery.local_commit`` Command BEFORE any Git effect, full
+        Diff Gate + identity proof BEFORE staging, post-effect proof, fenced
+        receipt.  This adapter adds the API tier only: optimistic Task-version
+        gate for FRESH submissions (replays/settled evidence converge), the
+        API's short Leader lease, and the uniform replay labeling.  Nothing in
+        the request can influence Git: the message is bounded plain text and
+        every argv is Core-built and audited.
+        """
+
+        attempt_id = _entity_id(attempt_id, "attempt_id")
+        expected_version = _version(payload.expected_task_version)
+        message = (
+            None
+            if payload.message is None
+            else _text(payload.message, "message", required=True,
+                      max_bytes=MAX_COMMIT_MESSAGE_BYTES)
+        )
+        with self._write() as conn:
+            attempt = domain.get_attempt(conn, attempt_id)  # 404 before effects
+            task = self._require_task(conn, attempt.task_id)
+            replayed = (
+                self._delivery_key_replay(
+                    conn, delivery_core.COMMIT_EVIDENCE_KIND,
+                    delivery_core.COMMIT_COMMAND_KIND, key)
+                or self._delivery_settled(
+                    conn, delivery_core.COMMIT_EVIDENCE_KIND, attempt_id)
+            )
+            if not replayed:
+                self._require_version(task, expected_version)
+            with self._lease(conn, task.project_id) as lease:
+                evidence = delivery_core.create_local_commit(
+                    conn, attempt_id, idempotency_key=key, lease=lease,
+                    message=message)
+            command = commands_core.get_command(conn, evidence.command_id)
+            return 201, {
+                "commit": commit_evidence_dto(evidence),
+                "execution": "applied",
+                "command": _command_dto(command),
+                "replayed": replayed,
+            }, replayed
+
+    def delivery_ship(
+        self, attempt_id: str, payload: DeliveryShipRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        """Record the immutable ship evidence for a ``local_only`` Attempt.
+
+        Core pins the COMPLETE base→Commit diff (digest + artifact), the
+        passing current verifier profile/config bindings, and the canonical
+        policy digest, and PROPOSES ``accept_local_commit`` — it never DONEs
+        anything (that takes the exact-echo Approval below).  Missing commit
+        evidence surfaces honestly as 404; verifier/mode refusals as 409
+        ``DELIVERY_REFUSED`` with the stable refusal kind.
+        """
+
+        attempt_id = _entity_id(attempt_id, "attempt_id")
+        expected_version = _version(payload.expected_task_version)
+        with self._write() as conn:
+            attempt = domain.get_attempt(conn, attempt_id)  # 404 before effects
+            task = self._require_task(conn, attempt.task_id)
+            replayed = (
+                self._delivery_key_replay(
+                    conn, delivery_core.SHIP_EVIDENCE_KIND,
+                    delivery_core.SHIP_COMMAND_KIND, key)
+                or self._delivery_settled(
+                    conn, delivery_core.SHIP_EVIDENCE_KIND, attempt_id)
+            )
+            if not replayed:
+                self._require_version(task, expected_version)
+            with self._lease(conn, task.project_id) as lease:
+                evidence = delivery_core.record_ship_evidence(
+                    conn, attempt_id, idempotency_key=key, lease=lease)
+            command = commands_core.get_command(conn, evidence.command_id)
+            return 201, {
+                "ship": ship_evidence_dto(evidence),
+                "execution": "applied",
+                "command": _command_dto(command),
+                "replayed": replayed,
+            }, replayed
+
+    def delivery_reconcile(
+        self, command_id: str, payload: DeliveryReconcileRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        """Settle an interrupted Commit Command against observed Git facts.
+
+        Idempotency here is anchored to the Command row itself (Core's
+        ``reconcile_command`` only moves ``running``/``unknown`` and an
+        already-settled Command replays its resolution — replay never repeats
+        an effect): ``adopted`` when Git proves exactly one owned commit on
+        the verified base in this Attempt's identity-clean worktree,
+        ``expired`` when HEAD still equals the base, and fail-closed refusal
+        (nothing settled) for ambiguous/dirty/foreign scenes.  The
+        ``Idempotency-Key`` header stays required for uniformity with every
+        other write route.
+        """
+
+        command_id = _entity_id(command_id, "command_id")
+        actor = _text(payload.actor, "actor", required=True,
+                      max_bytes=MAX_ACTOR_BYTES)
+        reason = _text(payload.reason, "reason", required=True,
+                       max_bytes=MAX_REASON_BYTES)
+        with self._write() as conn:
+            command = commands_core.get_command(conn, command_id)  # 404
+            if command.kind != delivery_core.COMMIT_COMMAND_KIND:
+                raise ApiError(
+                    422,
+                    VALIDATION_FAILED,
+                    _INVALID_COMMAND_MESSAGE,
+                    details={
+                        "field": "command_id",
+                        "constraint":
+                            f"kind {delivery_core.COMMIT_COMMAND_KIND}",
+                    },
+                )
+            stored = _loads(command.payload_json)
+            project_id = (stored.get("project_id")
+                          if isinstance(stored, dict) else None)
+            if not isinstance(project_id, str) or not project_id:
+                raise ApiError(
+                    409,
+                    CONFLICT,
+                    _CONFLICT_MESSAGE,
+                    details={"reason_code": "COMMAND_NOT_PROJECT_SCOPED",
+                           "command_id": command.id},
+                )
+            replayed = command.state in ("confirmed", "expired")
+            with self._lease(conn, project_id) as lease:
+                result = delivery_core.reconcile_commit_receipt(
+                    conn, command_id, lease=lease, actor=actor, reason=reason)
+            settled = result["command"]
+            evidence = result["commit_evidence"]
+            return 200, {
+                "resolution": result["resolution"],
+                "command": _command_dto(settled),
+                "commit": (commit_evidence_dto(evidence)
+                          if evidence is not None else None),
+                "execution": "applied",
+                "replayed": replayed,
+            }, replayed
+
+    def delivery_approval(
+        self, ship_evidence_id: str, payload: DeliveryApprovalRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        """Accept/reject EXACTLY the bound Commit/branch of one ship evidence.
+
+        Acceptance must echo the evidence's own ``commit_sha`` and ``branch``
+        (a wrong or missing echo is refused; Core re-pins equality against
+        the durable evidence and re-verifies the live workspace/diff/verifier/
+        policy chain before CASing VERIFYING -> DONE through the domain
+        durable-fact gate).  A reject records the decision, leaves the Task
+        VERIFYING, and closes this evidence version — fixes arrive as a new
+        bounded Attempt.  This route never touches report-only/scout
+        approvals: those stay on ``POST /verifications/{id}/approvals``.
+        """
+
+        ship_evidence_id = _entity_id(ship_evidence_id, "ship_evidence_id")
+        decision = payload.decision.strip().lower()
+        if decision not in APPROVAL_DECISIONS:
+            raise ApiError(
+                422,
+                VALIDATION_FAILED,
+                _INVALID_COMMAND_MESSAGE,
+                details={"field": "decision", "constraint": "accept or reject"},
+            )
+        actor = _text(payload.actor, "actor", required=True,
+                      max_bytes=MAX_ACTOR_BYTES)
+        reason = _text(payload.reason, "reason", required=True,
+                       max_bytes=MAX_REASON_BYTES)
+        commit_sha = payload.commit_sha.strip() if payload.commit_sha else None
+        branch = payload.branch.strip() if payload.branch else None
+        if commit_sha is not None and not _COMMIT_SHA_RE.match(commit_sha):
+            raise ApiError(
+                422,
+                VALIDATION_FAILED,
+                _INVALID_COMMAND_MESSAGE,
+                details={"field": "commit_sha",
+                       "constraint": "lowercase git commit digest (40 or 64 hex)"},
+            )
+        if branch is not None and any(
+                char.isspace() or _byte_len(branch) > MAX_BRANCH_BYTES
+                for char in branch):
+            raise ApiError(
+                422,
+                VALIDATION_FAILED,
+                _INVALID_COMMAND_MESSAGE,
+                details={"field": "branch",
+                       "constraint": f"non-space, at most {MAX_BRANCH_BYTES} bytes"},
+            )
+        if decision == "accept" and (commit_sha is None or branch is None):
+            raise ApiError(
+                422,
+                VALIDATION_FAILED,
+                _INVALID_COMMAND_MESSAGE,
+                details={"field": "commit_sha/branch",
+                       "constraint": "accept must echo commit_sha and branch"},
+            )
+        with self._write() as conn:
+            evidence = delivery_core.get_ship_evidence(conn, ship_evidence_id)  # 404
+            task = self._require_task(conn, evidence.task_id)
+            replayed = (
+                self._delivery_key_replay(
+                    conn, delivery_core.APPROVAL_EVENT_KIND,
+                    delivery_core.APPROVAL_COMMAND_KIND, key)
+                or delivery_core.load_delivery_approval(conn, evidence.id) is not None
+            )
+            if not replayed:
+                self._require_version(task, payload.expected_task_version)
+            with self._lease(conn, task.project_id) as lease:
+                approval = delivery_core.approve_local_delivery(
+                    conn, ship_evidence_id, decision=decision,
+                    commit_sha=commit_sha, branch=branch, actor=actor,
+                    reason=reason, idempotency_key=key, lease=lease)
+            command = commands_core.get_command(conn, approval.command_id)
+            live = domain.get_task(conn, task.id)
+            return 200, {
+                "approval": delivery_approval_dto(approval),
+                "task": _task_dto(live),
+                "execution": "applied",
+                "command": _command_dto(command),
+                "replayed": replayed,
+            }, replayed
+
     # -- reads ------------------------------------------------------------------------
 
     def get_command(self, command_id: str) -> dict[str, Any]:
@@ -1501,6 +1883,9 @@ def build_command_router(
     * illegal transition / occupied slot            -> 409 CONFLICT
     * approval tier while the runtime holds the lease -> 409 CONFLICT
       (details carry ``reason_code: LEADER_BUSY``)
+    * M4-04 fail-closed delivery refusal (identity/drift/unowned/empty/size/
+      verifier/policy/mode/...) -> 409 CONFLICT (details carry
+      ``reason_code: DELIVERY_REFUSED`` plus the stable ``refusal_kind``)
     * store missing/too-new/unusable                -> 503 SERVICE_UNAVAILABLE
 
     Responses are redacted; raw Core/SQL text never echoes back.
@@ -1608,6 +1993,19 @@ def build_command_router(
                 409, CONFLICT, _CONFLICT_MESSAGE,
                 details={"reason_code": "CONFLICT"},
             ) from None
+        except delivery_core.DeliveryRefusal as exc:
+            # M4-04: Core refused a local-delivery step fail-closed (nothing
+            # written, no Git effect).  That is a state conflict — not
+            # malformed input — surfaced with the stable machine tag
+            # ``refusal_kind`` (identity/unowned/dirty/empty/drift/
+            # main-branch/size/verifier/ambiguous/policy/stale/settled/mode);
+            # the raw Core message (which can name workspace paths) stays
+            # server-side.
+            raise ApiError(
+                409, CONFLICT, _CONFLICT_MESSAGE,
+                details={"reason_code": "DELIVERY_REFUSED",
+                       "refusal_kind": exc.kind},
+            ) from None
         except ValidationError:
             raise ApiError(422, VALIDATION_FAILED, _INVALID_COMMAND_MESSAGE) from None
         except (SchemaOutOfDateError, StorageError):
@@ -1705,6 +2103,44 @@ def build_command_router(
         return _respond(
             lambda: service.approval_decision(verification_id, payload, key)
         )
+
+    # -- M4-04 local-only delivery (Commit/Diff evidence + exact acceptance) ----
+    #
+    # ``report_only`` keeps its existing approval home above
+    # (``/verifications/{id}/approvals`` unchanged); these routes add ONLY
+    # the local-only Commit/Diff chain.  ``direct_pr``/``ship`` stay gated
+    # out: Core forms ship evidence for ``delivery=local_only`` exclusively
+    # until M4-05 exists, and the API exposes no push-capable surface.
+
+    @router.post("/attempts/{attempt_id}/delivery/commit")
+    def delivery_commit(
+        attempt_id: str, request: Request, payload: DeliveryCommitRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(lambda: service.delivery_commit(attempt_id, payload, key))
+
+    @router.post("/attempts/{attempt_id}/delivery/ship-evidence")
+    def delivery_ship(
+        attempt_id: str, request: Request, payload: DeliveryShipRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(lambda: service.delivery_ship(attempt_id, payload, key))
+
+    @router.post("/commands/{command_id}/delivery/reconcile")
+    def delivery_reconcile(
+        command_id: str, request: Request, payload: DeliveryReconcileRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(
+            lambda: service.delivery_reconcile(command_id, payload, key))
+
+    @router.post("/ship-evidence/{ship_evidence_id}/approval")
+    def delivery_approval(
+        ship_evidence_id: str, request: Request, payload: DeliveryApprovalRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(
+            lambda: service.delivery_approval(ship_evidence_id, payload, key))
 
     # -- Command status ------------------------------------------------------------
 

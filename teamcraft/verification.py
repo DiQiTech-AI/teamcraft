@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Any, Sequence
 
 from . import briefs, commands, domain, events, leader, storage, workspaces, worktrees
@@ -1107,6 +1107,60 @@ def configure_verifier_profile(
         commands.confirm_command(conn, command.id,
             result_json=_json({"profile_id": profile_id, "profile_version": version}),
             clock=clock)
+        # M4-04: a profile config change alters the required-verifier snapshot.
+        # Any locally-accepted DONE Task whose ship evidence pinned a different
+        # snapshot is invalidated and reopened in the same transaction — an
+        # approval formed under old verifier/config versions can never keep a
+        # Task DONE after the verifier rules moved underneath it.
+        reopened_ships = conn.execute(
+            "SELECT t.id, ("
+            "  SELECT e.payload_json FROM events e WHERE e.kind = ?"
+            "   AND e.task_id = t.id AND json_extract(e.payload_json, '$.decision') = 'accept'"
+            "   ORDER BY e.seq DESC LIMIT 1)"
+            " FROM tasks t WHERE t.project_id = ? AND t.status = 'done'",
+            (domain.DELIVERY_APPROVAL_EVENT_KIND, project.id),
+        ).fetchall()
+        current_snapshot = required_profile_snapshot(conn, project.id)
+        for row in reopened_ships:
+            approval_json = row[1]
+            if approval_json is None:
+                continue
+            try:
+                approval_row = json.loads(str(approval_json))
+                ship_event_id = str(approval_row.get("ship_evidence_id") or "")
+            except (TypeError, ValueError):
+                continue
+            ship_row = conn.execute(
+                "SELECT payload_json FROM events WHERE event_id = ? AND kind = ?",
+                (ship_event_id, domain.SHIP_EVIDENCE_EVENT_KIND),
+            ).fetchone()
+            if ship_row is None:
+                continue
+            try:
+                evidence_payload = json.loads(str(ship_row[0]))
+                verifier_entries = evidence_payload.get("verifiers_json")
+                if isinstance(verifier_entries, str):
+                    verifier_entries = json.loads(verifier_entries)
+                pinned = {str(item.get("profile")):
+                        (int(item.get("profile_version")), str(item.get("config_digest")))
+                        for item in verifier_entries if isinstance(item, dict)}
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if pinned == current_snapshot:
+                continue
+            ship_task = domain.get_task(conn, str(row[0]))
+            if ship_task.status != "done":
+                continue
+            domain._cas_task(conn, ship_task, status="needs_human",
+                             expected_version=ship_task.version, now=_now(clock))
+            events.append_event(conn, "delivery.approval_invalidated",
+                project_id=project.id, task_id=ship_task.id,
+                payload_json=_json({"reason": "verifier_profile_changed",
+                    "profile": profile, "profile_version": version,
+                    "pinned": sorted([list(pair) for pair in pinned.items()]),
+                    "current": sorted([list(pair) for pair in current_snapshot.items()]),
+                    "next": "new bounded Attempt with fresh commit/ship evidence"}),
+                clock=clock)
         return {"id": profile_id, "project_id": project.id, "profile": profile,
                 "profile_version": version, "enabled": enabled,
                 "argv": list(argv_tuple), "timeout_seconds": timeout_seconds,
@@ -1123,6 +1177,32 @@ def list_verifier_profiles(conn: storage.TeamCraftConnection,
         (require_entity_id(project_id),),
     ).fetchall()
     return [_profile_value(row) for row in rows]
+
+
+def required_profile_snapshot(conn: storage.TeamCraftConnection,
+                             project_id: str) -> dict[str, tuple[int, str]]:
+    """M4-04 currency view: ``profile -> (profile_version, config_digest)``.
+
+    The snapshot covers exactly the profiles that MUST pass for ship
+    evidence — the latest recorded version of every profile that currently
+    has an approved-and-enabled configuration.  Profiles with no approved
+    configuration are absent (a missing verifier can never be silently
+    satisfied); explicitly disabled profiles are excluded (SKIPPED is not a
+    required pass).  :func:`teamcraft.delivery.record_ship_evidence` pins
+    this snapshot; the domain acceptance gate and ``*_is_current`` checks
+    recompute it — any difference (new profile added, version bump, digest
+    change, enable/disable) invalidates the pinned evidence.
+    """
+    project_id = require_entity_id(project_id)
+    rows = conn.execute(
+        "SELECT profile, profile_version, config_digest, enabled "
+        "FROM verifier_profiles p WHERE p.project_id = ? AND profile_version ="
+        " (SELECT MAX(p2.profile_version) FROM verifier_profiles p2"
+        "   WHERE p2.project_id = p.project_id AND p2.profile = p.profile)",
+        (project_id,),
+    ).fetchall()
+    return {str(row[0]): (int(row[1]), str(row[2])) for row in rows
+            if int(row[3]) == 1}
 
 
 _WORKTREE_COLUMNS = (
