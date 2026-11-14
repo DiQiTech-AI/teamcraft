@@ -35,7 +35,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from . import commands as command_core
 from . import briefs
@@ -47,6 +47,7 @@ from . import domain
 from . import fresh_start
 from . import leader
 from . import storage
+from . import verification
 from . import worktrees
 from .errors import IllegalTransitionError, TeamCraftError, ValidationError
 from .events import append_event
@@ -941,6 +942,157 @@ def member_workspace_status(
                  "dirty": status.dirty, "change_count": status.change_count})
     return {"member": member, "role": role, "routed": "worktree",
             "worktree": view}
+
+
+# ---------------------------------------------------------------------------
+# M4-03 worktree verifier: pinned profile execution inside the Attempt worktree
+# ---------------------------------------------------------------------------
+
+
+def member_attempt(conn: TeamCraftConnection, member: str) -> tuple[str, str]:
+    """(task_id, attempt_id) for a member, refusing unbound members."""
+
+    _role, _read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if task_id is None or attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Task/Attempt lineage; nothing to verify")
+    return str(task_id), str(attempt_id)
+
+
+def _worktree_verification_dto(
+    v: "verification.WorktreeVerification", *, current: bool | None = None,
+) -> dict[str, Any]:
+    dto: dict[str, Any] = {
+        "verification_id": v.id, "command_id": v.command_id,
+        "task_id": v.task_id, "attempt_id": v.attempt_id,
+        "attempt_no": v.attempt_no, "task_version": v.task_version,
+        "dispatch_task_version": v.dispatch_task_version,
+        "brief_digest": v.brief_digest,
+        "worker_report_digest": v.worker_report_digest,
+        "allocation_id": v.allocation_id, "worktree_path": v.worktree_path,
+        "branch": v.branch, "base_sha": v.base_sha,
+        "profile": v.profile, "profile_version": v.profile_version,
+        "config_digest": v.config_digest, "argv": list(v.argv) if v.argv else None,
+        "status": v.status, "exit_code": v.exit_code,
+        "report_digest": v.report_digest, "log_relpath": v.log_relpath,
+        "log_digest": v.log_digest, "created_at": v.created_at,
+    }
+    if current is not None:
+        dto["current"] = current
+    return dto
+
+
+def verify_member_workspace(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    profile: str,
+    idempotency_key: str,
+    lease: leader.Lease,
+    artifact_root: str | None = None,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Run ONE approved verifier profile in the member's OWN worktree (M4-03).
+
+    Read-only members have no writable worktree and are refused; every safety
+    rule (finished Attempt + completed WorkerReport + VERIFYING task, exact
+    registered identity, Diff Gate before/after, pinned cwd/env/timeout/argv,
+    bounded artifact under the configured artifact root, one settled verdict
+    per Attempt+profile) lives in
+    :func:`teamcraft.verification.run_worktree_verifier`.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no writable worktree to"
+            " verify inside")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing allocated to verify")
+    result = verification.run_worktree_verifier(
+        conn, attempt_id, profile=profile, idempotency_key=idempotency_key,
+        lease=lease, artifact_root=artifact_root, run_git=run_git, clock=clock)
+    return {"member": member, "role": role,
+            "verification": _worktree_verification_dto(result)}
+
+
+def run_member_workspace_verifier_suite(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    profiles: Sequence[str] | None = None,
+    artifact_root: str | None = None,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Run the approved P0 profile suite in the member's worktree (M4-03)."""
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no writable worktree to"
+            " verify inside")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing allocated to verify")
+    suite = verification.run_worktree_suite(
+        conn, attempt_id, idempotency_key=idempotency_key, lease=lease,
+        profiles=profiles, artifact_root=artifact_root, run_git=run_git,
+        clock=clock)
+    return {"member": member, "role": role, "suite": suite}
+
+
+def member_workspace_verifications(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    artifact_root: str | None = None,
+) -> dict[str, Any]:
+    """Durable worktree-verification evidence view for one member (audit)."""
+
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or attempt_id is None or task_id is None:
+        return {"member": member, "role": role, "verifications": [],
+                "commands": [], "artifact_root": None}
+    rows = verification.list_worktree_verifications(conn, attempt_id)
+    project = domain.get_task(conn, task_id).project_id
+    root = artifact_root or verification.default_artifact_root(
+        domain.get_project(conn, project).repo_path)
+    return {"member": member, "role": role,
+            "artifact_root": root,
+            "verifications": [
+                _worktree_verification_dto(
+                    row, current=verification.worktree_verification_is_current(conn, row))
+                for row in rows],
+            "commands": verification.list_worktree_verification_commands(conn, task_id)}
+
+
+def configure_project_verifier_profile(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    profile: str,
+    argv: Sequence[str],
+    timeout_seconds: int,
+    actor: str,
+    idempotency_key: str,
+    lease: leader.Lease,
+    enabled: bool = True,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Approve one verifier profile argv for the member's project (M4-03)."""
+
+    _role, _read_only, task_id, _attempt_id = _workspace_member_row(conn, member)
+    project_id = _project_id_for_member(conn, member, task_id)
+    return verification.configure_verifier_profile(
+        conn, project_id, profile=profile, argv=argv,
+        timeout_seconds=timeout_seconds, actor=actor,
+        idempotency_key=idempotency_key, lease=lease, enabled=enabled,
+        clock=clock)
 
 
 # ---------------------------------------------------------------------------

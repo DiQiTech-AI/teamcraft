@@ -3,7 +3,7 @@ description: Herdr team developer responsible for bounded implementation and ver
 mode: primary
 model: omlx/Qwen3.8-Flash-Next-oQ4e-mtp
 temperature: 0.1
-steps: 100
+steps: 150
 permission:
   "*": ask
   read: allow

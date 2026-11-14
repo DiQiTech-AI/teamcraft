@@ -118,6 +118,12 @@ class CEOProtocolTests(unittest.TestCase):
             self.assertTrue(storage.migrate_to_head(db).fresh)
             raw = sqlite3.connect(db)
             # Downgrade only this synthetic fixture to the exact v4 shape.
+            for trigger in storage._V17_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V17_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("worktree_verifications", "verifier_profiles"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
             for trigger in storage._V5_TRIGGERS:
                 raw.execute(f"DROP TRIGGER {trigger}")
             raw.execute("ALTER TABLE attempts DROP COLUMN protocol_hash")

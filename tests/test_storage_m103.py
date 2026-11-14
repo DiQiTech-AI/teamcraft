@@ -191,6 +191,16 @@ def _shed_v6_m203_artifacts(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
 
+def _shed_v17_m403_artifacts(conn: sqlite3.Connection) -> None:
+    """Strip schema-v17 verifier tables from fixtures claiming an older head."""
+    for trigger in storage._V17_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V17_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("worktree_verifications", "verifier_profiles"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def _shed_v8_m206_artifacts(conn: sqlite3.Connection) -> None:
     """Strip schema-v8..v15 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
@@ -281,6 +291,8 @@ EXPECTED_TABLES = {
     "wake_cursors", "wakes", "wake_events",
     # M3-04 schema v15 durable scheduler dispatch control plane.
     "scheduler_controls",
+    # M4-03 schema v17 verifier profile and immutable result evidence.
+    "verifier_profiles", "worktree_verifications",
     # SQLite-internal table materialised by the AUTOINCREMENT DDL of
     # events.seq (M1-05); it appears in sqlite_master from schema creation on.
     "sqlite_sequence",
@@ -3819,6 +3831,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         raw = sqlite3.connect(str(self.db))
         try:
             raw.execute("PRAGMA busy_timeout=5000")
+            _shed_v17_m403_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS scheduler_controls")
             raw.execute("DELETE FROM schema_migrations WHERE version > 14")
             raw.execute("PRAGMA user_version=14")
@@ -3863,6 +3876,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         try:
             raw.execute("PRAGMA busy_timeout=5000")
             _shed_v5_protocol_artifacts(raw)
+            _shed_v17_m403_artifacts(raw)
             _shed_v6_m203_artifacts(raw)
             _shed_v8_m206_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS task_dependencies")
@@ -3935,8 +3949,9 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         self.assertEqual(lagging["missing_head_tables"],
                          ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
                           "prompt_deliveries", "runtime_meta", "scheduler_controls", "task_dependencies",
-                          "verification_configs", "verifications", "wake_cursors",
-                          "wake_events", "wakes", "worker_reports"])
+                          "verification_configs", "verifications", "verifier_profiles",
+                          "wake_cursors", "wake_events", "wakes", "worker_reports",
+                          "worktree_verifications"])
 
     def test_migrate_still_refuses_to_write_around_inconsistent_head(self) -> None:
         self._drop_v2_table()
@@ -3990,6 +4005,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
         shutil.copyfile(result.backup_path, rogue)
         raw = sqlite3.connect(str(rogue))
         _shed_v5_protocol_artifacts(raw)
+        _shed_v17_m403_artifacts(raw)
         _shed_v6_m203_artifacts(raw)
         _shed_v8_m206_artifacts(raw)
         raw.execute("DROP TABLE task_dependencies")
@@ -4034,6 +4050,7 @@ class VersionedCompletenessGateTests(unittest.TestCase):
             raw.execute("PRAGMA busy_timeout=5000")
             if back_to_v2:
                 _shed_v5_protocol_artifacts(raw)
+                _shed_v17_m403_artifacts(raw)
                 _shed_v6_m203_artifacts(raw)
                 _shed_v8_m206_artifacts(raw)
             raw.execute("DROP TABLE IF EXISTS events")

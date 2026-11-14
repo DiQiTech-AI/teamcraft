@@ -3734,6 +3734,153 @@ def worktree_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# M4-03 worktree verifier CLI (parity with teamcraft.verification additions)
+# ---------------------------------------------------------------------------
+
+
+def _require_m403_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M4-03."""
+
+    missing = sorted(name for name in (
+        "run_worktree_verifier", "run_worktree_suite", "configure_verifier_profile",
+    ) if not hasattr(_verification, name))
+    missing += sorted(name for name in (
+        "verify_member_workspace", "run_member_workspace_verifier_suite",
+        "member_workspace_verifications", "configure_project_verifier_profile",
+    ) if not hasattr(_adapter, name))
+    if missing:
+        raise TeamctlError(
+            "the resolved TeamCraft core predates M4-03 Worktree Verifier"
+            f" (missing: {', '.join(missing)}); refresh the bundled core with"
+            " scripts/install.sh or reinstall the package")
+
+
+def _verifier_artifact_root(store: StateStore, args: argparse.Namespace) -> str | None:
+    value = getattr(args, "artifact_root", None)
+    if value is None:
+        return None  # core default: <repo>/.teamcraft/verifications
+    expanded = os.path.expanduser(value)
+    if not os.path.isabs(expanded):
+        expanded = str(store.project_root / expanded)
+    return expanded
+
+
+def verifier_profile_configure(args: argparse.Namespace) -> int:
+    """Approve one P0 verifier profile argv for the project (M4-03)."""
+
+    _require_m403_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = store.ensure_project()
+    lease = store.acquire_lease("verifier-profile-configure", 60)
+    try:
+        conn = store._connect()
+        try:
+            config = _verification.configure_verifier_profile(
+                conn, project_id, profile=args.profile,
+                argv=[args.executable, *args.arg],
+                timeout_seconds=args.timeout_seconds, actor=args.actor,
+                idempotency_key=args.idempotency_key, lease=lease,
+                enabled=not args.disabled,
+            )
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(config, sort_keys=True))
+    return 0
+
+
+def worktree_verify(args: argparse.Namespace) -> int:
+    """Run ONE approved profile inside the member's identity-verified worktree."""
+
+    _require_m403_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    # Pinned profile timeout is capped at one hour; keep the project lease
+    # live through the subprocess plus the fenced result commit.
+    lease = store.acquire_lease("worktree-verify", 3700)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.verify_member_workspace(
+                conn, args.member, profile=args.profile,
+                idempotency_key=args.idempotency_key, lease=lease,
+                artifact_root=_verifier_artifact_root(store, args),
+            )
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_verify_suite(args: argparse.Namespace) -> int:
+    """Run the approved P0 profile suite in the member's worktree (M4-03)."""
+
+    _require_m403_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("worktree-verify-suite", 3700)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.run_member_workspace_verifier_suite(
+                conn, args.member, idempotency_key=args.idempotency_key,
+                lease=lease, profiles=args.profile or None,
+                artifact_root=_verifier_artifact_root(store, args),
+            )
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_verify_status(args: argparse.Namespace) -> int:
+    """Durable worktree-verification evidence view for one member (audit)."""
+
+    _require_m403_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        try:
+            result = _adapter.member_workspace_verifications(
+                conn, args.member,
+                artifact_root=_verifier_artifact_root(store, args))
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_verify_artifact(args: argparse.Namespace) -> int:
+    """Read back and integrity-verify one persisted worktree verifier log."""
+
+    _require_m403_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        try:
+            artifact = _verification.read_worktree_artifact(
+                conn, args.verification_id,
+                artifact_root=_verifier_artifact_root(store, args))
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(artifact, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -4071,6 +4218,53 @@ def build_parser() -> argparse.ArgumentParser:
     add_cwd(worktree_status_parser)
     worktree_status_parser.add_argument("--member", required=True)
     worktree_status_parser.set_defaults(handler=worktree_status)
+
+    profile_parser = commands.add_parser("verifier-profile-configure",
+                                        aliases=["verifier-profile"])
+    add_cwd(profile_parser)
+    profile_parser.add_argument("--profile", required=True,
+        choices=["lint", "test", "typecheck", "secret_scan"])
+    profile_parser.add_argument("--executable", required=True)
+    profile_parser.add_argument("--arg", action="append", default=[],
+        help="additional fixed argument (repeatable); argv is pinned at approval")
+    profile_parser.add_argument("--timeout-seconds", required=True, type=int)
+    profile_parser.add_argument("--actor", required=True)
+    profile_parser.add_argument("--idempotency-key", required=True)
+    profile_parser.add_argument("--disabled", action="store_true",
+        help="record an explicit disable (runs of this profile then SKIPPED)")
+    profile_parser.set_defaults(handler=verifier_profile_configure)
+
+    wt_verify_parser = commands.add_parser("worktree-verify")
+    add_cwd(wt_verify_parser)
+    wt_verify_parser.add_argument("--member", required=True)
+    wt_verify_parser.add_argument("--profile", required=True,
+        choices=["lint", "test", "typecheck", "secret_scan"])
+    wt_verify_parser.add_argument("--idempotency-key", required=True)
+    wt_verify_parser.add_argument("--artifact-root", default=None,
+        help="configured artifact root (default <repo>/.teamcraft/verifications)")
+    wt_verify_parser.set_defaults(handler=worktree_verify)
+
+    wt_suite_parser = commands.add_parser("worktree-verify-suite")
+    add_cwd(wt_suite_parser)
+    wt_suite_parser.add_argument("--member", required=True)
+    wt_suite_parser.add_argument("--profile", action="append", default=[],
+        choices=["lint", "test", "typecheck", "secret_scan"],
+        help="restrict the suite to these profiles (default: all four)")
+    wt_suite_parser.add_argument("--idempotency-key", required=True)
+    wt_suite_parser.add_argument("--artifact-root", default=None)
+    wt_suite_parser.set_defaults(handler=worktree_verify_suite)
+
+    wt_verify_status_parser = commands.add_parser("worktree-verify-status")
+    add_cwd(wt_verify_status_parser)
+    wt_verify_status_parser.add_argument("--member", required=True)
+    wt_verify_status_parser.add_argument("--artifact-root", default=None)
+    wt_verify_status_parser.set_defaults(handler=worktree_verify_status)
+
+    wt_artifact_parser = commands.add_parser("worktree-verify-artifact")
+    add_cwd(wt_artifact_parser)
+    wt_artifact_parser.add_argument("--verification-id", required=True)
+    wt_artifact_parser.add_argument("--artifact-root", default=None)
+    wt_artifact_parser.set_defaults(handler=worktree_verify_artifact)
     return parser
 
 

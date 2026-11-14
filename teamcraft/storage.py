@@ -114,7 +114,10 @@ from .errors import (
 #: protocol identity columns; v9 (M2-08) adds project-scoped CEO initialization.
 #: v16 (M4-01) pins base-SHA evidence on the append-only ``events`` stream
 #: (binding trigger + indexes; deliberately no new tables/columns).
-SCHEMA_VERSION = 16
+#: v17 (M4-03) adds the worktree verifier store: append-only approved verifier
+#: profiles plus immutable per-profile Worktree Verification rows (Diff-Gate
+#: and pinned-execution evidence is enforced by triggers at the storage edge).
+SCHEMA_VERSION = 17
 
 #: Mirrors ``pyproject.toml`` until a single source of truth is chosen.
 APP_VERSION = "0.2.0.dev0"
@@ -950,6 +953,113 @@ _V16_STATEMENTS = (
        WHERE kind = 'workspace_base_evidence'""",
 )
 
+_V17_TABLES = frozenset({"verifier_profiles", "worktree_verifications"})
+_V17_TRIGGERS = frozenset({
+    "trg_verifier_profiles_no_update", "trg_verifier_profiles_no_delete",
+    "trg_worktree_verifications_no_update", "trg_worktree_verifications_no_delete",
+    "trg_worktree_verifications_pass_evidence",
+    "trg_worktree_verifications_log_containment",
+})
+_V17_INDEXES = frozenset({
+    "idx_verifier_profiles_project", "idx_worktree_verifications_attempt",
+    "idx_worktree_verifications_task", "ux_worktree_verifications_accepted",
+})
+_V17_STATEMENTS = (
+    """CREATE TABLE verifier_profiles (
+       id TEXT PRIMARY KEY,
+       command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+       project_id TEXT NOT NULL REFERENCES projects(id),
+       profile TEXT NOT NULL CHECK (profile IN ('lint','test','typecheck','secret_scan')),
+       profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+       enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+       argv_json TEXT NOT NULL,
+       timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds BETWEEN 1 AND 3600),
+       config_digest TEXT NOT NULL,
+       approved_by TEXT NOT NULL,
+       idempotency_key TEXT NOT NULL UNIQUE,
+       created_at TEXT NOT NULL,
+       UNIQUE(project_id, profile, profile_version)
+     )""",
+    "CREATE INDEX idx_verifier_profiles_project ON verifier_profiles(project_id, profile, profile_version DESC)",
+    """CREATE TRIGGER trg_verifier_profiles_no_update BEFORE UPDATE ON verifier_profiles
+       BEGIN SELECT RAISE(ABORT, 'verifier profiles are append-only'); END""",
+    """CREATE TRIGGER trg_verifier_profiles_no_delete BEFORE DELETE ON verifier_profiles
+       BEGIN SELECT RAISE(ABORT, 'verifier profiles are permanent audit records'); END""",
+    """CREATE TABLE worktree_verifications (
+       id TEXT PRIMARY KEY,
+       command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
+       project_id TEXT NOT NULL REFERENCES projects(id),
+       task_id TEXT NOT NULL REFERENCES tasks(id),
+       attempt_id TEXT NOT NULL REFERENCES attempts(id),
+       attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+       task_version INTEGER NOT NULL CHECK (task_version >= 0),
+       dispatch_task_version INTEGER NOT NULL CHECK (dispatch_task_version >= 0),
+       brief_digest TEXT NOT NULL,
+       worker_report_id INTEGER NOT NULL REFERENCES worker_reports(id),
+       worker_report_digest TEXT NOT NULL,
+       allocation_id TEXT NOT NULL,
+       worktree_path TEXT NOT NULL,
+       branch TEXT NOT NULL,
+       base_sha TEXT NOT NULL,
+       claims_json TEXT NOT NULL,
+       profile TEXT NOT NULL CHECK (profile IN ('lint','test','typecheck','secret_scan')),
+       profile_version INTEGER CHECK (profile_version IS NULL OR profile_version >= 1),
+       config_digest TEXT,
+       argv_json TEXT CHECK (argv_json IS NULL OR json_valid(argv_json) = 1),
+       status TEXT NOT NULL CHECK (status IN ('pass','fail','error','skipped','stale')),
+       exit_code INTEGER,
+       report_json TEXT NOT NULL CHECK (length(report_json) <= 262144),
+       report_digest TEXT NOT NULL CHECK (length(report_digest) = 64),
+       log_relpath TEXT,
+       log_digest TEXT CHECK (log_digest IS NULL OR length(log_digest) = 64),
+       created_at TEXT NOT NULL
+     )""",
+    "CREATE INDEX idx_worktree_verifications_attempt ON worktree_verifications(attempt_id, profile, created_at)",
+    "CREATE INDEX idx_worktree_verifications_task ON worktree_verifications(task_id, created_at)",
+    # At most ONE accepted (pass) result per Attempt+profile: an accepted
+    # verification can never be duplicated by replay or a concurrent runner.
+    "CREATE UNIQUE INDEX ux_worktree_verifications_accepted ON worktree_verifications(attempt_id, profile) WHERE status = 'pass'",
+    """CREATE TRIGGER trg_worktree_verifications_no_update BEFORE UPDATE ON worktree_verifications
+       BEGIN SELECT RAISE(ABORT, 'worktree verifications and artifacts are immutable'); END""",
+    """CREATE TRIGGER trg_worktree_verifications_no_delete BEFORE DELETE ON worktree_verifications
+       BEGIN SELECT RAISE(ABORT, 'worktree verifications are permanent audit records'); END""",
+    # A PASS is only storable when the storage-visible evidence is complete:
+    # exact workspace identity, BOTH Diff Gates ok, exit code 0 with no
+    # timeout/truncation, and a bound profile version.  The service layer
+    # enforces the same rules; this trigger is the fail-closed floor.
+    """CREATE TRIGGER trg_worktree_verifications_pass_evidence
+       BEFORE INSERT ON worktree_verifications
+       WHEN NEW.status = 'pass'
+       BEGIN
+         SELECT RAISE(ABORT, 'passing worktree verification requires a bound profile version and the exact workspace binding')
+           WHERE NEW.profile_version IS NULL OR NEW.config_digest IS NULL
+              OR NEW.argv_json IS NULL OR NEW.allocation_id IS NULL
+              OR NEW.worktree_path IS NULL OR NEW.branch IS NULL OR NEW.base_sha IS NULL;
+         SELECT RAISE(ABORT, 'passing worktree verification requires verified identity and both Diff Gates ok')
+           WHERE json_valid(NEW.report_json) = 0
+              OR COALESCE(json_extract(NEW.report_json, '$.identity_verified'), 0) <> 1
+              OR COALESCE(json_extract(NEW.report_json, '$.diff_gate_before.ok'), 0) <> 1
+              OR COALESCE(json_extract(NEW.report_json, '$.diff_gate_after.ok'), 0) <> 1;
+         SELECT RAISE(ABORT, 'passing worktree verification requires exit code 0 without timeout or truncation')
+           WHERE NEW.exit_code IS NULL OR NEW.exit_code <> 0
+              OR COALESCE(json_extract(NEW.report_json, '$.timed_out'), 0) <> 0
+              OR COALESCE(json_extract(NEW.report_json, '$.truncated'), 0) <> 0
+              OR COALESCE(json_extract(NEW.report_json, '$.ran'), 0) <> 1;
+       END""",
+    # Persisted log paths are artifact-root-relative: absolute spellings,
+    # traversal, backslashes and NUL can never enter the audit record.
+    """CREATE TRIGGER trg_worktree_verifications_log_containment
+       BEFORE INSERT ON worktree_verifications
+       WHEN NEW.log_relpath IS NOT NULL
+       BEGIN
+         SELECT RAISE(ABORT, 'verifier log path must be artifact-root-relative (no absolute, traversal, backslash or NUL)')
+           WHERE substr(NEW.log_relpath, 1, 1) = '/'
+              OR NEW.log_relpath LIKE '%..%'
+              OR NEW.log_relpath LIKE '%\\%%'
+              OR instr(NEW.log_relpath, char(0)) > 0;
+       END""",
+)
+
 _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
@@ -967,6 +1077,7 @@ _MIGRATION_STEPS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (14, _V14_STATEMENTS),
     (15, _V15_STATEMENTS),
     (16, _V16_STATEMENTS),
+    (17, _V17_STATEMENTS),
 )
 
 #: Tables each step introduces; the audit floor for an incremental upgrade
@@ -987,6 +1098,7 @@ _TABLES_BY_VERSION: dict[int, frozenset[str]] = {
     12: frozenset(),
     13: frozenset(),
     15: _V15_TABLES,
+    17: _V17_TABLES,
 }
 
 
@@ -994,7 +1106,7 @@ def _head_tables() -> frozenset[str]:
     """All tables that must exist for a schema to be complete at head."""
 
     return (_V1_TABLES | _V2_TABLES | _V3_TABLES | _V4_TABLES | _V6_TABLES
-            | _V8_TABLES | _V9_TABLES | _V10_TABLES | _V15_TABLES)
+            | _V8_TABLES | _V9_TABLES | _V10_TABLES | _V15_TABLES | _V17_TABLES)
 
 
 def _required_tables_for(version: int) -> frozenset[str]:
@@ -1090,6 +1202,7 @@ _OBJECTS_BY_VERSION: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     14: (_V14_TRIGGERS, frozenset()),
     15: (_V15_TRIGGERS, frozenset()),
     16: (_V16_TRIGGERS, _V16_INDEXES),
+    17: (_V17_TRIGGERS, _V17_INDEXES),
 }
 
 

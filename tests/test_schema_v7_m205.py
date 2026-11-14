@@ -40,6 +40,14 @@ class SchemaV7Tests(unittest.TestCase):
             raw.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
             # M3-04 (v15): honest v6 sheds the dispatch gate artifacts too.
             raw.execute("DROP TABLE IF EXISTS scheduler_controls")
+            # M4-03 (v17): honest v6 fixtures also shed verifier policy and
+            # result evidence together with their integrity objects.
+            for trigger in storage._V17_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V17_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("worktree_verifications", "verifier_profiles"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
             task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
             for column in ("paused", "execution_policy_json"):
                 if column in task_columns:

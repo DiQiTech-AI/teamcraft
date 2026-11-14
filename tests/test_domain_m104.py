@@ -101,6 +101,16 @@ def _shed_v6_m203_artifacts(conn) -> None:
         conn.execute("ALTER TABLE tasks DROP COLUMN max_attempts")
 
 
+def _shed_v17_m403_artifacts(conn) -> None:
+    """Strip M4-03 tables before shedding their referenced v6/v3 rows."""
+    for trigger in storage._V17_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in storage._V17_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for table in ("worktree_verifications", "verifier_profiles"):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def _shed_v8_m206_artifacts(conn) -> None:
     """Strip schema-v8..v15 additions from fixtures claiming schema v1-v7."""
     for trigger in storage._V8_TRIGGERS:
@@ -256,6 +266,7 @@ class DomainM104Tests(unittest.TestCase):
         # (correctly) treated as an inconsistent schema by the write gate.
         with storage.transaction(self.conn):
             _shed_v5_protocol_artifacts(self.conn)
+            _shed_v17_m403_artifacts(self.conn)
             _shed_v6_m203_artifacts(self.conn)
             _shed_v8_m206_artifacts(self.conn)
             self.conn.execute("DROP TABLE task_dependencies")
@@ -1189,6 +1200,7 @@ class M104UpgradePathTests(unittest.TestCase):
         try:
             with storage.transaction(conn):
                 _shed_v5_protocol_artifacts(conn)
+                _shed_v17_m403_artifacts(conn)
                 _shed_v6_m203_artifacts(conn)
                 _shed_v8_m206_artifacts(conn)
                 conn.execute("DROP TABLE task_dependencies")
@@ -1295,7 +1307,8 @@ class M104UpgradePathTests(unittest.TestCase):
             ["approvals", "attempt_briefs", "ceo_initializations", "commands", "events", "leader_lease", "members",
              "prompt_deliveries", "runtime_meta", "scheduler_controls", "task_dependencies",
              "verification_configs",
-             "verifications", "wake_cursors", "wake_events", "wakes", "worker_reports"],
+             "verifications", "verifier_profiles", "wake_cursors", "wake_events", "wakes",
+             "worker_reports", "worktree_verifications"],
         )
         # retrying the upgrade afterwards converges (idempotent recovery)
         report = storage.migrate_to_head(self.db)

@@ -890,7 +890,7 @@ class SchemaV16Tests(unittest.TestCase):
         report = storage.migrate_to_head(self.db)
         self.assertTrue(report.fresh)
         self.assertEqual(report.to_version, storage.SCHEMA_VERSION)
-        self.assertEqual(storage.SCHEMA_VERSION, 16)
+        self.assertEqual(storage.SCHEMA_VERSION, 17)
         info = storage.verify_database(self.db)
         self.assertTrue(info["ok"])
         self.assertEqual(info["missing_head_objects"], [])
@@ -908,7 +908,7 @@ class SchemaV16Tests(unittest.TestCase):
         report = storage.migrate_to_head(self.db)
         tables = set(storage.verify_database(self.db)["tables"])
         self.assertNotIn("workspace_base_evidence", tables)
-        self.assertEqual(report.to_version, 16)
+        self.assertEqual(report.to_version, storage.SCHEMA_VERSION)
 
     def test_upgrade_from_v15_applies_step_16(self):
         storage.migrate_to_head(self.db)
@@ -917,13 +917,19 @@ class SchemaV16Tests(unittest.TestCase):
             raw.execute(f"DROP TRIGGER IF EXISTS {name}")
         for name in sorted(storage._V16_INDEXES):
             raw.execute(f"DROP INDEX IF EXISTS {name}")
+        for name in sorted(storage._V17_TRIGGERS):
+            raw.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for name in sorted(storage._V17_INDEXES):
+            raw.execute(f"DROP INDEX IF EXISTS {name}")
+        for name in ("worktree_verifications", "verifier_profiles"):
+            raw.execute(f"DROP TABLE IF EXISTS {name}")
         raw.execute("DELETE FROM schema_migrations WHERE version > 15")
         raw.execute("PRAGMA user_version=15")
         raw.commit()
         raw.close()
         report = storage.migrate_to_head(self.db)
         self.assertEqual((report.from_version, report.to_version, report.applied),
-                         (15, 16, (16,)))
+                         (15, storage.SCHEMA_VERSION, (16, 17)))
         self.assertTrue(storage.verify_database(self.db)["ok"])
 
     def test_missing_v16_objects_fail_the_write_gate(self):
@@ -944,6 +950,12 @@ class SchemaV16Tests(unittest.TestCase):
         # v16 objects must still upgrade cleanly: v16 DDL is idempotent.
         storage.migrate_to_head(self.db)
         raw = sqlite3.connect(str(self.db))
+        for name in sorted(storage._V17_TRIGGERS):
+            raw.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for name in sorted(storage._V17_INDEXES):
+            raw.execute(f"DROP INDEX IF EXISTS {name}")
+        for name in ("worktree_verifications", "verifier_profiles"):
+            raw.execute(f"DROP TABLE IF EXISTS {name}")
         raw.execute("DROP TABLE IF EXISTS scheduler_controls")
         columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
         for column in ("paused", "execution_policy_json"):
@@ -954,8 +966,9 @@ class SchemaV16Tests(unittest.TestCase):
         raw.commit()
         raw.close()
         report = storage.migrate_to_head(self.db)
-        self.assertEqual((report.from_version, report.to_version), (14, 16))
-        self.assertEqual(report.applied, (15, 16))
+        self.assertEqual((report.from_version, report.to_version),
+                         (14, storage.SCHEMA_VERSION))
+        self.assertEqual(report.applied, (15, 16, 17))
 
 
 class ControlCharDisplayTests(unittest.TestCase):

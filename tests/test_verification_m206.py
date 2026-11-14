@@ -110,6 +110,16 @@ class VerificationM206Tests(unittest.TestCase):
                 raw.execute("ALTER TABLE ceo_initializations DROP COLUMN receipt_source")
             # M3-04 (v15): honest v7 sheds the dispatch gate artifacts too.
             raw.execute("DROP TABLE IF EXISTS scheduler_controls")
+            # M4-03 (v17): an honest v7 fixture cannot retain the verifier
+            # profile/result tables or their integrity objects.  Dropping the
+            # tables also removes their attached triggers and indexes, but do
+            # so explicitly first to keep this historical fixture auditable.
+            for trigger in storage._V17_TRIGGERS:
+                raw.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            for index in storage._V17_INDEXES:
+                raw.execute(f"DROP INDEX IF EXISTS {index}")
+            for table in ("worktree_verifications", "verifier_profiles"):
+                raw.execute(f"DROP TABLE IF EXISTS {table}")
             task_columns = {row[1] for row in raw.execute("PRAGMA table_info(tasks)")}
             for column in ("paused", "execution_policy_json"):
                 if column in task_columns:
