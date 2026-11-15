@@ -112,17 +112,20 @@ evidence, ``expected_task_version``; fresh submissions gate against the live
 Task version BEFORE any effect and replays/settled evidence keep converging
 after the world moved on (nothing new is written).  API clients can NEVER
 provide arbitrary Git argv, a repository/worktree path, an artifact root, or a
-shell: the request models are ``extra="forbid"``, every request field is an
-opaque id/digest/plain-text within fixed caps, and Core's audited runner
-(``FORBIDDEN_GIT_VERBS``) is what actually executes — push/merge/reset/clean
-and friends never appear.  Commit-scoped reconcile is anchored to the Command
+shell: the request models are ``extra="forbid"`` and every request field is an
+opaque id/digest/plain-text within fixed caps.  M4-04 local-only delivery uses
+Core's audited runner (``FORBIDDEN_GIT_VERBS``), so push/merge/reset/clean and
+friends never appear in that flow.  The M4-05 direct-PR routes below use the
+separate bounded GitHub adapter: they may push only the registered Attempt
+branch and refuse protected head branches such as ``main`` and ``master``.
+Commit-scoped reconcile is anchored to the Command
 row's own state machine (an already-settled Command replays its resolution),
 and the three delivery Command kinds plus their durable evidence events make
 every effect traceable via ``GET /commands/{command_id}``.  The pre-existing
 ``POST /verifications/{id}/approvals`` (report-only/scout approval) is
-retained unchanged; local-only acceptance is a SEPARATE exact-echo route, and
-``direct_pr`` remains gated out (Core's ship evidence is ``local_only``-only
-until M4-05 exists).
+retained unchanged; local-only acceptance is a SEPARATE exact-echo route.
+Direct-PR prepare/sync/approval/merge/reconcile are exposed separately by the
+M4-05 routes below; M4-04 ship evidence remains ``local_only``-only.
 
 Hard rules pinned here (M0 review M3-04 row; PLAN §8.5):
 
@@ -195,6 +198,9 @@ from .errors import (
 from .query import (
     commit_evidence_dto,
     delivery_approval_dto,
+    pr_evidence_dto,
+    pr_merge_approval_dto,
+    pr_merge_evidence_dto,
     ship_evidence_dto,
 )
 from .redaction import redact_value
@@ -600,6 +606,33 @@ class DeliveryApprovalRequest(BaseModel):
     expected_task_version: int = Field(ge=0)
     commit_sha: str | None = Field(default=None, max_length=128)
     branch: str | None = Field(default=None, max_length=MAX_BRANCH_BYTES)
+
+
+class DirectPrPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_task_version: int = Field(ge=0)
+
+
+class DirectPrApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: str
+    actor: str = Field(min_length=1, max_length=1024)
+    reason: str = Field(min_length=1, max_length=1024)
+    expected_task_version: int = Field(ge=0)
+    pr_number: int | None = Field(default=None, ge=1)
+    head_sha: str | None = Field(default=None, max_length=128)
+    base: str | None = Field(default=None, max_length=MAX_BRANCH_BYTES)
+
+
+class DirectPrMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_task_version: int = Field(ge=0)
+
+
+class DirectPrReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actor: str = Field(min_length=1, max_length=1024)
+    reason: str = Field(min_length=1, max_length=1024)
 
 
 # ---------------------------------------------------------------------------
@@ -1848,6 +1881,150 @@ class CommandService:
                 "replayed": replayed,
             }, replayed
 
+    # -- M4-05 direct-PR delivery ---------------------------------------------
+
+    def direct_pr_prepare(
+        self, attempt_id: str, payload: DirectPrPrepareRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        attempt_id = _entity_id(attempt_id, "attempt_id")
+        expected = _version(payload.expected_task_version)
+        with self._write() as conn:
+            attempt = domain.get_attempt(conn, attempt_id)
+            task = self._require_task(conn, attempt.task_id)
+            existing = delivery_core.load_latest_pr_evidence(conn, task.id)
+            replayed = existing is not None and existing.attempt_id == attempt_id
+            if not replayed:
+                self._require_version(task, expected)
+            with self._lease(conn, task.project_id) as lease:
+                result = delivery_core.prepare_direct_pr(
+                    conn, attempt_id, idempotency_key=key, lease=lease)
+            evidence = result.pr_evidence
+            command = (commands_core.get_command(conn, result.command_id)
+                       if result.command_id else None)
+            return (200 if result.blocked else 201), {
+                "outcome": result.outcome, "blocked": result.blocked,
+                "ready": result.ready, "task_status": result.task_status,
+                "pull_request": (pr_evidence_dto(evidence)
+                                 if evidence is not None else None),
+                "command": _command_dto(command) if command is not None else None,
+                "replayed": replayed,
+            }, replayed
+
+    def direct_pr_sync(
+        self, task_id: str, payload: DirectPrPrepareRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        task_id = _entity_id(task_id, "task_id")
+        expected = _version(payload.expected_task_version)
+        with self._write() as conn:
+            task = self._require_task(conn, task_id)
+            self._require_version(task, expected)
+            before = delivery_core.load_latest_pr_evidence(conn, task.id)
+            with self._lease(conn, task.project_id) as lease:
+                result = delivery_core.sync_direct_pr(
+                    conn, task.id, idempotency_key=key, lease=lease)
+            evidence = result.pr_evidence
+            replayed = before is not None and evidence is not None \
+                and before.id == evidence.id
+            command = (commands_core.get_command(conn, result.command_id)
+                       if result.command_id else None)
+            return 200, {
+                "outcome": result.outcome, "blocked": result.blocked,
+                "ready": result.ready, "task_status": result.task_status,
+                "pull_request": (pr_evidence_dto(evidence)
+                                 if evidence is not None else None),
+                "command": _command_dto(command) if command is not None else None,
+                "replayed": replayed,
+            }, replayed
+
+    def direct_pr_approval(
+        self, evidence_id: str, payload: DirectPrApprovalRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        evidence_id = _entity_id(evidence_id, "pr_evidence_id")
+        decision = payload.decision.strip().lower()
+        if decision not in ("approve", "reject"):
+            raise ApiError(422, VALIDATION_FAILED, _INVALID_COMMAND_MESSAGE,
+                           details={"field": "decision",
+                                    "constraint": "approve or reject"})
+        actor = _text(payload.actor, "actor", required=True,
+                      max_bytes=MAX_ACTOR_BYTES)
+        reason = _text(payload.reason, "reason", required=True,
+                       max_bytes=MAX_REASON_BYTES)
+        with self._write() as conn:
+            evidence = delivery_core.get_pr_evidence(conn, evidence_id)
+            task = self._require_task(conn, evidence.task_id)
+            existing = delivery_core.load_pr_merge_approval(conn, evidence.id)
+            replayed = existing is not None
+            if not replayed:
+                self._require_version(task, _version(payload.expected_task_version))
+            with self._lease(conn, task.project_id) as lease:
+                approval = delivery_core.approve_direct_pr_merge(
+                    conn, evidence.id, decision=decision,
+                    pr_number=payload.pr_number, head_sha=payload.head_sha,
+                    base=payload.base, actor=actor, reason=reason,
+                    idempotency_key=key, lease=lease)
+            command = commands_core.get_command(conn, approval.command_id)
+            return 200, {"approval": pr_merge_approval_dto(approval),
+                         "command": _command_dto(command),
+                         "replayed": replayed}, replayed
+
+    def direct_pr_merge(
+        self, evidence_id: str, payload: DirectPrMergeRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        evidence_id = _entity_id(evidence_id, "pr_evidence_id")
+        with self._write() as conn:
+            evidence = delivery_core.get_pr_evidence(conn, evidence_id)
+            task = self._require_task(conn, evidence.task_id)
+            existing = delivery_core.load_pr_merge_evidence(conn, task.id)
+            replayed = existing is not None
+            if not replayed:
+                self._require_version(task, _version(payload.expected_task_version))
+            with self._lease(conn, task.project_id) as lease:
+                merged = delivery_core.merge_direct_pr(
+                    conn, evidence.id, idempotency_key=key, lease=lease)
+            command = commands_core.get_command(conn, merged.command_id)
+            return 200, {"merge": pr_merge_evidence_dto(merged),
+                         "command": _command_dto(command),
+                         "replayed": replayed}, replayed
+
+    def direct_pr_reconcile(
+        self, command_id: str, payload: DirectPrReconcileRequest, key: str
+    ) -> tuple[int, dict[str, Any], bool]:
+        del key  # required uniformly at the HTTP boundary; Command is identity.
+        command_id = _entity_id(command_id, "command_id")
+        actor = _text(payload.actor, "actor", required=True,
+                      max_bytes=MAX_ACTOR_BYTES)
+        reason = _text(payload.reason, "reason", required=True,
+                       max_bytes=MAX_REASON_BYTES)
+        with self._write() as conn:
+            command = commands_core.get_command(conn, command_id)
+            stored = _loads(command.payload_json)
+            project_id = stored.get("project_id") if isinstance(stored, dict) else None
+            if not isinstance(project_id, str) or not project_id:
+                raise ApiError(409, CONFLICT, _CONFLICT_MESSAGE,
+                               details={"reason_code": "COMMAND_NOT_PROJECT_SCOPED"})
+            replayed = command.state in ("confirmed", "expired")
+            with self._lease(conn, project_id) as lease:
+                if command.kind == delivery_core.PR_MERGE_COMMAND_KIND:
+                    result = delivery_core.reconcile_pr_merge(
+                        conn, command.id, lease=lease, actor=actor, reason=reason)
+                    evidence = result.get("merge_evidence")
+                    body = {"merge": (pr_merge_evidence_dto(evidence)
+                                      if evidence is not None else None)}
+                elif command.kind == delivery_core.PR_PREPARE_COMMAND_KIND:
+                    result = delivery_core.reconcile_pr_receipt(
+                        conn, command.id, lease=lease, actor=actor, reason=reason)
+                    evidence = result.get("pr_evidence")
+                    body = {"pull_request": (pr_evidence_dto(evidence)
+                                             if evidence is not None else None)}
+                else:
+                    raise ApiError(422, VALIDATION_FAILED, _INVALID_COMMAND_MESSAGE,
+                                   details={"field": "command_id",
+                                            "constraint": "direct-PR effect command"})
+            body.update({"resolution": result["resolution"],
+                         "command": _command_dto(result["command"]),
+                         "replayed": replayed})
+            return 200, body, replayed
+
     # -- reads ------------------------------------------------------------------------
 
     def get_command(self, command_id: str) -> dict[str, Any]:
@@ -2108,9 +2285,11 @@ def build_command_router(
     #
     # ``report_only`` keeps its existing approval home above
     # (``/verifications/{id}/approvals`` unchanged); these routes add ONLY
-    # the local-only Commit/Diff chain.  ``direct_pr``/``ship`` stay gated
-    # out: Core forms ship evidence for ``delivery=local_only`` exclusively
-    # until M4-05 exists, and the API exposes no push-capable surface.
+    # the local-only Commit/Diff chain.  Core still forms this ship evidence
+    # exclusively for ``delivery=local_only``.  The separate M4-05 routes
+    # below own direct-PR prepare/sync/approval/merge/reconcile; their bounded
+    # push targets only the registered Attempt branch and refuses protected
+    # head branches such as ``main`` and ``master``.
 
     @router.post("/attempts/{attempt_id}/delivery/commit")
     def delivery_commit(
@@ -2141,6 +2320,45 @@ def build_command_router(
         key = _delivery_idempotency_key(request)
         return _respond(
             lambda: service.delivery_approval(ship_evidence_id, payload, key))
+
+    # -- M4-05 direct-PR delivery -----------------------------------------------
+
+    @router.post("/attempts/{attempt_id}/delivery/pr")
+    def direct_pr_prepare(
+        attempt_id: str, request: Request, payload: DirectPrPrepareRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(lambda: service.direct_pr_prepare(attempt_id, payload, key))
+
+    @router.post("/tasks/{task_id}/delivery/pr/sync")
+    def direct_pr_sync(
+        task_id: str, request: Request, payload: DirectPrPrepareRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(lambda: service.direct_pr_sync(task_id, payload, key))
+
+    @router.post("/pr-evidence/{pr_evidence_id}/approval")
+    def direct_pr_approval(
+        pr_evidence_id: str, request: Request, payload: DirectPrApprovalRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(
+            lambda: service.direct_pr_approval(pr_evidence_id, payload, key))
+
+    @router.post("/pr-evidence/{pr_evidence_id}/merge")
+    def direct_pr_merge(
+        pr_evidence_id: str, request: Request, payload: DirectPrMergeRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(lambda: service.direct_pr_merge(pr_evidence_id, payload, key))
+
+    @router.post("/commands/{command_id}/delivery/pr/reconcile")
+    def direct_pr_reconcile(
+        command_id: str, request: Request, payload: DirectPrReconcileRequest
+    ) -> Any:
+        key = _delivery_idempotency_key(request)
+        return _respond(
+            lambda: service.direct_pr_reconcile(command_id, payload, key))
 
     # -- Command status ------------------------------------------------------------
 

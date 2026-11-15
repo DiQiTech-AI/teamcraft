@@ -1170,6 +1170,48 @@ def _freshness_dto(fresh: "delivery.DeliveryFreshness") -> dict[str, Any]:
     return {"current": bool(fresh.ok), "problems": list(fresh.problems)}
 
 
+def _pr_evidence_dto(e: "delivery.PullRequestEvidence") -> dict[str, Any]:
+    return {
+        "id": e.id, "task_id": e.task_id, "attempt_id": e.attempt_id,
+        "attempt_no": e.attempt_no, "task_version": e.task_version,
+        "commit_sha": e.commit_sha, "branch": e.branch, "repo": e.repo,
+        "pr_number": e.pr_number, "pr_url": e.pr_url,
+        "head_sha": e.head_sha, "base_ref": e.base_ref,
+        "mergeable": e.mergeable, "checks": [dict(c) for c in e.checks],
+        "checks_digest": e.checks_digest, "ready": e.ready,
+        "source": e.source, "command_id": e.command_id,
+        "evidence_digest": e.evidence_digest, "occurred_at": e.occurred_at,
+    }
+
+
+def _pr_approval_dto(a: "delivery.PrMergeApproval") -> dict[str, Any]:
+    return {
+        "id": a.id, "command_id": a.command_id,
+        "pr_evidence_id": a.pr_evidence_id, "task_id": a.task_id,
+        "attempt_id": a.attempt_id, "task_version": a.task_version,
+        "repo": a.repo, "pr_number": a.pr_number, "head_sha": a.head_sha,
+        "base_ref": a.base_ref, "intended_base": a.intended_base,
+        "checks_digest": a.checks_digest, "decision": a.decision,
+        "actor": a.actor, "reason": a.reason,
+        "task_status_after": a.task_status_after, "occurred_at": a.occurred_at,
+    }
+
+
+def _pr_merge_dto(e: "delivery.PrMergeEvidence") -> dict[str, Any]:
+    return {
+        "id": e.id, "command_id": e.command_id,
+        "pr_evidence_id": e.pr_evidence_id,
+        "approval_event_id": e.approval_event_id, "task_id": e.task_id,
+        "attempt_id": e.attempt_id, "repo": e.repo,
+        "pr_number": e.pr_number, "pr_url": e.pr_url,
+        "head_sha": e.head_sha, "base_ref": e.base_ref,
+        "intended_base": e.intended_base,
+        "merge_commit_sha": e.merge_commit_sha, "merged_at": e.merged_at,
+        "method": e.method, "source": e.source,
+        "evidence_digest": e.evidence_digest, "occurred_at": e.occurred_at,
+    }
+
+
 def _command_summary(command: Any) -> dict[str, Any]:
     return {
         "command_id": command.id, "kind": command.kind, "state": command.state,
@@ -1438,6 +1480,156 @@ def decide_member_local_delivery(
     return {"member": member, "decision": approval.decision,
             "task_status_after": approval.task_status_after,
             "approval": _delivery_approval_dto(approval)}
+
+
+# ---------------------------------------------------------------------------
+# M4-05 direct-PR member surface
+# ---------------------------------------------------------------------------
+
+
+def prepare_member_direct_pr(
+    conn: TeamCraftConnection, member: str, *, idempotency_key: str,
+    lease: leader.Lease, run_git: Any = None, run_gh: Any = None,
+    which: Any = None, clock: Any = None,
+) -> dict[str, Any]:
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or attempt_id is None:
+        raise RuntimeAdapterError(f"member {member!r} has no writable Attempt")
+    result = delivery.prepare_direct_pr(
+        conn, attempt_id, idempotency_key=idempotency_key, lease=lease,
+        run_git=run_git, run_gh=run_gh, which=which, clock=clock)
+    return {"member": member, "role": role, "outcome": result.outcome,
+            "blocked": result.blocked, "detail": result.detail,
+            "ready": result.ready, "task_status": result.task_status,
+            "pull_request": (_pr_evidence_dto(result.pr_evidence)
+                             if result.pr_evidence is not None else None)}
+
+
+def sync_member_direct_pr(
+    conn: TeamCraftConnection, member: str, *, idempotency_key: str,
+    lease: leader.Lease, run_gh: Any = None, which: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or task_id is None or attempt_id is None:
+        raise RuntimeAdapterError(f"member {member!r} has no writable Attempt")
+    result = delivery.sync_direct_pr(
+        conn, task_id, idempotency_key=idempotency_key, lease=lease,
+        run_gh=run_gh, which=which, clock=clock)
+    if result.attempt_id != attempt_id:
+        raise RuntimeAdapterError("direct-PR sync returned another member's Attempt")
+    return {"member": member, "role": role, "outcome": result.outcome,
+            "blocked": result.blocked, "detail": result.detail,
+            "ready": result.ready, "task_status": result.task_status,
+            "pull_request": (_pr_evidence_dto(result.pr_evidence)
+                             if result.pr_evidence is not None else None)}
+
+
+def decide_member_pr_merge(
+    conn: TeamCraftConnection, member: str, *, pr_evidence_id: str,
+    decision: str, pr_number: int | None, head_sha: str | None,
+    base: str | None, actor: str, reason: str, idempotency_key: str,
+    lease: leader.Lease, run_gh: Any = None, which: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    _role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and may not decide PR delivery")
+    evidence = delivery.get_pr_evidence(conn, pr_evidence_id)
+    if attempt_id is None or evidence.attempt_id != attempt_id:
+        raise RuntimeAdapterError("PR evidence belongs to another member scope")
+    approval = delivery.approve_direct_pr_merge(
+        conn, evidence.id, decision=decision, pr_number=pr_number,
+        head_sha=head_sha, base=base, actor=actor, reason=reason,
+        idempotency_key=idempotency_key, lease=lease, run_gh=run_gh,
+        which=which, clock=clock)
+    return {"member": member, "approval": _pr_approval_dto(approval)}
+
+
+def merge_member_direct_pr(
+    conn: TeamCraftConnection, member: str, *, pr_evidence_id: str,
+    idempotency_key: str, lease: leader.Lease, run_gh: Any = None,
+    which: Any = None, clock: Any = None,
+) -> dict[str, Any]:
+    _role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and may not merge PR delivery")
+    evidence = delivery.get_pr_evidence(conn, pr_evidence_id)
+    if attempt_id is None or evidence.attempt_id != attempt_id:
+        raise RuntimeAdapterError("PR evidence belongs to another member scope")
+    merged = delivery.merge_direct_pr(
+        conn, evidence.id, idempotency_key=idempotency_key, lease=lease,
+        run_gh=run_gh, which=which, clock=clock)
+    return {"member": member, "merge": _pr_merge_dto(merged)}
+
+
+def reconcile_member_pr_effect(
+    conn: TeamCraftConnection, member: str, command_id: str, *,
+    lease: leader.Lease, actor: str, reason: str, run_git: Any = None,
+    run_gh: Any = None, which: Any = None, clock: Any = None,
+) -> dict[str, Any]:
+    """Reconcile an uncertain prepare/merge Command within member scope."""
+
+    _role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or task_id is None or attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no writable direct-PR Attempt")
+    command = command_core.get_command(conn, command_id)
+    if command.kind not in (delivery.PR_PREPARE_COMMAND_KIND,
+                            delivery.PR_MERGE_COMMAND_KIND):
+        raise RuntimeAdapterError(
+            f"command {command_id!r} is not a direct-PR effect Command")
+    try:
+        payload = json.loads(command.payload_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeAdapterError("direct-PR Command payload is malformed") from exc
+    if (not isinstance(payload, dict) or payload.get("task_id") != task_id
+            or payload.get("attempt_id") != attempt_id):
+        raise RuntimeAdapterError(
+            f"command {command_id!r} belongs to another member scope")
+    if command.kind == delivery.PR_MERGE_COMMAND_KIND:
+        result = delivery.reconcile_pr_merge(
+            conn, command.id, lease=lease, actor=actor, reason=reason,
+            run_gh=run_gh, clock=clock)
+        evidence = result.get("merge_evidence")
+        item = {"merge": _pr_merge_dto(evidence) if evidence is not None else None}
+    else:
+        result = delivery.reconcile_pr_receipt(
+            conn, command.id, lease=lease, actor=actor, reason=reason,
+            run_git=run_git, run_gh=run_gh, which=which, clock=clock)
+        evidence = result.get("pr_evidence")
+        item = {"pull_request": (_pr_evidence_dto(evidence)
+                                 if evidence is not None else None)}
+    item.update({"member": member, "resolution": result["resolution"],
+                 "command": _command_summary(result["command"])})
+    return item
+
+
+def member_direct_pr_status(
+    conn: TeamCraftConnection, member: str, *, live_gh: bool = True,
+    run_gh: Any = None, which: Any = None,
+) -> dict[str, Any]:
+    role, read_only, task_id, attempt_id = _workspace_member_row(conn, member)
+    empty = {"member": member, "role": role, "bound": False,
+             "pull_request": None, "approval": None, "merge": None}
+    if read_only or task_id is None or attempt_id is None:
+        return empty
+    pr = delivery.load_latest_pr_evidence(conn, task_id)
+    if pr is None or pr.attempt_id != attempt_id:
+        return dict(empty, bound=True)
+    approval = delivery.load_pr_merge_approval(conn, pr.id)
+    merged = delivery.load_pr_merge_evidence(conn, task_id)
+    return {"member": member, "role": role, "bound": True,
+            "pull_request": dict(_pr_evidence_dto(pr), **_freshness_dto(
+                delivery.pr_evidence_is_current(
+                    conn, pr, live_gh=live_gh, run_gh=run_gh, which=which))),
+            "approval": (dict(_pr_approval_dto(approval), **_freshness_dto(
+                delivery.pr_merge_approval_is_current(
+                    conn, approval, live_gh=live_gh, run_gh=run_gh, which=which)))
+                         if approval is not None else None),
+            "merge": _pr_merge_dto(merged) if merged is not None else None}
 
 
 # ---------------------------------------------------------------------------

@@ -177,6 +177,70 @@ def delivery_approval_dto(approval: delivery_core.DeliveryApproval) -> dict[str,
     }
 
 
+def pr_evidence_dto(evidence: delivery_core.PullRequestEvidence) -> dict[str, Any]:
+    """Public M4-05 PR facts; local worktree paths stay private."""
+
+    return {
+        "id": evidence.id, "seq": evidence.seq, "event_id": evidence.event_id,
+        "project_id": evidence.project_id, "task_id": evidence.task_id,
+        "attempt_id": evidence.attempt_id, "attempt_no": evidence.attempt_no,
+        "task_version": evidence.task_version,
+        "dispatch_task_version": evidence.dispatch_task_version,
+        "brief_digest": evidence.brief_digest,
+        "worker_report_digest": evidence.worker_report_digest,
+        "commit_evidence_id": evidence.commit_evidence_id,
+        "commit_sha": evidence.commit_sha, "branch": evidence.branch,
+        "repo": evidence.repo, "pr_number": evidence.pr_number,
+        "pr_url": evidence.pr_url, "head_branch": evidence.head_branch,
+        "head_sha": evidence.head_sha, "base_ref": evidence.base_ref,
+        "base_oid": evidence.base_oid, "mergeable": evidence.mergeable,
+        "checks": [dict(item) for item in evidence.checks],
+        "checks_digest": evidence.checks_digest, "ready": evidence.ready,
+        "source": evidence.source, "command_id": evidence.command_id,
+        "evidence_digest": evidence.evidence_digest,
+        "occurred_at": evidence.occurred_at,
+    }
+
+
+def pr_merge_approval_dto(approval: delivery_core.PrMergeApproval) -> dict[str, Any]:
+    return {
+        "id": approval.id, "seq": approval.seq, "event_id": approval.event_id,
+        "command_id": approval.command_id,
+        "pr_evidence_id": approval.pr_evidence_id,
+        "pr_evidence_digest": approval.pr_evidence_digest,
+        "project_id": approval.project_id, "task_id": approval.task_id,
+        "attempt_id": approval.attempt_id, "attempt_no": approval.attempt_no,
+        "task_version": approval.task_version, "repo": approval.repo,
+        "pr_number": approval.pr_number, "head_sha": approval.head_sha,
+        "base_ref": approval.base_ref, "intended_base": approval.intended_base,
+        "checks_digest": approval.checks_digest,
+        "proposed_action": approval.proposed_action,
+        "decision": approval.decision, "actor": approval.actor,
+        "reason": approval.reason, "task_status_after": approval.task_status_after,
+        "occurred_at": approval.occurred_at,
+    }
+
+
+def pr_merge_evidence_dto(evidence: delivery_core.PrMergeEvidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id, "seq": evidence.seq, "event_id": evidence.event_id,
+        "command_id": evidence.command_id,
+        "pr_evidence_id": evidence.pr_evidence_id,
+        "approval_event_id": evidence.approval_event_id,
+        "project_id": evidence.project_id, "task_id": evidence.task_id,
+        "attempt_id": evidence.attempt_id, "attempt_no": evidence.attempt_no,
+        "task_version": evidence.task_version, "repo": evidence.repo,
+        "pr_number": evidence.pr_number, "pr_url": evidence.pr_url,
+        "head_sha": evidence.head_sha, "base_ref": evidence.base_ref,
+        "intended_base": evidence.intended_base,
+        "merge_commit_sha": evidence.merge_commit_sha,
+        "merged_at": evidence.merged_at, "merged": evidence.merged,
+        "method": evidence.method, "source": evidence.source,
+        "evidence_digest": evidence.evidence_digest,
+        "occurred_at": evidence.occurred_at,
+    }
+
+
 def freshness_dto(verdict: delivery_core.DeliveryFreshness) -> dict[str, Any]:
     """Reduce a Core currency verdict to ``ok`` + controlled signal tags."""
 
@@ -259,6 +323,9 @@ def _attempt_delivery_view(
     commit: delivery_core.CommitEvidence | None,
     ship: delivery_core.ShipEvidence | None,
     approval: delivery_core.DeliveryApproval | None,
+    pr: delivery_core.PullRequestEvidence | None = None,
+    pr_approval: delivery_core.PrMergeApproval | None = None,
+    pr_merge: delivery_core.PrMergeEvidence | None = None,
     *,
     live_git: bool,
 ) -> dict[str, Any]:
@@ -286,6 +353,13 @@ def _attempt_delivery_view(
             freshness["ship"] = freshness_dto(
                 delivery_core.ship_evidence_is_current(
                     conn, ship, live_git=live_git))
+    if pr is not None:
+        freshness["pr"] = freshness_dto(
+            delivery_core.pr_evidence_is_current(conn, pr, live_gh=live_git))
+    if pr_approval is not None:
+        freshness["pr_approval"] = freshness_dto(
+            delivery_core.pr_merge_approval_is_current(
+                conn, pr_approval, live_gh=live_git))
     return {
         "task": _task_brief_dto(task),
         "attempt": {"id": attempt_id, "attempt_no": attempt_no},
@@ -293,6 +367,11 @@ def _attempt_delivery_view(
         "ship": ship_evidence_dto(ship) if ship is not None else None,
         "approval": (delivery_approval_dto(approval)
                     if approval is not None else None),
+        "pull_request": pr_evidence_dto(pr) if pr is not None else None,
+        "pr_approval": (pr_merge_approval_dto(pr_approval)
+                        if pr_approval is not None else None),
+        "pr_merge": (pr_merge_evidence_dto(pr_merge)
+                     if pr_merge is not None else None),
         "freshness": freshness,
     }
 
@@ -307,8 +386,15 @@ def _attempt_delivery(
         ship = delivery_core.load_ship_evidence(conn, attempt.id)
         approval = (delivery_core.load_delivery_approval(conn, ship.id)
                     if ship is not None else None)
+        pr = delivery_core.load_latest_pr_evidence(conn, task.id)
+        if pr is not None and pr.attempt_id != attempt.id:
+            pr = None
+        pr_approval = (delivery_core.load_pr_merge_approval(conn, pr.id)
+                       if pr is not None else None)
+        pr_merge = delivery_core.load_pr_merge_evidence(conn, task.id)
         return _attempt_delivery_view(
             conn, task, attempt.id, attempt.attempt_no, commit, ship, approval,
+            pr, pr_approval, pr_merge,
             live_git=live_git)
 
 
@@ -333,9 +419,13 @@ def _task_delivery(
                  for e in delivery_core.list_ship_evidence(conn, task_id)}
         approvals = {e.attempt_id: e
                      for e in delivery_core.list_delivery_approvals(conn, task_id)}
+        prs = {e.attempt_id: e for e in delivery_core.list_pr_evidence(conn, task_id)}
+        pr_approvals = {e.attempt_id: e
+                        for e in delivery_core.list_pr_merge_approvals(conn, task_id)}
+        pr_merge = delivery_core.load_pr_merge_evidence(conn, task_id)
         attempt_no: dict[str, int] = {}
         for evidence in list(commits.values()) + list(ships.values()) + list(
-                approvals.values()):
+                approvals.values()) + list(prs.values()) + list(pr_approvals.values()):
             attempt_no.setdefault(evidence.attempt_id, evidence.attempt_no)
         ordered = sorted(attempt_no, key=lambda aid: (attempt_no[aid], aid))
         total = len(ordered)
@@ -345,7 +435,9 @@ def _task_delivery(
             approval = approvals.get(aid)
             items.append(_attempt_delivery_view(
                 conn, task, aid, attempt_no[aid], commits.get(aid), ship,
-                approval, live_git=live_git))
+                approval, prs.get(aid), pr_approvals.get(aid),
+                pr_merge if pr_merge is not None and pr_merge.attempt_id == aid else None,
+                live_git=live_git))
     return {
         "task": _task_brief_dto(task),
         "live_git": live_git,

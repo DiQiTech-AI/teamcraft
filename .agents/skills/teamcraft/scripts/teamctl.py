@@ -4078,6 +4078,147 @@ def delivery_reject(args: argparse.Namespace) -> int:
     return _local_delivery_decision(args, "reject")
 
 
+# ---------------------------------------------------------------------------
+# M4-05 direct-PR CLI
+# ---------------------------------------------------------------------------
+
+
+def _require_m405_core() -> None:
+    missing = sorted(name for name in (
+        "prepare_direct_pr", "sync_direct_pr", "approve_direct_pr_merge",
+        "merge_direct_pr", "reconcile_pr_receipt", "reconcile_pr_merge",
+    ) if _delivery is None or not callable(getattr(_delivery, name, None)))
+    missing += sorted(name for name in (
+        "prepare_member_direct_pr", "sync_member_direct_pr",
+        "decide_member_pr_merge", "merge_member_direct_pr",
+        "member_direct_pr_status", "reconcile_member_pr_effect",
+    ) if not callable(getattr(_adapter, name, None)))
+    if missing:
+        raise TeamctlError(
+            "the resolved TeamCraft core is too old for M4-05 direct-PR"
+            f" (missing: {', '.join(missing)}); refresh the bundled core with"
+            " scripts/install.sh or reinstall the package")
+
+
+def pr_prepare(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("direct-pr-prepare", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.prepare_member_direct_pr(
+                conn, args.member, idempotency_key=args.idempotency_key,
+                lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def pr_sync(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("direct-pr-sync", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.sync_member_direct_pr(
+                conn, args.member, idempotency_key=args.idempotency_key,
+                lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def pr_status(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        try:
+            result = _adapter.member_direct_pr_status(
+                conn, args.member, live_gh=not args.offline)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def pr_approval(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("direct-pr-approval", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.decide_member_pr_merge(
+                conn, args.member, pr_evidence_id=args.pr_evidence_id,
+                decision=args.decision, pr_number=args.pr_number,
+                head_sha=args.head_sha, base=args.base, actor=args.actor,
+                reason=args.reason, idempotency_key=args.idempotency_key,
+                lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def pr_merge(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("direct-pr-merge", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.merge_member_direct_pr(
+                conn, args.member, pr_evidence_id=args.pr_evidence_id,
+                idempotency_key=args.idempotency_key, lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def pr_reconcile(args: argparse.Namespace) -> int:
+    _require_m405_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("direct-pr-reconcile", 300)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.reconcile_member_pr_effect(
+                conn, args.member, args.command_id, lease=lease,
+                actor=args.actor, reason=args.reason)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", help="project root containing .teamcraft")
 
@@ -4533,6 +4674,54 @@ def build_parser() -> argparse.ArgumentParser:
     reject_parser.add_argument("--reason", required=True)
     reject_parser.add_argument("--idempotency-key", required=True)
     reject_parser.set_defaults(handler=delivery_reject)
+
+    pr_prepare_parser = commands.add_parser("pr-prepare")
+    add_cwd(pr_prepare_parser)
+    pr_prepare_parser.add_argument("--member", required=True)
+    pr_prepare_parser.add_argument("--idempotency-key", required=True)
+    pr_prepare_parser.set_defaults(handler=pr_prepare)
+
+    pr_sync_parser = commands.add_parser("pr-sync")
+    add_cwd(pr_sync_parser)
+    pr_sync_parser.add_argument("--member", required=True)
+    pr_sync_parser.add_argument("--idempotency-key", required=True)
+    pr_sync_parser.set_defaults(handler=pr_sync)
+
+    pr_status_parser = commands.add_parser("pr-status")
+    add_cwd(pr_status_parser)
+    pr_status_parser.add_argument("--member", required=True)
+    pr_status_parser.add_argument("--offline", action="store_true",
+        help="skip live GitHub re-checks and show durable facts only")
+    pr_status_parser.set_defaults(handler=pr_status)
+
+    pr_approval_parser = commands.add_parser("pr-approval")
+    add_cwd(pr_approval_parser)
+    pr_approval_parser.add_argument("--member", required=True)
+    pr_approval_parser.add_argument("--pr-evidence-id", required=True)
+    pr_approval_parser.add_argument("--decision", required=True,
+                                    choices=("approve", "reject"))
+    pr_approval_parser.add_argument("--pr-number", type=int)
+    pr_approval_parser.add_argument("--head-sha")
+    pr_approval_parser.add_argument("--base")
+    pr_approval_parser.add_argument("--actor", required=True)
+    pr_approval_parser.add_argument("--reason", required=True)
+    pr_approval_parser.add_argument("--idempotency-key", required=True)
+    pr_approval_parser.set_defaults(handler=pr_approval)
+
+    pr_merge_parser = commands.add_parser("pr-merge")
+    add_cwd(pr_merge_parser)
+    pr_merge_parser.add_argument("--member", required=True)
+    pr_merge_parser.add_argument("--pr-evidence-id", required=True)
+    pr_merge_parser.add_argument("--idempotency-key", required=True)
+    pr_merge_parser.set_defaults(handler=pr_merge)
+
+    pr_reconcile_parser = commands.add_parser("pr-reconcile")
+    add_cwd(pr_reconcile_parser)
+    pr_reconcile_parser.add_argument("--member", required=True)
+    pr_reconcile_parser.add_argument("--command-id", required=True)
+    pr_reconcile_parser.add_argument("--actor", required=True)
+    pr_reconcile_parser.add_argument("--reason", required=True)
+    pr_reconcile_parser.set_defaults(handler=pr_reconcile)
     return parser
 
 

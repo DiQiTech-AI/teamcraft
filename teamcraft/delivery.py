@@ -65,7 +65,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from . import commands, domain, events, leader, verification, workspaces, worktrees
+from . import commands, domain, events, github_adapter, leader, verification, workspaces, worktrees
 from .clock import Clock
 from .errors import (
     ConflictError,
@@ -86,9 +86,26 @@ __all__ = [
     "DeliveryFreshness",
     "CommitEvidence",
     "DeliveryApproval",
+    "DirectPrRefusal",
+    "DirectPrResult",
     "MAX_DELIVERY_DIFF_BYTES",
+    "PR_CONTRACT_VERSION",
+    "PR_EVIDENCE_KIND",
+    "PR_GIT_REMOTE",
+    "PR_MERGE_APPROVAL_COMMAND_KIND",
+    "PR_MERGE_APPROVAL_KIND",
+    "PR_MERGE_COMMAND_KIND",
+    "PR_MERGE_EVIDENCE_KIND",
+    "PR_PREPARE_COMMAND_KIND",
+    "PR_SYNC_COMMAND_KIND",
+    "DIRECT_PR_MERGE_ACTION",
+    "DIRECT_PR_READY",
+    "PrMergeApproval",
+    "PrMergeEvidence",
+    "PullRequestEvidence",
     "SHIP_COMMAND_KIND",
     "ShipEvidence",
+    "approve_direct_pr_merge",
     "approve_local_delivery",
     "commit_evidence_is_current",
     "create_local_commit",
@@ -96,16 +113,29 @@ __all__ = [
     "delivery_approval_is_current",
     "get_commit_evidence",
     "get_delivery_approval",
+    "get_pr_evidence",
+    "get_pr_merge_evidence",
     "get_ship_evidence",
     "list_commit_evidence",
     "list_delivery_approvals",
-    "list_ship_evidence",
+    "list_pr_evidence",
+    "list_pr_merge_approvals",
     "load_commit_evidence",
+    "load_latest_pr_evidence",
+    "load_pr_merge_approval",
+    "load_pr_merge_evidence",
     "load_ship_evidence",
+    "merge_direct_pr",
+    "pr_evidence_is_current",
+    "pr_merge_approval_is_current",
+    "prepare_direct_pr",
     "reconcile_commit_receipt",
+    "reconcile_pr_merge",
+    "reconcile_pr_receipt",
     "record_ship_evidence",
     "ship_evidence_is_current",
     "read_ship_diff",
+    "sync_direct_pr",
 ]
 
 #: Bumped when any persisted delivery payload semantics change incompatibly.
@@ -2341,4 +2371,2403 @@ def delivery_approval_is_current(conn: TeamCraftConnection,
                                     after_accept=approval.decision == "accept",
                                     run_git=run_git)
     problems.extend(chain.problems)
+    return DeliveryFreshness(ok=not problems, problems=tuple(problems))
+
+
+# ===========================================================================
+# M4-05 — direct-PR delivery: durable PR evidence, explicit human merge
+# approval, and fenced merge execution into the INTENDED base only.
+#
+# Mirrors the audited M4-04 pattern one level out: every GitHub effect rides a
+# durable Command written BEFORE the effect, is fenced by the live project
+# Leader lease, lands as append-only evidence rows with recomputable digests,
+# and re-derives its facts from durable rows at every gate.  The two human
+# edges stay separate: PR creation can only take a ship Task VERIFYING ->
+# READY_TO_MERGE, and DONE requires an explicit Approval bound to exactly this
+# PR/head/base plus a verified merge into the intended base.
+# ===========================================================================
+
+
+PR_CONTRACT_VERSION = domain.PR_DELIVERY_CONTRACT_VERSION
+PR_EVIDENCE_KIND = domain.PR_EVIDENCE_EVENT_KIND
+PR_MERGE_APPROVAL_KIND = domain.PR_MERGE_APPROVAL_EVENT_KIND
+PR_MERGE_EVIDENCE_KIND = domain.PR_MERGE_EVIDENCE_EVENT_KIND
+DIRECT_PR_READY = domain.DIRECT_PR_READY_EVENT
+DIRECT_PR_MERGE_ACTION = domain.DIRECT_PR_MERGE_ACTION
+
+#: Persistent Command kinds for the direct-PR slice.
+PR_PREPARE_COMMAND_KIND = "delivery.pr_prepare"
+PR_SYNC_COMMAND_KIND = "delivery.pr_sync"
+PR_MERGE_APPROVAL_COMMAND_KIND = "delivery.approve_pr_merge"
+PR_MERGE_COMMAND_KIND = "delivery.merge_pr"
+
+#: The single remote name this slice may ever address.
+PR_GIT_REMOTE = "origin"
+
+#: Status-check conclusions that count as merge-ready (mirrors the adapter and
+#: the domain gate; kept duplicated-per-layer like the digest rule).
+_PR_PASSING = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
+
+_PR_CHECKS_MAX = 200
+
+
+class DirectPrRefusal(DeliveryRefusal):
+    """A direct-PR step was refused fail-closed; nothing was written.
+
+    ``kind`` extends the :class:`DeliveryRefusal` tags with ``gh`` (tooling /
+    authentication unavailable), ``checks`` (required PR checks not passing),
+    ``wrong-base`` (the PR/merge does not target the intended base) and
+    ``approval`` (no current explicit human approval).
+    """
+
+
+@dataclass(frozen=True)
+class PullRequestEvidence:
+    """One immutable observation of a delivery pull request's facts."""
+
+    seq: int
+    event_id: str
+    project_id: str
+    task_id: str
+    attempt_id: str
+    attempt_no: int
+    task_version: int
+    dispatch_task_version: int
+    brief_digest: str
+    brief_version: int
+    worker_report_id: int
+    worker_report_digest: str
+    allocation_id: str
+    worktree_path: str
+    branch: str
+    base_sha: str
+    commit_sha: str
+    commit_evidence_id: str
+    policy_digest: str
+    repo: str
+    pr_number: int
+    pr_url: str
+    head_branch: str
+    head_sha: str
+    base_ref: str
+    base_oid: str
+    mergeable: str
+    checks: tuple[dict[str, Any], ...]
+    checks_digest: str
+    ready: bool
+    source: str          # created | adopted | reconciled | synced
+    command_id: str
+    evidence_digest: str
+    occurred_at: str
+
+    @property
+    def id(self) -> str:
+        return self.event_id
+
+
+@dataclass(frozen=True)
+class PrMergeApproval:
+    """One append-only human merge decision bound to exactly one PR evidence."""
+
+    seq: int
+    event_id: str
+    command_id: str
+    pr_evidence_id: str
+    pr_evidence_digest: str
+    project_id: str
+    task_id: str
+    attempt_id: str
+    attempt_no: int
+    task_version: int
+    repo: str
+    pr_number: int
+    head_sha: str
+    base_ref: str
+    intended_base: str
+    checks_digest: str
+    proposed_action: str
+    decision: str        # approve | reject
+    actor: str
+    reason: str
+    task_status_after: str
+    occurred_at: str
+
+    @property
+    def id(self) -> str:
+        return self.event_id
+
+
+@dataclass(frozen=True)
+class PrMergeEvidence:
+    """Durable proof of one merge outcome against the intended base."""
+
+    seq: int
+    event_id: str
+    command_id: str
+    pr_evidence_id: str
+    approval_event_id: str
+    project_id: str
+    task_id: str
+    attempt_id: str
+    attempt_no: int
+    task_version: int
+    dispatch_task_version: int
+    brief_digest: str
+    brief_version: int
+    worker_report_id: int
+    worker_report_digest: str
+    policy_digest: str
+    repo: str
+    pr_number: int
+    pr_url: str
+    head_sha: str
+    base_ref: str
+    intended_base: str
+    merge_commit_sha: str
+    merged_at: str | None
+    merged: bool
+    method: str
+    source: str          # executed | reconciled
+    evidence_digest: str
+    occurred_at: str
+
+    @property
+    def id(self) -> str:
+        return self.event_id
+
+
+@dataclass(frozen=True)
+class DirectPrResult:
+    """Outcome of one prepare/sync/reconcile pass of the direct-PR flow.
+
+    ``outcome``: ``blocked`` (no gh / no auth: zero writes), ``pending_checks``
+    (PR recorded, readiness facts not yet met), ``ready`` (this pass landed
+    VERIFYING -> READY_TO_MERGE), ``ready_updated`` (facts refreshed while the
+    Task already sat READY_TO_MERGE), ``unchanged`` (no fact movement),
+    ``adopted``/``expired`` (reconcile resolutions).
+    """
+
+    outcome: str
+    blocked: bool
+    detail: str
+    project_id: str
+    task_id: str
+    attempt_id: str
+    task_status: str
+    ready: bool
+    pr_number: int | None
+    pr_url: str
+    command_id: str | None
+    pr_evidence: PullRequestEvidence | None
+
+
+# ---------------------------------------------------------------------------
+# Direct-PR payload validation (fail closed on any shape/digest surprise)
+# ---------------------------------------------------------------------------
+
+_PR_EVIDENCE_FIELDS = frozenset({
+    "allocation_id", "attempt_id", "attempt_no", "base_oid", "base_ref",
+    "base_sha", "branch", "brief_digest", "brief_version", "checks_digest",
+    "checks_json", "commit_evidence_id", "commit_sha", "command_id",
+    "delivery_mode", "dispatch_task_version", "evidence_digest", "head_branch",
+    "head_sha", "mergeable", "policy_digest", "pr_number", "pr_url",
+    "project_id", "proposed_action", "ready", "repo", "schema_version",
+    "source", "task_id", "task_version", "worker_report_digest",
+    "worker_report_id", "worktree_path",
+})
+_PR_APPROVAL_FIELDS = frozenset({
+    "actor", "attempt_id", "attempt_no", "base_ref", "checks_digest",
+    "command_id", "decision", "head_sha", "intended_base",
+    "pr_evidence_digest", "pr_evidence_id", "pr_number", "project_id",
+    "proposed_action", "reason", "repo", "schema_version", "task_id",
+    "task_status_after", "task_version",
+})
+_PR_MERGE_FIELDS = frozenset({
+    "action", "approval_event_id", "attempt_id", "attempt_no", "base_ref",
+    "brief_digest", "brief_version", "command_id", "delivery_mode",
+    "dispatch_task_version", "evidence_digest", "head_sha", "intended_base",
+    "merge_commit_sha", "merged", "merged_at", "method", "policy_digest",
+    "pr_evidence_id", "pr_number", "pr_url", "project_id", "repo",
+    "schema_version", "source", "task_id", "task_version",
+    "worker_report_digest", "worker_report_id",
+})
+
+
+def _pr_checks(payload: dict, kind: str, where: str) -> list[dict[str, Any]]:
+    raw = payload.get("checks_json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise StorageError(f"{kind}.checks_json is invalid ({where})") from exc
+    if not isinstance(raw, list) or len(raw) > _PR_CHECKS_MAX:
+        raise StorageError(f"{kind}.checks_json is malformed ({where})")
+    checks: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise StorageError(f"{kind}.checks_json entry is malformed ({where})")
+        checks.append({
+            "name": str(item.get("name") or ""),
+            "status": str(item.get("status") or "").upper(),
+            "conclusion": (None if item.get("conclusion") is None
+                           else str(item["conclusion"]).upper()),
+        })
+    checks.sort(key=lambda c: (c["name"], c["status"]))
+    if _sha256_hex(_canonical_json(checks)) != payload.get("checks_digest"):
+        raise StorageError(f"{kind} checks digest does not recompute ({where})")
+    return checks
+
+
+def _checks_digest(checks: list[dict[str, Any]]) -> str:
+    return _sha256_hex(_canonical_json(checks))
+
+
+def _checks_passing(checks: list[dict[str, Any]]) -> bool:
+    if not checks:
+        return True
+    return all(str(c.get("conclusion") or "").upper() in _PR_PASSING
+               for c in checks)
+
+
+def _pr_payload(**fields: Any) -> str:
+    payload = dict(fields)
+    payload["schema_version"] = PR_CONTRACT_VERSION
+    payload["evidence_digest"] = _payload_digest(payload)
+    return _canonical_json(payload)
+
+
+def _pr_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
+                 payload_json: str) -> PullRequestEvidence:
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError) as exc:
+        raise StorageError(
+            f"PR evidence payload is not valid JSON (seq={seq}): {exc}") from exc
+    kind = "PR evidence"
+    where = f"seq={seq}"
+    _require_shape(payload, _PR_EVIDENCE_FIELDS, kind, where)
+    if payload.get("schema_version") != PR_CONTRACT_VERSION:
+        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    if _payload_digest(payload) != payload.get("evidence_digest"):
+        raise StorageError(f"{kind} digest does not recompute ({where})")
+    if payload.get("delivery_mode") != "direct_pr":
+        raise StorageError(f"{kind}.delivery_mode must be direct_pr ({where})")
+    if payload.get("proposed_action") != DIRECT_PR_MERGE_ACTION:
+        raise StorageError(f"{kind}.proposed_action is unknown ({where})")
+    if payload.get("source") not in ("created", "adopted", "reconciled",
+                                     "synced"):
+        raise StorageError(f"{kind}.source is invalid ({where})")
+    checks = _pr_checks(payload, kind, where)
+    head_branch = _require_str(payload, "head_branch", kind, where)
+    _refuse_protected_branch(head_branch)
+    if head_branch != _require_str(payload, "branch", kind, where):
+        raise StorageError(f"{kind} head/branch disagree ({where})")
+    if payload.get("ready") is not True and payload.get("ready") is not False:
+        raise StorageError(f"{kind}.ready must be a boolean ({where})")
+    mergeable = str(payload.get("mergeable") or "UNKNOWN")
+    row = conn.execute("SELECT occurred_at FROM events WHERE seq = ?",
+                      (seq,)).fetchone()
+    occurred_at = "" if row is None or row[0] is None else str(row[0])
+    evidence = PullRequestEvidence(
+        seq=seq, event_id=event_id,
+        project_id=_require_str(payload, "project_id", kind, where),
+        task_id=_require_str(payload, "task_id", kind, where),
+        attempt_id=_require_str(payload, "attempt_id", kind, where),
+        attempt_no=_require_int(payload, "attempt_no", kind, where, 1),
+        task_version=_require_int(payload, "task_version", kind, where, 0),
+        dispatch_task_version=_require_int(
+            payload, "dispatch_task_version", kind, where, 0),
+        brief_digest=_require_digest64(payload, "brief_digest", kind, where),
+        brief_version=_require_int(payload, "brief_version", kind, where, 1),
+        worker_report_id=_require_int(payload, "worker_report_id", kind, where, 1),
+        worker_report_digest=_require_digest64(
+            payload, "worker_report_digest", kind, where),
+        allocation_id=_require_str(payload, "allocation_id", kind, where),
+        worktree_path=_require_str(payload, "worktree_path", kind, where),
+        branch=head_branch,
+        base_sha=_require_sha(payload, "base_sha", kind, where),
+        commit_sha=_require_sha(payload, "commit_sha", kind, where),
+        commit_evidence_id=_require_str(payload, "commit_evidence_id", kind, where),
+        policy_digest=_require_digest64(payload, "policy_digest", kind, where),
+        repo=_require_str(payload, "repo", kind, where),
+        pr_number=_require_int(payload, "pr_number", kind, where, 1),
+        pr_url=str(payload.get("pr_url") or ""),
+        head_branch=head_branch,
+        head_sha=_require_sha(payload, "head_sha", kind, where),
+        base_ref=_require_str(payload, "base_ref", kind, where),
+        base_oid=_require_sha(payload, "base_oid", kind, where),
+        mergeable=mergeable,
+        checks=tuple(checks),
+        checks_digest=_require_digest64(payload, "checks_digest", kind, where),
+        ready=bool(payload.get("ready")),
+        source=str(payload["source"]),
+        command_id=_require_str(payload, "command_id", kind, where),
+        evidence_digest=_require_digest64(payload, "evidence_digest", kind, where),
+        occurred_at=occurred_at,
+    )
+    if evidence.head_sha != evidence.commit_sha:
+        raise StorageError(
+            f"{kind} head {evidence.head_sha!r} is not the delivered commit"
+            f" {evidence.commit_sha!r} ({where})")
+    return evidence
+
+
+def _pr_approval_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
+                         payload_json: str) -> PrMergeApproval:
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError) as exc:
+        raise StorageError(
+            f"PR merge approval payload is not valid JSON (seq={seq}): {exc}") from exc
+    kind = "PR merge approval"
+    where = f"seq={seq}"
+    _require_shape(payload, _PR_APPROVAL_FIELDS, kind, where)
+    if payload.get("schema_version") != PR_CONTRACT_VERSION:
+        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    decision = payload.get("decision")
+    if decision not in ("approve", "reject"):
+        raise StorageError(f"{kind}.decision is invalid ({where})")
+    if payload.get("proposed_action") != DIRECT_PR_MERGE_ACTION:
+        raise StorageError(f"{kind}.proposed_action is unknown ({where})")
+    _require_digest64(payload, "checks_digest", kind, where)
+    row = conn.execute("SELECT occurred_at FROM events WHERE seq = ?",
+                      (seq,)).fetchone()
+    occurred_at = "" if row is None or row[0] is None else str(row[0])
+    approval = PrMergeApproval(
+        seq=seq, event_id=event_id,
+        command_id=_require_str(payload, "command_id", kind, where),
+        pr_evidence_id=_require_str(payload, "pr_evidence_id", kind, where),
+        pr_evidence_digest=_require_digest64(
+            payload, "pr_evidence_digest", kind, where),
+        project_id=_require_str(payload, "project_id", kind, where),
+        task_id=_require_str(payload, "task_id", kind, where),
+        attempt_id=_require_str(payload, "attempt_id", kind, where),
+        attempt_no=_require_int(payload, "attempt_no", kind, where, 1),
+        task_version=_require_int(payload, "task_version", kind, where, 0),
+        repo=_require_str(payload, "repo", kind, where),
+        pr_number=_require_int(payload, "pr_number", kind, where, 1),
+        head_sha=_require_sha(payload, "head_sha", kind, where),
+        base_ref=_require_str(payload, "base_ref", kind, where),
+        intended_base=_require_str(payload, "intended_base", kind, where),
+        checks_digest=_require_digest64(payload, "checks_digest", kind, where),
+        proposed_action=str(payload["proposed_action"]),
+        decision=str(decision),
+        actor=_require_str(payload, "actor", kind, where),
+        reason=_require_str(payload, "reason", kind, where),
+        task_status_after=_require_str(payload, "task_status_after", kind, where),
+        occurred_at=occurred_at,
+    )
+    if approval.task_status_after != "ready_to_merge":
+        raise StorageError(
+            f"{kind}.task_status_after must be ready_to_merge — a merge"
+            f" approval NEVER completes delivery by itself ({where})")
+    if approval.intended_base != approval.base_ref:
+        raise StorageError(
+            f"{kind} binds base {approval.base_ref!r} as the intended base"
+            f" {approval.intended_base!r} mismatch ({where})")
+    return approval
+
+
+def _merge_evidence_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
+                            payload_json: str) -> PrMergeEvidence:
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError) as exc:
+        raise StorageError(
+            f"PR merge evidence payload is not valid JSON (seq={seq}): {exc}") from exc
+    kind = "PR merge evidence"
+    where = f"seq={seq}"
+    _require_shape(payload, _PR_MERGE_FIELDS, kind, where)
+    if payload.get("schema_version") != PR_CONTRACT_VERSION:
+        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    if payload.get("delivery_mode") != "direct_pr":
+        raise StorageError(f"{kind}.delivery_mode must be direct_pr ({where})")
+    if payload.get("action") != DIRECT_PR_MERGE_ACTION:
+        raise StorageError(f"{kind}.action is unknown ({where})")
+    if payload.get("source") not in ("executed", "reconciled"):
+        raise StorageError(f"{kind}.source is invalid ({where})")
+    if payload.get("merged") is not True:
+        raise StorageError(
+            f"{kind} must record merged=true (a non-merge is an audit event,"
+            f" never merge evidence) ({where})")
+    row = conn.execute("SELECT occurred_at FROM events WHERE seq = ?",
+                      (seq,)).fetchone()
+    occurred_at = "" if row is None or row[0] is None else str(row[0])
+    return PrMergeEvidence(
+        seq=seq, event_id=event_id,
+        command_id=_require_str(payload, "command_id", kind, where),
+        pr_evidence_id=_require_str(payload, "pr_evidence_id", kind, where),
+        approval_event_id=_require_str(payload, "approval_event_id", kind, where),
+        project_id=_require_str(payload, "project_id", kind, where),
+        task_id=_require_str(payload, "task_id", kind, where),
+        attempt_id=_require_str(payload, "attempt_id", kind, where),
+        attempt_no=_require_int(payload, "attempt_no", kind, where, 1),
+        task_version=_require_int(payload, "task_version", kind, where, 0),
+        dispatch_task_version=_require_int(
+            payload, "dispatch_task_version", kind, where, 0),
+        brief_digest=_require_digest64(payload, "brief_digest", kind, where),
+        brief_version=_require_int(payload, "brief_version", kind, where, 1),
+        worker_report_id=_require_int(payload, "worker_report_id", kind, where, 1),
+        worker_report_digest=_require_digest64(
+            payload, "worker_report_digest", kind, where),
+        policy_digest=_require_digest64(payload, "policy_digest", kind, where),
+        repo=_require_str(payload, "repo", kind, where),
+        pr_number=_require_int(payload, "pr_number", kind, where, 1),
+        pr_url=str(payload.get("pr_url") or ""),
+        head_sha=_require_sha(payload, "head_sha", kind, where),
+        base_ref=_require_str(payload, "base_ref", kind, where),
+        intended_base=_require_str(payload, "intended_base", kind, where),
+        merge_commit_sha=_require_sha(payload, "merge_commit_sha", kind, where),
+        merged_at=(None if payload.get("merged_at") is None
+                   else str(payload["merged_at"])),
+        merged=True,
+        method=str(payload.get("method")),
+        source=str(payload["source"]),
+        evidence_digest=_require_digest64(payload, "evidence_digest", kind, where),
+        occurred_at=occurred_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Durable readers
+# ---------------------------------------------------------------------------
+
+
+def _latest_event_row(conn: TeamCraftConnection, kind: str,
+                      task_id: str) -> Any:
+    return conn.execute(
+        "SELECT seq, event_id, payload_json FROM events WHERE kind = ?"
+        " AND task_id = ? ORDER BY seq DESC LIMIT 1", (kind, task_id),
+    ).fetchone()
+
+
+def get_pr_evidence(conn: TeamCraftConnection, event_id: str) -> PullRequestEvidence:
+    row = _event_by_id(conn, PR_EVIDENCE_KIND, require_entity_id(event_id))
+    return _pr_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+def list_pr_evidence(conn: TeamCraftConnection,
+                     task_id: str) -> list[PullRequestEvidence]:
+    rows = conn.execute(
+        "SELECT seq, event_id, payload_json FROM events WHERE kind = ?"
+        " AND task_id = ? ORDER BY seq ASC",
+        (PR_EVIDENCE_KIND, require_entity_id(task_id)),
+    ).fetchall()
+    return [_pr_from_row(conn, int(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+
+def load_latest_pr_evidence(conn: TeamCraftConnection,
+                            task_id: str) -> PullRequestEvidence | None:
+    row = _latest_event_row(conn, PR_EVIDENCE_KIND, require_entity_id(task_id))
+    if row is None:
+        return None
+    return _pr_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+def load_pr_merge_approval(conn: TeamCraftConnection,
+                          pr_evidence_id: str) -> PrMergeApproval | None:
+    rows = conn.execute(
+        "SELECT seq, event_id, payload_json FROM events WHERE kind = ?"
+        " AND json_extract(payload_json, '$.pr_evidence_id') = ?"
+        " ORDER BY seq ASC",
+        (PR_MERGE_APPROVAL_KIND, require_entity_id(pr_evidence_id)),
+    ).fetchall()
+    if len(rows) > 1:
+        raise StorageError(
+            f"{len(rows)} approvals for PR evidence {pr_evidence_id};"
+            " storage invariant broken")
+    if not rows:
+        return None
+    return _pr_approval_from_row(conn, int(rows[0][0]), str(rows[0][1]),
+                                str(rows[0][2]))
+
+
+def list_pr_merge_approvals(conn: TeamCraftConnection,
+                            task_id: str) -> list[PrMergeApproval]:
+    rows = conn.execute(
+        "SELECT seq, event_id, payload_json FROM events WHERE kind = ?"
+        " AND task_id = ? ORDER BY seq ASC",
+        (PR_MERGE_APPROVAL_KIND, require_entity_id(task_id)),
+    ).fetchall()
+    return [_pr_approval_from_row(conn, int(r[0]), str(r[1]), str(r[2]))
+            for r in rows]
+
+
+def get_pr_merge_evidence(conn: TeamCraftConnection,
+                         event_id: str) -> PrMergeEvidence:
+    row = _event_by_id(conn, PR_MERGE_EVIDENCE_KIND, require_entity_id(event_id))
+    return _merge_evidence_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+def load_pr_merge_evidence(conn: TeamCraftConnection,
+                           task_id: str) -> PrMergeEvidence | None:
+    row = _latest_event_row(conn, PR_MERGE_EVIDENCE_KIND,
+                            require_entity_id(task_id))
+    if row is None:
+        return None
+    return _merge_evidence_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+# ---------------------------------------------------------------------------
+# Scoped Git + gh helpers
+# ---------------------------------------------------------------------------
+
+
+class _DirectPrGitRunner:
+    """GitRunner wrapper for the direct-PR slice.
+
+    Identical forbidden-verb policy as local delivery, plus EXACTLY two scoped
+    additions: ``git push origin tc/<task>/<attempt>`` (the Attempt's own
+    isolated branch only — never a protected branch, never ``--force``, never a
+    different remote) and ``git ls-remote origin refs/heads/<branch>`` to read
+    back the remote head fact.  Nothing else that could rewrite history, touch
+    the base, or delete anything ever passes.
+    """
+
+    def __init__(self, runner: GitRunner, branch: str) -> None:
+        _refuse_protected_branch(branch)
+        self._runner = runner
+        self.branch = branch
+
+    def __call__(self, args: list[str], cwd: str) -> bytes:
+        argv = list(args)
+        if argv and argv[0] == "push":
+            if argv != ["push", PR_GIT_REMOTE, self.branch]:
+                raise DirectPrRefusal(
+                    "main-branch",
+                    "direct-PR delivery pushes only the exact Attempt branch"
+                    f" {self.branch!r} to {PR_GIT_REMOTE!r}; refusing "
+                    f"{argv!r}")
+            return self._runner(argv, cwd)
+        if argv and argv[0] == "ls-remote":
+            if argv != ["ls-remote", PR_GIT_REMOTE, f"refs/heads/{self.branch}"]:
+                raise DirectPrRefusal(
+                    "drift",
+                    f"direct-PR delivery reads only its own remote ref; refusing {argv!r}")
+            return self._runner(argv, cwd)
+        return _git_audit_safe(self._runner, argv, cwd)
+
+
+def _remote_head(runner: _DirectPrGitRunner, cwd: str) -> str | None:
+    """Remote sha of the Attempt branch, or ``None`` when it doesn't exist."""
+    try:
+        raw = runner(["ls-remote", PR_GIT_REMOTE, f"refs/heads/{runner.branch}"],
+                     cwd)
+    except workspaces.GitStateError as exc:
+        raise DirectPrRefusal(
+            "gh", f"could not read remote ref for {runner.branch!r}: {exc}")
+    text = _text(raw)
+    if not text:
+        return None
+    first = text.splitlines()[0].strip()
+    sha = first.split("\t", 1)[0].strip().lower() if first else ""
+    if not _SHA_RE.match(sha):
+        raise DirectPrRefusal(
+            "gh", f"unexpected ls-remote output for {runner.branch!r}: {text[:120]!r}")
+    return sha
+
+
+def _ensure_remote_branch(runner: _DirectPrGitRunner, cwd: str,
+                         commit_sha: str) -> str:
+    """Make the remote Attempt branch equal exactly ``commit_sha``.
+
+    Returns ``pushed`` / ``already``.  A foreign remote head (any sha that is
+    not the delivered commit) is a DRIFT refusal — this module never forces,
+    never fetches, and never rewrites: a human/reconcile decision is required.
+    """
+    head = _remote_head(runner, cwd)
+    if head == commit_sha:
+        return "already"
+    if head is not None:
+        raise DirectPrRefusal(
+            "drift",
+            f"remote branch {runner.branch!r} sits at {head[:12]}, not the"
+            f" delivered commit {commit_sha[:12]}; direct-PR delivery never"
+            " force-pushes or rebases over remote history")
+    runner(["push", PR_GIT_REMOTE, runner.branch], cwd)
+    verify = _remote_head(runner, cwd)
+    if verify != commit_sha:
+        raise StorageError(
+            f"push of {runner.branch!r} did not land the expected head"
+            f" (wanted {commit_sha!r}, remote now {verify!r}); reconcile before"
+            " creating the pull request")
+    return "pushed"
+
+
+def _direct_pr_policy(task: domain.Task) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    policy = _policy_of(task)
+    config = domain.direct_pr_config(policy)
+    if config is None:
+        raise DirectPrRefusal(
+            "mode",
+            "direct-PR delivery requires an EXPLICIT persisted policy:"
+            " delivery=direct_pr plus a direct_pr {repo, base} sub-policy on"
+            " the Task (nothing is inferred, and defaults are refused)")
+    return policy, _policy_digest(policy), config
+
+
+def _pr_pin_problems(conn: TeamCraftConnection, *, task_id: str, attempt_id: str,
+                    task_version: int, dispatch_ver: int, brief_digest: str,
+                    report_id: int, report_digest: str,
+                    expect_statuses: tuple[str, ...],
+                    check_version: bool = True,
+                    version_bump_ok: bool = False) -> list[str]:
+    problems: list[str] = []
+    try:
+        task = domain.get_task(conn, task_id)
+        attempt = domain.get_attempt(conn, attempt_id)
+        brief = verification.briefs.get_attempt_brief(conn, attempt_id)
+    except (NotFoundError, ValidationError):
+        return ["bindings: task/attempt/brief missing"]
+    report = conn.execute(
+        "SELECT id, report_digest, outcome FROM worker_reports WHERE attempt_id"
+        " = ? AND report_kind = 'final' ORDER BY id DESC LIMIT 1",
+        (attempt_id,),
+    ).fetchone()
+    if task.status not in expect_statuses:
+        problems.append(f"status: task is {task.status!r},"
+                       f" expected one of {list(expect_statuses)}")
+    if check_version:
+        # The readiness CAS (verifying -> READY_TO_MERGE) is the ONE legitimate
+        # version bump after PR evidence is formed; anything else is drift.
+        allowed = {task_version}
+        if version_bump_ok:
+            allowed.add(task_version + 1)
+        if task.version not in allowed:
+            problems.append(f"version: task is {task.version}, evidence bound"
+                           f" {sorted(allowed)}")
+    if attempt.status != "finished" or attempt.task_id != task.id:
+        problems.append(f"attempt: {attempt.status!r}")
+    if brief.task_version != dispatch_ver or brief.brief_digest != brief_digest:
+        problems.append("brief: pinned brief facts drifted")
+    if (report is None or int(report[0]) != report_id
+            or str(report[1]) != report_digest or str(report[2]) != "completed"):
+        problems.append("worker report: latest final completed report differs")
+    return problems
+
+
+def _live_pr_facts(runner: github_adapter.GitHubRunner, cwd: str, *, repo: str,
+                   evidence: PullRequestEvidence) -> tuple[github_adapter.PullRequestFacts | None, list[str]]:
+    """Read the authoritative live facts for the recorded PR; collect problems."""
+    problems: list[str] = []
+    try:
+        facts = github_adapter.read_pr(runner, cwd, repo=repo,
+                                       number=evidence.pr_number)
+    except github_adapter.GitHubInvocationError as exc:
+        return None, [f"gh: PR #{evidence.pr_number} unreadable: {exc.stderr or exc}"]
+    except github_adapter.GitHubError as exc:
+        return None, [f"gh: {exc}"]
+    if facts.head_sha != evidence.head_sha:
+        problems.append(
+            f"head: PR head moved to {facts.head_sha[:12]} from the bound"
+            f" {evidence.head_sha[:12]} (drift invalidates this evidence)")
+    if facts.base_ref != evidence.base_ref:
+        problems.append(
+            f"base: PR base is {facts.base_ref!r}, not the bound"
+            f" {evidence.base_ref!r}")
+    if facts.merged:
+        problems.append("state: the PR is already merged; this evidence is stale")
+    elif not facts.open:
+        problems.append(f"state: the PR is {facts.state}, not OPEN")
+    if facts.mergeable != "MERGEABLE":
+        problems.append(f"mergeable: PR reports {facts.mergeable}")
+    if not facts.checks_passing:
+        problems.append("checks: required status checks are not passing")
+    return facts, problems
+
+
+def _pr_evidence_event_id(attempt_id: str, pr_number: int, head_sha: str,
+                         checks_digest: str, mergeable: str, base_ref: str,
+                         task_version: int) -> str:
+    return "evt-dpe-" + _sha256_hex(
+        f"pr-evidence|{attempt_id}|{pr_number}|{task_version}|{base_ref}|"
+        f"{head_sha}|{checks_digest}|{mergeable}")[:40]
+
+
+def _pr_approval_event_id(pr_evidence_id: str) -> str:
+    return "evt-dpma-" + _sha256_hex(f"pr-merge-approval|{pr_evidence_id}")[:40]
+
+
+def _merge_evidence_event_id(pr_evidence_id: str) -> str:
+    return "evt-dpme-" + _sha256_hex(f"pr-merge|{pr_evidence_id}")[:40]
+
+
+def _persist_pr_evidence(conn: TeamCraftConnection, *, task: domain.Task,
+                         attempt: domain.Attempt, dispatch_ver: int,
+                         brief_digest: str, brief_version: int, report_id: int,
+                         report_digest: str, allocation: worktrees.WorktreeAllocation,
+                         commit: CommitEvidence, policy_digest: str,
+                         facts: github_adapter.PullRequestFacts, source: str,
+                         command_id: str, clock: Clock | None) -> PullRequestEvidence:
+    checks = [dict(c) for c in facts.checks]
+    checks.sort(key=lambda c: (c["name"], c["status"]))
+    ready = bool(facts.open and facts.mergeable == "MERGEABLE"
+                 and _checks_passing(checks))
+    payload_json = _pr_payload(
+        allocation_id=allocation.allocation_id, attempt_id=attempt.id,
+        attempt_no=attempt.attempt_no, base_oid=facts.base_sha or commit.base_sha,
+        base_ref=facts.base_ref, base_sha=commit.base_sha,
+        branch=facts.head_branch or allocation.branch,
+        brief_digest=brief_digest, brief_version=brief_version,
+        checks_digest=_checks_digest(checks),
+        checks_json=_canonical_json(checks),
+        commit_evidence_id=commit.event_id, commit_sha=commit.commit_sha,
+        command_id=command_id, delivery_mode="direct_pr",
+        dispatch_task_version=dispatch_ver, head_branch=facts.head_branch,
+        head_sha=facts.head_sha, mergeable=facts.mergeable,
+        policy_digest=policy_digest, pr_number=facts.number, pr_url=facts.url,
+        project_id=task.project_id, proposed_action=DIRECT_PR_MERGE_ACTION,
+        ready=ready, repo=facts.repo, source=source, task_id=task.id,
+        task_version=task.version, worker_report_digest=report_digest,
+        worker_report_id=report_id, worktree_path=allocation.worktree_path,
+    )
+    event, _inserted = events.append_event_idempotent(
+        conn, PR_EVIDENCE_KIND, project_id=task.project_id, task_id=task.id,
+        attempt_id=attempt.id, payload_json=payload_json,
+        event_id=_pr_evidence_event_id(
+            attempt.id, facts.number, facts.head_sha, _checks_digest(checks),
+            facts.mergeable, facts.base_ref, task.version),
+        clock=clock)
+    return _pr_from_row(conn, int(event.seq), event.event_id, payload_json)
+
+
+# ---------------------------------------------------------------------------
+# PREPARE — idempotent PR creation/adoption; VERIFYING -> READY_TO_MERGE only
+# ---------------------------------------------------------------------------
+
+
+def prepare_direct_pr(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_git: GitRunner | None = None,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    which: Any = None,
+    clock: Clock | None = None,
+) -> DirectPrResult:
+    """Create (or adopt) THE pull request for one finished Attempt.
+
+    Order is pinned like M4-04: probe (zero-write) → validate durable facts →
+    durable Command (pending→running, committed) → scoped Git push of the
+    Attempt branch → ``gh pr`` create/adopt → live read-back → fenced receipt.
+
+    Possible outcomes (:class:`DirectPrResult`):
+      * ``blocked`` — ``gh`` missing or unauthenticated; NOTHING was written
+        (no Command, no event, no Git/gh call beyond the probe).
+      * ``ready`` — PR open + mergeable + checks passing; Task CASed
+        VERIFYING → READY_TO_MERGE.  This is the furthest prepare goes: it can
+        NEVER complete the Task.
+      * ``pending_checks`` — PR recorded but readiness facts not met yet;
+        re-run :func:`sync_direct_pr` (or prepare again) to update facts.
+
+    Refusals (nothing written): non-``direct_pr`` policy or missing explicit
+    ``direct_pr`` repo/base config (``mode``), non-VERIFYING Task, missing
+    commit/verifier evidence, base/commit/drift, foreign remote branch head
+    (never force-pushed), protected branches.
+    """
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip() \
+            or len(idempotency_key.strip()) > 200:
+        raise ValidationError("idempotency_key is required and must be at most 200 characters")
+    key = idempotency_key.strip()
+    attempt_id = require_entity_id(attempt_id)
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+
+    attempt0 = domain.get_attempt(conn, attempt_id)
+    task0 = domain.get_task(conn, attempt0.task_id)
+    policy0 = _policy_of(task0)
+    if policy0.get("delivery") != "direct_pr":
+        raise DirectPrRefusal(
+            "mode",
+            f"task policy delivery is {policy0.get('delivery')!r}; direct-PR"
+            " preparation only runs for delivery=direct_pr")
+    _config_probe = domain.direct_pr_config(policy0)
+    if _config_probe is None:
+        raise DirectPrRefusal(
+            "mode",
+            "explicit persisted direct_pr policy with repo and base is required"
+            " (delivery=direct_pr alone does not enable execution)")
+
+    # ---- probe BEFORE any durable write: no gh / no auth => zero residue --
+    probe = github_adapter.probe_gh(gh, task_repo_root(conn, task0),
+                                    resolve=which)
+    if probe.blocked:
+        return DirectPrResult(
+            outcome="blocked", blocked=True, detail=probe.detail,
+            project_id=task0.project_id, task_id=task0.id, attempt_id=attempt0.id,
+            task_status=task0.status, ready=False, pr_number=None, pr_url="",
+            command_id=None, pr_evidence=None)
+
+    with _tx(conn):
+        replayed = _replay_by_key(conn, PR_EVIDENCE_KIND,
+                                  PR_PREPARE_COMMAND_KIND, key)
+        if replayed is not None:
+            evidence = _pr_from_row(conn, int(replayed[0]), str(replayed[1]),
+                                   str(replayed[2]))
+            if evidence.attempt_id != attempt_id:
+                raise ConflictError(
+                    "idempotency key already owns PR evidence for a different"
+                    " Attempt; refusing the collision")
+            leader.require_project_lease(conn, lease, evidence.project_id,
+                                        clock=clock)
+            task = domain.get_task(conn, evidence.task_id)
+            outcome = "ready" if evidence.ready else "pending_checks"
+            return DirectPrResult(
+                outcome=outcome, blocked=False, detail="replayed durable PR evidence",
+                project_id=evidence.project_id, task_id=evidence.task_id,
+                attempt_id=evidence.attempt_id, task_status=task.status,
+                ready=evidence.ready, pr_number=evidence.pr_number,
+                pr_url=evidence.pr_url, command_id=evidence.command_id,
+                pr_evidence=evidence)
+
+        # A settled PR evidence row for THIS attempt proves the PR effect
+        # already happened once — converge onto it BEFORE re-validating bound
+        # facts, because the readiness CAS legitimately bumps the Task version
+        # past the dispatch pin that _bound_attempt_facts demands.  Retrying
+        # after readiness must never push, create, or duplicate anything.
+        settled_existing = load_latest_pr_evidence(conn, task0.id)
+        settled_commit = load_commit_evidence(conn, attempt_id)
+        if (settled_existing is not None and settled_commit is not None
+                and settled_existing.attempt_id == attempt_id
+                and settled_existing.head_sha == settled_commit.commit_sha):
+            leader.require_project_lease(conn, lease, task0.project_id,
+                                        clock=clock)
+            outcome = "ready" if settled_existing.ready else "pending_checks"
+            return DirectPrResult(
+                outcome=outcome, blocked=False,
+                detail=(f"PR #{settled_existing.pr_number} already recorded for"
+                      " this commit; no duplicate created"),
+                project_id=task0.project_id, task_id=task0.id,
+                attempt_id=attempt_id, task_status=task0.status,
+                ready=settled_existing.ready,
+                pr_number=settled_existing.pr_number,
+                pr_url=settled_existing.pr_url,
+                command_id=settled_existing.command_id,
+                pr_evidence=settled_existing)
+
+        task, attempt, brief, report_id, dispatch_ver, report_digest = \
+            _bound_attempt_facts(conn, attempt_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        allocation = _bound_allocation(conn, task, attempt)
+        _policy, policy_digest, config = _direct_pr_policy(task)
+        commit = require_commit_evidence(conn, attempt.id)
+        if (commit.task_id != task.id or commit.attempt_no != attempt.attempt_no
+                or commit.task_version != task.version
+                or commit.brief_digest != brief.brief_digest
+                or commit.worker_report_id != report_id
+                or commit.worker_report_digest != report_digest
+                or commit.allocation_id != allocation.allocation_id):
+            raise ConflictError(
+                "commit evidence bindings no longer match the live Task/"
+                "Attempt/Brief/WorkerReport facts")
+        verifiers, _required = _required_verifier_evidence(conn, task, attempt, None)
+        _unresolved_same_key(conn, PR_PREPARE_COMMAND_KIND, key)
+        _unresolved_other_key(conn, PR_PREPARE_COMMAND_KIND, attempt.id, key)
+
+        existing = load_latest_pr_evidence(conn, task.id)
+        if (existing is not None and existing.attempt_id == attempt.id
+                and existing.head_sha == commit.commit_sha):
+            # A PR already exists for this exact delivered commit: never create
+            # a second one — converge onto the settled/adopted evidence.
+            outcome = "ready" if existing.ready else "pending_checks"
+            return DirectPrResult(
+                outcome=outcome, blocked=False,
+                detail=f"PR #{existing.pr_number} already recorded for this"
+                      " commit; no duplicate created",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt.id,
+                task_status=task.status, ready=existing.ready,
+                pr_number=existing.pr_number, pr_url=existing.pr_url,
+                command_id=existing.command_id, pr_evidence=existing)
+        if (existing is not None and existing.attempt_id == attempt.id
+                and existing.head_sha != commit.commit_sha):
+            raise ConflictError(
+                "a PR evidence row exists for this Attempt at a different head"
+                f" ({existing.head_sha[:12]} vs {commit.commit_sha[:12]});"
+                " reconcile before proceeding")
+
+        payload = {
+            "project_id": task.project_id, "task_id": task.id,
+            "task_version": task.version, "attempt_id": attempt.id,
+            "attempt_no": attempt.attempt_no,
+            "dispatch_task_version": dispatch_ver,
+            "brief_digest": brief.brief_digest, "brief_version": brief.brief_version,
+            "worker_report_id": report_id, "worker_report_digest": report_digest,
+            "allocation_id": allocation.allocation_id,
+            "worktree_path": allocation.worktree_path, "branch": allocation.branch,
+            "base_sha": allocation.base_sha, "commit_sha": commit.commit_sha,
+            "commit_evidence_id": commit.event_id, "policy_digest": policy_digest,
+            "repo": config["repo"], "base": config["base"],
+            "merge_method": config["merge_method"],
+            "verifier_digest": _verifier_digest(verifiers),
+        }
+        digest = _sha256_hex(_canonical_json({
+            "brief_digest": brief.brief_digest, "attempt_id": attempt.id,
+            "commit_sha": commit.commit_sha,
+            "policy_digest": policy_digest, "worker_report_digest": report_digest,
+            "repo": config["repo"], "base": config["base"]}))
+        command = commands.submit_command(
+            conn, idempotency_key=key, kind=PR_PREPARE_COMMAND_KIND,
+            payload_json=_canonical_json(payload),
+            evidence_json=_evidence_envelope(task, attempt, dispatch_ver, digest),
+            clock=clock).command
+        if command.state == "pending":
+            commands.claim_command(conn, command.id, clock=clock)
+        else:
+            raise IllegalTransitionError(
+                "PR prepare Command is already running/uncertain; reconcile it"
+                " before retry", entity="command", current=command.state,
+                event="pr_prepare")
+
+    git = _DirectPrGitRunner(run_git or _default_run_git, allocation.branch)
+    repo_root = task_repo_root(conn, task)
+    try:
+        # ---- effects (outside any transaction): scoped push, then PR ------
+        _ensure_remote_branch(git, repo_root, commit.commit_sha)
+        adopted = github_adapter.find_open_pr(
+            gh, repo_root, repo=config["repo"], head=allocation.branch,
+            base=config["base"])
+        if adopted is not None:
+            source = "adopted"
+            if adopted.head_sha != commit.commit_sha:
+                raise DirectPrRefusal(
+                    "drift",
+                    f"open PR #{adopted.number} carries head"
+                    f" {adopted.head_sha[:12]}, not the delivered commit"
+                    f" {commit.commit_sha[:12]}; refusing to adopt a foreign PR")
+            facts = adopted
+        else:
+            source = "created"
+            try:
+                facts = github_adapter.create_pr(
+                    gh, repo_root, repo=config["repo"], head=allocation.branch,
+                    base=config["base"],
+                    title=f"[teamcraft] deliver {task.id} attempt {attempt.id}",
+                    body=_pr_body(task, attempt, commit, config))
+            except github_adapter.GitHubInvocationError as exc:
+                commands.mark_command_unknown(
+                    conn, command.id,
+                    note=("pr create returned an error; the PR may or may not"
+                        f" exist: {exc.stderr or exc}")[:1900], clock=clock)
+                raise StorageError(
+                    f"PR creation for attempt {attempt.id} was durably recorded"
+                    " but gh reported an error; run reconcile_pr_receipt before"
+                    " retry (never assume a duplicate)") from exc
+            facts = github_adapter.read_pr(gh, repo_root, repo=config["repo"],
+                                          number=facts.number)
+            if facts.head_sha != commit.commit_sha or facts.base_ref != config["base"]:
+                raise DirectPrRefusal(
+                    "drift",
+                    f"PR #{facts.number} reads back head"
+                    f" {facts.head_sha[:12]} into {facts.base_ref!r}; expected"
+                    f" {commit.commit_sha[:12]} into {config['base']!r}")
+
+        checks = [dict(c) for c in facts.checks]
+        checks.sort(key=lambda c: (c["name"], c["status"]))
+        ready = bool(facts.open and facts.mergeable == "MERGEABLE"
+                     and _checks_passing(checks))
+
+        # ---- fenced receipt ----
+        with _tx(conn):
+            leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+            current_task = domain.get_task(conn, task.id)
+            current_attempt = domain.get_attempt(conn, attempt.id)
+            current_brief = verification.briefs.get_attempt_brief(conn, attempt.id)
+            report_row = conn.execute(
+                "SELECT id, report_digest, outcome FROM worker_reports WHERE"
+                " attempt_id = ? AND report_kind = 'final' ORDER BY id DESC LIMIT 1",
+                (attempt.id,),
+            ).fetchone()
+            current_alloc = worktrees.require_allocation(conn, attempt.id)
+            current_commit = require_commit_evidence(conn, attempt.id)
+            current_policy = _policy_of(current_task)
+            fresh = (current_task.version == task.version
+                    and current_task.status == "verifying"
+                    and current_task.kind == "ship"
+                    and current_policy.get("delivery") == "direct_pr"
+                    and _policy_digest(current_policy) == policy_digest
+                    and current_attempt.status == "finished"
+                    and current_attempt.attempt_no == attempt.attempt_no
+                    and current_brief.brief_digest == brief.brief_digest
+                    and current_brief.task_version == dispatch_ver
+                    and report_row is not None and int(report_row[0]) == report_id
+                    and str(report_row[1]) == report_digest
+                    and str(report_row[2]) == "completed"
+                    and current_alloc.allocation_id == allocation.allocation_id
+                    and current_commit.event_id == commit.event_id
+                    and current_commit.commit_sha == commit.commit_sha)
+            if not fresh:
+                raise ConflictError(
+                    "delivery facts drifted while the PR was formed; refusing to"
+                    " record the evidence")
+            evidence = _persist_pr_evidence(
+                conn, task=current_task, attempt=current_attempt,
+                dispatch_ver=dispatch_ver, brief_digest=brief.brief_digest,
+                brief_version=brief.brief_version, report_id=report_id,
+                report_digest=report_digest, allocation=allocation,
+                commit=commit, policy_digest=policy_digest, facts=facts,
+                source=source, command_id=command.id, clock=clock)
+            outcome = "pending_checks"
+            status_after = current_task.status
+            if ready:
+                updated = domain.apply_task_event(
+                    conn, task.id, DIRECT_PR_READY,
+                    expected_version=current_task.version, clock=clock)
+                status_after = updated.status
+                outcome = "ready"
+                if status_after != "ready_to_merge":
+                    raise StorageError(
+                        "direct-PR readiness did not land READY_TO_MERGE;"
+                        " rolling the receipt back")
+            events.append_event(conn, "delivery.pr_ready" if ready
+                               else "delivery.pr_recorded",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt.id,
+                payload_json=_canonical_json({
+                    "pr_evidence_id": evidence.event_id,
+                    "command_id": command.id, "pr_number": evidence.pr_number,
+                    "pr_url": evidence.pr_url, "repo": evidence.repo,
+                    "head_branch": evidence.head_branch, "head_sha": evidence.head_sha,
+                    "base_ref": evidence.base_ref, "intended_base": config["base"],
+                    "mergeable": evidence.mergeable,
+                    "checks_digest": evidence.checks_digest,
+                    "ready": ready, "source": source,
+                    "task_status_after": status_after,
+                    "next": ("explicit human merge approval bound to this exact"
+                            " PR/head/base is required before any merge") if ready
+                           else "sync PR facts once checks complete"}),
+                clock=clock)
+            commands.confirm_command(conn, command.id, result_json=_canonical_json({
+                "pr_evidence_id": evidence.event_id, "pr_number": evidence.pr_number,
+                "pr_url": evidence.pr_url, "head_sha": evidence.head_sha,
+                "base_ref": evidence.base_ref, "ready": ready,
+                "task_status_after": status_after}),
+                clock=clock)
+            return DirectPrResult(
+                outcome=outcome, blocked=False, detail=f"PR #{evidence.pr_number} {source}",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt.id,
+                task_status=status_after, ready=ready, pr_number=evidence.pr_number,
+                pr_url=evidence.pr_url, command_id=command.id,
+                pr_evidence=evidence)
+    except DirectPrRefusal:
+        try:
+            commands.mark_command_unknown(
+                conn, command.id,
+                note="direct-PR preparation refused after claim; effect state"
+                   " must be reconciled against GitHub", clock=clock)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        detail = str(exc).encode("utf-8")[:500].decode("utf-8", errors="ignore")
+        try:
+            commands.mark_command_unknown(
+                conn, command.id,
+                note=f"direct-PR preparation interrupted: {detail}", clock=clock)
+        except Exception:
+            pass
+        raise
+
+
+def _pr_body(task: domain.Task, attempt: domain.Attempt, commit: CommitEvidence,
+             config: dict[str, Any]) -> str:
+    return _canonical_json({
+        "task_id": task.id, "attempt_id": attempt.id,
+        "attempt_no": attempt.attempt_no, "task_version": task.version,
+        "commit_sha": commit.commit_sha, "base_sha": commit.base_sha,
+        "intended_base": config["base"], "merge_method": config["merge_method"],
+        "provenance": "TeamCraft M4-05 direct-PR delivery",
+        "note": "merge only via an explicit TeamCraft merge approval bound to"
+               " the exact head/base"})
+
+
+# ---------------------------------------------------------------------------
+# SYNC — refresh head/base/check facts; readiness CAS when facts turn ready
+# ---------------------------------------------------------------------------
+
+
+def sync_direct_pr(
+    conn: TeamCraftConnection,
+    task_id: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    which: Any = None,
+    clock: Clock | None = None,
+) -> DirectPrResult:
+    """Re-read the durable PR's live facts and record a new evidence row.
+
+    Never creates a PR and never merges.  When the recorded Task is still
+    VERIFYING and the fresh facts are ready (open + mergeable + checks
+    passing), this is what CASes VERIFYING → READY_TO_MERGE; when the Task is
+    already READY_TO_MERGE it refreshes the audit trail (and drift becomes
+    visible to :func:`pr_evidence_is_current`).  Any head/base movement, PR
+    close/merge, policy change or Task drift lands as problems, never as a
+    silent pass.
+    """
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip() \
+            or len(idempotency_key.strip()) > 200:
+        raise ValidationError("idempotency_key is required and must be at most 200 characters")
+    key = idempotency_key.strip()
+    task_id = require_entity_id(task_id)
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+
+    task0 = domain.get_task(conn, task_id)
+    if task0.kind != "ship":
+        raise DirectPrRefusal("mode", "only ship Tasks have direct-PR evidence")
+    _policy0, _pd0, config0 = _direct_pr_policy(task0)
+    if task0.status not in ("verifying", "ready_to_merge"):
+        raise DirectPrRefusal(
+            "stale", f"task status {task0.status!r} has no live direct-PR to sync")
+    existing0 = load_latest_pr_evidence(conn, task_id)
+    if existing0 is None:
+        raise NotFoundError("no durable PR evidence to sync; run prepare_direct_pr first")
+
+    probe = github_adapter.probe_gh(gh, task_repo_root(conn, task0), resolve=which)
+    if probe.blocked:
+        return DirectPrResult(
+            outcome="blocked", blocked=True, detail=probe.detail,
+            project_id=task0.project_id, task_id=task0.id,
+            attempt_id=existing0.attempt_id, task_status=task0.status,
+            ready=False, pr_number=existing0.pr_number, pr_url=existing0.pr_url,
+            command_id=None, pr_evidence=None)
+
+    with _tx(conn):
+        replayed = _replay_by_key(conn, PR_EVIDENCE_KIND, PR_SYNC_COMMAND_KIND, key)
+        if replayed is not None:
+            evidence = _pr_from_row(conn, int(replayed[0]), str(replayed[1]),
+                                   str(replayed[2]))
+            leader.require_project_lease(conn, lease, evidence.project_id, clock=clock)
+            task = domain.get_task(conn, evidence.task_id)
+            return DirectPrResult(
+                outcome="ready" if evidence.ready else "pending_checks",
+                blocked=False, detail="replayed durable PR sync",
+                project_id=evidence.project_id, task_id=evidence.task_id,
+                attempt_id=evidence.attempt_id, task_status=task.status,
+                ready=evidence.ready, pr_number=evidence.pr_number,
+                pr_url=evidence.pr_url, command_id=evidence.command_id,
+                pr_evidence=evidence)
+
+        task = domain.get_task(conn, task_id)
+        attempt_id = existing0.attempt_id
+        attempt = domain.get_attempt(conn, attempt_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        problems = _pr_pin_problems(
+            conn, task_id=task.id, attempt_id=attempt_id,
+            task_version=existing0.task_version,
+            dispatch_ver=existing0.dispatch_task_version,
+            brief_digest=existing0.brief_digest,
+            report_id=existing0.worker_report_id,
+            report_digest=existing0.worker_report_digest,
+            expect_statuses=("verifying", "ready_to_merge"),
+            version_bump_ok=True)
+        policy, policy_digest, config = _direct_pr_policy(task)
+        if policy_digest != existing0.policy_digest:
+            problems.append("policy: execution policy drifted after the PR evidence")
+        if config["repo"] != existing0.repo or config["base"] != existing0.base_ref:
+            problems.append("policy: direct_pr repo/base drifted from the recorded PR")
+        commit = require_commit_evidence(conn, attempt_id)
+        if (commit.event_id != existing0.commit_evidence_id
+                or commit.commit_sha != existing0.commit_sha):
+            problems.append("commit: evidence chain drifted")
+        if problems:
+            raise ConflictError("direct-PR sync refused: " + "; ".join(problems))
+        _unresolved_same_key(conn, PR_SYNC_COMMAND_KIND, key)
+        _unresolved_other_key(conn, PR_SYNC_COMMAND_KIND, attempt_id, key)
+        command = commands.submit_command(
+            conn, idempotency_key=key, kind=PR_SYNC_COMMAND_KIND,
+            payload_json=_canonical_json({
+                "project_id": task.project_id, "task_id": task.id,
+                "task_version": task.version, "attempt_id": attempt_id,
+                "attempt_no": attempt.attempt_no,
+                "dispatch_task_version": existing0.dispatch_task_version,
+                "brief_digest": existing0.brief_digest,
+                "worker_report_id": existing0.worker_report_id,
+                "worker_report_digest": existing0.worker_report_digest,
+                "pr_evidence_id": existing0.event_id, "pr_number": existing0.pr_number,
+                "repo": config["repo"], "intended_base": config["base"],
+                "head_sha": existing0.head_sha, "policy_digest": policy_digest}),
+            evidence_json=_evidence_envelope(task, attempt,
+                                            existing0.dispatch_task_version,
+                                            existing0.evidence_digest),
+            clock=clock).command
+        if command.state == "pending":
+            commands.claim_command(conn, command.id, clock=clock)
+        else:
+            raise IllegalTransitionError(
+                "PR sync Command is already running/uncertain; reconcile it"
+                " before retry", entity="command", current=command.state,
+                event="pr_sync")
+
+    repo_root = task_repo_root(conn, task0)
+    try:
+        facts, live_problems = _live_pr_facts(gh, repo_root, repo=config["repo"],
+                                              evidence=existing0)
+        if facts is None:
+            raise DirectPrRefusal("gh", "; ".join(live_problems))
+        checks = [dict(c) for c in facts.checks]
+        checks.sort(key=lambda c: (c["name"], c["status"]))
+        ready = bool(facts.open and facts.mergeable == "MERGEABLE"
+                     and _checks_passing(checks))
+        unchanged = (facts.head_sha == existing0.head_sha
+                     and facts.base_ref == existing0.base_ref
+                     and facts.mergeable == existing0.mergeable
+                     and _checks_digest(checks) == existing0.checks_digest
+                     and facts.number == existing0.pr_number
+                     and ready == existing0.ready)
+        if live_problems and not ready:
+            # Drift (moved head, closed PR, failing checks) is recorded as an
+            # audit event only: stale facts can never form readiness.
+            events.append_event(conn, "delivery.pr_drift_observed",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt_id,
+                payload_json=_canonical_json({
+                    "pr_evidence_id": existing0.event_id, "pr_number": existing0.pr_number,
+                    "problems": live_problems, "command_id": command.id}),
+                clock=clock)
+            commands.confirm_command(conn, command.id, result_json=_canonical_json({
+                "pr_number": existing0.pr_number, "ready": False,
+                "problems": live_problems}), clock=clock)
+            return DirectPrResult(
+                outcome="pending_checks", blocked=False,
+                detail="; ".join(live_problems), project_id=task.project_id,
+                task_id=task.id, attempt_id=attempt_id, task_status=task.status,
+                ready=False, pr_number=existing0.pr_number,
+                pr_url=existing0.pr_url, command_id=command.id,
+                pr_evidence=existing0)
+
+        with _tx(conn):
+            leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+            current_task = domain.get_task(conn, task.id)
+            current_policy = _policy_of(current_task)
+            if (current_task.version != task.version
+                    or current_task.status != task.status
+                    or _policy_digest(current_policy) != policy_digest):
+                raise ConflictError(
+                    "direct-PR facts drifted while syncing; refusing the update")
+            evidence = existing0
+            if not unchanged:
+                evidence = _persist_pr_evidence(
+                    conn, task=current_task, attempt=attempt,
+                    dispatch_ver=existing0.dispatch_task_version,
+                    brief_digest=existing0.brief_digest,
+                    brief_version=existing0.brief_version,
+                    report_id=existing0.worker_report_id,
+                    report_digest=existing0.worker_report_digest,
+                    allocation=worktrees.require_allocation(conn, attempt_id),
+                    commit=commit, policy_digest=policy_digest, facts=facts,
+                    source="synced", command_id=command.id, clock=clock)
+            status_after = current_task.status
+            outcome = "ready_updated" if status_after == "ready_to_merge" \
+                else ("ready" if ready else "pending_checks")
+            if ready and current_task.status == "verifying":
+                updated = domain.apply_task_event(
+                    conn, task.id, DIRECT_PR_READY,
+                    expected_version=current_task.version, clock=clock)
+                status_after = updated.status
+                outcome = "ready"
+            events.append_event(conn, "delivery.pr_synced",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt_id,
+                payload_json=_canonical_json({
+                    "pr_evidence_id": evidence.event_id, "command_id": command.id,
+                    "pr_number": evidence.pr_number, "ready": ready,
+                    "unchanged": unchanged, "head_sha": evidence.head_sha,
+                    "base_ref": evidence.base_ref,
+                    "mergeable": evidence.mergeable,
+                    "checks_digest": evidence.checks_digest,
+                    "task_status_after": status_after}),
+                clock=clock)
+            commands.confirm_command(conn, command.id, result_json=_canonical_json({
+                "pr_evidence_id": evidence.event_id, "ready": ready,
+                "task_status_after": status_after}), clock=clock)
+            return DirectPrResult(
+                outcome=outcome, blocked=False, detail=f"PR #{evidence.pr_number} synced",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt_id,
+                task_status=status_after, ready=ready,
+                pr_number=evidence.pr_number, pr_url=evidence.pr_url,
+                command_id=command.id, pr_evidence=evidence)
+    except Exception as exc:
+        detail = str(exc).encode("utf-8")[:500].decode("utf-8", errors="ignore")
+        try:
+            commands.mark_command_unknown(
+                conn, command.id, note=f"direct-PR sync interrupted: {detail}",
+                clock=clock)
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# APPROVE — explicit human merge decision bound to exactly one PR evidence
+# ---------------------------------------------------------------------------
+
+
+def approve_direct_pr_merge(
+    conn: TeamCraftConnection,
+    pr_evidence_id: str,
+    *,
+    decision: str,
+    pr_number: int | None,
+    head_sha: str | None,
+    base: str | None,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    which: Any = None,
+    clock: Clock | None = None,
+) -> PrMergeApproval:
+    """Append an idempotent human merge decision for one recorded PR.
+
+    An ``approve`` MUST echo the evidence's exact PR number, head SHA and base
+    — anything else is refused.  Approval does NOT merge and does NOT complete
+    the Task: it only records that a human authorizes exactly this PR/head/base
+    merge, leaving the Task READY_TO_MERGE.  Only :func:`merge_direct_pr`
+    performs the fenced effect, and only the domain completion gate (re-deriving
+    this Approval + verified merge evidence + the intended-base match from
+    durable rows) can move the Task to DONE.
+
+    The live PR must still be open, mergeable, checks-passing, and at the bound
+    head/base at decision time; any drift invalidates this approval
+    opportunity (a fix arrives as a new bounded Attempt with fresh evidence).
+    A ``reject`` records the decision, leaves the Task READY_TO_MERGE, and
+    closes this evidence version for any later decision.
+    """
+    if decision not in ("approve", "reject"):
+        raise ValidationError("decision must be approve or reject")
+    if (not isinstance(actor, str) or not actor.strip()
+            or len(actor.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"actor is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    if (not isinstance(reason, str) or not reason.strip()
+            or len(reason.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"reason is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip() \
+            or len(idempotency_key.strip()) > 200:
+        raise ValidationError("idempotency_key is required and must be at most 200 characters")
+    if decision == "approve" and (pr_number is None or not head_sha or not base):
+        raise ValidationError(
+            "merge approval must explicitly echo the bound pr_number, head_sha"
+            " and base")
+    key = idempotency_key.strip()
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+
+    probe = None
+    with _tx(conn):
+        replayed = _replay_by_key(conn, PR_MERGE_APPROVAL_KIND,
+                                  PR_MERGE_APPROVAL_COMMAND_KIND, key)
+        if replayed is not None:
+            approval = _pr_approval_from_row(conn, int(replayed[0]),
+                                            str(replayed[1]), str(replayed[2]))
+            if (approval.pr_evidence_id != pr_evidence_id
+                    or approval.decision != decision
+                    or approval.actor != actor.strip()
+                    or approval.reason != reason.strip()):
+                raise ConflictError(
+                    "idempotency key already owns a different PR merge"
+                    " approval; refusing the collision")
+            leader.require_project_lease(conn, lease, approval.project_id,
+                                        clock=clock)
+            return approval
+
+        evidence = get_pr_evidence(conn, pr_evidence_id)
+        task = domain.get_task(conn, evidence.task_id)
+        attempt = domain.get_attempt(conn, evidence.attempt_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        if task.kind != "ship" or task.status != "ready_to_merge":
+            raise IllegalTransitionError(
+                "direct-PR merge approval requires a ship Task in"
+                " READY_TO_MERGE (PR creation never completes delivery and"
+                " approval never merges)",
+                entity="task", current=task.status, event="pr_merge_approval")
+        latest = load_latest_pr_evidence(conn, task.id)
+        if latest is None or latest.event_id != evidence.event_id:
+            raise ConflictError(
+                "only the LATEST PR evidence row for this Task may be approved;"
+                " newer PR facts supersede this approval target")
+        if task.version != evidence.task_version + 1:
+            raise ConflictError(
+                "the Task version moved after this PR evidence was formed"
+                f" (evidence bound {evidence.task_version}, task is"
+                f" {task.version}); stale evidence cannot be approved")
+        _policy, policy_digest, config = _direct_pr_policy(task)
+        if policy_digest != evidence.policy_digest:
+            raise ConflictError(
+                "the execution policy changed after the PR evidence was formed;"
+                " stale-policy approval is refused")
+        problems = _pr_pin_problems(
+            conn, task_id=task.id, attempt_id=evidence.attempt_id,
+            task_version=evidence.task_version,
+            dispatch_ver=evidence.dispatch_task_version,
+            brief_digest=evidence.brief_digest,
+            report_id=evidence.worker_report_id,
+            report_digest=evidence.worker_report_digest,
+            expect_statuses=("ready_to_merge",), version_bump_ok=True)
+        if problems:
+            raise ConflictError("merge approval refused: " + "; ".join(problems))
+        prior = load_pr_merge_approval(conn, evidence.id)
+        if prior is not None:
+            if (prior.decision == decision and prior.actor == actor.strip()
+                    and prior.reason == reason.strip()):
+                return prior
+            raise ConflictError(
+                "this PR evidence version already has an Approval"
+                f" ({prior.decision!r}); a settled decision is immutable —"
+                " drift or fixes require a new bounded Attempt with fresh"
+                " evidence")
+        _unresolved_other_key(conn, PR_MERGE_APPROVAL_COMMAND_KIND,
+                              evidence.attempt_id, key)
+        if decision == "approve":
+            if int(pr_number) != evidence.pr_number:
+                raise ConflictError(
+                    f"approval must echo the bound PR number"
+                    f" {evidence.pr_number}, got {pr_number!r}")
+            if str(head_sha).lower() != evidence.head_sha:
+                raise ConflictError(
+                    f"approval must echo the bound head SHA"
+                    f" {evidence.head_sha}, got {head_sha!r}")
+            if str(base).strip() != evidence.base_ref:
+                raise ConflictError(
+                    f"approval must echo the bound base"
+                    f" {evidence.base_ref!r}, got {base!r}")
+            if config["base"] != evidence.base_ref:
+                raise ConflictError(
+                    f"the PR base {evidence.base_ref!r} is not the intended base"
+                    f" {config['base']!r} persisted in the policy; merging into"
+                    " an unintended base is never approvable")
+
+    # Live GitHub proof at decision time (outside the transaction).
+    repo_root = task_repo_root(conn, task)
+    probe = github_adapter.probe_gh(gh, repo_root, resolve=which)
+    if probe.blocked:
+        raise DirectPrRefusal("gh", f"cannot record a merge decision: {probe.detail}")
+    facts, live_problems = _live_pr_facts(gh, repo_root, repo=evidence.repo,
+                                         evidence=evidence)
+    if facts is None or live_problems:
+        raise DirectPrRefusal(
+            "drift", "merge approval refused: "
+            + "; ".join(live_problems or ["PR unreadable"]))
+
+    with _tx(conn):
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        current_task = domain.get_task(conn, task.id)
+        if (current_task.version != task.version
+                or current_task.status != "ready_to_merge"):
+            raise ConflictError(
+                "the Task moved while the approval was being recorded;"
+                " refusing the decision")
+        if load_pr_merge_approval(conn, evidence.id) is not None:
+            raise ConflictError(
+                "a merge approval for this evidence raced this one; the settled"
+                " decision is the durable one")
+        payload_bindings = {
+            "project_id": task.project_id, "task_id": task.id,
+            "attempt_id": evidence.attempt_id, "attempt_no": evidence.attempt_no,
+            "task_version": task.version,
+            "pr_evidence_id": evidence.event_id,
+            "pr_evidence_digest": evidence.evidence_digest,
+            "repo": evidence.repo, "pr_number": evidence.pr_number,
+            "head_sha": evidence.head_sha, "base_ref": evidence.base_ref,
+            "intended_base": config["base"],
+            "checks_digest": evidence.checks_digest,
+            "proposed_action": DIRECT_PR_MERGE_ACTION,
+            "decision": decision, "actor": actor.strip(),
+            "reason": reason.strip(),
+            # A merge approval NEVER completes the Task; DONE only arrives via
+            # verified merge evidence through the domain gate.
+            "task_status_after": "ready_to_merge",
+        }
+        digest = _sha256_hex(_canonical_json({
+            "pr_evidence_digest": evidence.evidence_digest,
+            "head_sha": evidence.head_sha, "base_ref": evidence.base_ref,
+            "decision": decision}))
+        command = commands.submit_command(
+            conn, idempotency_key=key, kind=PR_MERGE_APPROVAL_COMMAND_KIND,
+            payload_json=_canonical_json(payload_bindings),
+            evidence_json=_evidence_envelope(task, attempt,
+                                            evidence.dispatch_task_version, digest),
+            clock=clock).command
+        if command.state == "pending":
+            commands.claim_command(conn, command.id, clock=clock)
+        else:
+            raise IllegalTransitionError(
+                "PR merge approval Command is already running/uncertain;"
+                " reconcile it before retry", entity="command",
+                current=command.state, event="pr_merge_approval")
+        approval_payload = {**payload_bindings,
+                           "schema_version": PR_CONTRACT_VERSION,
+                           "command_id": command.id}
+        event, _inserted = events.append_event_idempotent(
+            conn, PR_MERGE_APPROVAL_KIND, project_id=task.project_id,
+            task_id=task.id, attempt_id=evidence.attempt_id,
+            payload_json=_canonical_json(approval_payload),
+            event_id=_pr_approval_event_id(evidence.id), clock=clock)
+        approval = _pr_approval_from_row(conn, int(event.seq), event.event_id,
+                                        _canonical_json(approval_payload))
+        events.append_event(conn,
+            "delivery.pr_merge_approval_recorded" if decision == "approve"
+            else "delivery.pr_merge_approval_rejected",
+            project_id=task.project_id, task_id=task.id,
+            attempt_id=evidence.attempt_id,
+            payload_json=_canonical_json({
+                "approval_id": approval.id, "command_id": command.id,
+                "pr_evidence_id": evidence.id, "pr_number": evidence.pr_number,
+                "pr_url": evidence.pr_url, "decision": decision,
+                "head_sha": evidence.head_sha, "intended_base": config["base"],
+                "checks_digest": evidence.checks_digest,
+                "actor": actor.strip(), "reason": reason.strip(),
+                "task_status_after": "ready_to_merge",
+                "next": ("merge_direct_pr is now permitted for exactly this"
+                        " PR/head/base under a current Leader lease")
+                       if decision == "approve"
+                       else "new bounded Attempt required for any fix"}),
+            clock=clock)
+        commands.confirm_command(conn, command.id, result_json=_canonical_json({
+            "approval_id": approval.id, "decision": decision,
+            "task_status_after": "ready_to_merge",
+            "pr_number": evidence.pr_number, "head_sha": evidence.head_sha,
+            "intended_base": config["base"]}),
+            clock=clock)
+        return approval
+
+
+# ---------------------------------------------------------------------------
+# MERGE — fenced execution of an approved merge into the INTENDED base only
+# ---------------------------------------------------------------------------
+
+
+def merge_direct_pr(
+    conn: TeamCraftConnection,
+    pr_evidence_id: str,
+    *,
+    idempotency_key: str,
+    lease: leader.Lease,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    which: Any = None,
+    clock: Clock | None = None,
+) -> PrMergeEvidence:
+    """Execute the approved merge of exactly one PR into its intended base.
+
+    Nothing about this call is trusted: the durable Approval must exist and
+    bind this exact PR/head/intended base at the Task's CURRENT version; the
+    live PR must still be open/mergeable/checks-passing at the bound head and
+    base; the merge runs head-guarded (``--match-head-commit``); and DONE is
+    recorded ONLY after an authoritative read-back proves the PR merged into the
+    INTENDED base with a merge commit.  Any mismatch refuses or leaves the
+    effect for :func:`reconcile_pr_merge` — never a blind retry, never a
+    second merge, never DONE on the CLI's own say-so.
+    """
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip() \
+            or len(idempotency_key.strip()) > 200:
+        raise ValidationError("idempotency_key is required and must be at most 200 characters")
+    key = idempotency_key.strip()
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+
+    with _tx(conn):
+        replayed = _replay_by_key(conn, PR_MERGE_EVIDENCE_KIND,
+                                  PR_MERGE_COMMAND_KIND, key)
+        if replayed is not None:
+            evidence = _merge_evidence_from_row(conn, int(replayed[0]),
+                                               str(replayed[1]), str(replayed[2]))
+            leader.require_project_lease(conn, lease, evidence.project_id,
+                                        clock=clock)
+            if evidence.pr_evidence_id != pr_evidence_id:
+                raise ConflictError(
+                    "idempotency key already owns merge evidence for a"
+                    " different PR evidence; refusing the collision")
+            return evidence
+
+        pr = get_pr_evidence(conn, pr_evidence_id)
+        task = domain.get_task(conn, pr.task_id)
+        attempt = domain.get_attempt(conn, pr.attempt_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        if task.kind != "ship" or task.status != "ready_to_merge":
+            raise IllegalTransitionError(
+                "direct-PR merge requires a ship Task in READY_TO_MERGE",
+                entity="task", current=task.status, event="pr_merge")
+        latest = load_latest_pr_evidence(conn, task.id)
+        if latest is None or latest.event_id != pr.event_id:
+            raise DirectPrRefusal(
+                "stale", "only the latest PR evidence may be merged; newer PR"
+                         " facts supersede this merge target")
+        approval = load_pr_merge_approval(conn, pr.id)
+        if approval is None:
+            raise DirectPrRefusal(
+                "approval", "no durable human merge Approval exists for this PR"
+                           " evidence; merging without an explicit approval is"
+                           " refused")
+        if approval.decision != "approve":
+            raise DirectPrRefusal(
+                "approval", f"the recorded decision for this PR is"
+                           f" {approval.decision!r}; only approve may merge")
+        if approval.task_version != task.version:
+            raise DirectPrRefusal(
+                "approval",
+                f"the Approval is bound to Task version {approval.task_version}"
+                f" but the Task is now {task.version}; Task drift invalidates"
+                " the approval")
+        settled = load_pr_merge_evidence(conn, task.id)
+        if settled is not None:
+            raise ConflictError(
+                "this Task already has durable merge evidence"
+                f" ({settled.event_id}); a merge is never executed twice")
+        _policy, policy_digest, config = _direct_pr_policy(task)
+        if policy_digest != pr.policy_digest:
+            raise DirectPrRefusal(
+                "stale", "the execution policy changed after the PR evidence"
+                        " was formed; stale-policy merge is refused")
+        if config["base"] != pr.base_ref or config["repo"] != pr.repo:
+            raise DirectPrRefusal(
+                "wrong-base",
+                f"the persisted intended base/repo is {config['base']!r} in"
+                f" {config['repo']!r} but this PR targets {pr.base_ref!r} in"
+                f" {pr.repo!r}; merging into an unintended base is refused")
+        if (approval.head_sha != pr.head_sha
+                or approval.intended_base != pr.base_ref
+                or approval.pr_evidence_digest != pr.evidence_digest):
+            raise DirectPrRefusal(
+                "approval", "the Approval no longer binds this exact PR/head/base"
+                           " — head/base/evidence drift invalidates it")
+        problems = _pr_pin_problems(
+            conn, task_id=task.id, attempt_id=pr.attempt_id,
+            task_version=pr.task_version,
+            dispatch_ver=pr.dispatch_task_version,
+            brief_digest=pr.brief_digest, report_id=pr.worker_report_id,
+            report_digest=pr.worker_report_digest,
+            expect_statuses=("ready_to_merge",), version_bump_ok=True)
+        if problems:
+            raise ConflictError("merge refused: " + "; ".join(problems))
+        _unresolved_same_key(conn, PR_MERGE_COMMAND_KIND, key)
+        _unresolved_other_key(conn, PR_MERGE_COMMAND_KIND, pr.attempt_id, key)
+        command = commands.submit_command(
+            conn, idempotency_key=key, kind=PR_MERGE_COMMAND_KIND,
+            payload_json=_canonical_json({
+                "project_id": task.project_id, "task_id": task.id,
+                "task_version": task.version, "attempt_id": pr.attempt_id,
+                "attempt_no": pr.attempt_no,
+                "dispatch_task_version": pr.dispatch_task_version,
+                "brief_digest": pr.brief_digest,
+                "brief_version": pr.brief_version,
+                "worker_report_id": pr.worker_report_id,
+                "worker_report_digest": pr.worker_report_digest,
+                "policy_digest": policy_digest,
+                "pr_evidence_id": pr.event_id, "approval_event_id": approval.id,
+                "pr_number": pr.pr_number, "repo": pr.repo,
+                "head_sha": pr.head_sha, "intended_base": config["base"],
+                "merge_method": config["merge_method"]}),
+            evidence_json=_evidence_envelope(task, attempt,
+                                            pr.dispatch_task_version,
+                                            pr.evidence_digest),
+            clock=clock).command
+        if command.state == "pending":
+            commands.claim_command(conn, command.id, clock=clock)
+        else:
+            raise IllegalTransitionError(
+                "PR merge Command is already running/uncertain; reconcile it"
+                " before retry", entity="command", current=command.state,
+                event="pr_merge")
+
+    repo_root = task_repo_root(conn, task)
+    try:
+        probe = github_adapter.probe_gh(gh, repo_root, resolve=which)
+        if probe.blocked:
+            # Nothing was sent: the claimed Command expires cleanly.
+            commands.reconcile_command(
+                conn, command.id, outcome="expired",
+                note=f"merge not attempted ({probe.detail}); no GitHub effect"
+                   " happened", clock=clock)
+            raise DirectPrRefusal("gh", probe.detail)
+        # Pre-effect live proof: still exactly what the human approved.
+        facts, live_problems = _live_pr_facts(gh, repo_root, repo=pr.repo,
+                                              evidence=pr)
+        if facts is not None and facts.base_ref != config["base"]:
+            # A base that is not the intended one is the M4-05 headline risk;
+            # classify it precisely, before any generic drift wording.
+            commands.reconcile_command(
+                conn, command.id, outcome="expired",
+                note=f"merge refused: PR base {facts.base_ref!r} is not the"
+                   f" intended base {config['base']!r}; nothing merged",
+                clock=clock)
+            raise DirectPrRefusal(
+                "wrong-base",
+                f"the PR's live base is {facts.base_ref!r}, not the intended"
+                f" base {config['base']!r}; merging into an unintended base is"
+                " refused before the effect")
+        if facts is None or live_problems:
+            detail = "; ".join(live_problems or ["PR unreadable"])
+            commands.reconcile_command(
+                conn, command.id, outcome="expired",
+                note=f"merge not attempted (live check refused): {detail}"[:1900],
+                clock=clock)
+            raise DirectPrRefusal(
+                "drift" if facts is not None else "gh",
+                f"merge refused before effect: {detail}")
+
+        result = github_adapter.merge_pr(
+            gh, repo_root, repo=pr.repo, number=pr.pr_number,
+            head_sha=pr.head_sha, method=config["merge_method"])
+        if not result.merged:
+            commands.reconcile_command(
+                conn, command.id, outcome="expired",
+                note=("gh refused the merge (head guard/checks/permissions):"
+                    f" {result.raw}")[:1900], clock=clock)
+            raise DirectPrRefusal(
+                "checks",
+                f"gh refused the merge; nothing landed: {result.raw[:200]}")
+
+        # Authoritative read-back: the CLI's own claim is never enough.
+        after = github_adapter.read_pr(gh, repo_root, repo=pr.repo,
+                                      number=pr.pr_number)
+        if not after.merged:
+            raise StorageError(
+                f"gh reported merged=true for PR #{pr.pr_number} but the"
+                " authoritative read-back still shows it open; reconcile the"
+                " recorded merge Command")
+        if after.base_ref != config["base"]:
+            # A merge that landed on the WRONG base is durable truth, but it
+            # NEVER completes delivery: audit it, refuse, leave DONE
+            # unreachable at this Task version, and keep the Command uncertain
+            # for human review.  It is recorded as a dedicated audit kind —
+            # never as merge evidence, which by contract describes only a
+            # merge into the intended base.
+            with _tx(conn):
+                leader.require_project_lease(conn, lease, task.project_id,
+                                            clock=clock)
+                events.append_event(conn, "delivery_pr_wrong_base_merge",
+                    project_id=task.project_id, task_id=task.id,
+                    attempt_id=pr.attempt_id,
+                    payload_json=_canonical_json({
+                        "schema_version": PR_CONTRACT_VERSION,
+                        "command_id": command.id, "pr_evidence_id": pr.id,
+                        "approval_event_id": approval.id,
+                        "pr_number": pr.pr_number, "head_sha": pr.head_sha,
+                        "merged_into": after.base_ref,
+                        "intended_base": config["base"],
+                        "merge_commit_sha": after.merge_commit_sha,
+                        "merged_at": after.merged_at,
+                        "note": "merged into an unintended base; the Task can"
+                              " NEVER reach DONE on this evidence"}),
+                    clock=clock)
+            commands.mark_command_unknown(
+                conn, command.id,
+                note=("PR merged into"
+                    f" {after.base_ref!r}, NOT the intended base"
+                    f" {config['base']!r}; DONE refused — human review required"),
+                clock=clock)
+            raise DirectPrRefusal(
+                "wrong-base",
+                f"PR #{pr.pr_number} merged into {after.base_ref!r} instead of"
+                f" the intended base {config['base']!r}; delivery is NOT"
+                " complete and the Task stays READY_TO_MERGE")
+        if after.head_sha != pr.head_sha:
+            raise StorageError(
+                f"PR #{pr.pr_number} read back head {after.head_sha[:12]} after"
+                f" merge, not the approved {pr.head_sha[:12]}; reconcile the"
+                " merge Command")
+
+        with _tx(conn):
+            leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+            current_task = domain.get_task(conn, task.id)
+            current_attempt = domain.get_attempt(conn, pr.attempt_id)
+            current_approval = load_pr_merge_approval(conn, pr.id)
+            current_policy = _policy_of(current_task)
+            if (current_task.version != task.version
+                    or current_task.status != "ready_to_merge"
+                    or current_attempt.status != "finished"
+                    or current_attempt.attempt_no != pr.attempt_no
+                    or current_policy.get("delivery") != "direct_pr"
+                    or _policy_digest(current_policy) != policy_digest
+                    or current_approval is None
+                    or current_approval.id != approval.id
+                    or current_approval.task_version != task.version):
+                raise ConflictError(
+                    "merge facts drifted while the merge ran; refusing to"
+                    " record completion (inspect and reconcile)")
+            merge_commit = (after.merge_commit_sha or "").lower()
+            if not _SHA_RE.match(merge_commit):
+                raise StorageError(
+                    "authoritative merge read-back carries no merge commit SHA;"
+                    " refusing DONE — reconcile the merge Command")
+            payload_json = _pr_payload(
+                action=DIRECT_PR_MERGE_ACTION, approval_event_id=approval.id,
+                attempt_id=pr.attempt_id, attempt_no=pr.attempt_no,
+                base_ref=after.base_ref, brief_digest=pr.brief_digest,
+                brief_version=pr.brief_version, command_id=command.id,
+                delivery_mode="direct_pr",
+                dispatch_task_version=pr.dispatch_task_version,
+                head_sha=pr.head_sha, intended_base=config["base"],
+                merge_commit_sha=merge_commit,
+                merged=True, merged_at=after.merged_at,
+                method=config["merge_method"], policy_digest=policy_digest,
+                pr_evidence_id=pr.event_id, pr_number=pr.pr_number,
+                pr_url=after.url or pr.pr_url, project_id=task.project_id,
+                repo=pr.repo, source="executed", task_id=task.id,
+                task_version=task.version,
+                worker_report_digest=pr.worker_report_digest,
+                worker_report_id=pr.worker_report_id)
+            event, _ins = events.append_event_idempotent(
+                conn, PR_MERGE_EVIDENCE_KIND, project_id=task.project_id,
+                task_id=task.id, attempt_id=pr.attempt_id,
+                payload_json=payload_json,
+                event_id=_merge_evidence_event_id(pr.id), clock=clock)
+            evidence = _merge_evidence_from_row(conn, int(event.seq),
+                                               event.event_id, payload_json)
+            events.append_event(conn, "delivery.pr_merged",
+                project_id=task.project_id, task_id=task.id,
+                attempt_id=pr.attempt_id,
+                payload_json=_canonical_json({
+                    "merge_evidence_id": evidence.id, "command_id": command.id,
+                    "pr_evidence_id": pr.id, "approval_id": approval.id,
+                    "pr_number": pr.pr_number, "head_sha": pr.head_sha,
+                    "intended_base": config["base"],
+                    "merged_into": evidence.base_ref,
+                    "merge_commit_sha": evidence.merge_commit_sha,
+                    "method": evidence.method}),
+                clock=clock)
+            # The ONLY path to DONE for direct-PR: the domain gate re-derives
+            # merge evidence + approval binding + intended-base match + pins
+            # from durable rows inside this same transaction before the CAS.
+            updated = domain.apply_task_event(
+                conn, task.id, "approved_and_delivered",
+                expected_version=task.version, clock=clock)
+            if updated.status != "done":
+                raise StorageError(
+                    "direct-PR merge did not land DONE; rolling the merge"
+                    " evidence back")
+            commands.confirm_command(conn, command.id, result_json=_canonical_json({
+                "merge_evidence_id": evidence.id, "pr_number": pr.pr_number,
+                "merge_commit_sha": evidence.merge_commit_sha,
+                "merged_into": evidence.base_ref, "task_status_after": "done"}),
+                clock=clock)
+            return evidence
+    except DirectPrRefusal:
+        raise
+    except Exception as exc:
+        detail = str(exc).encode("utf-8")[:500].decode("utf-8", errors="ignore")
+        try:
+            commands.mark_command_unknown(
+                conn, command.id,
+                note=f"direct-PR merge interrupted; effect state uncertain:"
+                   f" {detail}", clock=clock)
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Reconcile — close interrupted PR effects against observed GitHub facts
+# ---------------------------------------------------------------------------
+
+
+def reconcile_pr_receipt(
+    conn: TeamCraftConnection,
+    command_id: str,
+    *,
+    lease: leader.Lease,
+    actor: str,
+    reason: str,
+    run_git: GitRunner | None = None,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    clock: Clock | None = None,
+) -> dict[str, Any]:
+    """Close an interrupted prepare/sync Command against live GitHub facts.
+
+    * an OPEN PR from the Attempt branch into the intended base at exactly the
+      delivered commit head is ADOPTED as durable evidence
+      (``source=reconciled``) — GitHub proves the effect, so a second PR is
+      never created; readiness CASes VERIFYING → READY_TO_MERGE when the
+      adopted facts are ready;
+    * no matching PR (and no foreign remote head) proves the effect did not
+      happen: the Command expires and a fresh prepare may follow under a new
+      key;
+    * ambiguous scenes — multiple matching PRs, a foreign head, drifted pins,
+      unreadable GitHub — fail closed and leave the Command uncertain.
+    """
+    if (not isinstance(actor, str) or not actor.strip()
+            or len(actor.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"actor is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    if (not isinstance(reason, str) or not reason.strip()
+            or len(reason.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"reason is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+    with _tx(conn):
+        command = commands.get_command(conn, command_id)
+        if command.kind not in (PR_PREPARE_COMMAND_KIND, PR_SYNC_COMMAND_KIND):
+            raise IllegalTransitionError(
+                "command is not a direct-PR prepare/sync run", entity="command",
+                current=command.state, event="pr_reconcile")
+        try:
+            payload = json.loads(command.payload_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValidationError("PR Command payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValidationError("PR Command payload must be a JSON object")
+        attempt_id = str(payload.get("attempt_id") or "")
+        task_id = str(payload.get("task_id") or "")
+        if not attempt_id or not task_id:
+            raise ValidationError(
+                "PR reconcile requires an attempt- and task-scoped Command")
+        task = domain.get_task(conn, task_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        existing = conn.execute(
+            "SELECT event_id FROM events WHERE kind = ? AND json_extract("
+            "payload_json, '$.command_id') = ?",
+            (PR_EVIDENCE_KIND, command.id),
+        ).fetchone()
+        if existing is not None:
+            raise ConflictError(
+                "this Command already owns durable PR evidence; accepted"
+                " results are immutable and must not be reconciled away")
+        if command.state in ("confirmed", "expired"):
+            return {"resolution": command.state, "command": command,
+                    "pr_evidence": None}
+        if command.state == "pending":
+            raise IllegalTransitionError(
+                "command was never claimed/executed; reconcile only from"
+                " running/unknown", entity="command", current=command.state,
+                event="pr_reconcile")
+        _policy, policy_digest, config = _direct_pr_policy(task)
+        attempt = domain.get_attempt(conn, attempt_id)
+        allocation = _bound_allocation(conn, task, attempt)
+        commit = require_commit_evidence(conn, attempt_id)
+        commit_sha = str(payload.get("commit_sha") or commit.commit_sha)
+        if commit_sha != commit.commit_sha:
+            raise ConflictError(
+                "the pinned commit no longer matches the delivered commit"
+                " evidence; refusing to reconcile against drifted facts")
+        problems = _pr_pin_problems(
+            conn, task_id=task_id, attempt_id=attempt_id,
+            task_version=int(payload.get("task_version") or -1),
+            dispatch_ver=int(payload.get("dispatch_task_version") or -1),
+            brief_digest=str(payload.get("brief_digest") or ""),
+            report_id=int(payload.get("worker_report_id") or -1),
+            report_digest=str(payload.get("worker_report_digest") or ""),
+            expect_statuses=("verifying",))
+        if policy_digest != str(payload.get("policy_digest") or ""):
+            problems.append("policy: policy drifted since the Command was written")
+        if problems:
+            raise ConflictError("PR reconcile refused: " + "; ".join(problems))
+
+    repo_root = task_repo_root(conn, task)
+    git = _DirectPrGitRunner(run_git or _default_run_git, allocation.branch)
+    remote = _remote_head(git, repo_root)
+    if remote is not None and remote != commit_sha:
+        raise DirectPrRefusal(
+            "ambiguous",
+            f"remote branch sits at {remote[:12]} rather than the delivered"
+            f" {commit_sha[:12]}; refusing to judge a foreign remote scene")
+    try:
+        found = github_adapter.find_open_pr(gh, repo_root, repo=config["repo"],
+                                           head=allocation.branch,
+                                           base=config["base"])
+    except github_adapter.GitHubError as exc:
+        raise DirectPrRefusal(
+            "ambiguous", f"cannot judge PR existence from GitHub: {exc}")
+
+    if found is None:
+        note = (f"pr receipt reconciled not-landed by {actor.strip()}:"
+               f" {reason.strip()} (no open PR head->intended base)")[:1900]
+        with _tx(conn):
+            settled = commands.reconcile_command(conn, command.id,
+                                                outcome="expired", note=note,
+                                                clock=clock)
+            events.append_event(conn, "delivery.pr_reconciled",
+                project_id=task.project_id, task_id=task.id, attempt_id=attempt_id,
+                payload_json=_canonical_json({
+                    "command_id": command.id, "resolution": "expired",
+                    "actor": actor.strip(),
+                    "fact": "no open pull request exists for"
+                           f" {allocation.branch!r} -> {config['base']!r};"
+                           " no PR effect happened"}),
+                clock=clock)
+        return {"resolution": "expired", "command": settled,
+                "pr_evidence": None}
+
+    if found.head_sha != commit_sha or found.base_ref != config["base"]:
+        raise DirectPrRefusal(
+            "ambiguous",
+            f"open PR #{found.number} carries head {found.head_sha[:12]} into"
+            f" {found.base_ref!r}, not the delivered {commit_sha[:12]} into"
+            f" {config['base']!r}; refusing to adopt a foreign PR")
+
+    with _tx(conn):
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        current_task = domain.get_task(conn, task_id)
+        if current_task.version != task.version or current_task.status not in (
+                "verifying", "ready_to_merge"):
+            raise ConflictError(
+                "Task moved while reconciling the PR receipt; refusing adoption")
+        evidence = _persist_pr_evidence(
+            conn, task=current_task, attempt=attempt,
+            dispatch_ver=int(payload.get("dispatch_task_version") or -1),
+            brief_digest=str(payload.get("brief_digest") or ""),
+            brief_version=int(payload.get("brief_version") or 1),
+            report_id=int(payload.get("worker_report_id") or -1),
+            report_digest=str(payload.get("worker_report_digest") or ""),
+            allocation=allocation, commit=commit, policy_digest=policy_digest,
+            facts=found, source="reconciled", command_id=command.id, clock=clock)
+        checks = [dict(c) for c in found.checks]
+        checks.sort(key=lambda c: (c["name"], c["status"]))
+        ready = bool(found.open and found.mergeable == "MERGEABLE"
+                     and _checks_passing(checks))
+        status_after = current_task.status
+        if ready and current_task.status == "verifying":
+            updated = domain.apply_task_event(
+                conn, task_id, DIRECT_PR_READY,
+                expected_version=current_task.version, clock=clock)
+            status_after = updated.status
+        note = (f"pr receipt reconciled adopted by {actor.strip()}:"
+               f" {reason.strip()}")[:1900]
+        settled = commands.reconcile_command(
+            conn, command.id, outcome="confirmed", note=note,
+            result_json=_canonical_json({
+                "pr_evidence_id": evidence.event_id, "pr_number": found.number,
+                "head_sha": found.head_sha, "base_ref": found.base_ref,
+                "ready": ready, "source": "reconciled",
+                "task_status_after": status_after}),
+            clock=clock)
+        events.append_event(conn, "delivery.pr_reconciled",
+            project_id=task.project_id, task_id=task.id, attempt_id=attempt_id,
+            payload_json=_canonical_json({
+                "command_id": command.id, "resolution": "adopted",
+                "pr_evidence_id": evidence.event_id, "pr_number": found.number,
+                "pr_url": found.url, "head_sha": found.head_sha,
+                "base_ref": found.base_ref, "actor": actor.strip(),
+                "ready": ready, "task_status_after": status_after,
+                "facts": [f"open PR #{found.number} head->intended base",
+                        "remote branch equals the delivered commit",
+                        "attempt finished with WorkerReport",
+                        "command.claimed event"]}),
+            clock=clock)
+        return {"resolution": "adopted", "command": settled,
+                "pr_evidence": evidence}
+
+
+def reconcile_pr_merge(
+    conn: TeamCraftConnection,
+    command_id: str,
+    *,
+    lease: leader.Lease,
+    actor: str,
+    reason: str,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    clock: Clock | None = None,
+) -> dict[str, Any]:
+    """Close an interrupted merge Command against the authoritative PR facts.
+
+    * merged into the INTENDED base at the approved head: the merge evidence is
+      adopted (``source=reconciled``) and the Task CASes to DONE through the
+      same durable-fact gate an executed merge uses — never twice;
+    * merged into any OTHER base: durable audit records the truth, the Command
+      expires, and DONE stays unreachable at this Task version;
+    * still open/closed unmerged: the merge did not happen — the Command
+      expires and a fresh merge may follow under a new key once the facts are
+      right again.
+    """
+    if (not isinstance(actor, str) or not actor.strip()
+            or len(actor.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"actor is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    if (not isinstance(reason, str) or not reason.strip()
+            or len(reason.encode("utf-8")) > MAX_DELIVERY_AUDIT_BYTES):
+        raise ValidationError(f"reason is required and must be at most {MAX_DELIVERY_AUDIT_BYTES} bytes")
+    gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+    with _tx(conn):
+        command = commands.get_command(conn, command_id)
+        if command.kind != PR_MERGE_COMMAND_KIND:
+            raise IllegalTransitionError(
+                "command is not a direct-PR merge run", entity="command",
+                current=command.state, event="pr_merge_reconcile")
+        try:
+            payload = json.loads(command.payload_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValidationError("merge Command payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValidationError("merge Command payload must be a JSON object")
+        task_id = str(payload.get("task_id") or "")
+        pr_evidence_id = str(payload.get("pr_evidence_id") or "")
+        approval_event_id = str(payload.get("approval_event_id") or "")
+        if not task_id or not pr_evidence_id or not approval_event_id:
+            raise ValidationError(
+                "merge reconcile requires task/PR-evidence/approval bindings")
+        task = domain.get_task(conn, task_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        existing = conn.execute(
+            "SELECT event_id FROM events WHERE kind = ? AND json_extract("
+            "payload_json, '$.command_id') = ?",
+            (PR_MERGE_EVIDENCE_KIND, command.id),
+        ).fetchone()
+        if existing is not None:
+            raise ConflictError(
+                "this Command already owns durable merge evidence; accepted"
+                " results are immutable")
+        if command.state in ("confirmed", "expired"):
+            return {"resolution": command.state, "command": command,
+                    "merge_evidence": None}
+        if command.state == "pending":
+            raise IllegalTransitionError(
+                "merge command was never claimed/executed; reconcile only from"
+                " running/unknown", entity="command", current=command.state,
+                event="pr_merge_reconcile")
+        settled_merge = load_pr_merge_evidence(conn, task_id)
+        if settled_merge is not None:
+            raise ConflictError(
+                "this Task already has durable merge evidence"
+                f" ({settled_merge.event_id}); never reconcile a second merge")
+        pr = get_pr_evidence(conn, pr_evidence_id)
+        approval = load_pr_merge_approval(conn, pr.id)
+        if (approval is None or approval.id != approval_event_id
+                or approval.decision != "approve"):
+            raise DirectPrRefusal(
+                "approval",
+                "the merge Command's bound Approval is missing or not an"
+                    " approve; an unapproved merge effect can never complete")
+        if approval.task_version != int(payload.get("task_version") or -1):
+            raise ConflictError(
+                "merge Command/Approval task-version bindings disagree")
+
+    repo_root = task_repo_root(conn, task)
+    facts = github_adapter.read_pr(gh, repo_root, repo=pr.repo,
+                                   number=pr.pr_number)
+    intended = str(payload.get("intended_base") or "")
+    head_sha = str(payload.get("head_sha") or "")
+
+    if not facts.merged:
+        note = (f"pr merge reconciled not-landed by {actor.strip()}:"
+               f" {reason.strip()} (PR #{pr.pr_number} state {facts.state!r})")[:1900]
+        with _tx(conn):
+            settled = commands.reconcile_command(conn, command.id,
+                                                outcome="expired", note=note,
+                                                clock=clock)
+            events.append_event(conn, "delivery.pr_merge_reconciled",
+                project_id=task.project_id, task_id=task.id,
+                attempt_id=pr.attempt_id,
+                payload_json=_canonical_json({
+                    "command_id": command.id, "resolution": "expired",
+                    "pr_number": pr.pr_number, "pr_state": facts.state,
+                    "actor": actor.strip(),
+                    "fact": "the PR is not merged; no merge effect happened"}),
+                clock=clock)
+        return {"resolution": "expired", "command": settled,
+                "merge_evidence": None}
+
+    if facts.base_ref != intended or facts.head_sha != head_sha:
+        with _tx(conn):
+            events.append_event(conn, "delivery_pr_wrong_base_merge",
+                project_id=task.project_id, task_id=task.id,
+                attempt_id=pr.attempt_id,
+                payload_json=_canonical_json({
+                    "schema_version": PR_CONTRACT_VERSION,
+                    "command_id": command.id, "pr_evidence_id": pr.id,
+                    "approval_event_id": approval.id,
+                    "pr_number": pr.pr_number, "head_sha": facts.head_sha,
+                    "approved_head_sha": head_sha,
+                    "merged_into": facts.base_ref, "intended_base": intended,
+                    "merge_commit_sha": facts.merge_commit_sha,
+                    "merged_at": facts.merged_at,
+                    "actor": actor.strip(),
+                    "note": "merged outside the intended base/head; the Task can"
+                          " NEVER reach DONE on this evidence"}),
+                clock=clock)
+            settled = commands.reconcile_command(
+                conn, command.id, outcome="expired",
+                note=("reconciled wrong-base merge by"
+                    f" {actor.strip()}: merged into {facts.base_ref!r}, not"
+                    f" {intended!r}; DONE refused")[:1900], clock=clock)
+        return {"resolution": "wrong_base", "command": settled,
+                "merge_evidence": None}
+
+    with _tx(conn):
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        current_task = domain.get_task(conn, task_id)
+        if current_task.status != "ready_to_merge" or current_task.version != task.version:
+            raise ConflictError(
+                "Task moved while reconciling the merge; refusing adoption")
+        _policy, policy_digest, config = _direct_pr_policy(current_task)
+        if config["base"] != intended or policy_digest != pr.policy_digest:
+            raise ConflictError(
+                "intended base/policy drifted while reconciling the merge")
+        merge_commit = (facts.merge_commit_sha or "").lower()
+        if not _SHA_RE.match(merge_commit):
+            raise StorageError(
+                "authoritative merge read-back carries no merge commit SHA;"
+                " reconcile cannot adopt without proof of the merge commit")
+        payload_json = _pr_payload(
+            action=DIRECT_PR_MERGE_ACTION, approval_event_id=approval.id,
+            attempt_id=pr.attempt_id, attempt_no=pr.attempt_no,
+            base_ref=facts.base_ref, brief_digest=pr.brief_digest,
+            brief_version=pr.brief_version, command_id=command.id,
+            delivery_mode="direct_pr",
+            dispatch_task_version=int(payload.get("dispatch_task_version") or -1),
+            head_sha=head_sha, intended_base=intended,
+            merge_commit_sha=merge_commit, merged=True, merged_at=facts.merged_at,
+            method=str(payload.get("merge_method") or "merge"),
+            policy_digest=policy_digest, pr_evidence_id=pr.event_id,
+            pr_number=pr.pr_number, pr_url=facts.url or pr.pr_url,
+            project_id=task.project_id, repo=pr.repo, source="reconciled",
+            task_id=task_id, task_version=current_task.version,
+            worker_report_digest=pr.worker_report_digest,
+            worker_report_id=pr.worker_report_id)
+        event, _ins = events.append_event_idempotent(
+            conn, PR_MERGE_EVIDENCE_KIND, project_id=task.project_id,
+            task_id=task_id, attempt_id=pr.attempt_id,
+            payload_json=payload_json,
+            event_id=_merge_evidence_event_id(pr.id), clock=clock)
+        evidence = _merge_evidence_from_row(conn, int(event.seq), event.event_id,
+                                           payload_json)
+        events.append_event(conn, "delivery.pr_merge_reconciled",
+            project_id=task.project_id, task_id=task_id, attempt_id=pr.attempt_id,
+            payload_json=_canonical_json({
+                "command_id": command.id, "resolution": "adopted",
+                "merge_evidence_id": evidence.id, "pr_number": pr.pr_number,
+                "merge_commit_sha": merge_commit, "merged_into": facts.base_ref,
+                "intended_base": intended, "actor": actor.strip(),
+                "facts": ["PR merged into the intended base",
+                        "head equals the approved head",
+                        "durable human Approval present",
+                        "command.claimed event"]}),
+            clock=clock)
+        updated = domain.apply_task_event(
+            conn, task_id, "approved_and_delivered",
+            expected_version=current_task.version, clock=clock)
+        if updated.status != "done":
+            raise StorageError(
+                "reconciled merge did not land DONE; rolling the adoption back")
+        settled = commands.reconcile_command(
+            conn, command.id, outcome="confirmed",
+            note=(f"pr merge reconciled adopted by {actor.strip()}:"
+                 f" {reason.strip()}")[:1900],
+            result_json=_canonical_json({
+                "merge_evidence_id": evidence.id, "pr_number": pr.pr_number,
+                "merge_commit_sha": merge_commit, "merged_into": facts.base_ref,
+                "task_status_after": "done"}),
+            clock=clock)
+        return {"resolution": "adopted", "command": settled,
+                "merge_evidence": evidence}
+
+
+# ---------------------------------------------------------------------------
+# Direct-PR currency helpers (head/base/check/policy/Task drift invalidates)
+# ---------------------------------------------------------------------------
+
+
+def pr_evidence_is_current(conn: TeamCraftConnection,
+                          evidence: PullRequestEvidence, *,
+                          live_gh: bool = True,
+                          run_gh: github_adapter.GitHubRunner | None = None,
+                          which: Any = None) -> DeliveryFreshness:
+    """Whether durable PR evidence still matches live Task/GitHub facts."""
+    problems: list[str] = []
+    try:
+        task = domain.get_task(conn, evidence.task_id)
+    except (NotFoundError, ValidationError):
+        return DeliveryFreshness(ok=False, problems=("task: missing",))
+    if task.status not in ("verifying", "ready_to_merge"):
+        problems.append(f"status: task is {task.status!r}")
+    elif task.status == "ready_to_merge" and task.version != evidence.task_version + 1:
+        problems.append(
+            f"version: ready Task is v{task.version} but evidence formed at"
+            f" v{evidence.task_version} without the readiness CAS")
+    elif task.status == "verifying" and task.version != evidence.task_version:
+        problems.append(f"version: task moved to v{task.version}")
+    problems.extend(_pr_pin_problems(
+        conn, task_id=evidence.task_id, attempt_id=evidence.attempt_id,
+        task_version=evidence.task_version,
+        dispatch_ver=evidence.dispatch_task_version,
+        brief_digest=evidence.brief_digest,
+        report_id=evidence.worker_report_id,
+        report_digest=evidence.worker_report_digest,
+        expect_statuses=("verifying", "ready_to_merge"), check_version=False))
+    try:
+        _policy, policy_digest, config = _direct_pr_policy(task)
+        if policy_digest != evidence.policy_digest:
+            problems.append("policy: execution policy drifted")
+        elif (config["repo"] != evidence.repo
+                or config["base"] != evidence.base_ref):
+            problems.append("policy: direct_pr repo/base drifted from the evidence")
+    except DeliveryRefusal as exc:
+        problems.append(f"policy: {exc}")
+    try:
+        commit = require_commit_evidence(conn, evidence.attempt_id)
+        if (commit.event_id != evidence.commit_evidence_id
+                or commit.commit_sha != evidence.commit_sha):
+            problems.append("commit: evidence chain drifted")
+    except (NotFoundError, StorageError) as exc:
+        problems.append(f"commit: {exc}")
+    latest = load_latest_pr_evidence(conn, evidence.task_id)
+    if latest is not None and latest.event_id != evidence.event_id:
+        problems.append("evidence: a newer PR observation supersedes this row")
+    if live_gh and task.status in ("verifying", "ready_to_merge"):
+        gh = github_adapter.AuditedGhRunner(run_gh or github_adapter.default_run_gh)
+        probe = github_adapter.probe_gh(gh, task_repo_root(conn, task),
+                                        resolve=which)
+        if probe.blocked:
+            problems.append(f"gh: {probe.detail}")
+        else:
+            _facts, live_problems = _live_pr_facts(
+                gh, task_repo_root(conn, task), repo=evidence.repo,
+                evidence=evidence)
+            problems.extend(live_problems)
+    return DeliveryFreshness(ok=not problems, problems=tuple(problems))
+
+
+def pr_merge_approval_is_current(
+    conn: TeamCraftConnection,
+    approval: PrMergeApproval, *,
+    live_gh: bool = True,
+    run_gh: github_adapter.GitHubRunner | None = None,
+    which: Any = None,
+) -> DeliveryFreshness:
+    """Whether an approved/rejected merge decision still stands against facts.
+
+    An approval is current while its Task sits READY_TO_MERGE at exactly the
+    bound version with the bound PR unchanged; after a verified merge it is
+    current only while the Task is DONE at ``version + 1`` with merge evidence
+    naming this approval and the intended base.  Head/base/check/policy/Task
+    drift shows up here as invalidation, exactly like M4-04 approvals.
+    """
+    problems: list[str] = []
+    try:
+        pr = get_pr_evidence(conn, approval.pr_evidence_id)
+    except (NotFoundError, StorageError) as exc:
+        return DeliveryFreshness(ok=False, problems=(f"evidence: {exc}",))
+    if approval.pr_evidence_digest != pr.evidence_digest:
+        problems.append("evidence: approval no longer binds this evidence version")
+    if (approval.head_sha != pr.head_sha or approval.base_ref != pr.base_ref
+            or approval.pr_number != pr.pr_number):
+        problems.append("binding: approval head/base/PR differ from evidence")
+    if approval.intended_base != pr.base_ref:
+        problems.append("binding: intended base does not equal the PR base")
+    task = domain.get_task(conn, approval.task_id)
+    merge = load_pr_merge_evidence(conn, approval.task_id)
+    if merge is None:
+        if task.status != "ready_to_merge" or task.version != approval.task_version:
+            problems.append(
+                f"status: task is {task.status!r} v{task.version}, approval"
+                f" bound ready v{approval.task_version}")
+        latest = load_latest_pr_evidence(conn, approval.task_id)
+        if latest is None or latest.event_id != pr.event_id:
+            problems.append("evidence: approval targets a superseded PR row")
+        if approval.decision == "approve" and live_gh:
+            gh = github_adapter.AuditedGhRunner(run_gh
+                                               or github_adapter.default_run_gh)
+            probe = github_adapter.probe_gh(gh, task_repo_root(conn, task),
+                                           resolve=which)
+            if probe.blocked:
+                problems.append(f"gh: {probe.detail}")
+            else:
+                _facts, live_problems = _live_pr_facts(
+                    gh, task_repo_root(conn, task), repo=pr.repo, evidence=pr)
+                problems.extend(live_problems)
+    else:
+        if (merge.approval_event_id != approval.id
+                or merge.pr_evidence_id != pr.event_id):
+            problems.append("merge: merge evidence does not name this approval")
+        if merge.intended_base != approval.intended_base:
+            problems.append("merge: intended base drifted")
+        if task.status != "done" or task.version != approval.task_version + 1:
+            problems.append(
+                f"status: merged task is {task.status!r} v{task.version},"
+                f" expected done v{approval.task_version + 1}")
+    if approval.decision == "approve":
+        freshness = pr_evidence_is_current(conn, pr, live_gh=False)
+        problems.extend(freshness.problems)
     return DeliveryFreshness(ok=not problems, problems=tuple(problems))

@@ -340,7 +340,34 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py delivery-accept \
 
 若 Git 已完成而 Commit 回执丢失，`commit-reconcile --member DEV_MEMBER --command-id COMMAND_ID --actor human --reason "按已观察的 Git 事实对账"` 只会在已登记 Worktree、native Session 与持久 Event 事实能精确证明时收养该 Commit，绝不会再创建一个替代 Commit。`delivery-reject` 记录明确拒绝且不完成 Task。Commit/分支、Task 版本、策略、verifier profile/config、Diff 或 Worktree identity 任一漂移，都会使旧 evidence 或 Approval 失效。只有回显并接受证据绑定的精确 Commit 和分支，才可把 `local_only` Task 从 VERIFYING 转为 DONE。
 
-认证 API 通过 `POST /api/v1/attempts/{attempt_id}/delivery/commit`、`POST /api/v1/attempts/{attempt_id}/delivery/ship-evidence`、`POST /api/v1/commands/{command_id}/delivery/reconcile` 与 `POST /api/v1/ship-evidence/{ship_evidence_id}/approval` 暴露同一套 Core 操作；只读视图为 `GET /api/v1/tasks/{task_id}/delivery`、`GET /api/v1/attempts/{attempt_id}/delivery`、`GET /api/v1/ship-evidence/{id}` 与 `GET /api/v1/ship-evidence/{id}/diff`。写入继续遵守 bearer、Origin/CSRF、`Idempotency-Key`、适用的 expected-version 与短 Leader lease 门禁。请求模型只接受 opaque id、预期 Task 版本、精确 Commit/分支回显与有界文本，客户端无法传入 Git argv、路径或 shell 片段。report-only/scout 审批仍使用 `/api/v1/verifications/{id}/approvals`；direct-PR 继续等待 M4-05。M4-04 不执行 push、merge、部署或 Worktree 删除。
+认证 API 通过 `POST /api/v1/attempts/{attempt_id}/delivery/commit`、`POST /api/v1/attempts/{attempt_id}/delivery/ship-evidence`、`POST /api/v1/commands/{command_id}/delivery/reconcile` 与 `POST /api/v1/ship-evidence/{ship_evidence_id}/approval` 暴露同一套 Core 操作；只读视图为 `GET /api/v1/tasks/{task_id}/delivery`、`GET /api/v1/attempts/{attempt_id}/delivery`、`GET /api/v1/ship-evidence/{id}` 与 `GET /api/v1/ship-evidence/{id}/diff`。写入继续遵守 bearer、Origin/CSRF、`Idempotency-Key`、适用的 expected-version 与短 Leader lease 门禁。请求模型只接受 opaque id、预期 Task 版本、精确 Commit/分支回显与有界文本，客户端无法传入 Git argv、路径或 shell 片段。report-only/scout 审批仍使用 `/api/v1/verifications/{id}/approvals`。M4-04 本身不执行 push、merge、部署或 Worktree 删除；受限的 direct-PR 流程见下节。
+
+## GitHub direct-PR 交付（M4-05 — 2026-11-15 独立验收通过）
+
+direct-PR 只由显式、封闭的 Task 策略启用，仓库和 intended base 均无隐式默认值：
+
+```json
+{
+  "delivery": "direct_pr",
+  "direct_pr": {
+    "repo": "owner/repository",
+    "base": "main",
+    "merge_method": "squash"
+  }
+}
+```
+
+Core 在写入任何 Command 或 Event 前探测 `gh` 可执行文件及认证账户；缺少 `gh` 或认证时返回 blocked 结果且不留下持久记录。prepare 随后复核 M4-04 Commit/Verifier 证据，只 push 已登记的 `tc/<task>/<attempt>` 分支，并为精确 head 与 intended base 创建或收养唯一的 open PR。远端存在外来 head 时不会 force-push，`main`、`master` 等受保护 head 分支会被拒绝。
+
+每次观察到的 PR 都以精确 head SHA/head 分支、base ref/SHA、mergeability、check rollup、policy digest、Commit evidence、Task/Attempt/Brief、最终 WorkerReport 和带 fencing 的 Command 持久化。只有 PR 仍 open、可合并且所有检查通过，Task 才从 VERIFYING 进入 READY_TO_MERGE；创建或同步 PR 绝不直接完成 Task。幂等键重放、创建回执丢失和已存在匹配 PR 都收敛到同一份证据，不重复开 PR。
+
+merge approval 是独立的人工决定，绑定精确 PR number、head SHA、base、intended base、check digest、policy、Task version 和 PR evidence digest。带 fencing 的 merge Command 在副作用前再次读取 live facts；head/base/check/policy 漂移、新 PR observation 覆盖旧证据、intended base 错误或 Leader/Task 证据过期都会使 Approval 失效。只有回读证明获批 PR 已合并到配置的 intended base，Task 才记为 DONE；创建或合并回执不明时保留为可按事实对账的状态。direct-PR 路径不会 push 受保护主分支、删除 Worktree 或执行 M4-06 冲突清理。
+
+认证 API 接线使用 `POST /api/v1/attempts/{attempt_id}/delivery/pr` 准备/收养 PR，使用 `POST /api/v1/tasks/{task_id}/delivery/pr/sync` 刷新 live facts，使用 `POST /api/v1/pr-evidence/{pr_evidence_id}/approval` 记录绑定的人工决定，使用 `POST /api/v1/pr-evidence/{pr_evidence_id}/merge` 执行 fenced merge，并以 `POST /api/v1/commands/{command_id}/delivery/pr/reconcile` 对账创建/同步/合并的歧义回执。既有 task/attempt delivery 读视图会包含 PR evidence、Approval、merge evidence 与 freshness，但不暴露本地 Worktree 路径。这些路由继承 bearer、Origin/CSRF、`Idempotency-Key`、有界请求模型和短 Leader lease 门禁。
+
+对应的 runtime adapter 通过六个 `teamctl` 命令暴露：`pr-prepare`、`pr-sync`、`pr-status`（`--offline` 只读持久事实，不做 live GitHub 复核）、`pr-approval`、`pr-merge` 与 `pr-reconcile`。会产生变更的命令先解析已登记 member/Attempt 并取得项目 Leader lease，再调用同一套 Core 函数；调用者无法传入任意 Git 或 `gh` argv。
+
+最终本机定向运行 `python3 -m unittest discover -s tests -p 'test_*_m405.py'`，**83 项 M4-05 测试全部通过**：Core adapter/domain/delivery 67 项，API 7 项、runtime adapter 4 项、CLI 4 项、离线 bundle 1 项。仓库最终全量运行 **988/988 tests、退出码 0**。独立 tester 复核实现与定向安全矩阵后给出 PASS 建议，因此 M4-05 登记为独立验收通过。tester 较早的一轮仓库全量在既有 M4-04 API verifier 测试夹具中出现一次负载诱发的超时，并非 M4-05 断言失败；仅把测试夹具 timeout 从 10 秒放宽到 30 秒，未改生产代码，随后 `test_api_m404.py` 连续两次 27/27 通过，最终全量亦 988/988 通过。本文不声称真实 GitHub 集成或 GitHub Actions 结果。
 
 ## 使用其他 Harness
 
@@ -464,7 +491,7 @@ M4-04 验证与独立验收（2026-11-14，macOS 本机）：CEO 全量运行 `p
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
-- M4-04 已实现 Core、CLI、runtime adapter 与认证 API 的 local-only Commit/Diff evidence 和精确 Commit/分支接受，并在上述 reconcile scope 顺序定向复验后于 2026-11-14 通过独立验收；尚不包含 direct-PR、push、merge、部署、清理或 M6-02 的丰富 Diff 页面。本工作树未运行 GitHub Actions。
+- M4-04 已实现 Core、CLI、runtime adapter 与认证 API 的 local-only Commit/Diff evidence 和精确 Commit/分支接受，并在上述 reconcile scope 顺序定向复验后于 2026-11-14 通过独立验收。M4-05 现已提供受限的 Core direct-PR adapter、evidence/approval/merge 状态机、认证 API 与六个 `teamctl` 表面；83 项定向测试和最终 988/988 全量通过，独立 tester 建议 PASS。既有 M4-04 API verifier 测试夹具的一次负载超时通过仅放宽测试 timeout（10→30 秒）稳定，随后该文件连续两次 27/27 通过；本文不声称真实 GitHub 或 GitHub Actions 结果。部署、Worktree 清理、M4-06 冲突处理与 M6-02 丰富 Diff 页面仍不在本切片范围。
 - M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复、M3-04 Command API、M3-05 最小 Web 控制台与 M3-06 浏览器 E2E 套件均已实现，且经自动化测试、本机 loopback HTTP 冒烟与可重复的 Fake-Herdr 无头 Chromium E2E 验证（连续两次全量 20 项绿色；`teamcraft/api/web/app.js` 修复 6 个真实控制台缺陷）。取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；内置控制台随常规 wheel 与 sdist 安装分发（`pyproject.toml` 已声明 `package-data`；两类归档已离线构建并检视，默认安装态 `WEB_ROOT` 已验证可解析并提供三个资产）。Chromium E2E 以真实 Chrome DevTools Protocol 输入驱动控制台，但一切 runtime 场景均为执行同一套 Core 原语的 Fake Herdr：它**不是**真实 Herdr 证据，Safari/Firefox 行为亦未覆盖。
 - CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。

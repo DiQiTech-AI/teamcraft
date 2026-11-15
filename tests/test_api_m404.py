@@ -193,7 +193,9 @@ class M404ApiFixture(unittest.TestCase):
                 ttl_seconds=3700)
             verification.configure_verifier_profile(
                 conn, self.project_id, profile=profile, argv=argv,
-                timeout_seconds=10, actor="human",
+                # Full-suite load can delay process startup well beyond the
+                # verifier's execution time; keep this harness timeout roomy.
+                timeout_seconds=30, actor="human",
                 idempotency_key=f"cfg-{profile}-{outcome}-{attempt_id}",
                 lease=lease, enabled=True)
             result = verification.run_worktree_verifier(

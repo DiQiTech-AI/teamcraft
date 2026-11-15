@@ -141,11 +141,68 @@ PAUSABLE_TASK_STATUSES = frozenset({"pending", "ready", "blocked"})
 #: part (max_attempts) lands on the enforced column, the rest is durable
 #: configuration the M4 executors consume.
 EXECUTION_POLICY_KEYS = frozenset(
-    {"delivery", "router", "verifier", "timeout_seconds", "max_attempts"}
+    {"delivery", "router", "verifier", "timeout_seconds", "max_attempts",
+     "direct_pr"}
 )
 #: Mirrors PLAN's acceptance modes (report-only / local-only / direct-PR /
 #: ship); anything else is rejected before persistence.
 DELIVERY_MODES = frozenset({"report_only", "local_only", "direct_pr", "ship"})
+
+#: M4-05: the closed shape of the ``direct_pr`` sub-policy.  A ``direct_pr``
+#: Task is only executable when this configuration is EXPLICITLY persisted on
+#: the Task (delivery=direct_pr plus repo/base); there are no defaults for
+#: which repository or base branch code may land in, and any later edit of it
+#: bumps the Task version and re-digests the policy, invalidating stale PR
+#: evidence and approvals exactly like every other policy drift.
+DIRECT_PR_POLICY_KEYS = frozenset({"repo", "base", "merge_method"})
+DIRECT_PR_MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
+_DIRECT_PR_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_DIRECT_PR_BASE_RE = re.compile(r"^[A-Za-z0-9._/-]{1,250}$")
+
+
+def _validate_direct_pr_subpolicy(value: Any) -> dict:
+    """Strict validation of a persisted ``direct_pr`` sub-policy object."""
+
+    if not isinstance(value, dict):
+        raise ValidationError("direct_pr policy must be a JSON object")
+    unknown = sorted(set(value) - DIRECT_PR_POLICY_KEYS)
+    if unknown:
+        raise ValidationError(
+            f"unknown direct_pr policy keys: {', '.join(unknown)}")
+    repo = value.get("repo")
+    if (not isinstance(repo, str) or not _DIRECT_PR_REPO_RE.match(repo)):
+        raise ValidationError(
+            "direct_pr.repo must be a GitHub 'owner/name' slug")
+    base = value.get("base")
+    if (not isinstance(base, str) or not base.strip()
+            or any(ch.isspace() for ch in base)
+            or not _DIRECT_PR_BASE_RE.match(base)):
+        raise ValidationError("direct_pr.base must be a 1..250 character branch name")
+    method = value.get("merge_method", "merge")
+    if method not in DIRECT_PR_MERGE_METHODS:
+        raise ValidationError(
+            "direct_pr.merge_method must be one of merge, squash, rebase")
+    return {"repo": repo, "base": base, "merge_method": method}
+
+
+def direct_pr_config(policy: Any) -> dict | None:
+    """Return the normalized direct-PR config, or ``None`` when the policy is
+    not a complete explicit ``direct_pr`` policy.
+
+    Never raises: callers use this as a question ("is direct-PR execution
+    durably configured?"), and ``None`` must become a fail-closed refusal in
+    the executor, not an exception at read time.
+    """
+
+    if not isinstance(policy, dict) or policy.get("delivery") != "direct_pr":
+        return None
+    sub = policy.get("direct_pr")
+    if not isinstance(sub, dict):
+        return None
+    try:
+        return _validate_direct_pr_subpolicy(sub)
+    except ValidationError:
+        return None
 
 #: Attempt statuses (PLAN 5.2).  ``unknown`` is non-terminal: only a
 #: reconcile-class event may resolve it, and it keeps the occupying slot.
@@ -205,6 +262,36 @@ LOCAL_ONLY_ACCEPT_ACTION = "accept_local_commit"
 #: Branches that local delivery must NEVER commit to or accept on.
 PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})
 
+# M4-05 direct-PR delivery: the durable contract that lets a ``direct_pr``
+# ship Task reach DONE through a real GitHub pull request.  Same append-only
+# ``events`` storage pattern as M4-04 (no schema step).  The flow has two
+# fenced, human-gated edges:
+#
+#   verifying --direct_pr_ready--> ready_to_merge   (PR created/adopted, the
+#       head/base/check facts recorded, PR open+mergeable+checks-passing)
+#   ready_to_merge --approved_and_delivered--> done  (an explicit human
+#       Approval bound to the exact PR/head/base/intended-base, executed under
+#       a current fenced Leader, and durably confirmed as merged into the
+#       INTENDED base).
+#
+# ``approved_and_delivered`` was a hard M3 refusal; M4-05 replaces that with a
+# durable-fact gate (:func:`_require_direct_pr_delivery_acceptance`) that is
+# the direct-PR analogue of the M4-04 local-only gate.  Only verified merge into
+# the intended base completes the Task; nothing here ever pushes a protected
+# branch.
+DIRECT_PR_READY_EVENT = "direct_pr_ready"
+PR_EVIDENCE_EVENT_KIND = "delivery_pr_evidence"
+PR_MERGE_APPROVAL_EVENT_KIND = "delivery_pr_merge_approval"
+PR_MERGE_EVIDENCE_EVENT_KIND = "delivery_pr_merge_evidence"
+#: The only proposed/accepted action the direct-PR flow understands.
+DIRECT_PR_MERGE_ACTION = "merge_direct_pr"
+#: GitHub PR evidence lives outside the local-only ``DELIVERY_CONTRACT_VERSION``
+#: payloads but shares the same integrity rule; versioned independently so a
+#: later hardening (partial unique indexes) can bump it without touching local.
+PR_DELIVERY_CONTRACT_VERSION = 1
+#: Status-check conclusions that count as merge-ready (mirrors the adapter).
+_PR_PASSING_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
+
 #: (status, event) -> allowed target tuple.  Multiple targets mean the caller
 #: must choose one (ambiguous events, PLAN 5.1 rows "NEEDS_HUMAN 或 BLOCKED"
 #: and "BLOCKED / READY"); zero targets is an illegal transition.
@@ -220,6 +307,7 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("verifying", "verification_passed"): ("needs_human",),
     ("verifying", "verification_failed"): ("needs_human",),
     ("verifying", LOCAL_DELIVERY_ACCEPT_EVENT): ("done",),
+    ("verifying", DIRECT_PR_READY_EVENT): ("ready_to_merge",),
     ("ready_to_merge", "approved_and_delivered"): ("done",),
     ("blocked", "blocked_cleared"): ("pending",),
     ("needs_human", "human_reconciled"): ("blocked", "ready", "failed"),
@@ -253,6 +341,11 @@ def task_transition_targets(
         # report_accepted.  The delivery-mode and evidence facts are re-checked
         # against durable rows inside apply_task_event (the door below).
         return ("done",) if kind == "ship" else ()
+    if event == DIRECT_PR_READY_EVENT:
+        # Direct-PR readiness is a ship-kind path only; the durable PR facts
+        # (open/mergeable/checks/head/base) are re-checked against events
+        # inside apply_task_event before verifying -> ready_to_merge fires.
+        return ("ready_to_merge",) if kind == "ship" else ()
     return _TASK_TRANSITIONS.get((status, event), ())
 
 
@@ -898,6 +991,276 @@ def _require_local_delivery_acceptance(
                     f" {sorted(current_required.items())})")
 
 
+# ---------------------------------------------------------------------------
+# M4-05 — durable direct-PR delivery facts (PR evidence + merge + Approval)
+#
+# These gates are the direct-PR analogue of the M4-04 local-only gate: they
+# read ONLY durable append-only rows (never caller arguments) and fail closed.
+# ---------------------------------------------------------------------------
+
+
+def _pr_policy_digest(policy: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(policy, sort_keys=True, separators=(",", ":"),
+                  ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _direct_pr_mode(task: Task, refuse, *,
+                    code: str = "DIRECT_PR_MODE_REQUIRED") -> dict:
+    try:
+        policy = json.loads(task.execution_policy_json or "{}")
+    except (TypeError, ValueError):
+        policy = None
+    if not isinstance(policy, dict) or policy.get("delivery") != "direct_pr":
+        raise refuse(code,
+                    "the Task's live execution policy is not delivery=direct_pr;"
+                    " direct_pr completion needs an explicit persisted policy")
+    return policy
+
+
+def _require_pr_attempt_pins(conn: TeamCraftConnection, task: Task, payload: dict,
+                             refuse) -> None:
+    """The bound Attempt/Brief/WorkerReport must still be the current ones."""
+
+    attempt_id = str(payload.get("attempt_id") or "")
+    attempt = conn.execute(
+        "SELECT id, status, attempt_no FROM attempts WHERE task_id = ?"
+        " ORDER BY attempt_no DESC LIMIT 1", (task.id,),
+    ).fetchone()
+    if (attempt is None or str(attempt[0]) != attempt_id
+            or str(attempt[1]) != "finished"
+            or int(attempt[2]) != int(payload.get("attempt_no") or -1)):
+        raise refuse("PR_FACTS_STALE",
+                    "the bound Attempt is not this Task's latest finished "
+                    "Attempt; stale-attempt acceptance is refused")
+    brief = conn.execute(
+        "SELECT task_version, brief_version, brief_digest FROM attempt_briefs"
+        " WHERE attempt_id = ?", (attempt_id,),
+    ).fetchone()
+    if (brief is None
+            or int(brief[0]) != int(payload.get("dispatch_task_version") or -1)
+            or int(brief[1]) != int(payload.get("brief_version") or -1)
+            or str(brief[2]) != payload.get("brief_digest")):
+        raise refuse("PR_FACTS_STALE",
+                    "the Brief bound into the PR evidence no longer matches the "
+                    "durable Attempt Brief")
+    report = conn.execute(
+        "SELECT id, task_version, brief_digest, report_digest, outcome, task_id"
+        " FROM worker_reports WHERE attempt_id = ? AND report_kind = 'final'"
+        " ORDER BY id DESC LIMIT 1", (attempt_id,),
+    ).fetchone()
+    if (report is None or int(report[0]) != int(payload.get("worker_report_id") or -1)
+            or int(report[1]) != int(payload.get("dispatch_task_version") or -1)
+            or str(report[2]) != payload.get("brief_digest")
+            or str(report[3]) != payload.get("worker_report_digest")
+            or str(report[4]) != "completed" or str(report[5]) != task.id):
+        raise refuse("PR_FACTS_STALE",
+                    "the WorkerReport bound into the PR evidence is no longer "
+                    "the latest final completed report")
+
+
+def _require_direct_pr_ready(
+    conn: TeamCraftConnection, task: Task, event: str
+) -> None:
+    """Fail-closed durable gate for ``direct_pr_ready`` (verifying -> ready).
+
+    A current-version, digest-stable PR evidence row must exist whose head is
+    the isolated Attempt branch, whose base is the intended base, whose checks
+    are recorded passing and mergeable, and whose Attempt/Brief/WorkerReport
+    pins are still live.  A MISSING ``gh``/auth never forms this row (the
+    adapter probes before any write), so readiness cannot be claimed falsely.
+    """
+
+    def refuse(code: str, message: str) -> IllegalTransitionError:
+        return IllegalTransitionError(
+            f"task {task.id} event {event!r}: {message}",
+            entity="task", current=task.status, event=event, reason_code=code,
+        )
+
+    if task.kind != "ship":
+        raise refuse("M4_EVIDENCE_REQUIRED",
+                    "only ship Tasks can reach ready_to_merge via a pull request")
+    policy = _direct_pr_mode(task, refuse)
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind = ? AND task_id = ?"
+        " AND json_extract(payload_json, '$.schema_version') = ?"
+        " AND json_extract(payload_json, '$.task_version') = ?"
+        " AND json_extract(payload_json, '$.delivery_mode') = 'direct_pr'"
+        " AND json_extract(payload_json, '$.proposed_action') = ?"
+        " ORDER BY seq DESC LIMIT 1",
+        (PR_EVIDENCE_EVENT_KIND, task.id, PR_DELIVERY_CONTRACT_VERSION,
+         task.version, DIRECT_PR_MERGE_ACTION),
+    ).fetchone()
+    if row is None:
+        raise refuse("PR_READY_FACTS_MISSING",
+                    "no durable direct-PR evidence bound to this Task's current"
+                    " version exists; create the pull request first")
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError) as exc:
+        raise refuse("PR_READY_FACTS_STALE",
+                    f"PR evidence payload is not valid JSON: {exc}")
+    if not isinstance(payload, dict):
+        raise refuse("PR_READY_FACTS_STALE",
+                    "PR evidence payload is not a JSON object")
+    if _delivery_payload_digest(payload) != payload.get("evidence_digest"):
+        raise refuse("PR_READY_FACTS_STALE",
+                    "PR evidence digest does not recompute; the durable record"
+                    " was tampered with")
+    if payload.get("policy_digest") != _pr_policy_digest(policy):
+        raise refuse("PR_READY_FACTS_STALE",
+                    "the Task execution policy changed after the PR evidence"
+                    " was formed")
+    head_branch = str(payload.get("head_branch") or "")
+    if not head_branch.startswith("tc/") or head_branch.lower() in PROTECTED_BRANCH_NAMES:
+        raise refuse("PR_READY_FACTS_STALE",
+                    f"bound head branch {head_branch!r} is not the isolated"
+                    " Attempt branch tc/<task>/<attempt>")
+    if str(payload.get("mergeable") or "").upper() != "MERGEABLE":
+        raise refuse("PR_READY_FACTS_STALE",
+                    "the bound PR is not recorded MERGEABLE")
+    checks = _delivery_json_field(payload, "checks_json")
+    if not isinstance(checks, list):
+        raise refuse("PR_READY_FACTS_STALE",
+                    "PR evidence carries no status-check rollup")
+    checks_digest = hashlib.sha256(
+        json.dumps(checks, sort_keys=True, separators=(",", ":"),
+                  ensure_ascii=False).encode("utf-8")).hexdigest()
+    if checks_digest != payload.get("checks_digest"):
+        raise refuse("PR_READY_FACTS_STALE",
+                    "PR status-check digest does not recompute")
+    for check in checks:
+        if not isinstance(check, dict):
+            raise refuse("PR_READY_FACTS_STALE", "status-check entry is malformed")
+        conclusion = str(check.get("conclusion") or "").upper()
+        if conclusion not in _PR_PASSING_CONCLUSIONS:
+            raise refuse(
+                "PR_READY_FACTS_STALE",
+                f"status check {check.get('name')!r} is"
+                f" {conclusion or str(check.get('status') or 'pending')}"
+                "; the PR is not merge-ready")
+    _require_pr_attempt_pins(conn, task, payload, refuse)
+
+
+def _require_direct_pr_delivery_acceptance(
+    conn: TeamCraftConnection, task: Task, event: str
+) -> None:
+    """Fail-closed durable gate for ``approved_and_delivered`` (the direct-PR
+    completion edge ``ready_to_merge -> done``).
+
+    Requires, at the Task's CURRENT version, a chain of durable rows that
+    together prove an explicit human Approval (bound to the exact PR/head/base/
+    intended-base) whose merge landed on the INTENDED base:
+    merge evidence -> PR evidence + merge Approval, with head/base/intended and
+    every digest consistent, and the Attempt/Brief/WorkerReport pins still live.
+    """
+
+    def refuse(code: str, message: str) -> IllegalTransitionError:
+        return IllegalTransitionError(
+            f"task {task.id} event {event!r}: {message}",
+            entity="task", current=task.status, event=event, reason_code=code,
+        )
+
+    if task.kind != "ship":
+        raise refuse("M4_EVIDENCE_REQUIRED",
+                    "only ship Tasks can complete via direct-PR merge")
+    # A Task not explicitly persisted as direct_pr keeps the legacy M3/M4
+    # refusal code (M4_EVIDENCE_REQUIRED): the mode-refusal door belongs to
+    # the direct-PR pipeline (direct_pr_ready / prepare), never to the
+    # generic completion edge, so pre-M4-05 consumers keep their contract.
+    policy = _direct_pr_mode(task, refuse, code="M4_EVIDENCE_REQUIRED")
+
+    merge_row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind = ? AND task_id = ?"
+        " AND json_extract(payload_json, '$.schema_version') = ?"
+        " AND json_extract(payload_json, '$.task_version') = ?"
+        " AND json_extract(payload_json, '$.merged') = 1"
+        " ORDER BY seq DESC LIMIT 1",
+        (PR_MERGE_EVIDENCE_EVENT_KIND, task.id, PR_DELIVERY_CONTRACT_VERSION,
+         task.version),
+    ).fetchone()
+    if merge_row is None:
+        raise refuse("MERGE_FACTS_MISSING",
+                    "no durable merge evidence confirms this Task's PR was merged"
+                    " at its current version; a verified merge is required for DONE")
+    try:
+        merge = json.loads(str(merge_row[0]))
+    except (TypeError, ValueError) as exc:
+        raise refuse("MERGE_FACTS_STALE", f"merge evidence is not valid JSON: {exc}")
+    if not isinstance(merge, dict):
+        raise refuse("MERGE_FACTS_STALE", "merge evidence is not a JSON object")
+    if _delivery_payload_digest(merge) != merge.get("evidence_digest"):
+        raise refuse("MERGE_FACTS_STALE", "merge evidence digest does not recompute")
+    if merge.get("delivery_mode") != "direct_pr" or merge.get("action") != DIRECT_PR_MERGE_ACTION:
+        raise refuse("MERGE_FACTS_STALE",
+                    "merge evidence is not a direct_pr merge_direct_pr record")
+    if merge.get("policy_digest") != _pr_policy_digest(policy):
+        raise refuse("MERGE_FACTS_STALE",
+                    "the Task execution policy changed after the merge evidence")
+    if not merge.get("merged"):
+        raise refuse("MERGE_FACTS_STALE", "merge evidence is not a merged result")
+    merge_commit = str(merge.get("merge_commit_sha") or "")
+    if not _SHA_RE.match(merge_commit):
+        raise refuse("MERGE_FACTS_STALE",
+                    "merge evidence carries no merge commit SHA into the base")
+
+    intended = str(merge.get("intended_base") or "")
+    merged_into = str(merge.get("base_ref") or "")
+    head_sha = str(merge.get("head_sha") or "").lower()
+    if not intended or merged_into != intended:
+        raise refuse("MERGE_FACTS_STALE",
+                    f"PR merged into {merged_into!r}, not the intended base"
+                    f" {intended!r}; merging into an unintended base never"
+                    " completes delivery")
+
+    # The PR evidence the merge references.
+    pr_row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind = ? AND event_id = ?",
+        (PR_EVIDENCE_EVENT_KIND, str(merge.get("pr_evidence_id") or "")),
+    ).fetchone()
+    if pr_row is None:
+        raise refuse("MERGE_FACTS_STALE",
+                    "merge evidence references a PR evidence row that does not exist")
+    pr = json.loads(str(pr_row[0]))
+    if not isinstance(pr, dict) or _delivery_payload_digest(pr) != pr.get("evidence_digest"):
+        raise refuse("MERGE_FACTS_STALE", "PR evidence digest does not recompute")
+    if (str(pr.get("task_id")) != task.id
+            or str(pr.get("attempt_id")) != str(merge.get("attempt_id"))
+            or pr.get("delivery_mode") != "direct_pr"):
+        raise refuse("MERGE_FACTS_STALE",
+                    "PR evidence does not bind this Task/Attempt as a direct_pr PR")
+    if str(pr.get("base_ref") or "") != intended or str(pr.get("head_sha") or "").lower() != head_sha:
+        raise refuse("MERGE_FACTS_STALE",
+                    "the PR's recorded head/base do not match the merged head and"
+                    " intended base (drift invalidates the completion)")
+
+    # The explicit human Approval that authorized exactly this merge.
+    approval_row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind = ? AND event_id = ?",
+        (PR_MERGE_APPROVAL_EVENT_KIND, str(merge.get("approval_event_id") or "")),
+    ).fetchone()
+    if approval_row is None:
+        raise refuse("APPROVAL_REQUIRED",
+                    "no durable merge Approval row backs this merge evidence")
+    approval = json.loads(str(approval_row[0]))
+    if not isinstance(approval, dict):
+        raise refuse("APPROVAL_REQUIRED", "merge Approval row is malformed")
+    if (approval.get("decision") != "approve"
+            or approval.get("proposed_action") != DIRECT_PR_MERGE_ACTION
+            or int(approval.get("task_version") or -1) != task.version):
+        raise refuse("APPROVAL_REQUIRED",
+                    "the merge Approval is not a current explicit approve for"
+                    " this direct-PR merge")
+    if (str(approval.get("pr_evidence_id")) != str(merge.get("pr_evidence_id"))
+            or str(approval.get("intended_base") or "") != intended
+            or str(approval.get("head_sha") or "").lower() != head_sha):
+        raise refuse("APPROVAL_STALE",
+                    "the human Approval does not bind this exact PR/head/intended"
+                    " base; approval binding mismatch invalidates completion")
+
+    _require_pr_attempt_pins(conn, task, merge, refuse)
+
+
 def _require_deps_done(
     conn: TeamCraftConnection, task: Task, event: str
 ) -> None:
@@ -1124,6 +1487,25 @@ def update_task(
                      "next": "new bounded Attempt with fresh commit/ship evidence"}),
                 clock=clock)
             return reopened
+        if task.status == "done" and conn.execute(
+            "SELECT 1 FROM events WHERE kind = ? AND task_id = ?"
+            " AND json_extract(payload_json, '$.decision') = 'approve' LIMIT 1",
+            (PR_MERGE_APPROVAL_EVENT_KIND, task.id),
+        ).fetchone() is not None:
+            # M4-05: a direct-PR ship Task is DONE only on the strength of its
+            # bound PR/merge/approval evidence chain.  ANY later Task mutation
+            # invalidates that evidence version; reopen in the same CAS so the
+            # old merge approval can never carry a drifted Task to DONE again.
+            reopened = _cas_task(conn, task, status="needs_human",
+                                 expected_version=expected_version, now=_utc_iso(clock), **updates)
+            events.append_event(conn, "delivery.pr_merge_approval_invalidated",
+                project_id=task.project_id, task_id=task.id,
+                payload_json=_canonical_json(
+                    {"reason": "task_evidence_changed",
+                     "next": "new bounded Attempt with fresh PR evidence"
+                            " (M4-06 owns any integration/cleanup follow-up)"}),
+                clock=clock)
+            return reopened
         return _cas_task(conn, task, expected_version=expected_version, now=_utc_iso(clock), **updates)
 
 
@@ -1175,11 +1557,16 @@ def apply_task_event(
                 reason_code="VERIFICATION_SERVICE_REQUIRED",
             )
         if event == "approved_and_delivered":
-            raise IllegalTransitionError(
-                "ship delivery requires M4 Worktree/Commit/Diff evidence",
-                entity="task", current=task.status, event=event,
-                reason_code="M4_EVIDENCE_REQUIRED",
-            )
+            # M4-05: this edge (ready_to_merge -> done) is the direct-PR
+            # completion.  It is no longer a blanket M3 refusal: instead the
+            # durable-fact gate re-derives the merge evidence, the human
+            # Approval binding, the intended-base match and the Task pins from
+            # append-only rows before the CAS.  From any status other than
+            # ready_to_merge there is simply no target and the transition is
+            # illegal (see task_transition_targets).
+            _require_direct_pr_delivery_acceptance(conn, task, event)
+        if event == DIRECT_PR_READY_EVENT:
+            _require_direct_pr_ready(conn, task, event)
         if event == "report_accepted":
             if task.kind != "scout":
                 raise IllegalTransitionError(
@@ -1685,6 +2072,13 @@ def set_execution_policy(
         if not isinstance(merged, dict):
             merged = {}
         merged.update(policy)
+        if "direct_pr" in merged:
+            # M4-05: a persisted direct_pr sub-policy is validated on write so
+            # a malformed repo/base can never sit dormant and steer a later
+            # merge.  A direct_pr Task with no sub-policy at all remains
+            # persistable (the mode alone is honest configuration) but the M4-05
+            # executor refuses it fail-closed until repo/base are explicit.
+            _validate_direct_pr_subpolicy(merged["direct_pr"])
         fields: dict[str, Any] = {"execution_policy_json": _canonical_json(merged)}
         if "max_attempts" in policy:
             fields["max_attempts"] = int(policy["max_attempts"])
@@ -2021,11 +2415,19 @@ __all__ = [
     "DELIVERY_CONTRACT_VERSION",
     "DELIVERY_MODES",
     "DEPENDENCY_EDITABLE_STATUSES",
+    "DIRECT_PR_MERGE_ACTION",
+    "DIRECT_PR_MERGE_METHODS",
+    "DIRECT_PR_POLICY_KEYS",
+    "DIRECT_PR_READY_EVENT",
     "EXECUTION_POLICY_KEYS",
     "LOCAL_DELIVERY_ACCEPT_EVENT",
     "LOCAL_ONLY_ACCEPT_ACTION",
     "OCCUPYING_ATTEMPT_STATUSES",
     "PAUSABLE_TASK_STATUSES",
+    "PR_DELIVERY_CONTRACT_VERSION",
+    "PR_EVIDENCE_EVENT_KIND",
+    "PR_MERGE_APPROVAL_EVENT_KIND",
+    "PR_MERGE_EVIDENCE_EVENT_KIND",
     "PROTECTED_BRANCH_NAMES",
     "PRIORITY_MAX",
     "PRIORITY_MIN",
@@ -2045,6 +2447,7 @@ __all__ = [
     "create_project",
     "create_task",
     "dependencies_of",
+    "direct_pr_config",
     "get_attempt",
     "get_project",
     "get_session",
