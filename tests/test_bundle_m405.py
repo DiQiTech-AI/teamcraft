@@ -43,6 +43,7 @@ class M405OfflineBundleTests(unittest.TestCase):
                 "delivery.py",
                 "domain.py",
                 "github_adapter.py",
+                "recovery.py",
                 "runtime_adapter.py",
                 "verification.py",
             ):
@@ -64,11 +65,14 @@ class M405OfflineBundleTests(unittest.TestCase):
                     (
                         "import teamcraft, teamcraft.delivery, "
                         "teamcraft.github_adapter; "
-                        "from teamcraft import domain; "
+                        "from teamcraft import domain, recovery; "
                         "assert domain.DIRECT_PR_READY_EVENT == "
                         "'direct_pr_ready'; "
                         "assert domain.DIRECT_PR_MERGE_ACTION == "
                         "'merge_direct_pr'; "
+                        "assert domain.LEGACY_MISSING_REPORT_COMMAND_KIND == "
+                        "'recovery.legacy_missing_report'; "
+                        "assert callable(recovery.disposition_legacy_missing_report); "
                         "print(teamcraft.__file__)"
                     ),
                 ],

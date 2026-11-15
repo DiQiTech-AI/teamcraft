@@ -2751,6 +2751,35 @@ def recovery_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def recovery_legacy_incomplete(args: argparse.Namespace) -> int:
+    """Disposition one evidence-free finished legacy Attempt for retry."""
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = _recovery_lease(store)
+    try:
+        conn = store._connect()
+        try:
+            task = _recovery.disposition_legacy_missing_report(
+                conn, args.task_id, attempt_id=args.attempt_id,
+                expected_version=args.expected_version, actor=args.actor,
+                reason=args.reason, idempotency_key=args.idempotency_key,
+                lease=lease,
+            )
+            command = conn.execute(
+                "SELECT id FROM commands WHERE idempotency_key=?",
+                (args.idempotency_key,),
+            ).fetchone()
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps({
+        "task_id": task.id, "task_status": task.status,
+        "task_version": task.version, "attempt_id": args.attempt_id,
+        "command_id": None if command is None else str(command[0]),
+    }, sort_keys=True))
+    return 0
+
+
 def _dump(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
@@ -4356,6 +4385,16 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--reason", required=True)
     retry_parser.add_argument("--idempotency-key", required=True)
     retry_parser.set_defaults(handler=recovery_retry)
+
+    legacy_parser = commands.add_parser("recovery-legacy-incomplete")
+    add_cwd(legacy_parser)
+    legacy_parser.add_argument("--task-id", required=True)
+    legacy_parser.add_argument("--attempt-id", required=True)
+    legacy_parser.add_argument("--expected-version", required=True, type=int)
+    legacy_parser.add_argument("--actor", required=True)
+    legacy_parser.add_argument("--reason", required=True)
+    legacy_parser.add_argument("--idempotency-key", required=True)
+    legacy_parser.set_defaults(handler=recovery_legacy_incomplete)
 
     # M3-04 CLI/API parity: task lifecycle + policy + dispatch gate, routed
     # through the same Core transitions the /api/v1 routes apply.

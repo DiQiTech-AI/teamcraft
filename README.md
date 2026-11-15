@@ -256,6 +256,28 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-retry \
 
 Timeouts never stop or restart agents by themselves. `UNKNOWN` attempts keep their slot, and a new attempt requires an approved retry within the Task's `max_attempts` (default 3).
 
+For a legacy ship Task already stuck in `VERIFYING` because its latest
+finished Attempt predates durable WorkerReport and M4 evidence, record the
+missing result before requesting the separate retry approval:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-legacy-incomplete \
+  --task-id TASK_ID --attempt-id ATTEMPT_ID --expected-version TASK_VERSION \
+  --actor human --reason "legacy attempt has no report or delivery evidence" \
+  --idempotency-key legacy-incomplete-ATTEMPT_ID-1
+```
+
+This fenced operation applies only when the latest finished ship Attempt has
+no final WorkerReport, Worktree Verification, Verification, Approval,
+worktree-allocation, or delivery evidence, and no unresolved Attempt-bound
+Verification or delivery Command. It preserves that Attempt, writes
+an audit Command/Event, and moves only `VERIFYING` to `NEEDS_HUMAN`. A later
+`recovery-retry` rechecks the same absence facts before moving to `READY`; it
+does not create an Attempt or claim successful delivery. The sequence is
+disposition, separate retry approval, any required Task policy update, then
+normal fresh dispatch. A policy version bump intentionally invalidates stale
+reconciliation evidence.
+
 To start from a clean runtime, `reset` archives the current database with an online SQLite backup into `.teamcraft/archive-*` and creates an empty database. It requires the exact resolved project root and never imports, moves, or deletes legacy JSON state:
 
 ```bash

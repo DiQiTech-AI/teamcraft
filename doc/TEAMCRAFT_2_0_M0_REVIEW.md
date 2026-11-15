@@ -839,3 +839,33 @@ Watcher 使用 caller-driven 低频 polling；校验 pane、terminal、native se
 **自动化与独立验收证据（2026-11-15，macOS 本机）**：`python3 -m unittest discover -s tests -p 'test_*_m405.py'` 最终结果为 **83 tests、退出码 0**：Core adapter/domain/delivery **67**，API **7**，runtime adapter **4**，teamctl CLI **4**，离线 bundle **1**。覆盖 adapter argv allowlist/解析、域 transition/fail-closed gate、真实本地 Git + bare origin + Fake GitHub 的 create/adopt/retry/sync/approval/drift/merge/reconcile、API/CLI 参数与 scope 转换，以及安装器生成离线 Core 后逐字节/导入一致性。此前 `delivery_pr_evidence.branch` 未写入导致 20 个 delivery 用例报错，修复 payload 字段后同一模式全部通过；adapter 另收紧为仅允许 `gh auth status` 与 `gh pr list|create|view|merge`。独立 `tester_m405_accept` 复核 M4-05 实现、边界与定向矩阵后给出 **PASS 建议**。其较早的一轮完整仓库运行仅在既有 `tests/test_api_m404.py` verifier fixture 中出现一次负载诱发 timeout，并非 M4-05 失败；测试专用 timeout 从 10 秒放宽到 30 秒后，该文件独立连续两次 **27/27 tests、退出码 0**，未修改生产代码。CEO 随后运行完整仓库套件，最终结果为 **988/988 tests、退出码 0**。真实 GitHub 与 GitHub Actions 当前均未运行。
 
 **README 同步**：README.md / README.zh-CN.md 已新增 direct-PR 显式策略、零写入 probe、唯一 PR 收敛、READY_TO_MERGE、人工 Approval、漂移失效、intended-base DONE 门禁和受保护分支边界，并登记五个认证 API 写路由、六个 `teamctl` 命令、83 项定向测试、最终 988/988 全量与独立 tester PASS 建议；同时保留真实 GitHub/GitHub Actions 未验证边界，并说明 M4-04 测试夹具 10→30 秒的纯测试稳定化及其两次 27/27 复验。
+
+### 12.24 旧版缺失 WorkerReport 的有界恢复路径（已验证）
+
+早期在项目根目录执行的 ship Attempt 可能已是 `finished`，而 Task 停在
+`VERIFYING`，但运行时没有最终 WorkerReport、Worktree/Commit/Diff、Verifier
+或 Approval 证据。该历史状态不能补造成功报告，也不能绕过 M4 门禁直接
+DONE。新增的 owner 操作为认证 Task Command `legacy_incomplete`（CLI：
+`recovery-legacy-incomplete`）：在 expected-version、项目 Leader lease、最新
+Attempt 身份和幂等键约束下，只有确认上述全部证据均不存在时，才写入
+`recovery.legacy_missing_report` Command 与 append-only disposition Event，并将
+Task 从 `VERIFYING` 转为 `NEEDS_HUMAN`；原 finished Attempt 保持不变。
+
+随后仍须通过独立 `recovery-retry` 审批。Core 只认与当前 Task version、同一
+Attempt 精确绑定的 disposition Event，并在审批时重新核对最终报告和所有 M4
+证据仍不存在、Attempt 上限未耗尽且没有 occupying Attempt，之后才允许
+`NEEDS_HUMAN → READY`。新 Attempt 仍由正常调度创建，依赖 DONE 门禁保持不变。
+若还需调整执行策略，顺序必须是 disposition → 独立 retry approval → policy
+update → fresh dispatch；policy 更新引起的 Task version bump 会按设计使旧恢复
+证据失效。
+任何已有报告/交付/验证/审批事实、绑定 Attempt 的未结算 Verification/Delivery
+Command、非最新或非 finished Attempt、陈旧版本或
+失效 Leader 均在事务内 fail closed，不留下部分 Command/Event。
+
+**验证证据（2026-11-15）**：恢复契约定向套件 **10/10**、安装器离线 Core
+bundle 套件 **1/1** 均通过；bundle 门禁逐字节核对 `domain.py`、`recovery.py`
+等 canonical Core，并从隔离安装目录成功导入
+`disposition_legacy_missing_report`。既有 Recovery、API 与 CLI 回归分别
+**7/7**、**67/67**、**4/4** 通过，独立 tester 复核后给出 PASS。本节的通过
+只确认有界恢复能力本身，不改变 M4-02/M4-05 的历史交付结论；两项旧 Task
+仍须经 disposition、独立 retry approval、fresh Attempt 和正常 M4 证据门禁。

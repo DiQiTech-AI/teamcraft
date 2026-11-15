@@ -285,6 +285,12 @@ PR_MERGE_APPROVAL_EVENT_KIND = "delivery_pr_merge_approval"
 PR_MERGE_EVIDENCE_EVENT_KIND = "delivery_pr_merge_evidence"
 #: The only proposed/accepted action the direct-PR flow understands.
 DIRECT_PR_MERGE_ACTION = "merge_direct_pr"
+#: Owner-directed recovery for pre-evidence legacy Attempts.  This event can
+#: only move VERIFYING to NEEDS_HUMAN; :mod:`teamcraft.recovery` owns the
+#: durable no-report/no-delivery proof and separate retry approval.
+LEGACY_ATTEMPT_INCOMPLETE_EVENT = "legacy_attempt_incomplete"
+LEGACY_MISSING_REPORT_COMMAND_KIND = "recovery.legacy_missing_report"
+LEGACY_MISSING_REPORT_EVENT_KIND = "recovery.legacy_missing_report_disposition"
 #: GitHub PR evidence lives outside the local-only ``DELIVERY_CONTRACT_VERSION``
 #: payloads but shares the same integrity rule; versioned independently so a
 #: later hardening (partial unique indexes) can bump it without touching local.
@@ -306,6 +312,7 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("ready", "attempts_exhausted"): ("needs_human",),
     ("verifying", "verification_passed"): ("needs_human",),
     ("verifying", "verification_failed"): ("needs_human",),
+    ("verifying", LEGACY_ATTEMPT_INCOMPLETE_EVENT): ("needs_human",),
     ("verifying", LOCAL_DELIVERY_ACCEPT_EVENT): ("done",),
     ("verifying", DIRECT_PR_READY_EVENT): ("ready_to_merge",),
     ("ready_to_merge", "approved_and_delivered"): ("done",),
@@ -837,6 +844,97 @@ def _delivery_payload_digest(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(stripped, sort_keys=True, separators=(",", ":"),
                   ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def require_legacy_missing_report_facts(
+    conn: TeamCraftConnection, task: Task, attempt_id: str
+) -> Attempt:
+    """Re-derive strict evidence-free legacy Attempt eligibility."""
+
+    row = conn.execute(
+        "SELECT " + ", ".join(_ATTEMPT_COLUMNS)
+        + " FROM attempts WHERE id=?", (attempt_id,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"attempt not found: {attempt_id}")
+    attempt = Attempt(**_row_to(row, _ATTEMPT_COLUMNS))
+    if task.kind != "ship" or attempt.task_id != task.id:
+        raise ValidationError("legacy recovery requires a ship Task and its Attempt")
+    latest = conn.execute(
+        "SELECT id FROM attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    if latest is None or str(latest[0]) != attempt.id:
+        raise ConflictError("legacy recovery must bind the latest Attempt")
+    if attempt.status != "finished":
+        raise IllegalTransitionError(
+            "legacy recovery requires a finished Attempt",
+            entity="attempt", current=attempt.status,
+            event=LEGACY_ATTEMPT_INCOMPLETE_EVENT,
+        )
+    project = get_project(conn, task.project_id)
+    if (attempt.worktree_path != project.repo_path or attempt.branch is not None
+            or attempt.commit_sha is not None):
+        raise ConflictError(
+            "legacy recovery requires the original project-root Attempt "
+            "without an allocated branch or Commit"
+        )
+    checks = (
+        ("SELECT 1 FROM worker_reports WHERE attempt_id=? AND report_kind='final' LIMIT 1",
+         "a final WorkerReport already exists"),
+        ("SELECT 1 FROM worktree_verifications WHERE attempt_id=? LIMIT 1",
+         "Worktree Verification evidence already exists"),
+        ("SELECT 1 FROM verifications WHERE attempt_id=? LIMIT 1",
+         "Verification evidence already exists"),
+        ("SELECT 1 FROM approvals WHERE attempt_id=? LIMIT 1",
+         "Approval evidence already exists"),
+        ("SELECT 1 FROM events WHERE attempt_id=? "
+         "AND (kind LIKE 'worktree_%' OR kind LIKE 'delivery_%') LIMIT 1",
+         "Worktree or delivery evidence already exists"),
+        ("SELECT 1 FROM commands WHERE state IN ('pending','running','unknown') "
+         "AND (kind LIKE 'delivery.%' OR kind LIKE 'verification.%') "
+         "AND json_extract(payload_json, '$.attempt_id')=? LIMIT 1",
+         "an unresolved Verification or delivery Command exists"),
+    )
+    for sql, message in checks:
+        if conn.execute(sql, (attempt.id,)).fetchone() is not None:
+            raise ConflictError(message)
+    return attempt
+
+
+def _legacy_disposition_command(
+    conn: TeamCraftConnection, task: Task
+) -> tuple[str, Attempt, dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT id, payload_json FROM commands WHERE kind=? AND state='running' "
+        "AND json_extract(payload_json, '$.task_id')=? "
+        "AND json_extract(payload_json, '$.task_version')=?",
+        (LEGACY_MISSING_REPORT_COMMAND_KIND, task.id, task.version),
+    ).fetchall()
+    if len(rows) != 1:
+        raise IllegalTransitionError(
+            "legacy disposition requires exactly one claimed matching recovery Command",
+            entity="task", current=task.status,
+            event=LEGACY_ATTEMPT_INCOMPLETE_EVENT,
+            reason_code="RECOVERY_COMMAND_REQUIRED",
+        )
+    try:
+        payload = json.loads(str(rows[0][1]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("legacy recovery Command payload is malformed") from exc
+    if (not isinstance(payload, dict)
+            or not isinstance(payload.get("actor"), str)
+            or not payload["actor"].strip()
+            or not isinstance(payload.get("reason"), str)
+            or not payload["reason"].strip()
+            or not isinstance(payload.get("attempt_id"), str)):
+        raise ValidationError("legacy recovery Command payload is incomplete")
+    attempt = require_legacy_missing_report_facts(
+        conn, task, payload["attempt_id"]
+    )
+    if payload.get("attempt_no") != attempt.attempt_no:
+        raise ConflictError("legacy recovery Command Attempt binding is stale")
+    return str(rows[0][0]), attempt, payload
 
 
 def _delivery_json_field(payload: dict, key: str) -> Any:
@@ -1540,6 +1638,7 @@ def apply_task_event(
     require_head(conn)
     with _tx(conn):
         task = _fetch_task(conn, task_id)
+        legacy_disposition: tuple[str, Attempt, dict[str, Any]] | None = None
         if event == _DISPATCH_EVENT:
             raise IllegalTransitionError(
                 "task event 'dispatch_reserved' requires atomic attempt "
@@ -1622,13 +1721,39 @@ def apply_task_event(
             # pins, verifier profile currency, policy digest, protected branch)
             # are re-derived from durable rows — never from the caller.
             _require_local_delivery_acceptance(conn, task, event)
+        if event == LEGACY_ATTEMPT_INCOMPLETE_EVENT:
+            # This edge is deliberately unavailable through the bare generic
+            # state-machine door.  The matching recovery Command must already
+            # be claimed and every legacy/no-evidence fact is re-derived here
+            # inside the same transaction as the Task CAS.
+            legacy_disposition = _legacy_disposition_command(conn, task)
         targets = task_transition_targets(task.status, event, task.kind)
         resolved = _resolve_target("task", task.status, event, targets, target)
         if event in _FACT_GUARDED_TASK_EVENTS:
             _require_deps_done(conn, task, event)
         if event == _WORKER_DONE_EVENT or resolved in TERMINAL_TASK_STATUSES:
             _require_execution_finished(conn, task, event, resolved)
-        return _cas_task(conn, task, status=resolved, expected_version=expected_version, now=_utc_iso(clock))
+        updated = _cas_task(
+            conn, task, status=resolved, expected_version=expected_version,
+            now=_utc_iso(clock),
+        )
+        if legacy_disposition is not None:
+            command_id, attempt, payload = legacy_disposition
+            events.append_event(
+                conn, LEGACY_MISSING_REPORT_EVENT_KIND,
+                project_id=task.project_id, task_id=task.id,
+                attempt_id=attempt.id,
+                payload_json=_canonical_json({
+                    "task_id": task.id, "source_task_version": task.version,
+                    "task_version": updated.version,
+                    "task_status": updated.status,
+                    "attempt_id": attempt.id,
+                    "attempt_no": attempt.attempt_no,
+                    "disposition": "incomplete", "command_id": command_id,
+                    "actor": payload["actor"], "reason": payload["reason"],
+                }), clock=clock,
+            )
+        return updated
 
 
 # ---------------------------------------------------------------------------
@@ -2421,6 +2546,9 @@ __all__ = [
     "DIRECT_PR_READY_EVENT",
     "EXECUTION_POLICY_KEYS",
     "LOCAL_DELIVERY_ACCEPT_EVENT",
+    "LEGACY_ATTEMPT_INCOMPLETE_EVENT",
+    "LEGACY_MISSING_REPORT_COMMAND_KIND",
+    "LEGACY_MISSING_REPORT_EVENT_KIND",
     "LOCAL_ONLY_ACCEPT_ACTION",
     "OCCUPYING_ATTEMPT_STATUSES",
     "PAUSABLE_TASK_STATUSES",
@@ -2457,6 +2585,7 @@ __all__ = [
     "observe_session",
     "pause_task",
     "ready_queue",
+    "require_legacy_missing_report_facts",
     "recompute_ready",
     "register_session",
     "remove_dependency",

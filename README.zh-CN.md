@@ -256,6 +256,25 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-retry \
 
 超时本身不会停止或重启 Agent。`UNKNOWN` Attempt 持续占位，新 Attempt 必须经批准且在 Task 的 `max_attempts`（默认 3）内重试。
 
+若旧版 ship Task 已停在 `VERIFYING`，且其最新 finished Attempt 产生于
+WorkerReport 与 M4 证据链落地之前，先明确登记“结果缺失”，再单独批准重试：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py recovery-legacy-incomplete \
+  --task-id TASK_ID --attempt-id ATTEMPT_ID --expected-version TASK_VERSION \
+  --actor human --reason "旧 Attempt 没有报告或交付证据" \
+  --idempotency-key legacy-incomplete-ATTEMPT_ID-1
+```
+
+该 fenced 操作仅接受最新的 finished ship Attempt，且要求不存在最终
+WorkerReport、Worktree Verification、Verification、Approval、Worktree 分配或
+交付证据，也不存在绑定该 Attempt 的未结算 Verification/Delivery Command。
+它保留原 Attempt，只写入审计 Command/Event，并仅将
+`VERIFYING` 转为 `NEEDS_HUMAN`。之后的 `recovery-retry` 会再次核对这些缺失
+事实才转为 `READY`；它不会创建 Attempt，也不会宣称旧交付成功。顺序固定为：
+登记缺失结果 → 独立批准重试 → 如需则更新 Task policy → 正常派发新 Attempt；
+policy 的版本递增会有意使旧恢复证据失效。
+
 若要从干净运行状态重新开始，`reset` 会先用 SQLite 在线备份把当前数据库归档到 `.teamcraft/archive-*`，再创建空数据库。它要求传入精确解析后的项目根，且绝不导入、移动或删除旧 JSON 状态：
 
 ```bash

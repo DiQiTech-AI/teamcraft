@@ -29,6 +29,9 @@ Scheduler pause / resume                  ``scheduler.pause_schedule`` /
                                          every planning snapshot)
 Retry approval                            ``recovery.approve_retry`` under a
                                          short API-held lease
+Legacy missing-report disposition         ``recovery.disposition_legacy_missing_report``
+                                         under a short API-held lease; never
+                                         completes or rewrites the Attempt
 Approval decision (accept/reject)        ``verification.decide_approval``
                                          under a short API-held lease
 Manual CEO Wake request                   ``wake.request_ceo_attention``
@@ -248,7 +251,8 @@ API_LEASE_TTL_SECONDS = 10
 
 #: Actions accepted by POST /tasks/{task_id}/commands.
 TASK_COMMAND_ACTIONS = frozenset(
-    {"pause", "resume", "cancel", "retry", "wait", "reconcile"}
+    {"pause", "resume", "cancel", "retry", "wait", "reconcile",
+     "legacy_incomplete"}
 )
 #: Actions recorded through ``recovery.request_action`` (attempt-scoped).
 _RECOVERY_PASSTHROUGH_ACTIONS = frozenset({"cancel", "wait", "reconcile"})
@@ -1243,6 +1247,32 @@ class CommandService:
                 replayed = existing is not None
                 return 200, {
                     "task": _task_dto(updated),
+                    "execution": "applied",
+                    "command": _command_dto(command),
+                    "replayed": replayed,
+                }, replayed
+
+            if action == "legacy_incomplete":
+                if attempt_id is None:
+                    raise ApiError(
+                        422, VALIDATION_FAILED, _INVALID_COMMAND_MESSAGE,
+                        details={"field": "attempt_id", "constraint": "required"},
+                    )
+                existing = self._command_by_key(conn, key)
+                if existing is None:
+                    self._require_version(task, expected_version)
+                with self._lease(conn, task.project_id) as lease:
+                    updated = recovery.disposition_legacy_missing_report(
+                        conn, task_id, attempt_id=attempt_id,
+                        expected_version=expected_version, actor=actor,
+                        reason=reason, idempotency_key=key, lease=lease,
+                    )
+                command = self._command_by_key(conn, key)
+                assert command is not None
+                replayed = existing is not None
+                return 200, {
+                    "task": _task_dto(updated),
+                    "attempt_id": attempt_id,
                     "execution": "applied",
                     "command": _command_dto(command),
                     "replayed": replayed,

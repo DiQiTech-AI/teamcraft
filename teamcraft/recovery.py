@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import contextlib
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -160,6 +161,127 @@ def escalate_attempt_limit(conn: TeamCraftConnection, task_id: str, *, lease: le
         events.append_event(conn, "recovery.attempts_exhausted", project_id=task.project_id,
             task_id=task.id, payload_json=_json({"attempts_used": used, "max_attempts": task.max_attempts}), clock=clock)
         return domain.apply_task_event(conn, task.id, "attempts_exhausted", expected_version=task.version, clock=clock)
+
+
+LEGACY_MISSING_REPORT_COMMAND = domain.LEGACY_MISSING_REPORT_COMMAND_KIND
+LEGACY_MISSING_REPORT_EVENT = domain.LEGACY_MISSING_REPORT_EVENT_KIND
+
+
+def disposition_legacy_missing_report(
+    conn: TeamCraftConnection,
+    task_id: str,
+    *,
+    attempt_id: str,
+    expected_version: int,
+    actor: str,
+    reason: str,
+    idempotency_key: str,
+    lease: leader.Lease,
+    clock: Clock | None = None,
+) -> domain.Task:
+    """Audit an incomplete legacy Attempt and move VERIFYING to NEEDS_HUMAN.
+
+    This never manufactures execution or delivery evidence and never mutates
+    the historical Attempt.  A separate :func:`approve_retry` call is needed
+    before Core can reserve a fresh Attempt.
+    """
+
+    if not isinstance(actor, str) or not actor.strip() or not isinstance(reason, str) or not reason.strip():
+        raise ValidationError("actor and reason are required")
+    with _tx(conn):
+        task = domain.get_task(conn, task_id)
+        leader.require_project_lease(conn, lease, task.project_id, clock=clock)
+        existing = conn.execute(
+            "SELECT id, kind, payload_json, state FROM commands WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            try:
+                prior = json.loads(str(existing[2]))
+            except (TypeError, json.JSONDecodeError):
+                prior = {}
+            expected = {
+                "task_id": task_id, "attempt_id": attempt_id,
+                "task_version": expected_version, "actor": actor.strip(),
+                "reason": reason.strip(),
+            }
+            if (str(existing[1]) != LEGACY_MISSING_REPORT_COMMAND
+                    or any(prior.get(key) != value for key, value in expected.items())):
+                raise ConflictError("legacy recovery idempotency key has different content")
+            if str(existing[3]) == "confirmed":
+                return task
+            raise IllegalTransitionError(
+                "legacy recovery Command must be confirmed for replay",
+                entity="command", current=str(existing[3]),
+                event=domain.LEGACY_ATTEMPT_INCOMPLETE_EVENT,
+            )
+        if task.status != "verifying":
+            raise IllegalTransitionError(
+                "legacy recovery requires a VERIFYING Task",
+                entity="task", current=task.status,
+                event=domain.LEGACY_ATTEMPT_INCOMPLETE_EVENT,
+            )
+        if task.version != expected_version:
+            raise ConflictError(
+                f"task {task.id} version conflict: expected {expected_version}, found {task.version}"
+            )
+        attempt = domain.get_attempt(conn, attempt_id)
+        domain.require_legacy_missing_report_facts(conn, task, attempt.id)
+        payload = {
+            "task_id": task.id, "task_version": task.version,
+            "attempt_id": attempt.id, "attempt_no": attempt.attempt_no,
+            "actor": actor.strip(), "reason": reason.strip(),
+        }
+        absence_digest = hashlib.sha256(_json({
+            "contract": "legacy-missing-report-v1",
+            "task_id": task.id, "task_version": task.version,
+            "attempt_id": attempt.id, "attempt_no": attempt.attempt_no,
+            "final_worker_report": False, "m4_evidence": False,
+        }).encode("utf-8")).hexdigest()
+        submission = commands.submit_command(
+            conn, idempotency_key=idempotency_key,
+            kind=LEGACY_MISSING_REPORT_COMMAND, payload_json=_json(payload),
+            evidence_json=_json({
+                "task_id": task.id, "task_version": task.version,
+                "attempt_id": attempt.id, "attempt_no": attempt.attempt_no,
+                "digest": absence_digest,
+            }), clock=clock,
+        )
+        command = submission.command
+        commands.claim_command(conn, command.id, clock=clock)
+        updated = domain.apply_task_event(
+            conn, task.id, domain.LEGACY_ATTEMPT_INCOMPLETE_EVENT,
+            expected_version=task.version, clock=clock,
+        )
+        result = {
+            "task_id": task.id, "task_version": updated.version,
+            "task_status": updated.status, "attempt_id": attempt.id,
+            "attempt_no": attempt.attempt_no, "disposition": "incomplete",
+        }
+        commands.confirm_command(conn, command.id, result_json=_json(result), clock=clock)
+        return updated
+
+
+def _legacy_missing_report_retryable(
+    conn: TeamCraftConnection, task: domain.Task, attempt: domain.Attempt
+) -> bool:
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind=? AND task_id=? AND attempt_id=? "
+        "ORDER BY seq DESC LIMIT 1",
+        (LEGACY_MISSING_REPORT_EVENT, task.id, attempt.id),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if (not isinstance(payload, dict)
+            or payload.get("task_version") != task.version
+            or payload.get("disposition") != "incomplete"):
+        return False
+    domain.require_legacy_missing_report_facts(conn, task, attempt.id)
+    return True
 
 
 def request_action(conn: TeamCraftConnection, *, task_id: str, action: str,
@@ -411,7 +533,27 @@ def approve_retry(conn: TeamCraftConnection, task_id: str, *, actor: str, reason
         prior_status = str(attempts[1])
         report = conn.execute("SELECT report_json FROM worker_reports WHERE attempt_id = ? AND report_kind='final' ORDER BY recorded_at DESC LIMIT 1", (str(attempts[0]),)).fetchone()
         outcome = None if report is None else worker_reports.parse_worker_report(str(report[0])).get("outcome")
-        if prior_status not in {"failed", "cancelled"} and not (prior_status == "finished" and outcome in {"blocked", "failed"}):
+        legacy_retryable = (
+            task.status == "needs_human"
+            and prior_status == "finished"
+            and outcome is None
+            and _legacy_missing_report_retryable(
+                conn, task, domain.get_attempt(conn, str(attempts[0]))
+            )
+        )
+        if legacy_retryable and conn.execute(
+            "SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.depends_on_id "
+            "WHERE d.task_id=? AND p.status<>'done' LIMIT 1",
+            (task.id,),
+        ).fetchone() is not None:
+            raise IllegalTransitionError(
+                "legacy retry requires all dependencies to be DONE",
+                entity="task", current=task.status, event="retry_approved",
+                reason_code="DEPENDENCIES_NOT_SATISFIED",
+            )
+        if (prior_status not in {"failed", "cancelled"}
+                and not (prior_status == "finished" and outcome in {"blocked", "failed"})
+                and not legacy_retryable):
             raise IllegalTransitionError("previous attempt is not explicitly retryable", entity="attempt", current=prior_status, event="retry_approved")
         commands.claim_command(conn, command.id, clock=clock)
         event = "retry_approved" if task.status == "running" else "human_reconciled"
