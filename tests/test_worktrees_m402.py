@@ -6,6 +6,10 @@ repository is never touched, and no branch/worktree is added to it.
 Coverage of the acceptance matrix:
 * two concurrent writable Attempts get DISTINCT worktrees/branches and never
   share uncommitted edits;
+* a CONCURRENT IDENTICAL allocation converges on one identity: the loser of
+  the durable INSERT adopts the WON record (created=False) without running its
+  own Git effect, and two racing threads land on exactly one record, worktree
+  and branch (fail-closed refusals included);
 * restart discovery/claim adopts ONLY the exact recorded identity
   (path + branch + repository + worktree markers);
 * a failed worker with dirty changes leaves the workspace AND the durable
@@ -23,6 +27,7 @@ Coverage of the acceptance matrix:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sqlite3
 import subprocess
@@ -274,6 +279,195 @@ class AllocationTests(_Fixture):
         with self.assertRaises(WorktreeIdentityError) as ctx:
             self.allocate(task, attempt)
         self.assertEqual(ctx.exception.kind, "missing")
+
+
+# ---------------------------------------------------------------------------
+# Concurrent identical allocation (one record, one workspace, one identity)
+# ---------------------------------------------------------------------------
+
+
+class _GitRecorder:
+    """GitRunner that records every argv while delegating to real Git."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args, cwd) -> bytes:
+        self.calls.append(list(args))
+        return workspaces._default_run_git(args, str(cwd))
+
+    def added(self) -> list[list[str]]:
+        """The ``git worktree add`` effects this side actually ran."""
+
+        return [call for call in self.calls if call[:2] == ["worktree", "add"]]
+
+
+class _RacingGit(_GitRecorder):
+    """Recorder that lets a rival allocation complete at one chosen probe.
+
+    ``on_trigger`` runs immediately BEFORE the exact trigger argv executes,
+    exactly once.  Triggering on the allocation's LAST Git probe before its
+    durable INSERT reproduces the deterministic core of the concurrent race:
+    the rival commits its record (and materialises the workspace) while this
+    call is in flight between the probe and the INSERT.
+    """
+
+    def __init__(self, trigger: list[str], on_trigger) -> None:
+        super().__init__()
+        self._trigger = list(trigger)
+        self._on_trigger = on_trigger
+        self.fired = False
+
+    def __call__(self, args, cwd) -> bytes:
+        call = list(args)
+        self.calls.append(call)
+        if not self.fired and call == self._trigger:
+            self.fired = True
+            self._on_trigger()
+        return workspaces._default_run_git(args, str(cwd))
+
+
+class ConcurrentAllocationTests(_Fixture):
+    # -- helpers ---------------------------------------------------------
+
+    def _worktree_count(self) -> int:
+        return len([line for line in
+                    git("worktree", "list", cwd=self.repo).splitlines()
+                    if line.strip()])
+
+    def _branch_lines(self, branch: str) -> list[str]:
+        return [line for line in
+                git("branch", "--list", branch, cwd=self.repo).splitlines()
+                if line.strip()]
+
+    def _allocation_rows(self, attempt_id: str) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = ? AND attempt_id = ?",
+            (ALLOCATED_EVENT_KIND, attempt_id)).fetchone()[0])
+
+    # -- tests -----------------------------------------------------------
+
+    def test_concurrent_identical_allocation_adopts_the_won_record(self):
+        """Deterministic core of the allocation race: the DB is the arbiter.
+
+        A rival process commits the byte-identical ``worktree_allocated``
+        record while this allocation sits between its last pre-INSERT Git
+        probe and its own INSERT.  The loser must adopt the WON record
+        (``created=False``) after verifying the winner's exact workspace
+        identity — never run its own Git effect, never fork a second
+        record/worktree/branch/identity.
+        """
+
+        task, attempt = self.make_attempt(["src/**"])
+        branch = worktrees.worktree_branch(task.id, attempt.id)
+        winner_git = _GitRecorder()
+        won: list[tuple[worktrees.WorktreeAllocation, bool]] = []
+
+        def rival_allocates() -> None:
+            conn = storage.connect(self.db)  # another "process"
+            try:
+                won.append(worktrees.allocate_attempt_worktree(
+                    conn, task_id=task.id, attempt_id=attempt.id,
+                    repo_root=str(self.repo), run_git=winner_git))
+            finally:
+                conn.close()
+
+        # Fire between the loser's last pre-INSERT probe and its INSERT, so
+        # the rival's deterministic event_id lands first with identical bytes.
+        racer = _RacingGit(
+            ["rev-parse", "--verify", f"refs/heads/{branch}"], rival_allocates)
+        alloc, created = self.allocate(task, attempt, run_git=racer)
+
+        self.assertTrue(racer.fired)
+        self.assertEqual(len(won), 1)
+        won_alloc, won_created = won[0]
+        self.assertTrue(won_created)
+        # The loser adopts the winner instead of creating a parallel identity.
+        self.assertFalse(created)
+        self.assertEqual(alloc, won_alloc)
+        # Exactly one durable record for the Attempt.
+        self.assertEqual(self._allocation_rows(attempt.id), 1)
+        # Exactly one Git effect, and it never ran on the loser's side.
+        self.assertEqual(racer.added(), [])
+        self.assertEqual(len(winner_git.added()), 1)
+        self.assertEqual(self._worktree_count(), 2)  # root + one attempt tree
+        self.assertEqual(len(self._branch_lines(branch)), 1)
+        # The adopted workspace carries exactly the winner's identity markers.
+        markers = {key: git("config", "--worktree", "--get", key,
+                            cwd=Path(alloc.worktree_path))
+                   for key in ("teamcraft.allocationId", "teamcraft.attemptId",
+                               "teamcraft.taskId")}
+        self.assertEqual(markers, {
+            "teamcraft.allocationId": alloc.allocation_id,
+            "teamcraft.attemptId": attempt.id,
+            "teamcraft.taskId": task.id,
+        })
+        # The Attempt row mirrors the single identity (mirror replay is safe).
+        row = domain.get_attempt(self.conn, attempt.id)
+        self.assertEqual((row.worktree_path, row.branch),
+                         (alloc.worktree_path, alloc.branch))
+        # Discovery and exact-identity claim converge on that same record.
+        self.assertEqual(worktrees.lifecycle_state(self.conn, attempt.id),
+                         "allocated")
+        self.assertEqual(worktrees.claim_worktree(self.conn, attempt.id), alloc)
+
+    def test_two_threads_identical_allocation_converge_on_one_identity(self):
+        """Real threads, no injection: still exactly one identity.
+
+        Schedules legitimately differ — the loser either adopts the won record
+        or refuses fail-closed against a half-materialised workspace — but the
+        invariants must hold for EVERY schedule: one durable record, one Git
+        effect, one worktree/branch, and every success bound to the SAME
+        allocation.
+        """
+
+        task, attempt = self.make_attempt(["src/**"])
+        branch = worktrees.worktree_branch(task.id, attempt.id)
+        fail_closed = ("missing", "unregistered", "occupied", "foreign")
+
+        def allocate_one():
+            recorder = _GitRecorder()
+            conn = storage.connect(self.db)
+            try:
+                alloc, created = worktrees.allocate_attempt_worktree(
+                    conn, task_id=task.id, attempt_id=attempt.id,
+                    repo_root=str(self.repo), run_git=recorder)
+                return ("ok", alloc, created, recorder, None)
+            except WorktreeIdentityError as exc:
+                return ("refused", None, None, recorder, exc)
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(allocate_one) for _ in range(2)]
+            concurrent.futures.wait(futures)
+        outcomes = [f.result() for f in futures]
+
+        oks = [o for o in outcomes if o[0] == "ok"]
+        refusals = [o for o in outcomes if o[0] == "refused"]
+        self.assertEqual(len(oks) + len(refusals), 2,
+                         [str(o[4]) for o in refusals])
+        # Exactly one thread performed the durable INSERT and the Git effect;
+        # any other success can only be an adoption of that same identity.
+        creators = [o for o in oks if o[2]]
+        adopters = [o for o in oks if not o[2]]
+        self.assertEqual(len(creators), 1, [o[2] for o in oks])
+        self.assertEqual(sum(len(o[3].added()) for o in outcomes), 1)
+        for outcome in adopters:
+            self.assertEqual(outcome[1], creators[0][1])
+        for outcome in refusals:
+            self.assertIn(outcome[4].kind, fail_closed)
+        # Durable + on-disk state: one record, one worktree, one branch.
+        self.assertEqual(self._allocation_rows(attempt.id), 1)
+        self.assertEqual(self._worktree_count(), 2)
+        self.assertEqual(len(self._branch_lines(branch)), 1)
+        # Whichever schedule ran, the recorded identity is claimable exactly.
+        winner = creators[0][1]
+        self.assertEqual(worktrees.claim_worktree(self.conn, attempt.id),
+                         winner)
+        row = domain.get_attempt(self.conn, attempt.id)
+        self.assertEqual((row.worktree_path, row.branch),
+                         (winner.worktree_path, winner.branch))
 
 
 # ---------------------------------------------------------------------------
