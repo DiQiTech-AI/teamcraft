@@ -362,6 +362,75 @@ def _config_value(row: Any) -> dict[str, Any]:
             "created_at": str(row[8])}
 
 
+def _is_exact_local_only_policy_rebind(
+    conn: storage.TeamCraftConnection,
+    task: domain.Task,
+    attempt: domain.Attempt,
+    brief: briefs.AttemptBrief,
+    report_digest: str,
+) -> bool:
+    """Recognize the one supported post-completion policy correction.
+
+    A WorkerReport and its Brief stay pinned to the dispatch version.  The
+    ordinary completion edge consumes exactly one Task version; this narrow
+    recovery recognizes one additional CAS only when the append-only audit
+    stream proves that it added the previously absent ``local_only`` delivery
+    policy.  Any missing, repeated, reordered, or differently shaped history
+    remains stale.
+    """
+
+    expected_policy = {"delivery": "local_only"}
+    if (task.kind != "ship" or task.status != "verifying"
+            or task.version != brief.task_version + 2
+            or task.execution_policy_json != _json(expected_policy)):
+        return False
+
+    finished_rows = conn.execute(
+        "SELECT seq, payload_json FROM events WHERE task_id=? AND attempt_id=?"
+        " AND kind='attempt.execution_finished' ORDER BY seq",
+        (task.id, attempt.id),
+    ).fetchall()
+    if len(finished_rows) != 1:
+        return False
+    try:
+        finished_payload = json.loads(str(finished_rows[0][1]))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if finished_payload != {
+        "outcome": "completed", "report_digest": report_digest,
+    }:
+        return False
+
+    policy_rows = conn.execute(
+        "SELECT seq, project_id, attempt_id, payload_json FROM events"
+        " WHERE task_id=? AND kind='task.policy_updated' ORDER BY seq",
+        (task.id,),
+    ).fetchall()
+    if len(policy_rows) != 1:
+        return False
+    seq, project_id, event_attempt_id, payload_json = policy_rows[0]
+    if (int(seq) <= int(finished_rows[0][0])
+            or str(project_id) != task.project_id
+            or event_attempt_id is not None):
+        return False
+    try:
+        payload = json.loads(str(payload_json))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and set(payload) == {
+            "actor", "policy", "reason", "requested", "task_id", "version",
+        }
+        and payload.get("task_id") == task.id
+        and payload.get("version") == brief.task_version + 2
+        and payload.get("policy") == expected_policy
+        and payload.get("requested") == expected_policy
+        and isinstance(payload.get("actor"), str)
+        and isinstance(payload.get("reason"), str)
+    )
+
+
 def _bound_facts(conn: storage.TeamCraftConnection, attempt_id: str):
     attempt = domain.get_attempt(conn, attempt_id)
     task = domain.get_task(conn, attempt.task_id)
@@ -378,9 +447,13 @@ def _bound_facts(conn: storage.TeamCraftConnection, attempt_id: str):
             or str(report_row[3]) != brief.brief_digest or str(report_row[5]) != "completed"):
         raise ValidationError("Verification requires a finished Attempt with completed WorkerReport")
     # WorkerReport/Brief remain pinned to dispatch-time evidence. Exactly one
-    # later Task CAS is expected for worker_reported_done; any other version
-    # drift before/after that completion transition fails closed.
-    if task.version != brief.task_version + 1:
+    # later Task CAS is expected for worker_reported_done.  A second CAS is
+    # accepted only for the audited local-only policy correction above; every
+    # other drift before/after completion fails closed.
+    normal_completion = task.version == brief.task_version + 1
+    local_only_rebind = _is_exact_local_only_policy_rebind(
+        conn, task, attempt, brief, str(report_row[4]))
+    if not normal_completion and not local_only_rebind:
         raise ValidationError("Task evidence version changed outside worker_reported_done; Verification is stale")
     if task.status != "verifying":
         raise IllegalTransitionError("Verification requires Task status VERIFYING", entity="task", current=task.status, event="verification_run")
@@ -1733,13 +1806,22 @@ def worktree_verification_is_current(conn: storage.TeamCraftConnection,
             (attempt.id, verification.profile),
         ).fetchone()
         accepted = verification.status == "pass"
+        exact_policy_rebind = (
+            accepted
+            and verification.task_version == brief.task_version + 1
+            and verification.dispatch_task_version == brief.task_version
+            and _is_exact_local_only_policy_rebind(
+                conn, task, attempt, brief,
+                verification.worker_report_digest)
+        )
         return bool(
             task.project_id == verification.project_id
             and attempt.task_id == task.id
             and attempt.status == "finished"
             and attempt.attempt_no == verification.attempt_no
             and (task.status == "verifying" if accepted else task.status in ("verifying", "needs_human"))
-            and (task.version == verification.task_version if accepted
+            and ((task.version == verification.task_version
+                  or exact_policy_rebind) if accepted
                  else task.version >= verification.task_version)
             and brief.task_version == verification.dispatch_task_version
             and brief.brief_digest == verification.brief_digest
