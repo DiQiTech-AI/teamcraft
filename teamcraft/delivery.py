@@ -100,6 +100,11 @@ __all__ = [
     "PR_SYNC_COMMAND_KIND",
     "DIRECT_PR_MERGE_ACTION",
     "DIRECT_PR_READY",
+    "CLEANUP_REFUSED_EVENT_KIND",
+    "INTEGRATION_CHECK_EVENT_KIND",
+    "INTEGRATION_REQUIRED_EVENT_KIND",
+    "CleanupEligibility",
+    "IntegrationStatus",
     "PrMergeApproval",
     "PrMergeEvidence",
     "PullRequestEvidence",
@@ -107,10 +112,14 @@ __all__ = [
     "ShipEvidence",
     "approve_direct_pr_merge",
     "approve_local_delivery",
+    "check_integration_state",
+    "cleanup_attempt_worktree",
     "commit_evidence_is_current",
     "create_local_commit",
     "default_delivery_artifact_root",
     "delivery_approval_is_current",
+    "ensure_integration_task",
+    "evaluate_cleanup_eligibility",
     "get_commit_evidence",
     "get_delivery_approval",
     "get_pr_evidence",
@@ -121,6 +130,7 @@ __all__ = [
     "list_pr_evidence",
     "list_pr_merge_approvals",
     "load_commit_evidence",
+    "load_integration_requirement",
     "load_latest_pr_evidence",
     "load_pr_merge_approval",
     "load_pr_merge_evidence",
@@ -129,6 +139,7 @@ __all__ = [
     "pr_evidence_is_current",
     "pr_merge_approval_is_current",
     "prepare_direct_pr",
+    "reconcile_cleanup_worktree",
     "reconcile_commit_receipt",
     "reconcile_pr_merge",
     "reconcile_pr_receipt",
@@ -972,7 +983,8 @@ def _verify_workspace_binding(conn: TeamCraftConnection, attempt_id: str,
     problems: list[str] = []
     audited = _AuditedRunner(runner)
     try:
-        worktrees.claim_worktree(conn, attempt_id, run_git=audited)
+        worktrees.validate_worktree_identity(
+            conn, attempt_id, run_git=audited)
     except (worktrees.WorktreeIdentityError, workspaces.GitStateError,
             StorageError, NotFoundError) as exc:
         problems.append(f"identity: {exc}")
@@ -4771,3 +4783,579 @@ def pr_merge_approval_is_current(
         freshness = pr_evidence_is_current(conn, pr, live_gh=False)
         problems.extend(freshness.problems)
     return DeliveryFreshness(ok=not problems, problems=tuple(problems))
+
+
+# ===========================================================================
+# M4-06 — integration conflict detection + evidence-gated safe cleanup.
+#
+# Bounded questions this slice answers, fail-closed:
+#
+#   "Has the base this Attempt was branched from moved, and does its branch
+#   integrate cleanly?  If integration work is required, where is the ONE
+#   explicit Task that says so?  And which workspace may be released — ONLY
+#   when it is exactly OURS, completely clean, carries no undelivered
+#   commits, and its delivery is DONE with complete current evidence?"
+#
+# Pinned decisions:
+#
+# * NEVER integrate automatically.  Drift and conflicts are DETECTED (live
+#   ``rev-parse``/``merge-base`` and the in-memory ``git merge-tree`` probe
+#   through M4-02/M4-01 plumbing) and surfaced as durable facts; the response
+#   is an explicit integration Task, never a silent merge, rebase, reset, or
+#   overwrite (those verbs stay inside FORBIDDEN_GIT_VERBS / FORBIDDEN_EFFECT_VERBS).
+# * Integration requirement records are idempotent per Attempt: one durable
+#   ``integration_required`` event keys the ONE integration Task
+#   (deterministic Task id).  Re-running detection appends digest-keyed
+#   ``integration_check`` audit rows (identical facts converge, changed facts
+#   land as new observations) but can never create a second Task.
+# * Cleanup (workspace release) is gated on the FULL matrix — CLEANABLE
+#   lifecycle, exact identity claim, clean worktree, terminal Attempt, DONE
+#   delivery Task, current approval/merge facts matching the delivered
+#   Commit, and branch tip == delivered commit (no undelivered commits).  Any
+#   refusal preserves the workspace AND lands a durable
+#   ``worktree_cleanup_refused`` audit fact; the only removal verb is the
+#   narrowly-guarded ``git worktree remove`` (never ``--force``) inside
+#   :func:`teamcraft.worktrees.finalize_cleaned_worktree`, whose crash window
+#   after the effect is adopted by reconcile.  Branches and commits are never
+#   deleted: the delivery record outlives the workspace.
+# ===========================================================================
+
+
+CLEANUP_REFUSED_EVENT_KIND = "worktree_cleanup_refused"
+
+#: Durable integration audit kinds (canonical names live alongside the Git
+#: probes in :mod:`teamcraft.worktrees`; re-exported here for callers of the
+#: delivery-facing surface).
+INTEGRATION_CHECK_EVENT_KIND = worktrees.INTEGRATION_CHECK_EVENT_KIND
+INTEGRATION_REQUIRED_EVENT_KIND = worktrees.INTEGRATION_REQUIRED_EVENT_KIND
+
+
+@dataclass(frozen=True)
+class IntegrationStatus:
+    """One detection pass: recorded vs live base + integration verdict."""
+
+    attempt_id: str
+    task_id: str
+    project_id: str
+    branch: str
+    recorded_base_sha: str
+    live_base_sha: str | None
+    base_drift: bool
+    merge_status: str
+    conflict_files: tuple[str, ...]
+    integration_required: bool
+    integration_task_id: str | None
+    problems: tuple[str, ...]
+
+
+class _FixedIdFactory:
+    """IdFactory emitting one deterministic id (single-shot Task creation)."""
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def new(self, namespace: str) -> str:
+        return self._value
+
+
+def _integration_check_event_id(payload_json: str) -> str:
+    return ("evt-itchk-"
+            + _sha256_hex(f"integration-check|{payload_json}")[:40])
+
+
+def _integration_required_event_id(attempt_id: str) -> str:
+    return ("evt-itgr-"
+            + _sha256_hex(f"integration-required|{attempt_id}")[:40])
+
+
+def _integration_task_id(attempt_id: str) -> str:
+    return "itg-" + _sha256_hex(f"integration-task|{attempt_id}")[:24]
+
+
+_INTEGRATION_CHECK_FIELDS = frozenset({
+    "attempt_id", "branch", "conflict_files", "integration_required",
+    "integration_task_id", "live_base_sha", "merge_status", "problems",
+    "project_id", "recorded_base_sha", "schema_version", "source_task_id",
+})
+
+
+def load_integration_requirement(
+    conn: TeamCraftConnection, attempt_id: str
+) -> tuple[str, str] | None:
+    """``(integration_task_id, event_id)`` when one was ever required.
+
+    Malformed requirement records fail closed (StorageError) — a corrupt
+    audit trail is never silently ignored.
+    """
+    require_entity_id(attempt_id)
+    rows = conn.execute(
+        "SELECT seq, event_id, payload_json FROM events WHERE kind = ?"
+        " AND attempt_id = ? ORDER BY seq ASC",
+        (INTEGRATION_REQUIRED_EVENT_KIND, attempt_id),
+    ).fetchall()
+    if len(rows) > 1:
+        raise StorageError(
+            f"{len(rows)} integration-required records for attempt"
+            f" {attempt_id}; storage invariant broken")
+    if not rows:
+        return None
+    try:
+        payload = json.loads(str(rows[0][2]))
+    except (TypeError, ValueError) as exc:
+        raise StorageError("integration-required payload is not valid JSON") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("schema_version") != DELIVERY_CONTRACT_VERSION
+            or payload.get("attempt_id") != attempt_id):
+        raise StorageError("integration-required payload has unexpected shape")
+    task_id = payload.get("integration_task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise StorageError("integration-required payload lacks its Task binding")
+    return task_id, str(rows[0][1])
+
+
+def check_integration_state(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    run_git: GitRunner | None = None,
+    clock: Clock | None = None,
+    audit: bool = True,
+) -> IntegrationStatus:
+    """Detect base drift + merge conflicts for one Attempt (read-only).
+
+    Issues only ``rev-parse``/``merge-base``/``merge-tree`` plumbing — no
+    worktree, index, ref, or remote moves.  With ``audit`` (default) every
+    pass lands a digest-keyed ``integration_check`` fact: identical
+    observations converge onto one row, changed facts append new ones, so the
+    detection history itself is auditable and replay-safe.
+    """
+    runner = _AuditedRunner(run_git or _default_run_git)
+    allocation = worktrees.require_allocation(conn, attempt_id)
+    task = domain.get_task(conn, allocation.task_id)
+    drift = worktrees.detect_base_drift(conn, attempt_id, run_git=runner)
+    merge = worktrees.check_merge_conflicts(conn, attempt_id,
+                                           base_sha=drift.live_base_sha,
+                                           run_git=runner)
+    required = bool(drift.drifted or merge.conflicting)
+    requirement = load_integration_requirement(conn, attempt_id)
+    problems = tuple(drift.problems) + tuple(merge.problems)
+    status = IntegrationStatus(
+        attempt_id=attempt_id, task_id=task.id, project_id=task.project_id,
+        branch=allocation.branch,
+        recorded_base_sha=allocation.base_sha,
+        live_base_sha=drift.live_base_sha, base_drift=drift.drifted,
+        merge_status=merge.status, conflict_files=merge.conflict_files,
+        integration_required=required,
+        integration_task_id=requirement[0] if requirement else None,
+        problems=problems)
+    if audit:
+        payload = _canonical_json({
+            "attempt_id": attempt_id, "branch": status.branch,
+            "conflict_files": list(status.conflict_files),
+            "integration_required": required,
+            "integration_task_id": status.integration_task_id,
+            "live_base_sha": status.live_base_sha,
+            "merge_status": status.merge_status, "problems": list(problems),
+            "project_id": status.project_id,
+            "recorded_base_sha": status.recorded_base_sha,
+            "schema_version": DELIVERY_CONTRACT_VERSION,
+            "source_task_id": task.id,
+        })
+        events.append_event_idempotent(
+            conn, INTEGRATION_CHECK_EVENT_KIND, project_id=task.project_id,
+            task_id=task.id, attempt_id=attempt_id, payload_json=payload,
+            event_id=_integration_check_event_id(payload), clock=clock)
+    return status
+
+
+def ensure_integration_task(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    run_git: GitRunner | None = None,
+    clock: Clock | None = None,
+) -> tuple[IntegrationStatus, domain.Task | None, bool]:
+    """Detection + the explicit, idempotent integration Task when required.
+
+    Returns ``(status, task, created)``.  When integration is not required no
+    Task is created (``task=None, created=False``) — but if a requirement was
+    EVER recorded it is still returned (the Task stands until a human closes
+    it; detection never auto-cancels).  The requirement event and the Task
+    commit in one transaction: a crash leaves either both or neither, and a
+    retry converges onto the same deterministic Task id.  Conflicts are only
+    ever REPORTED here — nothing merges, rebases, or overwrites.
+    """
+    runner = _AuditedRunner(run_git or _default_run_git)
+    status = check_integration_state(conn, attempt_id, run_git=runner,
+                                     clock=clock)
+    existing = load_integration_requirement(conn, attempt_id)
+    if status.integration_task_id is None and existing is not None:
+        # A requirement predates this pass (e.g. drift since healed).
+        return status, domain.get_task(conn, existing[0]), False
+    if not status.integration_required:
+        return status, None, False
+
+    source_task = domain.get_task(conn, status.task_id)
+    integration_task_id = _integration_task_id(attempt_id)
+    with _tx(conn):
+        raced = load_integration_requirement(conn, attempt_id)
+        if raced is not None:
+            return status, domain.get_task(conn, raced[0]), False
+        trigger = ("merge_conflict" if status.conflict_files else "base_drift")
+        acceptance = [
+            (f"resolve {status.merge_status} between {status.branch} and live"
+             f" base {status.live_base_sha}" if status.conflict_files else
+             f"reintegrate {status.branch} onto live base"
+             f" {status.live_base_sha}"),
+            ("re-verify the integrated result and re-deliver with fresh"
+             " evidence; never force-overwrite"),
+        ]
+        task = domain.create_task(
+            conn, source_task.project_id,
+            f"Integrate {source_task.title} after {trigger}",
+            description=(
+                f"M4-06 integration follow-up for attempt {attempt_id} "
+                f"(branch {status.branch}): recorded base "
+                f"{status.recorded_base_sha}, live base "
+                f"{status.live_base_sha}, merge probe {status.merge_status}"
+                + (f"; conflicting paths: "
+                   f"{', '.join(status.conflict_files)}"
+                   if status.conflict_files else "")
+                + ". Integration is explicit human-directed work: this Task "
+                  "never authorizes automatic merges or overwrites."),
+            acceptance_json=json.dumps(acceptance, ensure_ascii=False),
+            ownership_json=json.dumps(list(_allocation_claims(
+                conn, attempt_id))),
+            risk="high",
+            id_factory=_FixedIdFactory(integration_task_id),
+            clock=clock,
+        )
+        payload = _canonical_json({
+            "attempt_id": attempt_id,
+            "integration_task_id": task.id,
+            "project_id": source_task.project_id,
+            "schema_version": DELIVERY_CONTRACT_VERSION,
+            "source_task_id": source_task.id,
+            "trigger": trigger,
+        })
+        event, _inserted = events.append_event_idempotent(
+            conn, INTEGRATION_REQUIRED_EVENT_KIND,
+            project_id=source_task.project_id, task_id=source_task.id,
+            attempt_id=attempt_id, payload_json=payload,
+            event_id=_integration_required_event_id(attempt_id), clock=clock)
+        if event.event_id != _integration_required_event_id(attempt_id):
+            raise StorageError(
+                "integration requirement did not persist as expected;"
+                " storage invariant broken")
+    return status, task, True
+
+
+def _allocation_claims(conn: TeamCraftConnection,
+                       attempt_id: str) -> tuple[str, ...]:
+    return worktrees.require_allocation(conn, attempt_id).claims
+
+
+# ---------------------------------------------------------------------------
+# Evidence-gated cleanup eligibility + safe release
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CleanupEligibility:
+    """Whether one workspace may be released, and why not if it may not."""
+
+    attempt_id: str
+    eligible: bool
+    state: str   # cleaned | eligible | refused
+    reasons: tuple[str, ...]
+    cleaned: worktrees.WorktreeCleanedRecord | None
+
+
+def _current_delivery_facts(
+    conn: TeamCraftConnection, task: domain.Task, attempt_id: str, *,
+    run_git: GitRunner, live_git: bool = True,
+) -> tuple[list[str], str | None, str]:
+    """(problems, delivered commit sha, delivery mode) for the DONE gate.
+
+    A DONE ship Task must still stand on a CURRENT evidence chain:
+    ``local_only`` needs the accepted, still-current Approval on exactly the
+    bound Commit; ``direct_pr`` needs merged evidence whose approval chain is
+    current (evaluated without live gh calls so restart has no network
+    dependency); other modes have no cleanup story in this milestone and are
+    refused fail-closed.  ``live_git=False`` (reconcile) keeps every DURABLE
+    pin but skips workspace-bound re-proofs — the workspace is already gone,
+    and the effect-time branch-tip re-proof covers commit integrity.
+    """
+    problems: list[str] = []
+    policy = _policy_of(task)
+    mode = str(policy.get("delivery") or "")
+    ship = load_ship_evidence(conn, attempt_id)
+    if mode == "local_only":
+        if ship is None:
+            problems.append("ship-evidence-missing")
+            return problems, None, mode
+        approval = load_delivery_approval(conn, ship.id)
+        if approval is None:
+            problems.append("approval-missing")
+        elif approval.decision != "accept":
+            problems.append(f"approval-{approval.decision}")
+        else:
+            fresh = delivery_approval_is_current(conn, approval,
+                                                live_git=live_git,
+                                                run_git=run_git)
+            if not fresh.ok:
+                problems.extend(fresh.problems)
+        return problems, ship.commit_sha, mode
+    if mode == "direct_pr":
+        merge = load_pr_merge_evidence(conn, task.id)
+        if merge is None or merge.attempt_id != attempt_id:
+            problems.append("merge-evidence-missing")
+            return problems, None, mode
+        if not merge.merged:
+            problems.append("merge-evidence-not-merged")
+        approval = load_pr_merge_approval(conn, merge.pr_evidence_id)
+        if approval is None or approval.decision != "approve":
+            problems.append("merge-approval-missing")
+        else:
+            fresh = pr_merge_approval_is_current(conn, approval, live_gh=False)
+            if not fresh.ok:
+                problems.extend(fresh.problems)
+        return problems, merge.head_sha, mode
+    problems.append(f"delivery-mode-{mode or 'unset'}-not-cleanup-supported")
+    return problems, None, mode
+
+
+def evaluate_cleanup_eligibility(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    run_git: GitRunner | None = None,
+    workspace_expected: bool = True,
+    live_git: bool = True,
+) -> CleanupEligibility:
+    """The full CLEANABLE + DONE + evidence + identity matrix, read-only.
+
+    Nothing is deleted here; every failing check contributes a stable reason
+    tag.  Dirty, unmerged, unknown, unregistered, foreign, moved, still
+    running, undelivered, unapproved, or DONE-but-stale workspaces are all
+    PRESERVED (``eligible=False``).
+
+    ``workspace_expected=False`` (reconcile) admits a MISSING workspace — the
+    crash-after-effect window — and with it ``live_git=False`` keeps only the
+    durable evidence pins; the branch-tip re-proof still runs.
+    """
+    runner = _AuditedRunner(run_git or _default_run_git)
+    allocation = worktrees.load_allocation(conn, attempt_id)
+    if allocation is None:
+        return CleanupEligibility(attempt_id=attempt_id, eligible=False,
+                                  state="refused",
+                                  reasons=("no-allocation",), cleaned=None)
+    cleaned = worktrees.load_cleaned_record(conn, attempt_id)
+    if cleaned is not None:
+        return CleanupEligibility(attempt_id=attempt_id, eligible=True,
+                                  state="cleaned", reasons=("already-cleaned",),
+                                  cleaned=cleaned)
+    reasons: list[str] = []
+    attempt = domain.get_attempt(conn, attempt_id)
+    if attempt.status not in domain.TERMINAL_ATTEMPT_STATUSES:
+        reasons.append(f"attempt-{attempt.status}")
+    if worktrees.lifecycle_state(conn, attempt_id) != "cleanable":
+        reasons.append("worktree-not-cleanable")
+    task = domain.get_task(conn, allocation.task_id)
+    if task.status != "done":
+        reasons.append(f"delivery-task-{task.status}")
+        return CleanupEligibility(attempt_id=attempt_id, eligible=False,
+                                  state="refused",
+                                  reasons=tuple(reasons), cleaned=None)
+    if not os.path.exists(allocation.worktree_path):
+        # The workspace is already gone.  A plain cleanup must NOT fabricate
+        # the fact (something outside our flow removed it); only reconcile
+        # may adopt — and only when every DURABLE fact re-proves and the
+        # branch still pins exactly the delivered Commit.
+        if workspace_expected:
+            reasons.append("workspace-missing")
+        else:
+            registered = worktrees._registered_worktrees(
+                runner, allocation.repo_root)
+            if os.path.realpath(allocation.worktree_path) in registered:
+                reasons.append("workspace-unpruned-registration")
+        delivery_problems, commit_sha, _mode = _current_delivery_facts(
+            conn, task, attempt_id, run_git=runner, live_git=False)
+        reasons.extend(delivery_problems)
+        if commit_sha is not None:
+            tip = worktrees.branch_sha(runner, allocation.repo_root,
+                                      allocation.branch)
+            if tip != commit_sha:
+                reasons.append(
+                    f"undelivered-commits: branch tip {tip!r} != delivered "
+                    f"{commit_sha!r}")
+        if reasons:
+            return CleanupEligibility(attempt_id=attempt_id, eligible=False,
+                                      state="refused", reasons=tuple(reasons),
+                                      cleaned=None)
+        return CleanupEligibility(attempt_id=attempt_id, eligible=True,
+                                  state="eligible", reasons=(), cleaned=None)
+
+    delivery_problems, commit_sha, _mode = _current_delivery_facts(
+        conn, task, attempt_id, run_git=runner, live_git=live_git)
+    reasons.extend(delivery_problems)
+    if not reasons:
+        # Identity + cleanliness + no undelivered commits, live.
+        try:
+            worktrees.validate_worktree_identity(
+                conn, attempt_id, run_git=runner)
+        except (worktrees.WorktreeIdentityError, workspaces.GitStateError,
+               StorageError, NotFoundError) as exc:
+            kind = getattr(exc, "kind", None) or "identity-unreadable"
+            reasons.append(f"identity-{kind}")
+            reasons.append(f"identity-detail: {exc}")
+        else:
+            try:
+                state = workspaces.collect_workspace_state(
+                    allocation.worktree_path, run_git=runner)
+            except workspaces.GitStateError as exc:
+                reasons.append(f"git-state: {exc}")
+            else:
+                if state.changes:
+                    preview = ", ".join(entry.path for entry in state.changes[:5])
+                    reasons.append(
+                        f"workspace-dirty({len(state.changes)}): {preview}")
+                tip = worktrees.branch_sha(runner, allocation.repo_root,
+                                          allocation.branch)
+                if commit_sha is not None and tip != commit_sha:
+                    reasons.append(
+                        f"undelivered-commits: branch tip {tip!r} != "
+                        f"delivered {commit_sha!r}")
+    if reasons:
+        return CleanupEligibility(attempt_id=attempt_id, eligible=False,
+                                  state="refused", reasons=tuple(reasons),
+                                  cleaned=None)
+    return CleanupEligibility(attempt_id=attempt_id, eligible=True,
+                              state="eligible", reasons=(), cleaned=None)
+
+
+def _refuse_cleanup(conn: TeamCraftConnection, attempt_id: str,
+                    reasons: tuple[str, ...], *, clock: Clock | None) -> None:
+    """Durable audit fact for a refused cleanup (never silent)."""
+    allocation = worktrees.load_allocation(conn, attempt_id)
+    task_id = allocation.task_id if allocation is not None else None
+    payload = _canonical_json({
+        "attempt_id": attempt_id,
+        "project_id": allocation.project_id if allocation else None,
+        "reasons": list(reasons),
+        "schema_version": DELIVERY_CONTRACT_VERSION,
+        "task_id": task_id,
+    })
+    events.append_event(
+        conn, CLEANUP_REFUSED_EVENT_KIND,
+        project_id=allocation.project_id if allocation else None,
+        task_id=task_id, attempt_id=attempt_id, payload_json=payload,
+        clock=clock)
+
+
+def cleanup_attempt_worktree(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    lease: leader.Lease,
+    run_git: GitRunner | None = None,
+    clock: Clock | None = None,
+    reconcile: bool = False,
+) -> dict[str, Any]:
+    """Release exactly the CLEANABLE workspace when the gate is fully green.
+
+    Order: fence on the project Leader lease → full eligibility matrix →
+    delivered Commit re-derived from durable evidence → guarded removal in
+    :func:`teamcraft.worktrees.finalize_cleaned_worktree` (exact identity +
+    clean + branch-tip re-proof at effect time; ``git worktree remove``
+    without force; deterministic CLEANED fact; crash-after-effect adopted
+    when ``reconcile=True`` — or reported for reconcile otherwise).  Every
+    refusal lands ``worktree_cleanup_refused`` audit and preserves the scene.
+    """
+    runner = _AuditedRunner(run_git or _default_run_git)
+    attempt_id = require_entity_id(attempt_id)
+    allocation = worktrees.require_allocation(conn, attempt_id)
+    leader.require_project_lease(conn, lease, allocation.project_id,
+                                 clock=clock)
+    eligibility = evaluate_cleanup_eligibility(
+        conn, attempt_id, run_git=runner,
+        workspace_expected=not reconcile, live_git=not reconcile)
+    if eligibility.state == "cleaned":
+        assert eligibility.cleaned is not None
+        return {"attempt_id": attempt_id, "disposition": "replayed",
+                "cleaned": _cleaned_dict(eligibility.cleaned)}
+    if not eligibility.eligible:
+        _refuse_cleanup(conn, attempt_id, eligibility.reasons, clock=clock)
+        raise DeliveryRefusal(
+            "settled" if "already-cleaned" in eligibility.reasons else "drift",
+            "cleanup refused for attempt"
+            f" {attempt_id}: " + "; ".join(eligibility.reasons))
+
+    task = domain.get_task(conn, allocation.task_id)
+    ship = load_ship_evidence(conn, attempt_id)
+    commit = load_commit_evidence(conn, attempt_id)
+    mode = str(_policy_of(task).get("delivery") or "")
+    if mode == "direct_pr":
+        merge = load_pr_merge_evidence(conn, task.id)
+        commit_sha = merge.head_sha if merge is not None else None
+    else:
+        commit_sha = (ship.commit_sha if ship is not None
+                     else (commit.commit_sha if commit is not None else None))
+    if commit_sha is None:
+        reasons = ("delivered-commit-unresolvable",)
+        _refuse_cleanup(conn, attempt_id, reasons, clock=clock)
+        raise DeliveryRefusal("ambiguous",
+                             f"cleanup refused for attempt {attempt_id}:"
+                             " delivered commit could not be derived from"
+                             " durable evidence")
+    try:
+        record, disposition = worktrees.finalize_cleaned_worktree(
+            conn, attempt_id, commit_sha=commit_sha, delivery_mode=mode,
+            run_git=runner, clock=clock)
+    except (IllegalTransitionError, StorageError) as exc:
+        # The effect did NOT land (git refused / facts moved): preserve the
+        # scene, audit the failure, and re-raise verbatim — the same call
+        # succeeds (or converges onto CLEANED) once the cause is fixed.
+        _refuse_cleanup(conn, attempt_id, (f"finalize-failed: {exc}",),
+                        clock=clock)
+        raise
+    return {"attempt_id": attempt_id, "disposition": disposition,
+            "cleaned": _cleaned_dict(record)}
+
+
+def reconcile_cleanup_worktree(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    lease: leader.Lease,
+    run_git: GitRunner | None = None,
+    clock: Clock | None = None,
+) -> dict[str, Any]:
+    """Recover a cleanup that landed without its fact (crash window).
+
+    Identical gates to :func:`cleanup_attempt_worktree`, plus adoption: when
+    the recorded path is already gone (removed by the interrupted run) and
+    every remaining identity/delivery fact re-proves, the CLEANED record is
+    written from disk truth (``disposition="adopted"``).  Path present but
+    the first cleanup pass failed → same fail-closed refusal as cleanup.
+    """
+    return cleanup_attempt_worktree(conn, attempt_id, lease=lease,
+                                   run_git=run_git, clock=clock,
+                                   reconcile=True)
+
+
+def _cleaned_dict(record: worktrees.WorktreeCleanedRecord) -> dict[str, Any]:
+    return {
+        "event_id": record.event_id,
+        "seq": record.seq,
+        "project_id": record.project_id,
+        "task_id": record.task_id,
+        "attempt_id": record.attempt_id,
+        "allocation_id": record.allocation_id,
+        "worktree_path": record.worktree_path,
+        "branch": record.branch,
+        "base_sha": record.base_sha,
+        "commit_sha": record.commit_sha,
+        "delivery_mode": record.delivery_mode,
+        "occurred_at": record.occurred_at,
+    }

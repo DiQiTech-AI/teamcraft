@@ -50,7 +50,26 @@ Design decisions pinned here:
   members on the project root.
 
 Out of scope (intentionally absent): M4-03 verifier, M4-04 commit evidence,
-M4-05 GitHub PR, M4-06 cleanup/deletion.
+M4-05 GitHub PR.
+
+M4-06 (this build) consumes the CLEANABLE marker with the pieces appended at
+the bottom of this module:
+
+* :func:`detect_base_drift` compares the recorded base with the LIVE base of
+  the repository (read-only plumbing; ``merge``/``rebase`` verbs are never
+  issued anywhere in this module);
+* :func:`check_merge_conflicts` proves via ``git merge-tree`` (a purely
+  in-memory integration probe — it never touches any worktree, index or ref)
+  whether the Attempt branch integrates into the live base cleanly, conflicts,
+  fast-forwards, or is already contained;
+* :func:`finalize_cleaned_worktree` performs the ONLY deletion this package
+  ever performs: ``git worktree remove`` (never ``--force``) of the EXACT
+  recorded workspace, gated by the caller (``teamcraft.delivery``) on the
+  full CLEANABLE + delivery-DONE + evidence-complete eligibility matrix, and
+  lands a deterministic, append-only ``worktree_cleaned`` fact.  The branch
+  and every commit on it are PRESERVED (the delivery record outlives the
+  workspace); a crash between removal and the fact is adopted by reconcile,
+  so retries converge instead of repeating or lying about the effect.
 """
 
 from __future__ import annotations
@@ -58,6 +77,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import timezone
 from typing import Any, Iterable
@@ -85,20 +105,39 @@ from .workspaces import GitRunner
 
 __all__ = [
     "ALLOCATED_EVENT_KIND",
+    "CLEANED_EVENT_KIND",
     "CLEANABLE_EVENT_KIND",
+    "FORBIDDEN_EFFECT_VERBS",
+    "INTEGRATION_CHECK_EVENT_KIND",
+    "INTEGRATION_REQUIRED_EVENT_KIND",
+    "MERGE_STATUS_ANCESTOR",
+    "MERGE_STATUS_CLEAN",
+    "MERGE_STATUS_CONFLICT",
+    "MERGE_STATUS_EMPTY",
+    "MERGE_STATUS_FAST_FORWARD",
+    "MERGE_STATUS_UNKNOWN",
     "WORKTREE_NAMESPACE_DIR",
     "WORKTREES_CONTRACT_VERSION",
+    "BaseDrift",
+    "MergeCheck",
     "WorktreeAllocation",
+    "WorktreeCleanedRecord",
     "WorktreeIdentityError",
     "WorktreeStatus",
     "allocate_attempt_worktree",
+    "branch_sha",
+    "check_merge_conflicts",
     "claim_worktree",
+    "detect_base_drift",
     "discover_allocations",
+    "finalize_cleaned_worktree",
     "inspect_worktree",
     "lifecycle_state",
     "load_allocation",
+    "load_cleaned_record",
     "mark_worktree_cleanable",
     "require_allocation",
+    "validate_worktree_identity",
     "worktree_branch",
     "worktree_path_for",
 ]
@@ -110,6 +149,10 @@ WORKTREES_CONTRACT_VERSION = 1
 #: Immutable lifecycle records ride the append-only ``events`` stream.
 ALLOCATED_EVENT_KIND = "worktree_allocated"
 CLEANABLE_EVENT_KIND = "worktree_cleanable"
+
+#: M4-06 durable cleanup fact (one per Attempt; deterministic event id, so
+#: replays converge onto the single record and can never duplicate it).
+CLEANED_EVENT_KIND = "worktree_cleaned"
 
 #: Resource namespace inside the project repository (already gitignored).
 WORKTREE_NAMESPACE_DIR = ".teamcraft/worktrees"
@@ -508,21 +551,47 @@ def _verify_identity(conn: TeamCraftConnection, allocation: WorktreeAllocation,
         _MARKER_TASK: allocation.task_id,
     }
     present = {key: value for key, value in markers.items() if value is not None}
-    if present:
-        mismatched = {key: (value, expected[key])
-                      for key, value in present.items() if value != expected[key]}
-        if mismatched:
-            detail = ", ".join(f"{key}={found!r}!={want!r}"
-                              for key, (found, want) in sorted(mismatched.items()))
-            raise WorktreeIdentityError(
-                "foreign",
-                f"worktree {path!r} carries identity markers that do not match "
-                f"the allocation ({detail}); foreign or ambiguous identity — "
-                "never adopted, never cleanable")
-    elif repair:
+    mismatched = {key: (value, expected[key])
+                  for key, value in present.items() if value != expected[key]}
+    if mismatched:
+        detail = ", ".join(f"{key}={found!r}!={want!r}"
+                          for key, (found, want) in sorted(mismatched.items()))
+        raise WorktreeIdentityError(
+            "foreign",
+            f"worktree {path!r} carries identity markers that do not match "
+            f"the allocation ({detail}); foreign or ambiguous identity — "
+            "never adopted, never cleanable")
+    missing = tuple(sorted(set(expected) - set(present)))
+    if missing and not present and repair:
         # Everything else matches exactly (path, repo, registration, branch):
         # our own workspace whose worktree-scoped config was lost.  Re-pin it.
         _write_markers(runner, path, allocation)
+    elif missing:
+        raise WorktreeIdentityError(
+            "markers-missing",
+            f"worktree {path!r} lacks required identity marker(s) "
+            f"{', '.join(missing)}; read-only inspection never repairs or "
+            "adopts incomplete identity")
+
+
+def validate_worktree_identity(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    run_git: GitRunner | None = None,
+) -> WorktreeAllocation:
+    """Validate the exact recorded identity without repairing any marker.
+
+    This is the inspection-only counterpart to :func:`claim_worktree`.
+    Missing, partial, foreign, or mismatched markers are reported as identity
+    errors and no Git config, event, or database state is written.
+    """
+
+    runner = run_git or _default_run_git
+    allocation = require_allocation(conn, attempt_id)
+    verify_repo_root(allocation.repo_root)
+    _verify_identity(conn, allocation, runner, repair=False)
+    return allocation
 
 
 def claim_worktree(conn: TeamCraftConnection, attempt_id: str, *,
@@ -821,3 +890,475 @@ def mark_worktree_cleanable(
             f"cleanable record for attempt {attempt_id} did not persist as"
             " expected; storage invariant broken")
     return allocation
+
+
+# ---------------------------------------------------------------------------
+# M4-06 — base drift + merge-conflict detection (read-only Git probes)
+# ---------------------------------------------------------------------------
+
+#: Merge-check statuses (stable machine vocabulary).
+MERGE_STATUS_CLEAN = "clean"              # merges without conflict (divergent)
+MERGE_STATUS_FAST_FORWARD = "fast_forward"  # branch strictly ahead of base
+MERGE_STATUS_ANCESTOR = "ancestor"      # branch content already in base
+MERGE_STATUS_EMPTY = "empty"            # branch == base; nothing to integrate
+MERGE_STATUS_CONFLICT = "conflict"      # proven conflicting (never auto-merged)
+MERGE_STATUS_UNKNOWN = "unknown"        # undecidable -> fail closed, not clean
+
+#: Integration requirement event kinds (append-only audit stream).
+INTEGRATION_CHECK_EVENT_KIND = "integration_check"
+INTEGRATION_REQUIRED_EVENT_KIND = "integration_required"
+
+#: Git verbs the M4-06 surface may NEVER issue (same posture as M4-04: no
+#: push/merge/rebase/history rewrite; cleanup's only effect verb is the
+#: narrowly-guarded ``worktree remove`` below).
+FORBIDDEN_EFFECT_VERBS = frozenset({
+    "push", "pull", "fetch", "clone", "merge", "rebase", "reset", "clean",
+    "checkout", "switch", "restore", "prune", "gc", "filter-branch", "tag",
+    "notes", "mv",
+})
+
+
+@dataclass(frozen=True)
+class BaseDrift:
+    """Recorded base vs the repository's live base for one Attempt."""
+
+    attempt_id: str
+    branch: str
+    worktree_path: str
+    recorded_base_sha: str
+    live_base_sha: str | None   # None when the live base is unreadable
+    drifted: bool               # True only when live base PROVES movement
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeCheck:
+    """Whether the Attempt branch provably integrates into ``base_sha``."""
+
+    attempt_id: str
+    branch: str
+    base_sha: str | None
+    head_sha: str | None
+    status: str   # MERGE_STATUS_*
+    conflict_files: tuple[str, ...]
+    problems: tuple[str, ...]
+
+    @property
+    def clean(self) -> bool:
+        return self.status in (MERGE_STATUS_CLEAN, MERGE_STATUS_FAST_FORWARD,
+                              MERGE_STATUS_ANCESTOR, MERGE_STATUS_EMPTY)
+
+    @property
+    def conflicting(self) -> bool:
+        return self.status == MERGE_STATUS_CONFLICT
+
+
+def branch_sha(runner: GitRunner, repo_root: str, branch: str) -> str | None:
+    """Tip of ``branch`` inside ``repo_root`` (None when the ref is absent)."""
+
+    return _try_git(runner, ["rev-parse", "--verify", f"refs/heads/{branch}"],
+                   repo_root)
+
+
+def detect_base_drift(conn: TeamCraftConnection, attempt_id: str, *,
+                     run_git: GitRunner | None = None) -> BaseDrift:
+    """Compare the recorded base against the repository's live HEAD.
+
+    Read-only (``rev-parse`` only).  An unreadable live base is reported as
+    ``problems`` with ``drifted=False`` — callers must treat undecidable as
+    never-clean when making destructive decisions.
+    """
+
+    runner = run_git or _default_run_git
+    allocation = require_allocation(conn, attempt_id)
+    problems: tuple[str, ...] = ()
+    live: str | None = None
+    try:
+        root = verify_repo_root(allocation.repo_root)
+        live = _try_git(runner, ["rev-parse", "--verify", "HEAD"], root)
+        if live is None:
+            problems = ("live-base-unreadable",)
+    except GitStateError as exc:
+        problems = (f"live-base-unreadable: {exc}",)
+    drifted = live is not None and live != allocation.base_sha
+    return BaseDrift(
+        attempt_id=attempt_id, branch=allocation.branch,
+        worktree_path=allocation.worktree_path,
+        recorded_base_sha=allocation.base_sha, live_base_sha=live,
+        drifted=drifted, problems=problems)
+
+
+def _merge_tree_raw(runner: GitRunner, base: str, head: str,
+                   cwd: str) -> tuple[int | None, str, str]:
+    """Run ``git merge-tree --write-tree`` and recover its exit posture.
+
+    Returns ``(exit_code, stdout_text, error_text)``.  ``git merge-tree``
+    exits 0 for a clean merge and 1 for conflicts (both write a real tree
+    object; nothing in the worktree/index/refs moves).  A runner whose
+    failure text carries no exit code yields ``None`` — the caller must then
+    report UNKNOWN, never CLEAN.
+    """
+
+    try:
+        out = runner(["merge-tree", "--write-tree", "--name-only", base, head],
+                     cwd)
+        return 0, _text(out), ""
+    except GitStateError as exc:
+        text = str(exc)
+        match = re.search(r"exit (\d+)", text)
+        return (int(match.group(1)) if match else None), "", text
+
+
+def _conflict_paths(runner: GitRunner, ours: str, theirs: str, ancestor: str,
+                   cwd: str) -> tuple[str, ...]:
+    """Best-effort conflicted-path list via the legacy merge-tree form.
+
+    The legacy ``git merge-tree <ours> <theirs> <ancestor>`` form exits 0
+    even with conflicts and prints them to stdout ("changed in both" blocks
+    whose ``base/our/their`` lines carry ``mode oid path``).  Diagnostics
+    only — the verdict itself came from the ``--write-tree`` exit code.
+    """
+
+    try:
+        raw = runner(["merge-tree", ours, theirs, ancestor], cwd)
+    except GitStateError:
+        return ()
+    paths: list[str] = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        match = re.match(r"^\s+(?:our|their)\s+\S+\s+\S+\s+(\S+)\s*$", line)
+        if match and match.group(1) not in paths:
+            paths.append(match.group(1))
+    return tuple(paths[:20])
+
+
+def check_merge_conflicts(conn: TeamCraftConnection, attempt_id: str, *,
+                         base_sha: str | None = None,
+                         run_git: GitRunner | None = None) -> MergeCheck:
+    """Prove whether the Attempt branch integrates into ``base_sha``.
+
+    ``base_sha`` defaults to the repository's live HEAD.  Fast-foward /
+    already-ancestor / empty cases need no merge simulation at all; a truly
+    divergent branch is probed with ``git merge-tree --write-tree`` (purely
+    in-memory).  Exit 0 -> CLEAN, exit 1 -> CONFLICT (with best-effort path
+    diagnostics), anything else -> UNKNOWN.  Nothing is ever merged,
+    overwritten, or written to disk here.
+    """
+
+    runner = run_git or _default_run_git
+    allocation = require_allocation(conn, attempt_id)
+    root = verify_repo_root(allocation.repo_root)
+    head = branch_sha(runner, root, allocation.branch)
+    base = base_sha or _try_git(runner, ["rev-parse", "--verify", "HEAD"],
+                                root)
+    if head is None:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=None,
+                         status=MERGE_STATUS_UNKNOWN, conflict_files=(),
+                         problems=("attempt-branch-missing",))
+    if base is None:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=None, head_sha=head,
+                         status=MERGE_STATUS_UNKNOWN, conflict_files=(),
+                         problems=("live-base-unreadable",))
+    if head == base:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head, status=MERGE_STATUS_EMPTY,
+                         conflict_files=(), problems=())
+    merge_base = _try_git(runner, ["merge-base", base, head], root)
+    if merge_base == base:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head,
+                         status=MERGE_STATUS_FAST_FORWARD, conflict_files=(),
+                         problems=())
+    if merge_base == head:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head,
+                         status=MERGE_STATUS_ANCESTOR, conflict_files=(),
+                         problems=())
+    if merge_base is None:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head,
+                         status=MERGE_STATUS_UNKNOWN, conflict_files=(),
+                         problems=("merge-base-unreadable",))
+    exit_code, _out, err = _merge_tree_raw(runner, base, head, root)
+    if exit_code == 0:
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head, status=MERGE_STATUS_CLEAN,
+                         conflict_files=(), problems=())
+    if exit_code == 1:
+        files = _conflict_paths(runner, head, base, merge_base, root)
+        return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                         base_sha=base, head_sha=head,
+                         status=MERGE_STATUS_CONFLICT, conflict_files=files,
+                         problems=(f"merge-tree-conflict: {err[:200]}",))
+    return MergeCheck(attempt_id=attempt_id, branch=allocation.branch,
+                     base_sha=base, head_sha=head, status=MERGE_STATUS_UNKNOWN,
+                     conflict_files=(),
+                     problems=((f"merge-tree-undecidable(exit={exit_code}):"
+                               f" {err[:200]}"),))
+
+
+# ---------------------------------------------------------------------------
+# M4-06 — CLEANABLE -> CLEANED (the one narrowly-guarded deletion surface)
+# ---------------------------------------------------------------------------
+
+
+_CLEANED_PAYLOAD_FIELDS = (
+    "allocation_id", "attempt_id", "base_sha", "branch", "claims_digest",
+    "commit_sha", "delivery_mode", "project_id", "repo_root",
+    "schema_version", "source", "task_id", "worktree_path",
+)
+
+
+@dataclass(frozen=True)
+class WorktreeCleanedRecord:
+    """One immutable CLEANED fact: the workspace was released, refs kept."""
+
+    seq: int
+    event_id: str
+    allocation_id: str
+    project_id: str
+    task_id: str
+    attempt_id: str
+    repo_root: str
+    worktree_path: str
+    branch: str
+    base_sha: str
+    commit_sha: str
+    delivery_mode: str
+    claims_digest: str
+    source: str            # created | reconciled | replayed
+    occurred_at: str
+
+
+def _cleaned_event_id(attempt_id: str) -> str:
+    return "evt-wtkd-" + _sha256_hex(f"worktree-cleaned|{attempt_id}")[:40]
+
+
+def _cleaned_payload(allocation: WorktreeAllocation, *, commit_sha: str,
+                     delivery_mode: str) -> str:
+    # Deliberately stable: no clock/no crash-position marker, so a retry or a
+    # reconcile converges onto the SAME event row (append_event_idempotent
+    # only ever refuses when *content* differs, which proves two genuinely
+    # different facts, not a replay of one).
+    return _canonical_json({
+        "allocation_id": allocation.allocation_id,
+        "attempt_id": allocation.attempt_id,
+        "base_sha": allocation.base_sha,
+        "branch": allocation.branch,
+        "claims_digest": allocation.claims_digest,
+        "commit_sha": commit_sha,
+        "delivery_mode": delivery_mode,
+        "project_id": allocation.project_id,
+        "repo_root": allocation.repo_root,
+        "schema_version": WORKTREES_CONTRACT_VERSION,
+        "source": "cleanup",
+        "task_id": allocation.task_id,
+        "worktree_path": allocation.worktree_path,
+    })
+
+
+def _cleaned_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
+                     payload_json: str) -> WorktreeCleanedRecord:
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError) as exc:
+        raise StorageError(
+            f"worktree cleaned payload is not valid JSON (seq={seq}): {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != set(
+            _CLEANED_PAYLOAD_FIELDS):
+        raise StorageError(f"worktree cleaned payload has unexpected shape (seq={seq})")
+    if payload.get("schema_version") != WORKTREES_CONTRACT_VERSION:
+        raise StorageError(
+            f"unsupported worktree cleaned schema_version:"
+            f" {payload.get('schema_version')!r}")
+    strings = ("allocation_id", "attempt_id", "base_sha", "branch",
+               "commit_sha", "delivery_mode", "project_id", "repo_root",
+               "task_id", "worktree_path", "claims_digest", "source")
+    if not all(isinstance(payload.get(k), str) and payload[k] for k in strings):
+        raise StorageError(f"worktree cleaned binding fields are malformed (seq={seq})")
+    if payload["source"] != "cleanup":
+        raise StorageError(f"worktree cleaned source is invalid (seq={seq})")
+    for key in ("base_sha", "commit_sha"):
+        value = payload[key]
+        if not (len(value) in (40, 64) and all(
+                c in "0123456789abcdef" for c in value)):
+            raise StorageError(
+                f"worktree cleaned {key} is not a commit digest (seq={seq})")
+    digest = payload["claims_digest"]
+    if not (len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)):
+        raise StorageError(f"worktree cleaned claims digest malformed (seq={seq})")
+    if payload["branch"] != worktree_branch(payload["task_id"], payload["attempt_id"]):
+        raise StorageError(f"worktree cleaned branch is not the derived identity (seq={seq})")
+    if payload["worktree_path"] != worktree_path_for(payload["repo_root"], payload["attempt_id"]):
+        raise StorageError(f"worktree cleaned path is not the derived identity (seq={seq})")
+    row = conn.execute("SELECT occurred_at FROM events WHERE seq = ?",
+                      (seq,)).fetchone()
+    occurred_at = "" if row is None or row[0] is None else str(row[0])
+    return WorktreeCleanedRecord(
+        seq=seq, event_id=event_id, allocation_id=payload["allocation_id"],
+        project_id=payload["project_id"], task_id=payload["task_id"],
+        attempt_id=payload["attempt_id"], repo_root=payload["repo_root"],
+        worktree_path=payload["worktree_path"], branch=payload["branch"],
+        base_sha=payload["base_sha"], commit_sha=payload["commit_sha"],
+        delivery_mode=payload["delivery_mode"], claims_digest=digest,
+        source=payload["source"], occurred_at=occurred_at)
+
+
+def load_cleaned_record(conn: TeamCraftConnection,
+                        attempt_id: str) -> WorktreeCleanedRecord | None:
+    """The durable CLEANED fact for one Attempt (one per Attempt, ever)."""
+
+    require_entity_id(attempt_id)
+    row = _event_row(conn, CLEANED_EVENT_KIND, attempt_id)
+    if row is None:
+        return None
+    return _cleaned_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+def _cleanup_git(runner: GitRunner, args: list[str], cwd: str) -> str:
+    """The only Git effects M4-06 may issue: guarded ``worktree remove``.
+
+    ``--force``/``-f`` are refused unconditionally — Git's own refusal of a
+    dirty workspace is part of the safety story, never bypassed.
+    """
+
+    if args and args[0] == "worktree":
+        if len(args) < 2 or args[1] != "remove" or "-f" in args or "--force" in args:
+            raise StorageError(
+                "worktree cleanup only issues 'git worktree remove' without"
+                " force; refusing this command")
+        _git(runner, args, cwd)
+        return ""
+    if args and args[0] in FORBIDDEN_EFFECT_VERBS:
+        raise StorageError(
+            f"worktree cleanup never runs 'git {args[0]}' (no push/merge/"
+            "history rewrite/other deletion verbs are ever issued)")
+    return _git(runner, args, cwd)
+
+
+def finalize_cleaned_worktree(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    commit_sha: str,
+    delivery_mode: str,
+    run_git: GitRunner | None = None,
+    clock: Clock | None = None,
+) -> tuple[WorktreeCleanedRecord, str]:
+    """Release EXACTLY the recorded CLEANABLE workspace; keep every ref.
+
+    Returns ``(record, disposition)`` where disposition is
+    ``replayed`` (the durable CLEANED fact already existed), ``removed``
+    (this call performed the guarded ``git worktree remove``) or ``adopted``
+    (the removal had already landed but the fact did not — crash recovery
+    adopts the on-disk truth after re-proving every identity fact).
+
+    Safety (fail-closed, in order):
+    * CLEANED replays validate their binding against the live allocation and
+      converge onto the stored record;
+    * the allocation must still be CLEANABLE and its Attempt terminal;
+    * exact identity (path/registration/repo/branch; markers repaired only if
+      everything else matches): foreign, moved, dirty, or unmerged workspaces
+      are refused and PRESERVED;
+    * ``git worktree remove`` without ``--force`` lets Git itself refuse any
+      residue it sees;
+    * post-effect proof: the path is gone and deregistered, while the branch
+      ref still points at the delivered Commit (nothing is ever deleted from
+      Git history);
+    * one deterministic ``worktree_cleaned`` event per Attempt makes every
+      retry converge.
+    """
+
+    runner = run_git or _default_run_git
+    allocation = require_allocation(conn, attempt_id)
+    attempt = domain.get_attempt(conn, attempt_id)
+    if attempt.status not in domain.TERMINAL_ATTEMPT_STATUSES:
+        raise IllegalTransitionError(
+            f"attempt {attempt_id} is {attempt.status!r}; a non-terminal"
+            " Attempt's workspace is never removable",
+            entity="worktree", current="allocated", event="cleanup",
+            reason_code="ATTEMPT_NOT_TERMINAL")
+
+    existing = load_cleaned_record(conn, attempt_id)
+    if existing is not None:
+        if (existing.allocation_id != allocation.allocation_id
+                or existing.commit_sha != commit_sha
+                or existing.worktree_path != allocation.worktree_path
+                or existing.branch != allocation.branch):
+            raise StorageError(
+                f"cleaned record for attempt {attempt_id} does not bind this"
+                " allocation/commit; storage invariant broken")
+        return existing, "replayed"
+
+    if lifecycle_state(conn, attempt_id) != "cleanable":
+        raise IllegalTransitionError(
+            f"worktree for attempt {attempt_id} is not CLEANABLE; nothing may"
+            " be released", entity="worktree",
+            current=str(lifecycle_state(conn, attempt_id)), event="cleanup",
+            reason_code="WORKTREE_NOT_CLEANABLE")
+
+    root = verify_repo_root(allocation.repo_root)
+    tip = branch_sha(runner, root, allocation.branch)
+    if tip != commit_sha:
+        raise IllegalTransitionError(
+            f"branch {allocation.branch!r} tip is {tip!r}, not the delivered"
+            f" commit {commit_sha!r}; undelivered commits are never cleaned"
+            " away", entity="worktree", current="branch-moved",
+            event="cleanup", reason_code="UNDELIVERED_COMMITS")
+
+    path = allocation.worktree_path
+    effect = "adopted"
+    if os.path.exists(path):
+        # Live workspace: it must be exactly ours, completely clean, and Git
+        # itself gets the final veto (no force, ever).
+        _verify_identity(conn, allocation, runner, repair=False)
+        try:
+            workspace = collect_workspace_state(path, run_git=runner)
+        except GitStateError as exc:
+            raise StorageError(
+                f"worktree {path!r} has ambiguous git state ({exc}); cleanup"
+                " refuses and preserves the scene") from exc
+        if workspace.changes:
+            preview = ", ".join(entry.path for entry in workspace.changes[:5])
+            raise IllegalTransitionError(
+                f"worktree {path!r} holds {len(workspace.changes)} uncommitted"
+                f" change(s) [{preview}]; a dirty scene is preserved and never"
+                " cleaned", entity="worktree", current="dirty",
+                event="cleanup", reason_code="WORKTREE_DIRTY")
+        try:
+            _cleanup_git(runner, ["worktree", "remove", path], root)
+        except (GitStateError, StorageError) as exc:
+            raise StorageError(
+                f"git refused to remove worktree {path!r} ({exc}); the"
+                " workspace is preserved and nothing was recorded") from exc
+        effect = "removed"
+    else:
+        # Crash-recovery adoption: the removal landed, the fact did not.
+        # Re-prove every fact reachable without the workspace.
+        registered = _registered_worktrees(runner, root)
+        if os.path.realpath(path) in registered:
+            raise StorageError(
+                f"path {path!r} is still registered with {root!r} while its"
+                " directory is gone; run 'git worktree prune' manually is NOT"
+                " performed automatically — investigate first")
+
+    if os.path.exists(path):
+        raise StorageError(
+            f"worktree {path!r} still exists after removal; refusing to"
+            " record CLEANED")
+    if branch_sha(runner, root, allocation.branch) != commit_sha:
+        raise StorageError(
+            f"branch {allocation.branch!r} moved during cleanup; refusing to"
+            " record CLEANED — preserved for diagnosis")
+
+    payload = _cleaned_payload(allocation, commit_sha=commit_sha,
+                              delivery_mode=delivery_mode)
+    event, _inserted = events.append_event_idempotent(
+        conn, CLEANED_EVENT_KIND, project_id=allocation.project_id,
+        task_id=allocation.task_id, attempt_id=attempt_id,
+        payload_json=payload, event_id=_cleaned_event_id(attempt_id),
+        clock=clock)
+    record = _cleaned_from_row(conn, int(event.seq), event.event_id, payload)
+    return record, effect

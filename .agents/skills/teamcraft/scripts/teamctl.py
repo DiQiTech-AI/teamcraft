@@ -3769,6 +3769,147 @@ def worktree_status(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# M4-06 integration conflict detection + evidence-gated safe cleanup CLI
+# ---------------------------------------------------------------------------
+
+
+def _require_m406_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M4-06."""
+
+    missing = sorted(name for name in (
+        "member_integration_check", "member_integration_ensure",
+        "member_integration_status", "member_workspace_cleanup",
+        "member_workspace_cleanup_status", "member_workspace_cleanup_reconcile",
+    ) if not hasattr(_adapter, name))
+    missing += sorted(name for name in (
+        "check_integration_state", "ensure_integration_task",
+        "evaluate_cleanup_eligibility", "cleanup_attempt_worktree",
+        "reconcile_cleanup_worktree",
+    ) if not hasattr(_delivery, name))
+    if missing or not hasattr(_worktrees, "CLEANED_EVENT_KIND"):
+        raise TeamctlError(
+            "the resolved TeamCraft core predates M4-06 integration/cleanup"
+            f" (missing: {', '.join(missing) or 'teamcraft.worktrees CLEANED'});"
+            " refresh the bundled core with scripts/install.sh or reinstall"
+            " the package")
+
+
+def integration_check(args: argparse.Namespace) -> int:
+    """Detect base drift / merge conflicts for one member (never merges)."""
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m406_core()
+        try:
+            result = _adapter.member_integration_check(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def integration_ensure(args: argparse.Namespace) -> int:
+    """Create (idempotently) the explicit integration Task when required."""
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m406_core()
+        try:
+            result = _adapter.member_integration_ensure(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def integration_status(args: argparse.Namespace) -> int:
+    """Latest recorded integration facts + requirement for one member."""
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m406_core()
+        try:
+            result = _adapter.member_integration_status(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_cleanup_status(args: argparse.Namespace) -> int:
+    """Cleanup eligibility verdict for one member's worktree (read-only)."""
+
+    store = StateStore(resolve_project_root(args.cwd))
+    conn = store._connect()
+    try:
+        _require_m406_core()
+        try:
+            result = _adapter.member_workspace_cleanup_status(conn, args.member)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+    finally:
+        conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_cleanup(args: argparse.Namespace) -> int:
+    """Release one CLEANABLE worktree under the full evidence gate (M4-06).
+
+    Refusals preserve the workspace and land durable audit facts; only a
+    CLEANABLE workspace whose delivery Task is DONE with complete current
+    evidence is removed (``git worktree remove``, never ``--force``).
+    """
+
+    _require_m406_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("worktree-cleanup", 60)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.member_workspace_cleanup(
+                conn, args.member, lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def worktree_cleanup_reconcile(args: argparse.Namespace) -> int:
+    """Adopt a landed-but-unrecorded cleanup (crash recovery, M4-06)."""
+
+    _require_m406_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    lease = store.acquire_lease("worktree-cleanup-reconcile", 60)
+    try:
+        conn = store._connect()
+        try:
+            result = _adapter.member_workspace_cleanup_reconcile(
+                conn, args.member, lease=lease)
+        except _CoreError as exc:
+            raise _core_refusal(exc) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # M4-03 worktree verifier CLI (parity with teamcraft.verification additions)
 # ---------------------------------------------------------------------------
 
@@ -4595,6 +4736,37 @@ def build_parser() -> argparse.ArgumentParser:
     add_cwd(worktree_status_parser)
     worktree_status_parser.add_argument("--member", required=True)
     worktree_status_parser.set_defaults(handler=worktree_status)
+
+    # M4-06: integration conflict detection + evidence-gated safe cleanup.
+    integration_check_parser = commands.add_parser("integration-check")
+    add_cwd(integration_check_parser)
+    integration_check_parser.add_argument("--member", required=True)
+    integration_check_parser.set_defaults(handler=integration_check)
+
+    integration_ensure_parser = commands.add_parser("integration-ensure")
+    add_cwd(integration_ensure_parser)
+    integration_ensure_parser.add_argument("--member", required=True)
+    integration_ensure_parser.set_defaults(handler=integration_ensure)
+
+    integration_status_parser = commands.add_parser("integration-status")
+    add_cwd(integration_status_parser)
+    integration_status_parser.add_argument("--member", required=True)
+    integration_status_parser.set_defaults(handler=integration_status)
+
+    cleanup_status_parser = commands.add_parser("worktree-cleanup-status")
+    add_cwd(cleanup_status_parser)
+    cleanup_status_parser.add_argument("--member", required=True)
+    cleanup_status_parser.set_defaults(handler=worktree_cleanup_status)
+
+    cleanup_parser = commands.add_parser("worktree-cleanup")
+    add_cwd(cleanup_parser)
+    cleanup_parser.add_argument("--member", required=True)
+    cleanup_parser.set_defaults(handler=worktree_cleanup)
+
+    cleanup_reconcile_parser = commands.add_parser("worktree-cleanup-reconcile")
+    add_cwd(cleanup_reconcile_parser)
+    cleanup_reconcile_parser.add_argument("--member", required=True)
+    cleanup_reconcile_parser.set_defaults(handler=worktree_cleanup_reconcile)
 
     profile_parser = commands.add_parser("verifier-profile-configure",
                                         aliases=["verifier-profile"])

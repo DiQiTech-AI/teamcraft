@@ -946,6 +946,212 @@ def member_workspace_status(
 
 
 # ---------------------------------------------------------------------------
+# M4-06 integration conflict detection + evidence-gated safe cleanup
+# ---------------------------------------------------------------------------
+
+
+def _integration_status_dto(status: delivery.IntegrationStatus) -> dict[str, Any]:
+    return {
+        "attempt_id": status.attempt_id,
+        "task_id": status.task_id,
+        "project_id": status.project_id,
+        "branch": status.branch,
+        "recorded_base_sha": status.recorded_base_sha,
+        "live_base_sha": status.live_base_sha,
+        "base_drift": status.base_drift,
+        "merge_status": status.merge_status,
+        "conflict_files": list(status.conflict_files),
+        "integration_required": status.integration_required,
+        "integration_task_id": status.integration_task_id,
+        "problems": list(status.problems),
+    }
+
+
+def _cleanup_eligibility_dto(
+        verdict: delivery.CleanupEligibility) -> dict[str, Any]:
+    return {
+        "attempt_id": verdict.attempt_id,
+        "eligible": verdict.eligible,
+        "state": verdict.state,
+        "reasons": list(verdict.reasons),
+        "cleaned": (delivery._cleaned_dict(verdict.cleaned)
+                    if verdict.cleaned is not None else None),
+    }
+
+
+def member_integration_check(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Detect base drift / merge conflicts for the member's workspace.
+
+    Read-only Git plumbing plus one digest-keyed ``integration_check`` audit
+    fact.  Conflicts are only ever REPORTED — this never merges, rebases, or
+    overwrites anything.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        return {"member": member, "role": role, "integration": None,
+                "note": "read-only members have no writable workspace to check"}
+    if attempt_id is None:
+        return {"member": member, "role": role, "integration": None,
+                "note": "member has no Attempt; nothing was branched"}
+    status = delivery.check_integration_state(conn, attempt_id,
+                                              run_git=run_git, clock=clock)
+    return {"member": member, "role": role,
+            "integration": _integration_status_dto(status)}
+
+
+def member_integration_ensure(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Detection + the explicit idempotent integration Task when required.
+
+    Same facts, never the effect: repeated calls return the SAME integration
+    Task (``created=False``); when nothing is required no Task appears.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no workspace to integrate")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing was branched")
+    status, task, created = delivery.ensure_integration_task(
+        conn, attempt_id, run_git=run_git, clock=clock)
+    return {"member": member, "role": role,
+            "integration": _integration_status_dto(status),
+            "integration_task": (None if task is None else {
+                "id": task.id, "title": task.title, "status": task.status,
+                "version": task.version, "kind": task.kind,
+                "risk": task.risk}),
+            "created": created}
+
+
+def member_integration_status(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+) -> dict[str, Any]:
+    """Latest recorded integration facts for the member (no new facts)."""
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only or attempt_id is None:
+        return {"member": member, "role": role, "integration": None,
+                "requirement": None}
+    row = conn.execute(
+        "SELECT seq, event_id, payload_json, occurred_at FROM events"
+        " WHERE kind = ? AND attempt_id = ? ORDER BY seq DESC LIMIT 1",
+        (delivery.INTEGRATION_CHECK_EVENT_KIND, attempt_id)).fetchone()
+    latest: Any = None
+    if row is not None:
+        try:
+            latest = json.loads(str(row[2]))
+        except (TypeError, json.JSONDecodeError):
+            latest = None
+    requirement = delivery.load_integration_requirement(conn, attempt_id)
+    if latest is None:
+        # Nothing observed yet: compute a live view without creating an audit
+        # fact.  Status endpoints are inspection-only; explicit check/ensure
+        # commands own durable observations.
+        status = delivery.check_integration_state(conn, attempt_id,
+                                                  run_git=run_git,
+                                                  audit=False)
+        return {"member": member, "role": role,
+                "integration": _integration_status_dto(status),
+                "requirement": None if requirement is None else {
+                    "integration_task_id": requirement[0],
+                    "event_id": requirement[1]}}
+    return {"member": member, "role": role, "integration": latest,
+            "requirement": None if requirement is None else {
+                "integration_task_id": requirement[0],
+                "event_id": requirement[1]}}
+
+
+def member_workspace_cleanup_status(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    run_git: Any = None,
+) -> dict[str, Any]:
+    """Why (not) the member's workspace may be released — read-only audit."""
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        return {"member": member, "role": role, "cleanup": None,
+                "note": "read-only members have no writable worktree to clean"}
+    if attempt_id is None:
+        return {"member": member, "role": role, "cleanup": None,
+                "note": "member has no Attempt; nothing was allocated"}
+    verdict = delivery.evaluate_cleanup_eligibility(conn, attempt_id,
+                                                   run_git=run_git)
+    return {"member": member, "role": role,
+            "cleanup": _cleanup_eligibility_dto(verdict)}
+
+
+def member_workspace_cleanup(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    lease: leader.Lease,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Evidence-gated release of the member's CLEANABLE worktree (M4-06).
+
+    Only a CLEANABLE workspace whose delivery Task is DONE on a current,
+    complete evidence chain and exact Git identity is ever removed; dirty,
+    unmerged, unknown, or mismatched scenes are refused (with durable audit)
+    and PRESERVED.  Branches and commits outlive the workspace; replays
+    converge onto the single CLEANED fact.
+    """
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has no writable worktree to"
+            " clean up")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing was allocated to clean")
+    result = delivery.cleanup_attempt_worktree(conn, attempt_id, lease=lease,
+                                              run_git=run_git, clock=clock)
+    return {"member": member, "role": role, **result}
+
+
+def member_workspace_cleanup_reconcile(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    lease: leader.Lease,
+    run_git: Any = None,
+    clock: Any = None,
+) -> dict[str, Any]:
+    """Adopt a cleanup effect whose fact never landed (crash recovery)."""
+
+    role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
+    if read_only:
+        raise RuntimeAdapterError(
+            f"member {member!r} is read-only and has nothing to reconcile")
+    if attempt_id is None:
+        raise RuntimeAdapterError(
+            f"member {member!r} has no Attempt; nothing was allocated")
+    result = delivery.reconcile_cleanup_worktree(conn, attempt_id, lease=lease,
+                                                run_git=run_git, clock=clock)
+    return {"member": member, "role": role, **result}
+
+
+# ---------------------------------------------------------------------------
 # M4-03 worktree verifier: pinned profile execution inside the Attempt worktree
 # ---------------------------------------------------------------------------
 
