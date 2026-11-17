@@ -5,7 +5,7 @@ import json
 import importlib.util
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -18,8 +18,8 @@ try:
 except ImportError:
     _WEB_OK = False
 
-from teamcraft import commands, domain, events, leader, recovery, storage
-from teamcraft.errors import ConflictError, IllegalTransitionError
+from teamcraft import commands, domain, events, leader, recovery, storage, worker_reports
+from teamcraft.errors import ConflictError, IllegalTransitionError, ValidationError
 
 
 TEAMCTL_PATH = (Path(__file__).resolve().parents[1]
@@ -446,6 +446,177 @@ class LegacyMissingReportRecoveryTests(unittest.TestCase):
             conn, "task-1", attempt_id="attempt-1", expected_version=3,
             actor="owner", reason="missing", idempotency_key="key", lease=lease)
         store.release_lease.assert_called_once_with(lease)
+
+
+    def test_stale_leader_lease_fails_closed_for_disposition_and_retry(self):
+        task, attempt = self.legacy()
+        stale = self.lease()
+        self.clock.value += timedelta(seconds=61)
+        current = leader.acquire_or_renew(
+            self.conn, leader.project_scope(self.project.id), "second-owner",
+            ttl_seconds=60, clock=self.clock,
+        )
+        before = self.counts()
+        with self.assertRaises(leader.StaleLeaderError):
+            recovery.disposition_legacy_missing_report(
+                self.conn, task.id, attempt_id=attempt.id,
+                expected_version=task.version, actor="owner",
+                reason="fenced out", idempotency_key="legacy-fenced",
+                lease=stale, clock=self.clock,
+            )
+        self.assertEqual(domain.get_task(self.conn, task.id), task)
+        self.assertEqual(self.counts(), before)
+        needs_human = recovery.disposition_legacy_missing_report(
+            self.conn, task.id, attempt_id=attempt.id,
+            expected_version=task.version, actor="owner",
+            reason="fenced out", idempotency_key="legacy-fenced",
+            lease=current, clock=self.clock,
+        )
+        self.assertEqual(
+            (needs_human.status, needs_human.version),
+            ("needs_human", task.version + 1),
+        )
+        before_retry = self.counts()
+        with self.assertRaises(leader.StaleLeaderError):
+            recovery.approve_retry(
+                self.conn, task.id, actor="owner", reason="retry",
+                idempotency_key="retry-fenced", lease=stale, clock=self.clock,
+            )
+        self.assertEqual(domain.get_task(self.conn, task.id), needs_human)
+        self.assertEqual(self.counts(), before_retry)
+        approved = recovery.approve_retry(
+            self.conn, task.id, actor="owner", reason="retry",
+            idempotency_key="retry-fenced", lease=current, clock=self.clock,
+        )
+        self.assertEqual(
+            (approved.status, approved.version),
+            ("ready", needs_human.version + 1),
+        )
+
+    def test_retry_refuses_final_report_appearing_after_disposition(self):
+        for label, outcome in (("valid", "completed"), ("corrupt", None)):
+            with self.subTest(label=label):
+                task, attempt = self.legacy()
+                before_attempt = domain.get_attempt(self.conn, attempt.id)
+                needs_human = self.disposition(task, attempt,
+                                             key=f"legacy-{label}-late-report")
+                if outcome is None:
+                    report_json, report_digest = "{}", "f" * 64
+                else:
+                    validated = worker_reports.parse_worker_report({
+                        "schema_version": 1, "task_id": task.id,
+                        "attempt_id": attempt.id, "task_version": task.version,
+                        "brief_digest": "b" * 64, "report_kind": "final",
+                        "outcome": outcome, "milestone_id": "final",
+                        "summary": "late final result", "artifact_digest": None,
+                    })
+                    report_digest = str(validated["report_digest"])
+                    report_json = json.dumps(validated, ensure_ascii=False,
+                                           sort_keys=True, separators=(",", ":"))
+                with storage.transaction(self.conn):
+                    self.conn.execute(
+                        "INSERT INTO worker_reports (attempt_id,task_id,task_version,"
+                        "brief_digest,report_kind,outcome,milestone_id,report_digest,"
+                        "artifact_digest,report_json,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (attempt.id, task.id, task.version, "b" * 64, "final",
+                         outcome, "final", report_digest, None, report_json,
+                         self.clock.now().isoformat()),
+                    )
+                before = self.counts()
+                expected = IllegalTransitionError if outcome else ValidationError
+                with self.assertRaises(expected):
+                    recovery.approve_retry(
+                        self.conn, task.id, actor="owner", reason="retry anyway",
+                        idempotency_key=f"retry-after-report-{label}",
+                        lease=self.lease(), clock=self.clock,
+                    )
+                self.assertEqual(domain.get_task(self.conn, task.id), needs_human)
+                self.assertEqual(domain.get_attempt(self.conn, attempt.id), before_attempt)
+                self.assertEqual(self.counts(), before)
+                self.assertEqual(self.conn.execute(
+                    "SELECT COUNT(*) FROM commands WHERE idempotency_key=?",
+                    (f"retry-after-report-{label}",),
+                ).fetchone()[0], 0)
+
+    def test_approved_retry_enables_fresh_attempt_and_never_done(self):
+        self.assertEqual(
+            domain.task_transition_targets(
+                "verifying", domain.LEGACY_ATTEMPT_INCOMPLETE_EVENT, "ship"),
+            ("needs_human",),
+        )
+        self.assertNotIn(
+            "done",
+            domain.task_transition_targets("needs_human", "human_reconciled", "ship"),
+        )
+        scout = domain.create_task(self.conn, self.project.id, "scout",
+                                  kind="scout", clock=self.clock)
+        scout = domain.apply_task_event(
+            self.conn, scout.id, "dependencies_satisfied",
+            expected_version=scout.version, clock=self.clock,
+        )
+        scout_attempt = domain.create_attempt(
+            self.conn, scout.id, expected_version=scout.version,
+            worktree_path=self.root, clock=self.clock,
+        )
+        domain.transition_attempt(self.conn, scout_attempt.id, "start", clock=self.clock)
+        domain.transition_attempt(self.conn, scout_attempt.id, "activated", clock=self.clock)
+        domain.transition_attempt(self.conn, scout_attempt.id, "finish", clock=self.clock)
+        scout = domain.apply_task_event(
+            self.conn, scout.id, "worker_reported_done",
+            expected_version=domain.get_task(self.conn, scout.id).version,
+            clock=self.clock,
+        )
+        scout_counts = self.counts()
+        with self.assertRaises(ValidationError):
+            self.disposition(scout, scout_attempt, key="legacy-scout-refused")
+        self.assertEqual(domain.get_task(self.conn, scout.id), scout)
+        self.assertEqual(self.counts(), scout_counts)
+        task, attempt = self.legacy()
+        before_attempt = domain.get_attempt(self.conn, attempt.id)
+        needs_human = self.disposition(task, attempt)
+        self.assertEqual(needs_human.status, "needs_human")
+        approved = recovery.approve_retry(
+            self.conn, task.id, actor="owner", reason="fresh bounded attempt",
+            idempotency_key="retry-ready", lease=self.lease(), clock=self.clock,
+        )
+        self.assertEqual(approved.status, "ready")
+        fresh = domain.create_attempt(
+            self.conn, task.id, expected_version=approved.version,
+            worktree_path=self.root, clock=self.clock,
+        )
+        self.assertEqual(fresh.attempt_no, 2)
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id), before_attempt)
+        running = domain.get_task(self.conn, task.id)
+        self.assertEqual((running.status, running.version), ("running", approved.version + 1))
+        self.assertNotEqual(running.status, "done")
+
+    @unittest.skipUnless(_WEB_OK, "FastAPI test stack unavailable")
+    def test_api_replays_confirmed_result_and_refuses_content_divergence(self):
+        task, attempt = self.legacy()
+        service = CommandService(str(self.db))
+        app = create_app(command_service=service)
+        client = TestClient(app)
+        token = app.state.token_store.ensure()
+        path = f"/api/v1/tasks/{task.id}/commands"
+        body = {"action": "legacy_incomplete", "expected_version": task.version,
+                "actor": "owner", "reason": "legacy result absent",
+                "attempt_id": attempt.id}
+        headers = {"Authorization": f"Bearer {token}", "X-CSRF-Token": token,
+                   IDEMPOTENCY_HEADER: "api-legacy-replay"}
+        first = client.post(path, headers=headers, json=body)
+        self.assertEqual(first.status_code, 200, first.text)
+        counts = self.counts()
+        replay = client.post(path, headers=headers, json=body)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        payload = replay.json()
+        self.assertTrue(payload["replayed"])
+        self.assertEqual(payload["task"]["status"], "needs_human")
+        self.assertEqual(self.counts(), counts)
+        divergent = client.post(
+            path, headers=headers, json=dict(body, reason="different intent"))
+        self.assertEqual(divergent.status_code, 409, divergent.text)
+        self.assertEqual(divergent.json()["details"]["reason_code"], "CONFLICT")
+        self.assertEqual(self.counts(), counts)
 
 
 if __name__ == "__main__":
