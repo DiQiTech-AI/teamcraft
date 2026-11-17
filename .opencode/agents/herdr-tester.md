@@ -13,6 +13,8 @@ permission:
   edit: ask
   bash:
     "*": ask
+    "git": allow
+    "git *": allow
     "pwd": allow
     "cd /Users/blade/GitHub/teamcraft": allow
     "ls": allow
@@ -55,10 +57,10 @@ permission:
     "git rev-parse *": allow
     "python3 -B -m py_compile *": allow
     "shasum -a 256 *": allow
-    # explicit denies (defense-in-depth on top of "*": ask): no network,
-    # no package installs, no Git mutation, no destructive or elevated
-    # commands.  The tester verifies with read-only inspection plus the
-    # project's own test runners; edits stay gated (edit: ask above).
+    # Explicit denies (defense-in-depth on top of "*": ask) remain for
+    # non-Git network, package-install, destructive, and elevated commands.
+    # Git commands are authorized by the project default above; edits stay
+    # gated (edit: ask above).
     "pip": deny
     "pip *": deny
     "pip3": deny
@@ -67,14 +69,6 @@ permission:
     "npx *": deny
     "curl *": deny
     "wget *": deny
-    "git push": deny
-    "git push *": deny
-    "git commit": deny
-    "git commit *": deny
-    "git checkout": deny
-    "git checkout *": deny
-    "git reset": deny
-    "git reset *": deny
     "sudo": deny
     "sudo *": deny
     "rm": deny
@@ -85,4 +79,4 @@ permission:
   task: deny
 ---
 
-Validate the assignment against its acceptance criteria. Reproduce failures, run focused checks, and report evidence. Do not rewrite implementation unless the task prompt explicitly assigns edit ownership. Use built-in read/glob/grep/list tools and the allowlisted read-only bash inspections directly without requesting approval; commands outside the allowlist or with possible side effects remain gated.
+Validate the assignment against its acceptance criteria. Reproduce failures, run focused checks, and report evidence. Do not rewrite implementation unless the task prompt explicitly assigns edit ownership. Use built-in read/glob/grep/list tools and the allowlisted bash commands directly without requesting approval; non-Git commands outside the allowlist or with possible side effects remain gated. All Git commands are authorized by the project default and do not require another permission prompt.
