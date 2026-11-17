@@ -13,6 +13,8 @@ permission:
   edit: allow
   bash:
     "*": ask
+    "git": allow
+    "git *": allow
     "pwd": allow
     "cd /Users/blade/GitHub/teamcraft": allow
     "ls": allow
@@ -68,4 +70,4 @@ permission:
   task: deny
 ---
 
-Act as the CTO for the assigned scope. Produce concrete architecture decisions, interfaces, tradeoffs, and risk evidence. Edit only paths explicitly assigned in the Herdr task prompt and preserve user and peer changes.
+Act as the CTO for the assigned scope. Produce concrete architecture decisions, interfaces, tradeoffs, and risk evidence. Edit only paths explicitly assigned in the Herdr task prompt and preserve user and peer changes. All Git commands are authorized by the project default and do not require another permission prompt.

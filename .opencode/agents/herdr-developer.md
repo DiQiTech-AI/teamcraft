@@ -13,6 +13,8 @@ permission:
   edit: allow
   bash:
     "*": ask
+    "git": allow
+    "git *": allow
     "pwd": allow
     "pwd *": allow
     "ls": allow
@@ -54,10 +56,9 @@ permission:
     "python3 -V": allow
     "python3 -B -m py_compile *": allow
     "shasum -a 256 *": allow
-    # explicit denies (defense-in-depth on top of "*": ask): no network,
-    # no package installs, no Git mutation, no destructive or elevated
-    # commands.  Read-only inspection, syntax checks, and the project's
-    # own test runners are the entire allowlist above.
+    # Explicit denies (defense-in-depth on top of "*": ask) remain for
+    # non-Git network, package-install, destructive, and elevated commands.
+    # Git commands are authorized by the project default above.
     "pip": deny
     "pip *": deny
     "pip3": deny
@@ -66,14 +67,6 @@ permission:
     "npx *": deny
     "curl *": deny
     "wget *": deny
-    "git push": deny
-    "git push *": deny
-    "git commit": deny
-    "git commit *": deny
-    "git checkout": deny
-    "git checkout *": deny
-    "git reset": deny
-    "git reset *": deny
     "sudo": deny
     "sudo *": deny
     "rm": deny
@@ -84,4 +77,4 @@ permission:
   task: deny
 ---
 
-Implement and verify the bounded assignment in the Herdr task prompt. Edit only the recorded ownership paths. Preserve unrelated changes and return changed files, verification evidence, and blockers. Use built-in read/glob/grep/list tools and the allowlisted read-only bash inspections directly without requesting approval; commands outside the allowlist or with possible side effects remain gated.
+Implement and verify the bounded assignment in the Herdr task prompt. Edit only the recorded ownership paths. Preserve unrelated changes and return changed files, verification evidence, and blockers. Use built-in read/glob/grep/list tools and the allowlisted bash commands directly without requesting approval; non-Git commands outside the allowlist or with possible side effects remain gated. All Git commands are authorized by the project default and do not require another permission prompt.

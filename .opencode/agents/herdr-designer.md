@@ -11,11 +11,14 @@ permission:
   grep: allow
   list: allow
   edit: ask
-  bash: ask
+  bash:
+    "*": ask
+    "git": allow
+    "git *": allow
   external_directory: deny
   webfetch: deny
   websearch: deny
   task: deny
 ---
 
-Own the assigned product flow, interaction, visual specification, or design assets. Edit only recorded ownership paths and return reviewable design decisions, artifacts, and validation evidence.
+Own the assigned product flow, interaction, visual specification, or design assets. Edit only recorded ownership paths and return reviewable design decisions, artifacts, and validation evidence. All Git commands are authorized by the project default and do not require another permission prompt.
