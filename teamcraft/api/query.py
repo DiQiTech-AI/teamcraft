@@ -553,6 +553,10 @@ def build_query_router(
     def project_ceo(project_id: str) -> Any:
         return _run(lambda: service.get_ceo_view(project_id))
 
+    @router.get("/projects/{project_id}/capabilities")
+    def get_project_capabilities(project_id: str) -> Any:
+        return _run(lambda: service.get_project_capabilities(project_id))
+
     # -- Tasks ------------------------------------------------------------------
 
     @router.get("/tasks/{task_id}")

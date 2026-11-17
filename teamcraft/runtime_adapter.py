@@ -46,6 +46,7 @@ from . import ceo_initialization
 from . import domain
 from . import fresh_start
 from . import leader
+from . import providers
 from . import storage
 from . import verification
 from . import worktrees
@@ -92,6 +93,39 @@ _LIVE_TO_SESSION = {
 
 class RuntimeAdapterError(TeamCraftError):
     """Runtime state violation the CLI surfaces as an actionable error."""
+
+
+def record_capability_snapshot(
+    conn: TeamCraftConnection,
+    project_id: str,
+    snapshot: providers.CapabilitySnapshot,
+):
+    """Runtime entry point for one credential-free M5-01 probe result."""
+
+    try:
+        return providers.record_capability_probe(conn, project_id, snapshot)
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
+
+
+def bind_attempt_capability_snapshot(
+    conn: TeamCraftConnection,
+    attempt_id: str,
+    *,
+    harness: providers.CapabilitySnapshot,
+    provider: providers.CapabilitySnapshot,
+    model: str,
+    clock: Any = None,
+):
+    """Persist the exact Harness/Provider/Model choice for an Attempt."""
+
+    try:
+        return providers.bind_attempt_capabilities(
+            conn, attempt_id, harness=harness, provider=provider, model=model,
+            clock=clock,
+        )
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(str(exc)) from exc
 
 
 class TeamSessionMismatchError(RuntimeAdapterError):

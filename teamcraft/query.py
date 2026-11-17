@@ -53,7 +53,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import storage
+from . import providers, storage
 from .commands import COMMAND_STATES
 from .domain import (
     ATTEMPT_STATUSES,
@@ -1053,6 +1053,7 @@ class QueryService:
                 " WHERE attempt_id = ? ORDER BY id ASC",
                 (attempt_id,),
             ).fetchall()
+            capability_snapshot = providers.get_attempt_capabilities(conn, attempt_id)
         dto = _attempt_summary_dto(row)
         # Layered view: Task status (via task_id), Attempt status (here),
         # and Session live signals (sessions[]) stay three separate facts.
@@ -1062,7 +1063,26 @@ class QueryService:
         )
         dto["sessions"] = [_session_dto(item) for item in session_rows]
         dto["worker_reports"] = [_worker_report_dto(item) for item in report_rows]
+        dto["capability_snapshot"] = capability_snapshot
         return dto
+
+    def get_project_capabilities(self, project_id: str) -> dict[str, Any]:
+        """Latest durable probe per Harness/Provider with fail-closed health."""
+
+        with self._read() as conn:
+            self._require_project(conn, project_id)
+            snapshots = providers.latest_capability_probes(conn, project_id)
+        return {
+            "project_id": project_id,
+            "items": [
+                {
+                    **snapshot.payload(),
+                    "snapshot_digest": snapshot.snapshot_digest,
+                    "effective_health": snapshot.effective_health(),
+                }
+                for snapshot in snapshots
+            ],
+        }
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         with self._read() as conn:

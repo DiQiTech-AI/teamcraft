@@ -386,7 +386,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
-| **M5-01 Harness/Provider 能力注册与健康检查**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt | 探测有费用；版本/模型名不稳定；文档能力与实机不同 |
+| **M5-01 Harness/Provider 能力注册与健康检查（实现完成，待独立验收；证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。Core/Query/真实 API 路由定向测试 6/6 通过，待独立 tester 验收 | 探测有费用；版本/模型名不稳定；文档能力与实机不同 |
 | **M5-02 确定性 Router**；依赖 M5-01、M2-02 | 配置 local-first、任务风险、能力要求、人工覆盖；输出选择及 reason code；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不能仅因便宜走弱模型；用户覆盖有审计 | 风险分类错误；策略过度复杂 |
 | **M5-03 有界失败升级、CEO Wake 与预算**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
 | **M5-04 Usage 数据与价格来源**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
@@ -869,3 +869,34 @@ bundle 套件 **1/1** 均通过；bundle 门禁逐字节核对 `domain.py`、`re
 **7/7**、**67/67**、**4/4** 通过，独立 tester 复核后给出 PASS。本节的通过
 只确认有界恢复能力本身，不改变 M4-02/M4-05 的历史交付结论；两项旧 Task
 仍须经 disposition、独立 retry approval、fresh Attempt 和正常 M4 证据门禁。
+
+### 12.25 M5-01 Harness/Provider 能力注册与健康检查（2026-11-17）
+
+新增 `teamcraft/providers.py`，以既有 append-only Event 流作为能力注册表和
+Attempt 能力快照账本，不增加第二状态真源。Codex/OpenCode 探测只以清洁、
+固定 PATH 的无凭证子进程执行 `--version`，并记录 CEO Skill 与项目规则发现；
+Claude 明确返回 `unsupported/adapter_pending`。oMLX 探测只允许不含用户信息、
+query 或 fragment 的 loopback HTTP `/v1/models`，不会读取环境变量、API key 或
+认证配置；断连、HTTP 错误和非法响应均为非 healthy。
+
+每个快照包含版本、模型目录、发现和事件/ack 能力、来源、探测时间、有效期与
+稳定 reason code。`unknown`、`unhealthy`、`unsupported` 以及超过有效期的
+`stale` 均不会投影为 healthy。持久化前递归拒绝 credential-shaped 字段或文本。
+实际 Harness/Provider/Model 选择连同两个完整能力快照和 SHA-256 digest 以唯一
+不可变事件绑定到 Attempt；绑定只接受已在同一 Project 持久注册、当前仍 healthy
+且模型目录包含所选模型的快照，重复相同绑定幂等，不同绑定 fail closed。读取
+Attempt 快照时会重新投影两个快照的当前 effective health，使其过期后明确显示
+`stale/healthy:false`。M5-01 只提供显式绑定入口，不决定选择；确定性路由、风险
+规则和覆盖审计属于 M5-02。
+Query Service 与 `/api/v1/projects/{project_id}/capabilities` 暴露最新能力投影，
+Attempt 详情同时返回其能力快照。
+
+**本地验证**：`tests/test_providers_m501.py` 6 项测试通过，覆盖版本和规则
+发现、Claude pending、oMLX 模型发现和断连、非 loopback/含凭证 URL 拒绝、
+unknown/stale 非 healthy、未注册/unsupported/unhealthy 绑定拒绝、注册与 Attempt
+绑定幂等/不可变、Query 投影和密钥
+形状拒绝；通过项目 test extra 运行时，真实 FastAPI 路由投影也已执行且通过。
+可复现命令采用 `python3 -B -m unittest discover -s tests -p
+test_providers_m501.py`，避免第三方同名 `tests` package 遮蔽本项目模块。
+安装器离线 bundle 与相邻 API 回归由独立验收补跑后再关闭 Task。本节不声称已
+验证真实 Codex/OpenCode/oMLX 服务或 GitHub Actions。
