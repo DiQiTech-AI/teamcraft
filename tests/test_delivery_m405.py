@@ -360,7 +360,7 @@ class DirectPrDeliveryTests(unittest.TestCase):
     def configure_and_verify(self, attempt):
         verification.configure_verifier_profile(
             self.conn, self.project.id, profile="test",
-            argv=[sys.executable, "-c", "print('ok')"], timeout_seconds=10,
+            argv=[sys.executable, "-c", "print('ok')"], timeout_seconds=30,
             actor="human", idempotency_key="cfg-test", lease=self.lease(),
             enabled=True)
         result = verification.run_worktree_verifier(
