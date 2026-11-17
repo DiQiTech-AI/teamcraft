@@ -387,7 +387,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M5-01 Harness/Provider 能力注册与健康检查（实现完成，待独立验收；证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode/oMLX 健康检查，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。Core/Query/真实 API 路由定向测试 6/6 通过，待独立 tester 验收 | 探测有费用；版本/模型名不稳定；文档能力与实机不同 |
-| **M5-02 确定性 Router**；依赖 M5-01、M2-02 | 配置 local-first、任务风险、能力要求、人工覆盖；输出选择及 reason code；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不能仅因便宜走弱模型；用户覆盖有审计 | 风险分类错误；策略过度复杂 |
+| **M5-02 确定性 Router（实现完成，待独立验收；证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
 | **M5-03 有界失败升级、CEO Wake 与预算**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
 | **M5-04 Usage 数据与价格来源**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
@@ -900,3 +900,36 @@ unknown/stale 非 healthy、未注册/unsupported/unhealthy 绑定拒绝、注�
 test_providers_m501.py`，避免第三方同名 `tests` package 遮蔽本项目模块。
 安装器离线 bundle 与相邻 API 回归由独立验收补跑后再关闭 Task。本节不声称已
 验证真实 Codex/OpenCode/oMLX 服务或 GitHub Actions。
+
+### 12.26 M5-02 确定性 Router 实现记录（2026-11-18）
+
+新增 `teamcraft/router.py` 作为无 I/O 的纯决策层。调用方必须提供显式、带时区
+的 `now`、M5-01 `CapabilitySnapshot` 候选、任务风险/标签、能力要求和策略；
+Router 不探测服务、不读取环境或凭证、不写数据库，也不调用模型。候选先按
+Harness/Provider 当前 effective health 与模型目录过滤，再按显式能力要求和风险
+保证等级过滤。`unknown`、`unhealthy`、`unsupported`、`stale`、模型缺失、能力
+未知或不足都不能进入排序。
+
+普通任务按 local-first、相对 cost rank、保证等级和规范候选 ID 的稳定顺序选择；
+关闭 local-first 时才把 cost rank 提到普通任务的首要偏好。`auth`、`secrets`、
+`keys`、`deploy`、`deployment` 等标签自动提升为 high risk；high/critical 任务先
+按保证等级降序，再考虑 locality 与 cost，因此不会仅因便宜选择较弱模型。
+Router 不把未知价格当成 0：每个候选的相对 `cost_rank` 必须由调用方明确给出，
+真实价格与用量来源仍属 M5-04。
+
+人工覆盖包含目标 Harness/Provider/Model、actor 和 reason。覆盖目标仍须通过同一
+健康、模型、能力和风险门禁；目标不存在或不合格时 fail closed，不静默回退到
+另一候选。决策返回覆盖是否应用、稳定 reason code、effective risk、能力要求、
+以规范 JSON 三元组编码的 considered 列表和 SHA-256 decision digest。JSON 三元组
+保留 Harness/Provider/Model 的字段边界，含 `/` 的合法 M5-01 标识符不会相互碰撞。
+actor/reason 有长度边界，
+credential-shaped 文本在进入审计结果前被拒绝。
+
+**本地实现验证**：`tests/test_router_m502.py` **12/12** 通过，覆盖候选输入排列的
+选择与 digest 确定性、local-first 开关、普通任务价格偏好、高风险强模型优先、
+认证/密钥/部署标签升级、能力不满足、unknown/unhealthy/stale/模型缺失拒绝、
+人工覆盖的应用/审计/风险绕过拒绝、目标不存在、credential-shaped reason、
+含 `/` 的不同选择保持唯一且覆盖匹配无歧义、重复候选和无时区 `now`。
+`py_compile` 与 `git diff --check` 通过。M5-01 相邻回归
+与独立 tester 验收由交付门禁补跑后再关闭 Task；本节不声称真实模型调用、全量
+仓库回归或 GitHub Actions 已验证。
