@@ -176,6 +176,92 @@ class PolicyRebindVerificationTests(unittest.TestCase):
         self.assertEqual(shipped.task_version, task.version)
         self.assertEqual(shipped.dispatch_task_version, brief.task_version)
 
+    def test_existing_commit_survives_exact_policy_rebind_and_ships_current_version(self):
+        task, attempt, brief, _ = self.finished_ship()
+        self.configure_profile()
+        self.assertEqual(self.run_profile(attempt, "pass-before-policy").status,
+                         "pass")
+        commit = delivery.create_local_commit(
+            self.conn, attempt.id, idempotency_key="commit-before-policy",
+            lease=self.lease(),
+        )
+        self.assertEqual(commit.task_version, brief.task_version + 1)
+
+        task = self.add_local_only_policy(task)
+
+        current = delivery.commit_evidence_is_current(self.conn, commit)
+        self.assertTrue(current.ok, current.problems)
+        shipped = delivery.record_ship_evidence(
+            self.conn, attempt.id, idempotency_key="ship-after-policy",
+            lease=self.lease(),
+        )
+        self.assertEqual(shipped.task_version, task.version)
+        self.assertEqual(shipped.commit_evidence_id, commit.event_id)
+        self.assertEqual(shipped.dispatch_task_version, brief.task_version)
+
+    def test_existing_commit_stays_stale_for_non_exact_task_drift(self):
+        cases = ("unrelated_edit", "different_policy", "repeated_policy")
+        for case in cases:
+            with self.subTest(case=case):
+                task, attempt, _, _ = self.finished_ship()
+                self.configure_profile()
+                self.assertEqual(
+                    self.run_profile(attempt, f"pass-{case}").status, "pass")
+                commit = delivery.create_local_commit(
+                    self.conn, attempt.id,
+                    idempotency_key=f"commit-{case}", lease=self.lease(),
+                )
+                if case == "unrelated_edit":
+                    domain.update_task(
+                        self.conn, task.id, expected_version=task.version,
+                        title="edited after commit",
+                    )
+                elif case == "different_policy":
+                    domain.set_execution_policy(
+                        self.conn, task.id, expected_version=task.version,
+                        policy={"delivery": "ship"}, actor="ceo",
+                        reason="wrong delivery mode",
+                    )
+                else:
+                    task = self.add_local_only_policy(task)
+                    self.add_local_only_policy(task)
+
+                current = delivery.commit_evidence_is_current(
+                    self.conn, commit, live_git=False)
+                self.assertFalse(current.ok, case)
+                self.assertTrue(
+                    any(problem.startswith("version:")
+                        for problem in current.problems),
+                    current.problems,
+                )
+                self.assert_stale(attempt)
+
+    def test_detached_existing_commit_remains_ineligible_after_exact_rebind(self):
+        task, attempt, _, allocation = self.finished_ship()
+        self.configure_profile()
+        self.assertEqual(self.run_profile(attempt, "pass-before-detach").status,
+                         "pass")
+        commit = delivery.create_local_commit(
+            self.conn, attempt.id, idempotency_key="commit-before-detach",
+            lease=self.lease(),
+        )
+        self.add_local_only_policy(task)
+        git("checkout", "--detach", commit.commit_sha,
+            cwd=Path(allocation.worktree_path))
+
+        current = delivery.commit_evidence_is_current(self.conn, commit)
+        self.assertFalse(current.ok)
+        self.assertTrue(
+            any(problem.startswith("identity:") for problem in current.problems),
+            current.problems,
+        )
+        with self.assertRaises(delivery.DeliveryRefusal) as raised:
+            delivery.record_ship_evidence(
+                self.conn, attempt.id, idempotency_key="ship-detached",
+                lease=self.lease(),
+            )
+        self.assertEqual(raised.exception.kind, "drift")
+
     def test_unrelated_or_non_exact_drift_remains_stale(self):
         cases = (
             "unrelated_edit",

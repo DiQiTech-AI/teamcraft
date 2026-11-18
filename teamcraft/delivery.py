@@ -49,11 +49,14 @@ Pinned decisions:
   result verbatim; a settled Commit/ship evidence is returned (never redone)
   on any later call for the same Attempt; every mutation requires the live
   project Leader lease and re-checks its bindings inside the fence.
-* **Any drift invalidates.**  Task version bump (task/policy edits),
-  verifier profile/config changes, Commit amend/new commits on the branch,
-  worktree dirt or identity drift all fail the live re-checks used by
-  approval and by the ``*_is_current`` currency helpers; the domain gate
-  re-derives the same facts from durable rows at DONE time.
+* **Any unrecognized drift invalidates.**  Task version bumps, verifier
+  profile/config changes, Commit amend/new commits on the branch, worktree
+  dirt or identity drift all fail the live re-checks used by approval and by
+  the ``*_is_current`` currency helpers.  The sole version exception is the
+  audited, exact post-completion ``local_only`` policy correction recognized
+  by :mod:`teamcraft.verification`; immutable pre-correction Commit evidence
+  may feed new ship evidence at the corrected Task version, while every
+  other historical shape remains stale.
 """
 
 from __future__ import annotations
@@ -1044,6 +1047,34 @@ def _policy_digest(policy: dict[str, Any]) -> str:
     return _sha256_hex(_canonical_json(policy))
 
 
+def _commit_task_version_is_current(
+    conn: TeamCraftConnection,
+    task: domain.Task,
+    attempt: domain.Attempt,
+    brief: verification.briefs.AttemptBrief,
+    commit_task_version: int,
+    report_digest: str,
+) -> bool:
+    """Accept a Commit pin across only the audited local-only correction.
+
+    Commit evidence is immutable, so a Commit created before the supported
+    post-completion policy correction remains pinned to the completion
+    version.  It may be consumed at the corrected version only when the same
+    strict append-only history used by verification proves that exact single
+    correction.  All other Task drift remains stale.
+    """
+
+    return bool(
+        commit_task_version == task.version
+        or (
+            commit_task_version == brief.task_version + 1
+            and verification._is_exact_local_only_policy_rebind(
+                conn, task, attempt, brief, report_digest
+            )
+        )
+    )
+
+
 def _bound_allocation(conn: TeamCraftConnection, task: domain.Task,
                      attempt: domain.Attempt) -> worktrees.WorktreeAllocation:
     allocation = worktrees.require_allocation(conn, attempt.id)
@@ -1773,7 +1804,9 @@ def record_ship_evidence(
         _unresolved_other_key(conn, SHIP_COMMAND_KIND, attempt.id, key)
         commit = require_commit_evidence(conn, attempt.id)
         if (commit.task_id != task.id or commit.attempt_no != attempt.attempt_no
-                or commit.task_version != task.version
+                or not _commit_task_version_is_current(
+                    conn, task, attempt, brief, commit.task_version,
+                    report_digest)
                 or commit.brief_digest != brief.brief_digest
                 or commit.worker_report_id != report_id
                 or commit.worker_report_digest != report_digest
@@ -2224,7 +2257,8 @@ def approve_local_delivery(
 def _task_pin_problems(conn: TeamCraftConnection, task_id: str, attempt_id: str,
                       task_version: int, dispatch_ver: int, brief_digest: str,
                       report_id: int, report_digest: str, *,
-                      after_accept: bool) -> list[str]:
+                      after_accept: bool,
+                      allow_exact_local_only_rebind: bool = False) -> list[str]:
     problems: list[str] = []
     try:
         task = domain.get_task(conn, task_id)
@@ -2241,7 +2275,12 @@ def _task_pin_problems(conn: TeamCraftConnection, task_id: str, attempt_id: str,
     expected_version = task_version + (1 if after_accept else 0)
     if task.status != expected_status:
         problems.append(f"status: task is {task.status!r}, expected {expected_status!r}")
-    if task.version != expected_version:
+    version_is_current = task.version == expected_version
+    if (not version_is_current and allow_exact_local_only_rebind
+            and not after_accept):
+        version_is_current = _commit_task_version_is_current(
+            conn, task, attempt, brief, task_version, report_digest)
+    if not version_is_current:
         problems.append(f"version: task is {task.version}, evidence bound {task_version}"
                        + (f" (+1 for acceptance) = {expected_version}" if after_accept else ""))
     if attempt.status != "finished" or attempt.task_id != task.id:
@@ -2266,7 +2305,8 @@ def commit_evidence_is_current(conn: TeamCraftConnection,
                                   evidence.brief_digest,
                                   evidence.worker_report_id,
                                   evidence.worker_report_digest,
-                                  after_accept=False)
+                                  after_accept=False,
+                                  allow_exact_local_only_rebind=True)
     allocation = None
     try:
         allocation = worktrees.require_allocation(conn, evidence.attempt_id)
