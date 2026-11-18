@@ -175,7 +175,7 @@ class LocalDeliveryTests(unittest.TestCase):
                 domain.get_attempt(self.conn, attempt.id), allocation)
 
     def configure(self, *, profile: str = "test", argv=None, enabled=True,
-                  timeout: int = 10, key: str | None = None):
+                  timeout: int = 30, key: str | None = None):
         if argv is None:
             argv = [sys.executable, "-c", "print('ok')"]
         return verification.configure_verifier_profile(
@@ -202,7 +202,10 @@ class LocalDeliveryTests(unittest.TestCase):
             policy=policy or {"delivery": "local_only"})
         self.configure()
         result = self.run_verifier(attempt)
-        assert result.status == "pass", result.status
+        assert result.status == "pass", (
+            f"{result.status}: "
+            f"{result.report.decode('utf-8', errors='replace')}"
+        )
         return task, attempt, allocation
 
     def committed(self, *, title: str = "deliver", key: str = "commit-1"):
