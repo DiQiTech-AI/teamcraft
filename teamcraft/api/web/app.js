@@ -411,8 +411,7 @@ function forgetToken() {
   location.reload();
 }
 
-async function loadProjects() {
-  const seq = renderSeq;
+async function loadProjects(seq) {
   const select = clear(q("project-select"));
   let items;
   try {
@@ -450,13 +449,18 @@ async function loadProjects() {
 }
 
 function boot() {
+  /* Bind project loading to the render generation that initiated boot.
+     checkConnection() is asynchronous; capturing inside loadProjects()
+     would let a later navigation become the apparent owner and permit the
+     delayed bootstrap to rebuild that newer view. */
+  const seq = renderSeq;
   checkConnection().then(function (up) {
     if (!up) {
       banner("bad", "API unreachable. Start it with `teamcraft-api` " +
         "(loopback by default); work already queued keeps running " +
         "server-side meanwhile.");
     }
-    if (state.token) loadProjects();
+    if (state.token) loadProjects(seq);
   });
 }
 

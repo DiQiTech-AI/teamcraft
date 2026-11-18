@@ -2160,6 +2160,11 @@ class M306BackendRestartTests(_E2EBase):
         self.login()
         self.select_project()
         self.goto_view("Events")
+        self.page.wait(
+            "document.querySelector('#event-list') !== null"
+            " && __e2e.mainText().indexOf('Event stream') !== -1"
+            " ? JSON.stringify(true) : ''",
+            timeout=25, what="Events view ready after backend restart")
 
         # convergence: DOM seq == REST seq == durable SQLite order,
         # strictly increasing, zero duplicates, all offline writes present.
