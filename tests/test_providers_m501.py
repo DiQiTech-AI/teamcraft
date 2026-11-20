@@ -51,7 +51,9 @@ class ProviderCapabilitiesM501Tests(unittest.TestCase):
         (repo / "AGENTS.md").write_text("rules", encoding="utf-8")
 
         snapshot = providers.probe_harness(
-            "codex", repo, runner=lambda argv, cwd, timeout: (0, "codex-cli 0.166.0\n"),
+            "codex", repo, runner=lambda argv, cwd, timeout: (
+                0, "WARNING: could not create PATH aliases\ncodex-cli 0.166.0\n"
+            ),
             clock=self.clock,
         )
         self.assertEqual(snapshot.version, "codex-cli 0.166.0")
@@ -62,6 +64,65 @@ class ProviderCapabilitiesM501Tests(unittest.TestCase):
         claude = providers.probe_harness("claude", repo, clock=self.clock)
         self.assertEqual(claude.health, "unsupported")
         self.assertEqual(claude.reason_code, "adapter_pending")
+
+    def test_default_harness_runner_uses_isolated_minimal_environment(self) -> None:
+        observed: dict[str, object] = {}
+
+        def run(argv, **kwargs):
+            env = kwargs["env"]
+            observed["argv"] = argv
+            observed["env"] = dict(env)
+            self.assertEqual(
+                set(env),
+                {"PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                 "XDG_CACHE_HOME"},
+            )
+            home = Path(env["HOME"])
+            self.assertTrue(home.is_dir())
+            for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
+                location = Path(env[name])
+                self.assertTrue(location.is_dir())
+                self.assertEqual(location.parent, home)
+            return mock.Mock(
+                returncode=0,
+                stdout="opencode v2.2.6\n" + "x" * 5000,
+            )
+
+        with mock.patch.object(providers.subprocess, "run", side_effect=run):
+            code, output = providers._default_process_runner(
+                ("opencode", "--version"), str(self.root), 5.0
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(observed["argv"], ["opencode", "--version"])
+        self.assertEqual(len(output), providers.MAX_HARNESS_VERSION_OUTPUT_BYTES)
+        self.assertFalse(Path(observed["env"]["HOME"]).exists())
+
+    def test_default_harness_runner_classifies_process_errors(self) -> None:
+        cases = (
+            (FileNotFoundError(), 127),
+            (providers.subprocess.TimeoutExpired(["codex", "--version"], 5), 124),
+            (PermissionError("denied"), 126),
+        )
+        for error, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                providers.subprocess, "run", side_effect=error
+            ):
+                self.assertEqual(
+                    providers._default_process_runner(
+                        ("codex", "--version"), str(self.root), 5.0
+                    ),
+                    (expected, ""),
+                )
+
+    def test_version_parser_skips_diagnostics_and_unsafe_lines(self) -> None:
+        self.assertEqual(
+            providers._bounded_version(
+                "Warning: setup failed\nPlatformError: denied\nopencode v2.2.6\n"
+            ),
+            "opencode v2.2.6",
+        )
+        self.assertIsNone(providers._bounded_version("warning 2\nno-version\n"))
 
     def test_omlx_probe_detects_models_disconnect_and_refuses_non_loopback(self) -> None:
         body = json.dumps({"version": "0.9.1", "data": [{"id": "model-a"}]}).encode()

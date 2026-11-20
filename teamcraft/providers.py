@@ -12,6 +12,7 @@ import ipaddress
 import json
 import re
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -29,8 +30,10 @@ ATTEMPT_CAPABILITY_EVENT = "attempt.capability_snapshot"
 HEALTH_STATES = frozenset({"healthy", "unhealthy", "unknown", "unsupported"})
 CAPABILITY_STATES = frozenset({"supported", "unsupported", "unknown"})
 DEFAULT_TTL_SECONDS = 300
+MAX_HARNESS_VERSION_OUTPUT_BYTES = 4096
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,199}\Z")
 _SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,199}\Z")
+_VERSION_DIAGNOSTIC = re.compile(r"(?:warning|warn|error|platformerror)\b", re.I)
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|bearer|password|secret|token)", re.I)
 
 ProcessRunner = Callable[[Sequence[str], str, float], tuple[int, str]]
@@ -173,18 +176,45 @@ class CapabilitySnapshot:
 
 
 def _default_process_runner(argv: Sequence[str], cwd: str, timeout: float) -> tuple[int, str]:
-    try:
-        result = subprocess.run(list(argv), cwd=cwd, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, timeout=timeout, check=False, env={"PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"})
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return 127, ""
-    return int(result.returncode), result.stdout or ""
+    # Harness version probes must not consult the user's config, logs, cache,
+    # credentials, or proxy settings.  A fresh HOME/XDG scope also gives tools
+    # such as OpenCode a writable log location without touching user state.
+    with tempfile.TemporaryDirectory(prefix="teamcraft-harness-probe-") as home:
+        root = Path(home)
+        config, data, cache = root / "config", root / "data", root / "cache"
+        for directory in (config, data, cache):
+            directory.mkdir(mode=0o700)
+        env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
+            "HOME": str(root),
+            "XDG_CONFIG_HOME": str(config),
+            "XDG_DATA_HOME": str(data),
+            "XDG_CACHE_HOME": str(cache),
+        }
+        try:
+            result = subprocess.run(
+                list(argv), cwd=cwd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=timeout, check=False, env=env,
+            )
+        except FileNotFoundError:
+            return 127, ""
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        except OSError:
+            return 126, ""
+    return int(result.returncode), (result.stdout or "")[:MAX_HARNESS_VERSION_OUTPUT_BYTES]
 
 
 def _bounded_version(output: str) -> str | None:
-    line = output.splitlines()[0].strip()[:200] if output else ""
-    return line if line and _SAFE_VERSION.fullmatch(line) else None
+    for raw_line in output[:MAX_HARNESS_VERSION_OUTPUT_BYTES].splitlines():
+        line = raw_line.strip()
+        if (not line or len(line) > 200 or _VERSION_DIAGNOSTIC.match(line)
+                or not any(char.isdigit() for char in line)):
+            continue
+        if _SAFE_VERSION.fullmatch(line):
+            return line
+    return None
 
 
 def probe_harness(name: str, project_root: str | Path, *, runner: ProcessRunner | None = None,
