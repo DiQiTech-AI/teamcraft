@@ -49,6 +49,8 @@ const state = {
   pageOffset: 0,
   taskFilter: { status: "", kind: "" },
   wakeFilter: "",
+  usageRole: "",
+  usageLocality: "",
 };
 
 /* ------------------------------------------------------------------ *
@@ -505,6 +507,7 @@ function renderView() {
     ceo: viewCeo,
     events: viewEvents,
     wakes: viewWakes,
+    usage: viewUsage,
     approvals: viewApprovals,
     verifications: viewVerifications,
   };
@@ -833,7 +836,7 @@ async function viewTaskDetail(m) {
   const id = state.taskId;
   m.appendChild(spinner("Loading task " + id + "…"));
   const enc = encodeURIComponent(id);
-  let task, attempts, deps, verifs, approvals, recovery, err = null;
+  let task, attempts, deps, verifs, approvals, recovery, usage = null, err = null;
   try {
     const results = await Promise.all([
       api("/tasks/" + enc),
@@ -842,10 +845,14 @@ async function viewTaskDetail(m) {
       api("/tasks/" + enc + "/verifications?limit=50"),
       api("/tasks/" + enc + "/approvals?limit=50"),
       api("/tasks/" + enc + "/recovery-actions?limit=50"),
+      api("/tasks/" + enc + "/usage").catch(function () {
+        return { data: null };
+      }),
     ]);
     task = results[0].data; attempts = results[1].data;
     deps = results[2].data; verifs = results[3].data;
     approvals = results[4].data; recovery = results[5].data;
+    usage = results[6].data;
   } catch (e) { err = e; }
   if (seq !== renderSeq) return;  /* superseded by a newer navigation */
   clear(m);
@@ -932,6 +939,27 @@ async function viewTaskDetail(m) {
     approvalTable(approvals.items || [])));
   m.appendChild(section("Recovery actions",
     recoveryTable(recovery.items || [])));
+  if (usage) {
+    const ut = usage.totals || {};
+    m.appendChild(section(
+      "Usage & cost across attempts (durable ledger — failures included," +
+      " missing is unavailable, not zero)", [
+        kvTable([
+          ["ledger rows", String(usage.record_count) +
+            " across all attempts"],
+          ["input tokens", usageAmountText(ut, "input_tokens")],
+          ["output tokens", usageAmountText(ut, "output_tokens")],
+          ["total tokens", usageAmountText(ut, "total_tokens")],
+          ["cost", usageCostText(ut)],
+        ])].concat(usageCostGapBadges(ut)).concat(
+        (usage.items || []).length
+          ? [para(usage.items.length +
+            " ledger row(s) — every row traces to a usage_id/event;" +
+            " see the Usage tab for role/locality filters and trends",
+          "muted")]
+          : [para("no usage recorded for this task — unavailable, not" +
+            " zero", "empty")])));
+  }
 }
 
 function ul(items) {
@@ -1777,6 +1805,251 @@ async function viewWakes(m) {
   }
   m.appendChild(section("Recovery records (durable intents + outcomes)",
     recoveryTable(recovery.items || [])));
+}
+
+/* ------------------------------------------------------------------ *
+ * Usage & cost (M5-05).
+ *
+ * All figures come from the durable M5-04 ledger endpoints. Three states
+ * are kept visibly distinct: exact vs estimated vs unavailable; totals are
+ * labeled complete/partial/unavailable; costs never merge currencies, and
+ * unattributed cost or missing price versions surface as gap badges.
+ * Failed attempts are included because the ledger records every final
+ * WorkerReport regardless of outcome.
+ * ------------------------------------------------------------------ */
+
+const USAGE_ROLES = ["ceo", "worker", "verifier"];
+const USAGE_LOCALITIES = ["local", "cloud"];
+const USAGE_DIMENSION_LABELS = [
+  ["input_tokens", "Input tokens"],
+  ["output_tokens", "Output tokens"],
+  ["total_tokens", "Total tokens"],
+  ["cache_tokens", "Cache tokens"],
+  ["response_count", "Responses"],
+  ["wake_count", "CEO wakes"],
+  ["elapsed_ms", "Elapsed ms"],
+  ["cost_microunits", "Cost (microunits)"],
+];
+
+function completenessBadge(kind) {
+  if (kind === "complete") return badge("complete", "ok");
+  if (kind === "partial") return badge("partial — some records unknown", "warn");
+  return badge("unavailable — not recorded (not zero)", "bad");
+}
+
+/* The API derives the overall verdict from the actual per-dimension
+ * completenesses (never a blanket "partial"); the console just echoes it
+ * with a matching tone. */
+function totalLabelKind(label) {
+  const text = label || "";
+  if (text === "complete" || text.indexOf("complete for reported") === 0) {
+    return "ok";
+  }
+  if (text.indexOf("partial") === 0) return "warn";
+  if (text.indexOf("unavailable") === 0) return "bad";
+  return "muted";
+}
+
+function usageAmountText(totals, name) {
+  const d = totals && totals.dimensions && totals.dimensions[name];
+  if (!d || d.completeness === "unavailable") {
+    return "unavailable — not recorded (not zero)";
+  }
+  if (d.completeness === "partial") {
+    return String(d.known_sum) + "  (partial — " + d.unknown_count +
+      " of " + (d.known_count + d.unknown_count) + " records unknown)";
+  }
+  return String(d.known_sum);
+}
+
+function usageCostText(totals) {
+  const byCur = (totals && totals.cost_by_currency) || {};
+  const keys = Object.keys(byCur);
+  if (!keys.length) return "unavailable — no cost reported";
+  return keys.map(function (k) {
+    const c = byCur[k];
+    const suffix = c.completeness === "partial"
+      ? " (partial — " + c.unknown_count + " unknown)" : "";
+    return k + " " + String(c.known_sum) + suffix;
+  }).join("  ·  ");
+}
+
+function usageCostGapBadges(totals) {
+  const out = [];
+  if (totals.mixed_currencies) {
+    out.push(badge("mixed currencies — never merged into one number", "warn"));
+  }
+  if (totals.unattributed_cost_count > 0) {
+    out.push(badge(totals.unattributed_cost_count +
+      " cost(s) without currency", "warn"));
+  }
+  if (totals.missing_price_version_cost_count > 0) {
+    out.push(badge(totals.missing_price_version_cost_count +
+      " cost(s) without price version", "warn"));
+  }
+  if ((totals.price_versions || []).length) {
+    out.push(badge("price versions: " + totals.price_versions.join(", "),
+      "muted"));
+  }
+  return out;
+}
+
+function usageRowsTable(items) {
+  const head = ["role", "harness / model", "locality", "precision", "source",
+    "tokens (null = unavailable)", "cost + currency", "attempt outcome",
+    "trace"];
+  const rows = [el("tr", {}, head.map(function (h) {
+    return el("th", { text: h });
+  }))];
+  for (const r of items) {
+    const q = r.quantities || {};
+    const qText = ["input_tokens", "output_tokens", "total_tokens",
+      "cache_tokens"].map(function (k) {
+      return k.replace("_tokens", "") + "=" + ((q[k] && q[k].available)
+        ? q[k].value : "unavailable");
+    }).join("  ");
+    const outcome = r.attempt_outcome || "unknown";
+    rows.push(el("tr", {}, [
+      el("td", {}, badge(r.role, "muted")),
+      el("td", { text: fmt(r.harness) + " / " + fmt(r.model) }),
+      el("td", {}, badge(r.locality_label, r.locality ? "ok" : "muted")),
+      el("td", {}, badge(r.precision,
+        r.precision === "exact" ? "ok"
+          : r.precision === "estimated" ? "warn" : "bad")),
+      el("td", { text: r.source }),
+      el("td", { text: qText }),
+      el("td", { text: (q.cost_microunits && q.cost_microunits.available
+          ? q.cost_microunits.value : "unavailable") +
+        "  [" + r.currency_label + "]" +
+        (r.price_version ? " @ " + r.price_version : "") }),
+      el("td", {}, r.failure_included
+        ? badge(outcome + " — still counted", "bad")
+        : badge(outcome, outcome === "completed" ? "ok" : "muted")),
+      el("td", { class: "muted",
+        text: (r.usage_id || "").slice(0, 24) + " · evt " +
+          (r.event_id || "").slice(0, 24) }),
+    ]));
+  }
+  return el("table", { class: "list" }, rows);
+}
+
+async function viewUsage(m) {
+  const seq = renderSeq;
+  if (!needProject(clear(m))) return;
+  const pid = state.projectId;
+  m.appendChild(spinner("Loading usage…"));
+  const filters = (state.usageRole ? "&role=" + state.usageRole : "") +
+    (state.usageLocality ? "&locality=" + state.usageLocality : "");
+  let proj, ceo, err = null;
+  try {
+    const results = await Promise.all([
+      api("/projects/" + encodeURIComponent(pid) + "/usage?limit=50" + filters),
+      api("/projects/" + encodeURIComponent(pid) + "/ceo/usage").catch(
+        function () { return { data: null }; }),
+    ]);
+    proj = results[0].data;
+    ceo = results[1].data;
+  } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  clear(m);
+  if (err) { failInto(m, err, function () { renderView(); }); return; }
+
+  const totals = proj.totals || {};
+  m.appendChild(heading("Usage & cost", [badge(pid, "muted"),
+    badge("durable ledger · exact vs estimated vs unavailable", "muted")]));
+  m.appendChild(el("div", { class: "formrow" }, [
+    selectOf(USAGE_ROLES, state.usageRole, function () {
+      state.usageRole = this.value; renderView();
+    }),
+    selectOf(USAGE_LOCALITIES, state.usageLocality, function () {
+      state.usageLocality = this.value; renderView();
+    }),
+    badge("failed attempts included", "muted"),
+    badge(proj.record_count + " ledger row(s) in scope",
+      proj.record_count ? "muted" : "warn"),
+    badge("overall: " + fmt(totals.total_label),
+      totalLabelKind(totals.total_label)),
+  ]));
+
+  const totalRows = USAGE_DIMENSION_LABELS.map(function (d) {
+    return [d[1], [completenessBadge((totals.dimensions &&
+      totals.dimensions[d[0]] &&
+      totals.dimensions[d[0]].completeness) || "unavailable"),
+    para(usageAmountText(totals, d[0]))]];
+  });
+  m.appendChild(section("Totals over the filtered window (partial sums are" +
+    " labeled — nulls are never silently added)",
+  [kvTable(totalRows)].concat(usageCostGapBadges(totals))));
+
+  if (ceo) {
+    const wu = ceo.wake_usage || {};
+    const states = ceo.wake_states || {};
+    const stateBits = Object.keys(states).sort().map(function (k) {
+      return k + "=" + states[k];
+    });
+    m.appendChild(section("CEO / Wake attention (projected from the durable" +
+      " wakes ledger — read-only, never double-counted)", [
+      kvTable([
+        ["wake count (delivered or possibly delivered)",
+          fmt(wu.wake_count)],
+        ["tokens", para(fmt(wu.tokens_label || "unavailable"), "muted")],
+        ["wake states", para(stateBits.length ? stateBits.join("  ·  ")
+          : "no wakes recorded", "muted")],
+      ]),
+    ]));
+  }
+
+  const byRole = (proj.breakdown && proj.breakdown.by_role) || {};
+  const roleRows = [el("tr", {}, ["role", "records", "input", "output",
+    "cost"].map(function (h) { return el("th", { text: h }); }))];
+  for (const roleKey of Object.keys(byRole)) {
+    const t = byRole[roleKey];
+    roleRows.push(el("tr", {}, [
+      el("td", { text: roleKey }),
+      el("td", { text: String(t.record_count) }),
+      el("td", { text: usageAmountText(t, "input_tokens") }),
+      el("td", { text: usageAmountText(t, "output_tokens") }),
+      el("td", { text: usageCostText(t) }),
+    ]));
+  }
+  const byLoc = (proj.breakdown && proj.breakdown.by_locality) || {};
+  const locBits = Object.keys(byLoc).map(function (k) {
+    return k + ": " + byLoc[k].record_count + " row(s)";
+  });
+  m.appendChild(section("Breakdown by role · locality " +
+    (locBits.length ? "(" + locBits.join("  ·  ") + ")" : ""),
+    roleRows.length > 1 ? roleRows : [para("nothing in this filter — " +
+      "unavailable, not zero", "empty")]));
+
+  const trend = proj.trend || [];
+  if (trend.length) {
+    const trendRows = [el("tr", {}, ["date (UTC)", "rows", "input", "output",
+      "cost"].map(function (h) { return el("th", { text: h }); }))];
+    for (const day of trend) {
+      /* Every bucket carries the shared totals shape, so the trend uses
+       * the SAME amount/cost helpers (and the SAME honest wording) as
+       * the grand totals above — no parallel formatting to drift. */
+      const dt = day.totals || {};
+      trendRows.push(el("tr", {}, [
+        el("td", { text: day.date }),
+        el("td", { text: String(day.records) }),
+        el("td", { text: usageAmountText(dt, "input_tokens") }),
+        el("td", { text: usageAmountText(dt, "output_tokens") }),
+        el("td", { text: usageCostText(dt) }),
+      ]));
+    }
+    m.appendChild(section("Trend by day (unknowns stay visible per bucket)",
+      trendRows));
+  }
+
+  const items = proj.items || [];
+  m.appendChild(section("Ledger records (traceable to usage_id + event)",
+    items.length ? [usageRowsTable(items),
+      para("showing " + items.length + " of " + proj.record_count +
+        " rows in scope", "muted")]
+      : [emptyNote("usage record for this filter")]));
+  m.appendChild(section("How to read these numbers",
+    (proj.notes || []).map(function (n) { return para(n, "muted"); })));
 }
 
 /* ------------------------------------------------------------------ *

@@ -50,10 +50,11 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import providers, storage
+from . import providers, storage, usage
 from .commands import COMMAND_STATES
 from .domain import (
     ATTEMPT_STATUSES,
@@ -219,6 +220,12 @@ def _usage_view(raw: Any) -> dict[str, Any]:
         view[field] = amount
     view["available"] = any(view[field] is not None for field in USAGE_FIELDS)
     return view
+
+
+def fmt_amount_label(amount: int | None) -> str:
+    """Label a nullable quantity the honest way: null reads unavailable."""
+
+    return "unavailable" if amount is None else str(amount)
 
 
 def _page_payload(items: list[dict[str, Any]], limit: int, offset: int, total: int) -> dict[str, Any]:
@@ -1557,3 +1564,390 @@ class QueryService:
             page_offset,
             total,
         )
+
+    # -- Usage & cost (M5-05) ---------------------------------------------------
+    #
+    # Every number here derives from the durable M5-04 ledger (usage.recorded
+    # events + the CEO/Wake projection over the wakes table) — never from a
+    # re-derived guess.  Presentation rules fixed by the roadmap line M5-05:
+    # missing quantities are labeled ``unavailable`` (never zero), totals that
+    # still contain NULL contributors are labeled ``partial`` and their strict
+    # value stays null, every figure carries its currency and price version
+    # labels, and failed attempts are included because the ledger already
+    # records them.
+
+    @staticmethod
+    def _usage_completeness(total: Any) -> str:
+        """``complete`` | ``partial`` | ``unavailable`` for one dimension."""
+
+        if total.known_count == 0:
+            return "unavailable"
+        if total.unknown_count == 0:
+            return "complete"
+        return "partial"
+
+    @classmethod
+    def _usage_totals_dto(cls, totals: Any) -> dict[str, Any]:
+        payload = totals.payload()
+        payload["dimensions"] = {
+            name: dict(total.payload(),
+                      completeness=cls._usage_completeness(total))
+            for name, total in totals.dimensions.items()}
+        payload["cost_by_currency"] = {
+            currency: dict(total.payload(), currency=currency,
+                          completeness=cls._usage_completeness(total))
+            for currency, total in totals.cost_by_currency.items()}
+        payload["total_label"] = cls._usage_total_label(
+            totals.record_count,
+            [total["completeness"] for total in payload["dimensions"].values()])
+        return payload
+
+    @staticmethod
+    def _usage_total_label(record_count: int,
+                          completenesses: list[str]) -> str:
+        """Overall label derived from the ACTUAL per-dimension verdicts.
+
+        Earlier this claimed ``partial`` for any non-empty set — a label
+        inconsistency the M5-05 QA pass flagged: nothing may be called
+        partial unless some dimension really has NULL contributors, and a
+        set whose reported dimensions are all known reads complete-with-
+        gaps-explicit, never a blanket partial.
+        """
+
+        kinds = set(completenesses)
+        if record_count == 0 or not kinds or kinds == {"unavailable"}:
+            return "unavailable — nothing recorded (not zero)"
+        if "partial" in kinds:
+            return ("partial — some records unknown in at least one "
+                    "dimension (see per-dimension completeness)")
+        missing = sum(1 for kind in completenesses if kind == "unavailable")
+        if missing:
+            return ("complete for reported dimensions — " +
+                    str(missing) + " dimension(s) never reported "
+                    "(unavailable, not zero)")
+        return "complete"
+
+    @staticmethod
+    def _usage_timestamp(value: Any, field: str) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"{field} must be a timezone-aware ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValidationError(f"{field} must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _in_usage_window(record: Any, since: datetime | None,
+                        until: datetime | None) -> bool:
+        try:
+            when = datetime.fromisoformat(record.recorded_at)
+        except (TypeError, ValueError):
+            return False  # unparsable rows are never shown as in-window
+        if when.tzinfo is None:
+            return False
+        when = when.astimezone(timezone.utc)
+        if since is not None and when < since:
+            return False
+        if until is not None and when > until:
+            return False
+        return True
+
+    @staticmethod
+    def _usage_row_dto(record: Any) -> dict[str, Any]:
+        """One ledger row with explicit source/precision/currency labels."""
+
+        quantities = {}
+        for name in usage.USAGE_DIMENSIONS:
+            amount = getattr(record, name)
+            quantities[name] = {
+                "value": amount,
+                "available": amount is not None,
+                "label": fmt_amount_label(amount),
+            }
+        if record.currency is not None:
+            currency_label = record.currency
+        elif record.cost_microunits is not None:
+            currency_label = "unattributed (currency not reported)"
+        else:
+            currency_label = "unavailable"
+        return {
+            "usage_id": record.usage_id,
+            #: durable trace: the exact append that carries this record.
+            "event_id": "evt-usage-" + record.record_digest[:40],
+            "role": record.role,
+            "source": record.source,
+            "precision": record.precision,
+            "precision_label": {
+                "exact": "exact (reported by source)",
+                "estimated": "estimated (derived, labelled)",
+                "unavailable": "unavailable (nothing reported — not zero)",
+            }[record.precision],
+            "locality": record.locality,
+            "locality_label": record.locality or "unavailable",
+            "harness": record.harness,
+            "provider": record.provider,
+            "model": record.model,
+            "quantities": quantities,
+            "currency": record.currency,
+            "currency_label": currency_label,
+            "price_version": record.price_version,
+            "price_label": (record.price_version
+                           or "unpriced (no price version attached)"),
+            "recorded_at": record.recorded_at,
+            "task_id": record.task_id,
+            "attempt_id": record.attempt_id,
+        }
+
+    def _usage_filtered_records(
+        self, conn: sqlite3.Connection, project_id: str, *,
+        role: str | None, locality: str | None, precision: str | None,
+        since: datetime | None, until: datetime | None,
+    ) -> list[Any]:
+        rows = usage.list_usage(conn, project_id, role=role, locality=locality,
+                                precision=precision)
+        return [row for row in rows
+                if self._in_usage_window(row, since, until)]
+
+    @classmethod
+    def _usage_trend(cls, records: list[Any]) -> list[dict[str, Any]]:
+        """UTC-day trend buckets; NULLs stay visible inside every bucket.
+
+        Every bucket's ``totals`` uses the SAME shape as project/task/CEO
+        totals (``dimensions`` + ``cost_by_currency`` carrying
+        ``known_sum``/``unknown_count``/``completeness``).  One contract
+        means the console renders trend and grand totals with the exact
+        same helpers — a second compact shape here once rendered costs as
+        ``undefined`` (M5-05 QA blocker).
+        """
+
+        buckets: dict[str, list[Any]] = {}
+        for record in records:
+            when = datetime.fromisoformat(record.recorded_at).astimezone(
+                timezone.utc)
+            buckets.setdefault(when.date().isoformat(), []).append(record)
+        trend: list[dict[str, Any]] = []
+        for day in sorted(buckets):
+            totals = usage.UsageTotals.compute(buckets[day])
+            trend.append({"date": day, "records": totals.record_count,
+                         "totals": cls._usage_totals_dto(totals)})
+        return trend
+
+    @staticmethod
+    def _attempt_outcomes(conn: sqlite3.Connection,
+                          attempt_ids: list[str]) -> dict[str, str | None]:
+        if not attempt_ids:
+            return {}
+        marks = ",".join("?" for _ in attempt_ids)
+        return {str(row[0]): (None if row[1] is None else str(row[1]))
+                for row in conn.execute(
+                    "SELECT attempt_id, outcome FROM worker_reports"
+                    f" WHERE report_kind = 'final' AND attempt_id IN ({marks})",
+                    attempt_ids)}
+
+    def get_project_usage(
+        self, project_id: str, *,
+        role: str | None = None, locality: str | None = None,
+        precision: str | None = None,
+        since: str | None = None, until: str | None = None,
+        limit: int | None = None, offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Usage/cost view over the durable ledger for one project.
+
+        Filters implement the roadmap's screening: CEO/Worker/Verifier role,
+        local/cloud locality, precision and an ISO time window.  Totals,
+        breakdowns and the trend aggregate the WHOLE filtered set even when
+        ``items`` is only a page.
+        """
+
+        project_id = _entity_id(project_id, "project_id")
+        role = _choice(role, usage.USAGE_ROLES, "role")
+        locality = _choice(locality, usage.USAGE_LOCALITIES, "locality")
+        precision = _choice(precision, usage.PRECISION_STATES, "precision")
+        since_dt = self._usage_timestamp(since, "since")
+        until_dt = self._usage_timestamp(until, "until")
+        page_limit, page_offset = _page(limit, offset)
+        with self._read() as conn:
+            self._require_project(conn, project_id)
+            records = self._usage_filtered_records(
+                conn, project_id, role=role, locality=locality,
+                precision=precision, since=since_dt, until=until_dt)
+            totals = usage.UsageTotals.compute(records)
+            page = records[page_offset:page_offset + page_limit]
+            outcomes = self._attempt_outcomes(
+                conn, sorted({r.attempt_id for r in page if r.attempt_id}))
+        breakdown: dict[str, dict[str, Any]] = {
+            "by_role": {}, "by_locality": {}, "by_precision": {}}
+        for record in records:
+            groups = (("by_role", record.role),
+                      ("by_locality", record.locality or "unavailable"),
+                      ("by_precision", record.precision))
+            for bucket, key in groups:
+                breakdown[bucket].setdefault(key, []).append(record)
+        breakdown_dto = {
+            bucket: {key: self._usage_totals_dto(usage.UsageTotals.compute(rows))
+                    for key, rows in sorted(group.items())}
+            for bucket, group in breakdown.items()}
+        items = []
+        for record in page:
+            dto = self._usage_row_dto(record)
+            outcome = outcomes.get(record.attempt_id or "", "unknown")
+            dto["attempt_outcome"] = outcome
+            dto["failure_included"] = outcome in ("failed", "blocked")
+            items.append(dto)
+        return {
+            "project_id": project_id,
+            "filters": {"role": role, "locality": locality,
+                        "precision": precision,
+                        "since": since_dt.isoformat() if since_dt else None,
+                        "until": until_dt.isoformat() if until_dt else None},
+            "record_count": totals.record_count,
+            "totals": self._usage_totals_dto(totals),
+            "breakdown": breakdown_dto,
+            "trend": self._usage_trend(records),
+            "items": items,
+            "limit": page_limit,
+            "offset": page_offset,
+            "total": totals.record_count,
+            "has_more": page_offset + len(items) < totals.record_count,
+            "notes": [
+                "unknown quantities are null and labelled unavailable — never"
+                " summed as zero",
+                "partial totals list how many contributors were unknown",
+                "failed and blocked attempts are included (the ledger records"
+                " every final WorkerReport regardless of outcome)",
+                "costs aggregate only within one currency; unattributed costs"
+                " and missing price versions are counted as traceability gaps",
+            ],
+        }
+
+    def get_task_usage(
+        self, task_id: str, *,
+        role: str | None = None, locality: str | None = None,
+        precision: str | None = None,
+        since: str | None = None, until: str | None = None,
+    ) -> dict[str, Any]:
+        """Task-level usage detail across every Attempt — failures included."""
+
+        task_id = _entity_id(task_id, "task_id")
+        role = _choice(role, usage.USAGE_ROLES, "role")
+        locality = _choice(locality, usage.USAGE_LOCALITIES, "locality")
+        precision = _choice(precision, usage.PRECISION_STATES, "precision")
+        since_dt = self._usage_timestamp(since, "since")
+        until_dt = self._usage_timestamp(until, "until")
+        with self._read() as conn:
+            row = self._require_task(conn, task_id)
+            project_id = str(row[1])
+            records = self._usage_filtered_records(
+                conn, project_id, role=role, locality=locality,
+                precision=precision, since=since_dt, until=until_dt)
+            records = [r for r in records if r.task_id == task_id]
+            totals = usage.UsageTotals.compute(records)
+            outcomes = self._attempt_outcomes(
+                conn, sorted({r.attempt_id for r in records if r.attempt_id}))
+        items = []
+        for record in records:
+            dto = self._usage_row_dto(record)
+            outcome = outcomes.get(record.attempt_id or "", "unknown")
+            dto["attempt_outcome"] = outcome
+            dto["failure_included"] = outcome in ("failed", "blocked")
+            items.append(dto)
+        per_attempt: dict[str, Any] = {}
+        for record in records:
+            key = record.attempt_id or "unbound"
+            per_attempt.setdefault(key, []).append(record)
+        return {
+            "task_id": task_id,
+            "project_id": project_id,
+            "filters": {"role": role, "locality": locality,
+                        "precision": precision,
+                        "since": since_dt.isoformat() if since_dt else None,
+                        "until": until_dt.isoformat() if until_dt else None},
+            "record_count": totals.record_count,
+            "totals": self._usage_totals_dto(totals),
+            "per_attempt": {
+                attempt_id: self._usage_totals_dto(
+                    usage.UsageTotals.compute(rows))
+                for attempt_id, rows in sorted(per_attempt.items())},
+            "items": items,
+            "notes": [
+                "no rows means nothing was durably recorded — this is"
+                " unavailable, not zero usage",
+                "failed attempts' final reports are included with the same"
+                " NULL-preserving rules",
+                "every item traces to its usage_id and durable event_id",
+            ],
+        }
+
+    def get_ceo_usage(
+        self, project_id: str, *, target: str | None = None,
+        since: str | None = None, until: str | None = None,
+    ) -> dict[str, Any]:
+        """CEO/Wake usage from the durable wakes ledger + CEO ledger rows.
+
+        ``wake_count`` counts delivered-or-possibly-delivered wakes
+        (sending/submitted/acknowledged/processed/unknown); ``pending`` and
+        reconciled ``blocked`` never count.  CEO token/cost measurements are
+        unavailable in this runtime and stay null — never zero.
+        """
+
+        project_id = _entity_id(project_id, "project_id")
+        target = "ceo" if target is None else target
+        if not isinstance(target, str) or not _TARGET_NAME_RE.fullmatch(target):
+            raise ValidationError("target must be a normalized TeamCraft member name")
+        since_dt = self._usage_timestamp(since, "since")
+        until_dt = self._usage_timestamp(until, "until")
+        since_iso = since_dt.isoformat() if since_dt else None
+        until_iso = until_dt.isoformat() if until_dt else None
+        with self._read() as conn:
+            self._require_project(conn, project_id)
+            wake_view = usage.ceo_wake_usage(
+                conn, project_id, target_ceo_name=target,
+                since=since_iso, until=until_iso)
+            clauses = ["project_id = ?", "target_ceo_name = ?"]
+            params: list[Any] = [project_id, target]
+            if since_dt is not None:
+                clauses.append("COALESCE(submitted_at, updated_at) >= ?")
+                params.append(since_iso)
+            if until_dt is not None:
+                clauses.append("COALESCE(submitted_at, updated_at) <= ?")
+                params.append(until_iso)
+            where = " AND ".join(clauses)
+            wake_states = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    f"SELECT state, COUNT(*) FROM wakes WHERE {where}"
+                    " GROUP BY state", tuple(params))}
+            records = [r for r in
+                      usage.list_usage(conn, project_id, role="ceo")
+                      if self._in_usage_window(r, since_dt, until_dt)]
+        totals = usage.UsageTotals.compute(records)
+        return {
+            "project_id": project_id,
+            "target": target,
+            "window": {"since": since_iso, "until": until_iso},
+            "wake_usage": {
+                "wake_count": wake_view.wake_count,
+                "source": wake_view.source,
+                "precision": wake_view.precision,
+                "tokens_label": "unavailable — no harness reports CEO token"
+                              " usage; null, never zero",
+                "currency_label": "unavailable",
+                "recorded_at": wake_view.recorded_at,
+            },
+            "wake_states": wake_states,
+            "ledger_items": [self._usage_row_dto(r) for r in records],
+            "ledger_totals": self._usage_totals_dto(totals),
+            "notes": [
+                "wake_count = delivered-or-possibly-delivered wakes"
+                " (sending/submitted/acknowledged/processed/unknown);"
+                " pending and blocked never count",
+                "unknown deliveries (state=unknown) conservatively consume"
+                " attention and are shown, never hidden",
+                "this is a read projection over the wakes ledger — it"
+                " appends nothing and cannot double-count",
+            ],
+        }

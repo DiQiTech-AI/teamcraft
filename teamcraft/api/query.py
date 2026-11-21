@@ -563,6 +563,59 @@ def build_query_router(
     def get_task(task_id: str) -> Any:
         return _run(lambda: service.get_task(task_id))
 
+    # -- Usage & cost (M5-05) ----------------------------------------------------
+    #
+    # Read-only projections over the durable M5-04 usage ledger.  Filters are
+    # closed sets (role/locality/precision) plus timezone-aware ISO time
+    # windows; anything unrecognized fails 422 through the uniform handler,
+    # and every response passes the same redaction as the rest of the API.
+
+    @router.get("/tasks/{task_id}/usage")
+    def get_task_usage(
+        task_id: str,
+        role: str | None = None,
+        locality: str | None = None,
+        precision: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> Any:
+        return _run(
+            lambda: service.get_task_usage(
+                task_id, role=role, locality=locality, precision=precision,
+                since=since, until=until,
+            )
+        )
+
+    @router.get("/projects/{project_id}/usage")
+    def get_project_usage(
+        project_id: str,
+        role: str | None = None,
+        locality: str | None = None,
+        precision: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> Any:
+        return _run(
+            lambda: service.get_project_usage(
+                project_id, role=role, locality=locality, precision=precision,
+                since=since, until=until, limit=limit, offset=offset,
+            )
+        )
+
+    @router.get("/projects/{project_id}/ceo/usage")
+    def get_ceo_usage(
+        project_id: str,
+        target: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> Any:
+        return _run(
+            lambda: service.get_ceo_usage(
+                project_id, target=target, since=since, until=until)
+        )
+
     @router.get("/tasks/{task_id}/attempts")
     def list_task_attempts(
         task_id: str,
