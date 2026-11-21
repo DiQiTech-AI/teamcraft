@@ -29,7 +29,7 @@ from pathlib import PurePosixPath
 import unicodedata
 
 from . import (ceo_initialization, commands, domain, escalation, events, leader,
-               recovery, router, wake)
+               recovery, router, usage, wake)
 from .clock import Clock, SystemClock
 from .errors import NotFoundError, ValidationError
 from .ids import require_entity_id
@@ -1042,17 +1042,22 @@ def get_cloud_budget(
 def _durable_token_usage(
     conn: TeamCraftConnection, project_id: str, task_id: str,
 ) -> escalation.TokenUsage:
-    """Durable token usage for one Task, null-aware.
+    """Durable token usage for one Task, null-aware (M5-04 ledger).
 
-    M5-04 (per-Attempt usage records with source and exact/estimated flags)
-    does not exist yet, so this runtime persists no usage anywhere and the
-    only honest answer is all-NULL — UNKNOWN.  The reservation gate must
-    treat that as unknown (never zero, never free), which is exactly why a
-    cloud dispatch without usage evidence is conservatively refused today.
-    When M5-04 lands usage rows, this seam aggregates them per Task without
-    substituting nulls.
+    Aggregates the project's durable usage rows (FINAL WorkerReports,
+    verifier runs) for this Task through
+    :func:`teamcraft.usage.task_token_usage`: a dimension is known only when
+    EVERY contributing record reported it — any NULL keeps the dimension
+    unknown (never summed as zero, never treated as free), and costs only
+    aggregate when every reported cost shares one non-null currency.  With
+    no rows at all the answer is all-NULL (unavailable), so cloud dispatch
+    without usage evidence remains conservatively refused.  All localities
+    count toward the cloud caps: unproven locality is charged rather than
+    excused, because undercounting cloud spend is the direction this gate
+    must never fail in.
     """
-    return escalation.TokenUsage()
+
+    return usage.task_token_usage(conn, project_id, task_id)
 
 
 def _latest_retry_approval_requested_at(conn: TeamCraftConnection,

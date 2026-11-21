@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from . import briefs, domain, storage
+from . import briefs, domain, providers, storage, usage
 from .clock import Clock, SystemClock
 from .errors import ConflictError, ValidationError
 from .events import append_event
@@ -141,7 +141,63 @@ def record_worker_report(conn: storage.TeamCraftConnection, report: str | dict[s
             domain.transition_attempt(conn, attempt.id, "finish", result_json=canonical, clock=clock)
             append_event(conn, "attempt.execution_finished", task_id=attempt.task_id, attempt_id=attempt.id,
                 payload_json=json.dumps({"outcome": value["outcome"], "report_digest": value["report_digest"]}, sort_keys=True), clock=clock)
+            # M5-04: every durable FINAL report — completed, blocked or failed
+            # alike — projects exactly one row into the usage ledger.  Final
+            # is the accounting unit per Attempt (progress reports are
+            # skipped: their usage claims may be cumulative, and counting both
+            # would double-count).  A report with no usage still lands as an
+            # unavailable row: missing must be visible, never zero.  An exact
+            # replay returns before this point, so replays add no row.
+            _project_final_usage(conn, attempt.task_id, attempt.id, value, recorded)
     return ValidatedProgress(attempt.task_id, attempt.id, brief.task_version, brief.brief_digest, value["milestone_id"], value["report_digest"], value.get("artifact_digest"), recorded)
+
+
+def _project_final_usage(conn: storage.TeamCraftConnection, task_id: str,
+                        attempt_id: str, value: dict, recorded_at: str) -> None:
+    """Project one FINAL WorkerReport into the M5-04 usage ledger.
+
+    Quantities come only from the report's own ``usage`` object and the
+    Attempt's durable capability binding (M5-01); anything absent stays NULL.
+    Wire-level contradictions (e.g. ``total_tokens`` below its known parts)
+    never retroactively invalidate the M2-03 report contract: the ledger then
+    honestly records this Attempt's tokens as unavailable while keeping any
+    separately reported cost.
+    """
+    usage_data = value.get("usage") or {}
+    harness = provider = model = None
+    locality = None
+    try:
+        caps = providers.get_attempt_capabilities(conn, attempt_id)
+    except ConflictError:
+        caps = None
+    if isinstance(caps, dict):
+        selection = caps.get("selection") or {}
+        harness = selection.get("harness") or None
+        provider = selection.get("provider") or None
+        model = selection.get("model") or None
+        source = str((caps.get("provider_snapshot") or {}).get("source") or "")
+        # Loopback is the only derivable locality; cloud is never inferred.
+        if source.startswith("http://127.") or source.startswith("http://[::1]"):
+            locality = "local"
+    tokens = {name: usage_data.get(name) for name in
+              ("input_tokens", "output_tokens", "total_tokens", "cache_tokens")}
+    known = any(amount is not None for amount in tokens.values())
+    fields = dict(
+        role="worker", source="worker_report",
+        precision="exact" if known else "unavailable",
+        harness=harness, provider=provider, model=model, locality=locality,
+        response_count=None, wake_count=None, elapsed_ms=None,
+        cost_microunits=usage_data.get("cost_microunits"),
+        currency=None, price_version=None,
+        task_id=task_id, attempt_id=attempt_id, recorded_at=recorded_at)
+    try:
+        record = usage.UsageRecord(**tokens, **fields)
+    except ValidationError:
+        record = usage.UsageRecord(
+            input_tokens=None, output_tokens=None, total_tokens=None,
+            cache_tokens=None, **fields | {"precision": "unavailable"})
+    project_id = domain.get_task(conn, task_id).project_id
+    usage.record_usage(conn, project_id, record)
 
 
 def _progress(row: Any) -> ValidatedProgress:

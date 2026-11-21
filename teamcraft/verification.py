@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import timezone
 from typing import Any, Sequence
 
-from . import briefs, commands, domain, events, leader, storage, workspaces, worktrees
+from . import briefs, commands, domain, events, leader, storage, usage, workspaces, worktrees
 from .clock import Clock, SystemClock
 from .errors import (
     ConflictError,
@@ -563,12 +563,16 @@ def run_verification(
     status, exit_code, stdout, stderr, timed_out = "error", None, b"", b"", False
     truncated = False
     cleanup_error: str | None = None
+    started_mono = time.monotonic()
     try:
         exit_code, stdout, stderr, timed_out, truncated, cleanup_error = _run_bounded(
             config["argv"], cwd=repo_path, timeout_seconds=config["timeout_seconds"])
         status = "error" if timed_out or truncated or cleanup_error else ("pass" if exit_code == 0 else "fail")
     except Exception as exc:
         stderr = str(exc).encode("utf-8", errors="replace")
+    # Measured wall time of the external verifier — real even when the run
+    # failed/timed out, because failed executions still consumed the time.
+    duration_ms = int((time.monotonic() - started_mono) * 1000)
     artifact_obj = {"argv": config["argv"], "cwd": repo_path, "exit_code": exit_code,
         "timed_out": timed_out, "stdout": stdout.decode("utf-8", errors="replace"),
         "stderr": stderr.decode("utf-8", errors="replace"), "truncated": truncated}
@@ -622,6 +626,15 @@ def run_verification(
                 task_id=task.id, attempt_id=attempt.id,
                 payload_json=_json({"verification_id": run_id, "command_id": command.id, "status": status,
                     "artifact_digest": artifact_digest, "config_version": config["config_version"], "rules_version": config["rules_version"]}), clock=clock)
+            # M5-04 ledger: verifier elapsed is measured; LLM token/cost
+            # quantities are not measured by this runtime and stay NULL
+            # (precision unavailable).  pass/fail/error/stale all record —
+            # spent time counts regardless of verdict.  Replays return before
+            # this transaction, so an idempotent replay adds no row.
+            usage.record_usage(conn, task.project_id, usage.UsageRecord(
+                role="verifier", source="verification_run",
+                precision="unavailable", elapsed_ms=duration_ms,
+                task_id=task.id, attempt_id=attempt.id, recorded_at=_now(clock)))
             commands.confirm_command(conn, command.id, result_json=_json({"verification_id": run_id,
                 "status": status, "artifact_digest": artifact_digest}), clock=clock)
             return get_verification(conn, run_id)
@@ -1750,6 +1763,15 @@ def run_worktree_verifier(
                     "diff_gate_before_ok": bool(gate_before and gate_before["ok"]),
                     "diff_gate_after_ok": bool(gate_after and gate_after["ok"])}),
                 clock=clock)
+            # M5-04 ledger: one verifier usage row per actually-executed
+            # run (pass/fail/error/stale alike — the elapsed time was spent);
+            # replay short-circuits before this transaction, so retries
+            # neither duplicate nor lose the row, and token/cost stay NULL
+            # because this runtime measures none.
+            usage.record_usage(conn, task.project_id, usage.UsageRecord(
+                role="verifier", source="worktree_verification_run",
+                precision="unavailable", elapsed_ms=duration_ms,
+                task_id=task.id, attempt_id=attempt.id, recorded_at=_now(clock)))
             task_status_after = current_task.status
             if (status in ("fail", "error", "stale")
                     and current_task.status == "verifying"
