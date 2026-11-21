@@ -3398,6 +3398,94 @@ def verification_artifact(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_m503_core() -> None:
+    """Fail fast, with a fix hint, when the resolved Core predates M5-03.
+
+    The wake-budget surface lives entirely in ``teamcraft.wake``; an older
+    bundled copy has no durable budget API at all, and refusing before any
+    write beats an ``AttributeError`` mid-command.
+    """
+
+    missing = sorted(name for name in (
+        "record_wake_budget", "get_wake_budget", "wake_budget_usage",
+        "record_urgent_wake_escalation",
+    ) if not callable(getattr(_wake, name, None)))
+    if missing:
+        raise TeamctlError(
+            "the resolved TeamCraft core is too old for wake-budget commands"
+            f" (missing: {', '.join(missing)}); refresh the bundled core with"
+            " scripts/install.sh or reinstall the package")
+
+
+#: Reason prefix Core uses when the window budget refused an URGENT Wake.
+#: Read from the core when present so the CLI and the decision layer cannot
+#: drift apart silently; the literal keeps stale cores behaving as before.
+URGENT_WAKE_BUDGET_EXHAUSTED_REASON = str(getattr(
+    _wake, "URGENT_WAKE_BUDGET_EXHAUSTED_REASON", "urgent_wake_budget_exhausted"))
+
+
+class _WakeDeferred(Exception):
+    """Internal control flow: this Wake was refused before any Herdr I/O.
+
+    It carries the operator-facing ``deferred`` payload out of the delivery
+    block so the deferral path cannot be mistaken for a delivery attempt whose
+    outcome is UNKNOWN (nothing was prompted, nothing is recorded as sent).
+    """
+    def __init__(self, output: dict[str, Any]) -> None:
+        super().__init__(json.dumps(output, sort_keys=True))
+        self.output = output
+
+
+def _urgent_interrupt_candidate(store: StateStore, project_id: str,
+                               wake_item: Any) -> bool:
+    """Does the durable policy even permit an urgent interrupt attempt?
+
+    This only decides whether admission is *attempted* while the CEO looks
+    busy.  :func:`teamcraft.wake.admit_pending_wake` still decides
+    authoritatively from durable state (session state, priority floor, and
+    remaining window budget), so a false positive here can never deliver
+    over budget or without the persisted opt-in.
+    """
+
+    if not callable(getattr(_wake, "get_wake_budget", None)):
+        return False
+    conn = store._connect()
+    try:
+        current = _wake.get_wake_budget(conn, project_id)
+    except _CoreError:
+        # An unreadable budget policy fails closed: no interrupt attempt.
+        return False
+    finally:
+        conn.close()
+    if current is None:
+        return False
+    return bool(current.policy.allow_urgent_interrupt
+                and wake_item.priority >= current.policy.urgent_priority)
+
+
+def _record_urgent_wake_escalation(store: StateStore, project_id: str,
+                                  wake_id: str, lease: _leader.Lease,
+                                  *, detail: str) -> str:
+    """Persist the human-escalation record for an over-budget urgent Wake."""
+
+    if not callable(getattr(_wake, "record_urgent_wake_escalation", None)):
+        raise TeamctlError(
+            "the resolved TeamCraft core cannot record urgent Wake"
+            " escalations; refresh the bundled core with scripts/install.sh"
+            " or reinstall the package")
+    conn = store._connect()
+    try:
+        _event, inserted = _wake.record_urgent_wake_escalation(
+            conn, project_id, wake_id, lease, detail=detail)
+    except _CoreError as exc:
+        raise TeamctlError(
+            f"urgent Wake deferral needs human escalation but it could not"
+            f" be recorded: {exc}") from exc
+    finally:
+        conn.close()
+    return "recorded" if inserted else "already_recorded"
+
+
 def _verify_wake_herdr_target(member: dict[str, Any], initialization: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     """Pin the wake to the same canonical CEO pane, terminal, and native session."""
     if (member.get("role") != "ceo" or member.get("name") != initialization.canonical_ceo_name
