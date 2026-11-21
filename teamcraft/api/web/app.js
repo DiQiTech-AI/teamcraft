@@ -54,6 +54,8 @@ const state = {
   dagFilter: { status: "", kind: "" },
   dagFocus: "",
   dagOffset: 0,
+  diffTaskId: "",
+  timelineTaskId: "",
 };
 
 /* ------------------------------------------------------------------ *
@@ -515,6 +517,8 @@ function renderView() {
     usage: viewUsage,
     approvals: viewApprovals,
     verifications: viewVerifications,
+    diff: viewDiff,
+    timeline: viewTimeline,
   };
   (handlers[state.view] || viewOverview)(m);
 }
@@ -2574,6 +2578,584 @@ function recoveryTable(items) {
       "actor", "reason", "requested", "ttl"].map(function (h) {
       return el("th", { text: h });
     }))].concat(rows))];
+}
+
+/* ------------------------------------------------------------------ *
+ * Diff & Timeline (M6-02): safe rendering of Commit/Diff evidence,
+ * Verification output, and the Attempt/Session/Event execution timeline.
+ *
+ * Server capabilities VERIFIED against this API build (not assumed):
+ *
+ * - GET /tasks/{id}/delivery returns durable Commit/Ship/Approval
+ *   evidence per attempt with controlled freshness verdicts (ok +
+ *   signal tags; raw Core problem text never rides the wire);
+ * - GET /ship-evidence/{id}/diff returns the COMPLETE diff artifact as
+ *   JSON text (the ``diff`` field) plus digest/size facts — the Core
+ *   refuses oversized diffs fail-closed at write time, so this route
+ *   never hands out a silently clipped "complete" digest;
+ * - verification artifacts arrive as bounded previews (8 KiB by the
+ *   query layer) with honest ``preview_truncated`` and ``binary``
+ *   flags — a binary artifact carries a null preview, never a fake;
+ * - there is NO raw-byte download surface on this server: no
+ *   Content-Disposition endpoint exists (the only file responses in
+ *   teamcraft/api are the console's own static assets).  This console
+ *   therefore renders bounded, text-only views and deliberately offers
+ *   no fake download button; durable bytes stay server-side and are
+ *   fetchable as JSON through exactly the routes named above.
+ *
+ * Display bounds (client-side, always labeled; durable bytes are never
+ * modified): the diff body renders at most DIFF_RENDER_LIMIT chars,
+ * each rendered line at most DIFF_LINE_LIMIT chars, and the merged
+ * timeline at most TIMELINE_RENDER_LIMIT rows.  Every bound that bites
+ * raises a visible marker; binary content is announced, never silently
+ * mangled into mystery glyphs.
+ * ------------------------------------------------------------------ */
+
+const DIFF_RENDER_LIMIT = 20000;
+const DIFF_LINE_LIMIT = 240;
+const TIMELINE_RENDER_LIMIT = 300;
+
+/* Shared closed task picker for the two evidence pages: the options are
+ * the durable task rows themselves, and picking only navigates (it
+ * writes nothing). */
+function taskSelectFor(items, currentId, stateKey) {
+  const sel = el("select", { class: "in wide" });
+  for (const t of items) {
+    sel.appendChild(el("option", { value: t.id,
+      text: clipText(t.id, 22) + "  ·  " + clipText(fmt(t.title), 40),
+      selected: t.id === currentId }));
+  }
+  sel.addEventListener("change", function () {
+    state[stateKey] = this.value;
+    renderView();
+  });
+  return sel;
+}
+
+function pickTaskId(items, wantedId, fallbackId) {
+  if (wantedId && items.some(function (t) { return t.id === wantedId; })) {
+    return wantedId;
+  }
+  if (fallbackId && items.some(function (t) {
+    return t.id === fallbackId;
+  })) {
+    return fallbackId;
+  }
+  return items[0].id;
+}
+
+/* Binary announcement, never silent glyph soup: U+FFFD is what the
+ * server's UTF-8 decode-with-replacement produced for non-text bytes,
+ * and git self-reports binary hunks in the diff text itself. */
+function looksBinaryDiff(text) {
+  const t = String(text === null || text === undefined ? "" : text);
+  if (!t) return false;
+  return t.indexOf("\uFFFD") !== -1 ||
+    t.indexOf("GIT binary patch") !== -1 ||
+    t.indexOf("Binary files ") !== -1;
+}
+
+function diffLineKind(line) {
+  if (line.indexOf("diff --git ") === 0 || line.indexOf("index ") === 0 ||
+      line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0 ||
+      line.indexOf("@@") === 0 || line.indexOf("GIT binary patch") === 0 ||
+      line.indexOf("Binary files ") === 0) return "meta";
+  if (line.indexOf("+") === 0) return "add";
+  if (line.indexOf("-") === 0) return "del";
+  return "ctx";
+}
+
+function renderDiffBody(text) {
+  const pre = el("pre", { class: "diff" });
+  let body = String(text === null || text === undefined ? "" : text);
+  let charClipped = false;
+  if (body.length > DIFF_RENDER_LIMIT) {
+    body = body.slice(0, DIFF_RENDER_LIMIT);
+    charClipped = true;
+  }
+  let lineClipped = 0;
+  for (const raw of body.split("\n")) {
+    let line = raw;
+    if (line.length > DIFF_LINE_LIMIT) {
+      line = line.slice(0, DIFF_LINE_LIMIT) + " …[line clipped]";
+      lineClipped += 1;
+    }
+    pre.appendChild(el("div", { class: "d-" + diffLineKind(raw),
+      text: line === "" ? " " : line }));
+  }
+  return { node: pre, charClipped: charClipped, lineClipped: lineClipped };
+}
+
+function diffEvidenceNode(p) {
+  const out = [];
+  out.push(el("div", { class: "hrow" }, [
+    badge("commit " + String(p.commit_sha || "?").slice(0, 12), "ok"),
+    badge("base " + String(p.base_sha || "?").slice(0, 12), "muted"),
+    badge(fmt(p.branch), "muted"),
+    badge(fmt(p.file_count) + " file(s)", "muted"),
+    badge(fmt(p.diff_bytes) + " bytes", "muted"),
+    badge("text-only render", "muted"),
+  ]));
+  out.push(kvTable([
+    ["ship evidence", el("code", { text: fmt(p.ship_evidence_id) })],
+    ["commit sha", el("code", { text: fmt(p.commit_sha) })],
+    ["base sha", el("code", { text: fmt(p.base_sha) })],
+    ["diff digest (verified against the artifact by the server)",
+      el("code", { text: fmt(p.diff_digest) })],
+    ["proposed action · delivery mode",
+      fmt(p.proposed_action) + " · " + fmt(p.delivery_mode)],
+    ["artifact relpath (server-side, relative only)",
+      el("code", { text: fmt(p.diff_relpath) })],
+  ]));
+  if (looksBinaryDiff(p.diff)) {
+    out.push(badge("binary content in diff — binary hunks appear as " +
+      "escaped text (replacement chars), never as markup", "warn"));
+  }
+  const rendered = renderDiffBody(p.diff);
+  out.push(rendered.node);
+  if (rendered.charClipped) {
+    out.push(para("display truncated at " + DIFF_RENDER_LIMIT +
+      " characters of " + fmt(p.diff_bytes) + " bytes — this route " +
+      "serves the COMPLETE diff as JSON (Core refuses oversized diffs " +
+      "fail-closed); no raw-byte download endpoint exists on this " +
+      "server, so the console only ever shows this bounded text view.",
+    "warn"));
+  }
+  if (rendered.lineClipped) {
+    out.push(para(rendered.lineClipped + " long line(s) clipped at " +
+      DIFF_LINE_LIMIT + " characters for display — durable bytes " +
+      "unchanged.", "muted"));
+  }
+  return section("Complete diff artifact — digest-verified JSON", out);
+}
+
+/* Controlled freshness vocabulary from the API: ok -> current, else
+ * STALE plus the server's signal tags (never raw Core problem text). */
+function freshnessBadges(fresh) {
+  const out = [];
+  for (const key of Object.keys(fresh || {})) {
+    const v = fresh[key] || {};
+    if (v.ok) {
+      out.push(badge(key + " evidence: current", "ok"));
+    } else {
+      const sig = (v.signals || []).length
+        ? " [" + v.signals.join(", ") + "]" : "";
+      out.push(badge(key + " evidence: STALE" + sig +
+        " — do not treat as accepted", "bad"));
+    }
+  }
+  return out;
+}
+
+function loadDiffInto(box, shipEvidenceId) {
+  clear(box);
+  box.appendChild(spinner("Loading complete diff (JSON text)…"));
+  api("/ship-evidence/" + encodeURIComponent(shipEvidenceId) + "/diff")
+    .then(function (res) {
+      clear(box);
+      box.appendChild(diffEvidenceNode(res.data));
+    })
+    .catch(function (e) {
+      clear(box);
+      failInto(box, e, function () { loadDiffInto(box, shipEvidenceId); });
+    });
+}
+
+function deliveryAttemptCard(view) {
+  const card = el("div", { class: "attempt" });
+  const commit = view.commit;
+  const ship = view.ship;
+  const approval = view.approval;
+  card.appendChild(el("div", { class: "hrow" }, [
+    badge("attempt #" + fmt(view.attempt.attempt_no), "muted"),
+    el("code", { text: fmt(view.attempt.id) }),
+    commit ? badge("commit " + String(commit.commit_sha).slice(0, 12),
+      "ok") : badge("no commit evidence", "muted"),
+    ship ? badge("ship evidence " + String(ship.id).slice(0, 12), "muted")
+      : badge("no ship evidence", "muted"),
+    approval ? badge("decision: " + approval.decision,
+      approval.decision === "accept" ? "ok" : "bad")
+      : badge("no decision recorded", "warn"),
+  ]));
+  const rows = [];
+  if (commit) {
+    rows.push(["commit sha (the accepted link target)",
+      el("code", { text: fmt(commit.commit_sha) })]);
+    rows.push(["parent / base sha",
+      fmt(commit.parent_sha) + " / " + fmt(commit.base_sha)]);
+    rows.push(["branch", el("code", { text: fmt(commit.branch) })]);
+    rows.push(["diff digest · file count",
+      fmt(commit.diff_digest) + " · " + fmt(commit.file_count) +
+      " file(s)"]);
+    rows.push(["evidence digest · event · command",
+      fmt(commit.evidence_digest) + " · evt " + fmt(commit.event_id) +
+      " · cmd " + fmt(commit.command_id)]);
+    rows.push(["brief / worker-report binding", "brief v" +
+      fmt(commit.brief_version) + " (" + fmt(commit.brief_digest) +
+      ") · report " + fmt(commit.worker_report_digest)]);
+  }
+  if (ship) {
+    rows.push(["ship diff bytes · verifiers", fmt(ship.diff_bytes) +
+      " bytes · " + ((ship.verifiers || []).length) + " verifier row(s)"]);
+    rows.push(["ship evidence digest · verifier digest",
+      fmt(ship.evidence_digest) + " · " + fmt(ship.verifier_digest)]);
+  }
+  if (approval) {
+    rows.push(["approval binding", "commit " + fmt(approval.commit_sha) +
+      " · branch " + fmt(approval.branch) + " · task v" +
+      fmt(approval.task_version) + " · status after: " +
+      fmt(approval.task_status_after)]);
+  }
+  if (view.pull_request) {
+    /* pr_url stays TEXT: the console never turns server-supplied URLs
+     * into clickable hrefs (an href is a navigation sink; a repo URL is
+     * data, displayed for the operator to copy deliberately). */
+    rows.push(["pull request (text only — not a live link)",
+      fmt(view.pull_request.repo) + " #" + fmt(view.pull_request.pr_number) +
+      " · " + fmt(view.pull_request.pr_url)]);
+  }
+  if (rows.length) card.appendChild(kvTable(rows));
+  if (approval) {
+    card.appendChild(para(fmt(approval.decision) + " by " +
+      fmt(approval.actor) + " — " + fmt(approval.reason), "muted"));
+  }
+  const fresh = freshnessBadges(view.freshness);
+  if (fresh.length) card.appendChild(el("div", { class: "formrow" }, fresh));
+  if (ship) {
+    const diffBox = el("div", {});
+    card.appendChild(el("div", { class: "formrow" }, [
+      el("button", { type: "button",
+        text: "View complete diff (digest-verified JSON text)",
+        onclick: function () { loadDiffInto(diffBox, ship.id); } }),
+      para("GET /api/v1/ship-evidence/" + ship.id + "/diff — the whole " +
+        fmt(ship.diff_bytes) + "-byte artifact as recorded; no raw " +
+        "download endpoint exists on this server.", "muted"),
+    ]));
+    card.appendChild(diffBox);
+  } else {
+    card.appendChild(para("No ship evidence for this attempt — nothing to " +
+      "diff yet (report-only attempts record no diff artifact).", "muted"));
+  }
+  return card;
+}
+
+/* One verification run, rendered honestly: bounded preview or a clear
+ * binary/truncation announcement — never a silently missing output. */
+function verificationCard(v) {
+  const art = v.artifact || {};
+  const out = [el("div", { class: "hrow" }, [
+    badge(v.status, statusKind(v.status)),
+    el("code", { text: fmt(v.id) }),
+    badge("attempt #" + fmt(v.attempt_no), "muted"),
+    badge("exit " + fmt(v.exit_code), v.exit_code === 0 ? "ok"
+      : v.exit_code === null || v.exit_code === undefined ? "warn" : "bad"),
+  ]), para("task v" + fmt(v.task_version) + " · dispatch v" +
+    fmt(v.dispatch_task_version) + " · cfg v" + fmt(v.config_version) +
+    " · rules " + fmt(v.rules_version), "muted"),
+  jsonBlock(v.argv, "verifier argv")];
+  out.push(badge(fmt(art.size_bytes) + " artifact bytes", "muted"));
+  if (art.binary) {
+    out.push(para("binary artifact — the API reports binary=true with a " +
+      "null preview; there is no textual rendering of bytes and no raw " +
+      "download route on this server.", "warn"));
+  } else if (art.preview) {
+    out.push(jsonBlock({ preview: art.preview }, "output preview"));
+  } else {
+    out.push(para("no preview recorded — unavailable, not empty.", "muted"));
+  }
+  if (art.preview_truncated) {
+    out.push(para("preview truncated by the API at its 8 KiB bound — the " +
+      "full bytes stay server-side (no raw download endpoint exists).",
+    "warn"));
+  }
+  out.push(para("artifact digest " + fmt(art.digest) + " · brief " +
+    fmt(v.brief_digest) + " · report " + fmt(v.worker_report_digest),
+  "muted"));
+  return el("div", { class: "report" }, out);
+}
+
+async function viewDiff(m) {
+  const seq = renderSeq;
+  if (!needProject(clear(m))) return;
+  const pid = state.projectId;
+  m.appendChild(spinner("Loading delivery evidence…"));
+  let tasks, err = null;
+  try {
+    tasks = (await api("/projects/" + encodeURIComponent(pid) +
+      "/tasks?limit=200")).data;
+  } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  clear(m);
+  if (err) { failInto(m, err, function () { renderView(); }); return; }
+  const items = tasks.items || [];
+  m.appendChild(heading("Diff & verification evidence",
+    [badge(pid, "muted"), badge("read-only page", "muted")]));
+  m.appendChild(para("Verified server capabilities behind this page: the " +
+    "delivery route returns durable Commit/Ship/Approval evidence with " +
+    "freshness verdicts; the ship diff route serves the COMPLETE diff " +
+    "artifact as JSON text (Core refuses oversized diffs fail-closed); " +
+    "verification artifacts are bounded previews with truncation and " +
+    "binary flags. This server exposes NO raw-byte download endpoint " +
+    "(no Content-Disposition surface) — everything here is bounded, " +
+    "escaped text and nothing on this page writes.", "muted"));
+  if (!items.length) {
+    m.appendChild(emptyNote("tasks in this project"));
+    return;
+  }
+  state.diffTaskId = pickTaskId(items, state.diffTaskId, state.taskId);
+  m.appendChild(el("div", { class: "formrow" }, [
+    el("label", { text: "task" }),
+    taskSelectFor(items, state.diffTaskId, "diffTaskId"),
+  ]));
+  const enc = encodeURIComponent(state.diffTaskId);
+  let del, verifs, err2 = null;
+  try {
+    const results = await Promise.all([
+      api("/tasks/" + enc + "/delivery?limit=100"),
+      api("/tasks/" + enc + "/verifications?limit=100"),
+    ]);
+    del = results[0].data;
+    verifs = results[1].data;
+  } catch (e) { err2 = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  if (err2) { failInto(m, err2, function () { renderView(); }); return; }
+  const delItems = del.items || [];
+  m.appendChild(section("Commit / ship / approval evidence per attempt " +
+    "(stale verdicts come from the durable freshness check, not a guess)",
+  delItems.length ? delItems.map(deliveryAttemptCard)
+    : [para("no delivery evidence recorded for this task — nothing was " +
+      "committed through the M4 paths yet.", "empty")]));
+  const vItems = verifs.items || [];
+  m.appendChild(section("Verification runs for this task",
+    vItems.length ? vItems.map(verificationCard)
+      : [emptyNote("verification runs for this task")]));
+}
+
+/* ------------------------------------------------------------------ *
+ * Execution timeline (M6-02): one chronologically merged view over the
+ * Attempt / Session / Verification / Approval / Event layers.
+ *
+ * Ordering honesty: the durable event seq is the order authority for
+ * events; timestamps are the UTC strings stored on the durable rows
+ * (ISO-8601 sorts lexicographically).  Rows without a timestamp are
+ * kept and labelled, never dropped or guessed into place.  Sessions
+ * lazy-load their own route because /attempts/{id} is the only place
+ * the session rows are served.
+ * ------------------------------------------------------------------ */
+
+function tlEntry(t, seq, layer, text, tone, ref) {
+  return { t: t || null, seq: seq || 0, layer: layer, text: text,
+    tone: tone, ref: ref || "" };
+}
+
+function timelineEntries(attempts, events, verifs, approvals) {
+  const out = [];
+  for (const a of attempts) {
+    if (a.started_at) {
+      out.push(tlEntry(a.started_at, 0, "attempt",
+        "attempt #" + fmt(a.attempt_no) + " started" +
+        (a.commit_sha ? " · commit " + String(a.commit_sha).slice(0, 12)
+          : " · no commit recorded"), statusKind(a.status),
+      a.id.slice(0, 12)));
+    }
+    if (a.finished_at) {
+      out.push(tlEntry(a.finished_at, 0, "attempt",
+        "attempt #" + fmt(a.attempt_no) + " finished (" + fmt(a.status) +
+        ")", statusKind(a.status), a.id.slice(0, 12)));
+    }
+    if (!a.started_at && !a.finished_at) {
+      out.push(tlEntry(null, 0, "attempt",
+        "attempt #" + fmt(a.attempt_no) + " (" + fmt(a.status) +
+        ") — no timestamps recorded", statusKind(a.status),
+      a.id.slice(0, 12)));
+    }
+  }
+  for (const v of verifs) {
+    out.push(tlEntry(v.created_at, 0, "verification",
+      "verification → " + fmt(v.status) + " (exit " + fmt(v.exit_code) +
+      ")", statusKind(v.status), v.id.slice(0, 12)));
+  }
+  for (const a of approvals) {
+    out.push(tlEntry(a.created_at, 0, "approval",
+      "approval: " + fmt(a.decision) + " by " + fmt(a.actor),
+    a.decision === "accept" ? "ok" : "bad", a.id.slice(0, 12)));
+  }
+  for (const e of events) {
+    out.push(tlEntry(e.occurred_at, e.seq, "event", e.kind +
+      (e.progress_class ? " · " + e.progress_class : ""),
+    e.payload_truncated ? "warn" : "muted",
+    "seq " + fmt(e.seq) + " · " + String(e.event_id).slice(0, 12)));
+  }
+  out.sort(function (x, y) {
+    if (x.t && y.t && x.t !== y.t) return x.t < y.t ? -1 : 1;
+    if (x.t && !y.t) return -1;
+    if (!x.t && y.t) return 1;
+    return x.seq - y.seq;
+  });
+  return out;
+}
+
+function timelineTable(entries) {
+  const rows = [el("tr", {}, ["when (UTC)", "layer", "what", "ref"].map(
+    function (h) { return el("th", { text: h }); }))];
+  let shown = 0;
+  for (const e of entries) {
+    if (shown >= TIMELINE_RENDER_LIMIT) break;
+    rows.push(el("tr", { class: "tlrow" }, [
+      el("td", { text: e.t || "timestamp unknown" }),
+      el("td", {}, badge(e.layer, e.tone)),
+      el("td", { text: e.text }),
+      el("td", { class: "muted", text: e.ref || "—" }),
+    ]));
+    shown += 1;
+  }
+  return { table: el("table", { class: "list" }, rows), shown: shown };
+}
+
+function lazySessionsFor(a) {
+  const box = el("div", {});
+  const btn = el("button", { type: "button",
+    text: "Load sessions for attempt #" + fmt(a.attempt_no) });
+  btn.addEventListener("click", async function () {
+    btn.disabled = true;
+    clear(box);
+    box.appendChild(spinner("Loading sessions…"));
+    try {
+      const full = (await api("/attempts/" +
+        encodeURIComponent(a.id))).data;
+      clear(box);
+      const ss = full.sessions || [];
+      if (!ss.length) {
+        box.appendChild(para("No sessions recorded for this attempt.",
+          "empty"));
+      } else {
+        const rows = [el("tr", {}, ["session", "backend", "live state",
+          "native id", "pane", "created", "last observed"].map(
+          function (h) { return el("th", { text: h }); }))];
+        for (const s of ss) {
+          rows.push(el("tr", {}, [
+            el("td", { class: "muted", text: fmt(s.id) }),
+            el("td", { text: fmt(s.backend) }),
+            el("td", {}, badge(fmt(s.state), statusKind(s.state))),
+            el("td", { class: "muted", text: fmt(s.native_session_id) }),
+            el("td", { class: "muted", text: fmt(s.pane_id) }),
+            el("td", { text: fmt(s.created_at) }),
+            el("td", { text: fmt(s.last_observed_at) }),
+          ]));
+        }
+        box.appendChild(el("table", { class: "list" }, rows));
+        box.appendChild(para("Session state is the live signal only — it " +
+          "never implies Attempt finish or Task completion.", "muted"));
+      }
+    } catch (e) {
+      clear(box);
+      failInto(box, e, function () { btn.click(); });
+      btn.disabled = false;
+    }
+  });
+  box.appendChild(btn);
+  return box;
+}
+
+async function viewTimeline(m) {
+  const seq = renderSeq;
+  if (!needProject(clear(m))) return;
+  const pid = state.projectId;
+  m.appendChild(spinner("Loading execution timeline…"));
+  let tasks, err = null;
+  try {
+    tasks = (await api("/projects/" + encodeURIComponent(pid) +
+      "/tasks?limit=200")).data;
+  } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  clear(m);
+  if (err) { failInto(m, err, function () { renderView(); }); return; }
+  const items = tasks.items || [];
+  m.appendChild(heading("Execution timeline",
+    [badge(pid, "muted"), badge("read-only page", "muted")]));
+  if (!items.length) {
+    m.appendChild(emptyNote("tasks in this project"));
+    return;
+  }
+  state.timelineTaskId = pickTaskId(items, state.timelineTaskId,
+    state.taskId);
+  m.appendChild(el("div", { class: "formrow" }, [
+    el("label", { text: "task" }),
+    taskSelectFor(items, state.timelineTaskId, "timelineTaskId"),
+  ]));
+  const enc = encodeURIComponent(state.timelineTaskId);
+  let task, attempts, events, verifs, approvals;
+  let err2 = null;
+  try {
+    const results = await Promise.all([
+      api("/tasks/" + enc),
+      api("/tasks/" + enc + "/attempts?limit=100"),
+      api("/events?task_id=" + enc + "&limit=200"),
+      api("/tasks/" + enc + "/verifications?limit=100"),
+      api("/tasks/" + enc + "/approvals?limit=100"),
+    ]);
+    task = results[0].data;
+    attempts = results[1].data;
+    events = results[2].data;
+    verifs = results[3].data;
+    approvals = results[4].data;
+  } catch (e) { err2 = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  if (err2) { failInto(m, err2, function () { renderView(); }); return; }
+  m.appendChild(el("div", { class: "hrow" }, [
+    badge(task.status, statusKind(task.status)),
+    badge("task v" + fmt(task.version), "muted"),
+    el("button", { type: "button", text: "Open task detail",
+      onclick: function () {
+        state.taskId = task.id;
+        setView("task");
+      } }),
+    el("button", { type: "button", text: "Open diff evidence",
+      onclick: function () {
+        state.diffTaskId = task.id;
+        setView("diff");
+      } }),
+  ]));
+  const entries = timelineEntries(attempts.items || [], events.items || [],
+    verifs.items || [], approvals.items || []);
+  if (!entries.length) {
+    m.appendChild(emptyNote("timeline rows for this task"));
+  } else {
+    const rendered = timelineTable(entries);
+    m.appendChild(section("Merged timeline (attempt · session source · " +
+      "verification · approval · event)", [rendered.table]));
+    if (rendered.shown < entries.length) {
+      m.appendChild(para("display bound: showing " + rendered.shown +
+        " of " + entries.length + " rows — the durable log keeps the " +
+        "rest; page it through REST /events with after_seq (there is no " +
+        "raw log download endpoint on this server).", "warn"));
+    }
+    const evTotal = (events.page && events.page.total) || 0;
+    m.appendChild(para("ordering authority: durable event seq within one " +
+      "timestamp; timestamps are the UTC strings stored on the durable " +
+      "rows. This task has " + fmt(evTotal) + " durable events total; " +
+      "this fetch pulled the newest bound (" + (events.items || []).length +
+      " delivered).", "muted"));
+  }
+  const aItems = attempts.items || [];
+  m.appendChild(section("Sessions per attempt (live signals kept a " +
+    "separate layer)", aItems.length
+    ? aItems.map(function (a) {
+      return el("div", { class: "attempt" }, [
+        el("div", { class: "hrow" }, [
+          badge("attempt #" + fmt(a.attempt_no), statusKind(a.status)),
+          el("code", { text: fmt(a.id) }),
+          a.commit_sha
+            ? badge("commit " + String(a.commit_sha).slice(0, 12), "ok")
+            : badge("no commit recorded", "muted"),
+        ]),
+        lazySessionsFor(a),
+      ]);
+    })
+    : [emptyNote("attempts for this task")]));
+  m.appendChild(para("This page merges durable rows from five read " +
+    "routes; it writes nothing and never implies completion from a live " +
+    "signal.", "muted"));
 }
 
 /* ------------------------------------------------------------------ *

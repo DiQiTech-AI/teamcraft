@@ -254,3 +254,31 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   cursor: pointer;
   text-decoration: underline;
 }
+
+/* ------------------------------------------------------------------ *
+ * M6-02 Diff / verification / execution timeline.
+ * ------------------------------------------------------------------ */
+
+.warn { color: var(--warn); }
+
+.diffwrap-card, .diff { max-width: 100%; }
+
+pre.diff {
+  background: #0d1117;
+  color: #d6e2ef;
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow: auto;
+  max-height: 60vh;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  margin: 6px 0;
+}
+pre.diff .d-add { color: #3fb950; }
+pre.diff .d-del { color: #f85149; }
+pre.diff .d-meta { color: #8b949e; font-weight: 600; }
+pre.diff .d-ctx { color: #c9d1d9; }
+
+.tlrow td { font-size: 12px; }
