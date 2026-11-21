@@ -210,3 +210,47 @@ details summary { cursor: pointer; color: var(--accent); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px; background: #eef1f4; padding: 0 4px; border-radius:
   4px; }
+
+/* ------------------------------------------------------------------ *
+ * M6-01 read-only dependency DAG.
+ * ------------------------------------------------------------------ */
+
+.dagwrap {
+  overflow: auto;
+  max-height: 70vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 6px;
+}
+.dag { display: block; }
+
+.dag-node { cursor: pointer; }
+.dag-node rect { stroke-width: 1.5; }
+.dag-node rect.k-ok    { fill: #eaf6ee; stroke: var(--ok); }
+.dag-node rect.k-warn  { fill: #fbf4e4; stroke: var(--warn); }
+.dag-node rect.k-bad   { fill: #fdecea; stroke: var(--bad); }
+.dag-node rect.k-muted { fill: #eef1f4; stroke: var(--muted); }
+.dag-focus rect { stroke: var(--accent); stroke-width: 3; }
+
+.dag-id    { font-size: 10px; fill: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dag-title { font-size: 12px; font-weight: 600; fill: var(--ink); }
+.dag-meta  { font-size: 11px; fill: var(--muted); }
+.dag-role  { font-size: 11px; fill: var(--ink); }
+.dag-block { font-size: 11px; font-weight: 700; fill: var(--bad); }
+
+.dag-edge { stroke: #8a94a0; stroke-width: 1.5; fill: none; }
+.dag-arrow { fill: #8a94a0; }
+.dag-edge.e-unmet { stroke: var(--bad); stroke-dasharray: 5 4; }
+.dag-arrow-unmet { fill: var(--bad); }
+
+.linkish {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}

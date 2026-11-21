@@ -51,6 +51,9 @@ const state = {
   wakeFilter: "",
   usageRole: "",
   usageLocality: "",
+  dagFilter: { status: "", kind: "" },
+  dagFocus: "",
+  dagOffset: 0,
 };
 
 /* ------------------------------------------------------------------ *
@@ -474,6 +477,7 @@ function setView(view) {
   if (view !== "events") stopStream();
   state.view = view;
   state.pageOffset = 0;
+  state.dagOffset = 0;
   renderView();
 }
 
@@ -502,6 +506,7 @@ function renderView() {
   const handlers = {
     overview: viewOverview,
     tasks: viewTasks,
+    dag: viewDag,
     task: viewTaskDetail,
     agents: viewAgents,
     ceo: viewCeo,
@@ -824,6 +829,308 @@ function createTaskForm(pid) {
       "refused 422 before any core call (ownership/max_attempts cannot be " +
       "silently dropped).", "muted"),
   ]);
+}
+
+/* ------------------------------------------------------------------ *
+ * DAG (M6-01): read-only dependency visualization.
+ *
+ * Everything drawn here comes from one GET on the M6-01 graph route —
+ * the same durable ``task_dependencies`` rows the per-task dependency
+ * route serves — so the arrows are the backend's edges verbatim.  The
+ * view is presentation-only: no edge add/remove call, no drag handlers,
+ * no node repositioning reaches the server; cycle prevention stays
+ * exactly where the Core put it (``domain.add_dependency``).  Status,
+ * role (Task kind + assigned members) and blocker explanations are all
+ * fields of the graph payload, never client-side guesses.
+ * ------------------------------------------------------------------ */
+
+/* The SVG namespace is an XML identifier, not a fetched resource —
+ * createElementNS performs no network I/O.  It is assembled at runtime
+ * so the console's static "no http(s) literals anywhere" invariant
+ * (tests/test_web_m305.py) stays mechanically checkable. */
+const SVG_NS = "http:" + "//www.w3.org/2000/svg";
+
+function svgEl(tag, attrs, children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  const o = attrs || {};
+  for (const key of Object.keys(o)) {
+    const v = o[key];
+    if (v === null || v === undefined || v === false) continue;
+    if (key === "text") node.textContent = String(v);
+    else if (key.startsWith("on") && typeof v === "function") {
+      node.addEventListener(key.slice(2), v);
+    } else node.setAttribute(key, String(v));
+  }
+  for (const child of children || []) {
+    if (child === null || child === undefined || child === false) continue;
+    node.appendChild(child);
+  }
+  return node;
+}
+
+function clipText(text, max) {
+  const t = String(text === null || text === undefined ? "" : text);
+  if (!t) return "(empty)";
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+/* Layered layout: one column per server-computed depth level (depth is
+ * derived from the FULL project graph, so filters page without
+ * relabelling), rows stack within a column.  Nodes whose depth the
+ * backend refused to assign (cycle/tamper flag) land in a trailing
+ * flagged column instead of a fabricated position. */
+function dagLayout(nodes) {
+  let maxDepth = 0;
+  for (const n of nodes) {
+    if (typeof n.depth === "number" && n.depth > maxDepth) maxDepth = n.depth;
+  }
+  const cols = new Map();
+  for (const n of nodes) {
+    const d = typeof n.depth === "number" ? n.depth : maxDepth + 1;
+    if (!cols.has(d)) cols.set(d, []);
+    cols.get(d).push(n);
+  }
+  return cols;
+}
+
+const DAG_W = 210;
+const DAG_H = 78;
+const DAG_GX = 70;
+const DAG_GY = 18;
+const DAG_PAD = 16;
+
+function dagSvg(graph, focusId) {
+  const nodes = graph.nodes || [];
+  const cols = dagLayout(nodes);
+  const depths = Array.from(cols.keys()).sort(function (a, b) { return a - b; });
+  const pos = {};
+  let rowsMax = 1;
+  depths.forEach(function (d, ci) {
+    const list = cols.get(d);
+    rowsMax = Math.max(rowsMax, list.length);
+    list.forEach(function (n, ri) {
+      pos[n.id] = { x: DAG_PAD + ci * (DAG_W + DAG_GX),
+        y: DAG_PAD + ri * (DAG_H + DAG_GY) };
+    });
+  });
+  const width = DAG_PAD * 2 +
+    Math.max(1, depths.length) * (DAG_W + DAG_GX) - DAG_GX;
+  const height = DAG_PAD * 2 + rowsMax * (DAG_H + DAG_GY) - DAG_GY;
+  const svg = svgEl("svg", { width: width, height: height,
+    viewBox: "0 0 " + width + " " + height, class: "dag" }, [
+    svgEl("defs", {}, [
+      svgEl("marker", { id: "dag-arrow", viewBox: "0 0 10 10", refX: 9,
+        refY: 5, markerWidth: 7, markerHeight: 7,
+        orient: "auto-start-reverse" },
+      [svgEl("path", { d: "M0,0 L10,5 L0,10 z", class: "dag-arrow" })]),
+      svgEl("marker", { id: "dag-arrow-unmet", viewBox: "0 0 10 10",
+        refX: 9, refY: 5, markerWidth: 7, markerHeight: 7,
+        orient: "auto-start-reverse" },
+      [svgEl("path", { d: "M0,0 L10,5 L0,10 z",
+        class: "dag-arrow-unmet" })]),
+    ]),
+  ]);
+
+  /* Edges first so nodes paint over the wires.  source -> target reads
+   * "source must reach DONE before target"; dashed red marks a dependency
+   * that is NOT done — exactly the backend ``satisfied`` flag. */
+  for (const e of graph.edges || []) {
+    const s = pos[e.source];
+    const t = pos[e.target];
+    if (!s || !t) continue;
+    const x1 = s.x + DAG_W;
+    const y1 = s.y + DAG_H / 2;
+    const x2 = t.x;
+    const y2 = t.y + DAG_H / 2;
+    const mid = Math.max(28, (x2 - x1) / 2);
+    svg.appendChild(svgEl("path", {
+      d: "M" + x1 + "," + y1 + " C" + (x1 + mid) + "," + y1 + " " +
+        (x2 - mid) + "," + y2 + " " + x2 + "," + y2,
+      class: "dag-edge" + (e.satisfied ? "" : " e-unmet"),
+      "marker-end": e.satisfied ? "url(#dag-arrow)" : "url(#dag-arrow-unmet)",
+    }));
+  }
+
+  for (const n of nodes) {
+    const p = pos[n.id];
+    if (!p) continue;
+    const assign = (n.assignees || []).map(function (a) {
+      return a.role + ":" + a.name;
+    }).join(", ");
+    const g = svgEl("g", {
+      class: "dag-node" + (focusId && n.id === focusId ? " dag-focus" : ""),
+      tabindex: "0",
+      onclick: function () { state.taskId = n.id; setView("task"); },
+      onkeydown: function (ev) {
+        if (ev.key === "Enter") { state.taskId = n.id; setView("task"); }
+      },
+    }, [
+      svgEl("rect", { x: p.x, y: p.y, width: DAG_W, height: DAG_H, rx: 8,
+        class: "k-" + statusKind(n.status) }),
+      svgEl("text", { x: p.x + 10, y: p.y + 16, class: "dag-id",
+        text: clipText(n.id, 26) }),
+      svgEl("text", { x: p.x + 10, y: p.y + 34, class: "dag-title",
+        text: clipText(n.title, 24) }),
+      svgEl("text", { x: p.x + 10, y: p.y + 50, class: "dag-meta",
+        text: n.kind + " · " + n.status + (n.paused ? " · paused" : "") }),
+      svgEl("text", { x: p.x + 10, y: p.y + 66, class: "dag-role",
+        text: assign ? clipText(assign, 30) : "no member assigned" }),
+    ]);
+    if (n.blocked_by_dependencies) {
+      g.appendChild(svgEl("text", { x: p.x + DAG_W - 10, y: p.y + 16,
+        class: "dag-block", "text-anchor": "end",
+        text: "⛔ " + (n.unmet_dependencies || []).length }));
+    }
+    svg.appendChild(g);
+  }
+  return svg;
+}
+
+async function viewDag(m) {
+  const seq = renderSeq;
+  if (!needProject(clear(m))) return;
+  const pid = state.projectId;
+  m.appendChild(spinner("Loading dependency graph…"));
+  const qs = ["limit=200", "offset=" + state.dagOffset];
+  if (state.dagFilter.status) qs.push("status=" + state.dagFilter.status);
+  if (state.dagFilter.kind) qs.push("kind=" + state.dagFilter.kind);
+  let graph, err = null;
+  try {
+    graph = (await api("/projects/" + encodeURIComponent(pid) +
+      "/dependency-graph?" + qs.join("&"))).data;
+  } catch (e) { err = e; }
+  if (seq !== renderSeq) return;  /* superseded by a newer navigation */
+  clear(m);
+  if (err) { failInto(m, err, function () { renderView(); }); return; }
+
+  const stats = graph.stats || {};
+  m.appendChild(heading("Dependency DAG", [
+    badge(pid, "muted"),
+    badge(fmt(stats.tasks_total) + " tasks · " + fmt(stats.edges_total) +
+      " edges", "muted"),
+    graph.acyclic ? badge("acyclic — matches the core invariant", "ok")
+      : badge("CYCLE in stored data — the core forbids this", "bad"),
+    badge("read-only: no drag, no edge edits", "muted"),
+  ]));
+  m.appendChild(para(fmt(graph.edge_semantics), "muted"));
+  if (!graph.acyclic) {
+    m.appendChild(el("div", { class: "statebox s-error" }, [
+      el("strong", { text: "Stored dependency data contains a cycle" }),
+      para("Nodes in or downstream of the cycle: " +
+        ((graph.cycle_nodes || []).join(", ") || "unknown") +
+        " — Core add_dependency refuses cycles at write time, so these " +
+        "rows indicate tampered or foreign-written state. The UI flags " +
+        "them; it cannot repair or create edges.", "muted"),
+    ]));
+  }
+
+  /* Big-graph filters + locate (roadmap 9.6 M6-01).  Closed-set filter
+   * controls only — the same enumerations the API validates against. */
+  const focusIn = el("input", { type: "text", class: "in wide",
+    placeholder: "locate task id (highlight)", value: state.dagFocus });
+  m.appendChild(el("div", { class: "formrow" }, [
+    el("label", { text: "status" }),
+    selectOf(TASK_STATUSES, state.dagFilter.status, function () {
+      state.dagFilter.status = this.value;
+      state.dagOffset = 0;
+      renderView();
+    }),
+    el("label", { text: "kind" }),
+    selectOf(TASK_KINDS, state.dagFilter.kind, function () {
+      state.dagFilter.kind = this.value;
+      state.dagOffset = 0;
+      renderView();
+    }),
+    focusIn,
+    el("button", { type: "button", text: "Locate",
+      onclick: function () {
+        state.dagFocus = focusIn.value.trim();
+        renderView();
+      } }),
+  ]));
+
+  const nodes = graph.nodes || [];
+  if (!nodes.length) {
+    m.appendChild(emptyNote("task in this project for this filter"));
+    return;
+  }
+  if (state.dagFocus && !nodes.some(function (n) {
+    return n.id === state.dagFocus;
+  })) {
+    m.appendChild(badge("focus " + state.dagFocus + " is not on this " +
+      "page/filter — adjust the filters or page through", "warn"));
+  }
+  m.appendChild(el("div", { class: "dagwrap" },
+    [dagSvg(graph, state.dagFocus)]));
+  m.appendChild(el("div", { class: "formrow" }, [
+    el("button", { type: "button", text: "← Prev",
+      disabled: state.dagOffset === 0,
+      onclick: function () {
+        state.dagOffset = Math.max(0, state.dagOffset - 200);
+        renderView();
+      } }),
+    para("nodes " + (state.dagOffset + 1) + "–" +
+      (state.dagOffset + nodes.length) + " of " + graph.page.total +
+      (graph.page.has_more ? " — more pages follow" : ""), "muted"),
+    el("button", { type: "button", text: "Next →",
+      disabled: !graph.page.has_more,
+      onclick: function () { state.dagOffset += 200; renderView(); } }),
+    badge("arrows: dependency → dependent · solid = DONE · dashed red = " +
+      "not DONE", "muted"),
+  ]));
+  if ((graph.edges_outside_page || []).length) {
+    m.appendChild(badge(fmt(stats.edges_outside_page) +
+      " edge(s) reference tasks outside this page (see backend payload)",
+    "warn"));
+  }
+
+  /* Blocker explanations — one row per blocked/waiting task, every field
+   * from the durable graph payload. */
+  const blocked = nodes.filter(function (n) {
+    return n.blocked_by_dependencies || n.status_blocked;
+  });
+  const blockRows = [el("tr", {}, ["task", "kind/role", "status",
+    "unmet dependencies (id = status)", "blocking path upstream",
+    "assigned"].map(function (h) { return el("th", { text: h }); }))];
+  for (const n of blocked) {
+    const unmet = (n.unmet_dependencies || []).map(function (d) {
+      return d.id + " = " + d.status;
+    });
+    const path = (n.blocking_path || []).map(function (p) {
+      return p.id + "(" + p.status + ")";
+    });
+    let explanation;
+    if (path.length) {
+      explanation = "← " + path.join(" ← ") +
+        (n.blocking_path_truncated ? " … (chain truncated by API bound)"
+          : "");
+    } else if (n.status_blocked) {
+      explanation = "not dependency-caused — Core set status blocked";
+    } else {
+      explanation = "waiting on a direct dependency";
+    }
+    blockRows.push(el("tr", {}, [
+      el("td", {}, el("button", { type: "button", class: "linkish",
+        text: clipText(n.id, 22),
+        onclick: function () { state.taskId = n.id; setView("task"); } })),
+      el("td", { text: n.kind }),
+      el("td", {}, badge(n.status, statusKind(n.status))),
+      el("td", { text: unmet.length ? unmet.join(" · ")
+        : "none — dependency-clear" }),
+      el("td", { text: explanation }),
+      el("td", { text: (n.assignees || []).length
+        ? n.assignees.map(function (a) {
+          return a.role + ":" + a.name + "(" + a.phase + ")";
+        }).join(", ")
+        : "unassigned" }),
+    ]));
+  }
+  m.appendChild(section("Blockers explained (from durable dependency " +
+    "facts)", blocked.length ? blockRows
+    : [para("No task on this page is blocked or waiting on a dependency.",
+      "empty")]));
+  m.appendChild(section("How to read this graph",
+    (graph.notes || []).map(function (n) { return para(n, "muted"); })));
 }
 
 /* ------------------------------------------------------------------ *

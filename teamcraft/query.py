@@ -104,6 +104,12 @@ VERIFICATION_STATUSES = frozenset({"pass", "fail", "error", "stale"})
 RECOVERY_ACTIONS = frozenset({"wait", "cancel", "reconcile"})
 RECOVERY_KIND_PREFIX = "recovery."
 
+#: M6-01: bound on the upstream blocker-chain walk per node.  Long chains
+#: are truncated honestly (``blocking_path_truncated``) rather than hidden.
+MAX_BLOCKING_CHAIN_NODES = 12
+#: M6-01: cap on the ``edges_outside_page`` diagnostics list.
+MAX_OUTSIDE_PAGE_EDGES = 50
+
 #: Canonical usage quantities.  Null means *unknown*, never zero (FR-018).
 USAGE_FIELDS = ("input_tokens", "output_tokens", "total_tokens", "cost_microunits")
 
@@ -999,6 +1005,262 @@ class QueryService:
             ).fetchall()
         ]
         return depends_on, required_by
+
+    # -- Dependency DAG (M6-01, read-only visualization) -----------------------
+    #
+    # One server-side graph read for the console's DAG view (roadmap 9.6
+    # M6-01).  The graph is DERIVED exclusively from durable facts — the
+    # same ``tasks`` and ``task_dependencies`` rows the CLI and
+    # ``list_dependencies`` read — so the UI's arrows are byte-for-byte the
+    # core's edges (roadmap acceptance: "UI 与后端依赖一致").  Nothing here
+    # writes: this surface adds no edge, moves no node, and cannot close a
+    # cycle; the Core's ``add_dependency`` cycle check remains the single
+    # authority (``acyclic``/``cycle_nodes`` verify the invariant instead of
+    # assuming it).  Blocker explanations are structured facts, not guesses:
+    # ``unmet_dependencies`` mirrors the domain's own "dependency not DONE"
+    # predicate (``_UNFINISHED_DEPS_SQL``) and ``blocking_path`` walks that
+    # same predicate upstream, bounded and flagged.
+
+    def project_dependency_graph(
+        self,
+        project_id: str,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only dependency DAG for one project.
+
+        ``nodes`` carry the durable Task facts (status, kind/role, risk)
+        plus derived topological ``depth``, dependency id lists, unmet
+        dependency blockers and the runtime members assigned to each Task.
+        ``edges`` are ``{"source": depends_on_id, "target": task_id}`` —
+        read the arrow as "source must reach DONE before target is
+        dependency-clear".  Filters (status/kind) and pagination apply to
+        ``nodes`` only; edges pointing outside the returned page are
+        reported in ``edges_outside_page`` instead of silently dropped.
+        """
+
+        status = _choice(status, frozenset(TASK_STATUSES), "status")
+        kind = _choice(kind, frozenset(TASK_KINDS), "kind")
+        page_limit, page_offset = _page(limit, offset)
+        with self._read() as conn:
+            project = self._require_project(conn, project_id)
+            task_rows = conn.execute(
+                "SELECT id, title, kind, status, risk, priority, paused"
+                " FROM tasks WHERE project_id = ?"
+                # Same ordering authority as domain.list_tasks / list_tasks.
+                " ORDER BY priority DESC, created_at ASC, id ASC",
+                (str(project[0]),),
+            ).fetchall()
+            edge_rows = conn.execute(
+                "SELECT d.task_id, d.depends_on_id FROM task_dependencies d"
+                " JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?"
+                " ORDER BY d.task_id ASC, d.depends_on_id ASC",
+                (str(project[0]),),
+            ).fetchall()
+            member_rows = conn.execute(
+                "SELECT name, role, phase, task_id FROM members"
+                " WHERE task_id IS NOT NULL ORDER BY name ASC"
+            ).fetchall()
+
+        # -- full-graph facts (independent of filters, so filtering never
+        #     relabels or repositions a node's durable semantics) ----------
+        tasks: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for row in task_rows:
+            task_id = str(row[0])
+            tasks[task_id] = {
+                "id": task_id,
+                "title": str(row[1]),
+                "kind": str(row[2]),
+                "status": str(row[3]),
+                "risk": str(row[4]),
+                "priority": int(row[5]),
+                "paused": bool(int(row[6])),
+            }
+            order.append(task_id)
+
+        depends: dict[str, list[str]] = {tid: [] for tid in order}
+        required_by: dict[str, list[str]] = {tid: [] for tid in order}
+        edges_all: list[tuple[str, str]] = []
+        for task_id, depends_on_id in ((str(r[0]), str(r[1])) for r in edge_rows):
+            # Defensive: an edge naming a task outside this project's read
+            # (should be impossible through core paths) is surfaced in the
+            # dangling report, never rendered as a confirmed arrow.
+            if task_id not in tasks or depends_on_id not in tasks:
+                continue
+            depends[task_id].append(depends_on_id)
+            required_by[depends_on_id].append(task_id)
+            edges_all.append((depends_on_id, task_id))
+
+        # Kahn longest-path depth over the FULL project graph.  Nodes left
+        # after the sweep are in (or downstream of) a cycle — the Core
+        # forbids cycles at write time, so this is a tamper/self-consistency
+        # signal, reported honestly rather than rendered as a fake layout.
+        pending_counts = {tid: len(depends[tid]) for tid in order}
+        depth: dict[str, int | None] = {
+            tid: (0 if pending_counts[tid] == 0 else None) for tid in order
+        }
+        queue = [tid for tid in order if pending_counts[tid] == 0]
+        visited = 0
+        while queue:
+            current = queue.pop(0)
+            visited += 1
+            for nxt in required_by[current]:
+                current_depth = depth[current]
+                if depth[nxt] is None or (
+                    current_depth is not None and current_depth + 1 > depth[nxt]
+                ):
+                    depth[nxt] = (current_depth or 0) + 1
+                pending_counts[nxt] -= 1
+                if pending_counts[nxt] == 0:
+                    queue.append(nxt)
+        cycle_nodes: list[str] = []
+        if visited != len(order):
+            cycle_nodes = sorted(
+                tid for tid in order
+                if pending_counts[tid] > 0 or depth[tid] is None)
+
+        def _unmet(task_id: str) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": dep,
+                    "status": tasks[dep]["status"],
+                    "title": _clip_bytes(tasks[dep]["title"], MAX_TITLE_BYTES)[0],
+                }
+                for dep in depends[task_id]
+                if tasks[dep]["status"] != "done"
+            ]
+
+        def _blocking_path(task_id: str) -> tuple[list[dict[str, Any]], bool]:
+            """BFS upstream through unmet dependencies (bounded)."""
+
+            path: list[dict[str, Any]] = []
+            seen = {task_id}
+            frontier = [dep["id"] for dep in _unmet(task_id)]
+            truncated = False
+            while frontier and len(path) < MAX_BLOCKING_CHAIN_NODES:
+                current = frontier.pop(0)
+                if current in seen:
+                    continue
+                seen.add(current)
+                path.append({
+                    "id": current,
+                    "status": tasks[current]["status"],
+                    "title": _clip_bytes(tasks[current]["title"], MAX_TITLE_BYTES)[0],
+                })
+                frontier.extend(dep["id"] for dep in _unmet(current))
+            if frontier and len(path) >= MAX_BLOCKING_CHAIN_NODES:
+                truncated = True
+            return path, truncated
+
+        assignees: dict[str, list[dict[str, str]]] = {}
+        for name, role, phase, raw_task_id in member_rows:
+            if raw_task_id is None:
+                continue
+            assignees.setdefault(str(raw_task_id), []).append({
+                "name": str(name),
+                "role": str(role),
+                "phase": str(phase),
+            })
+
+        # -- filtered page ------------------------------------------------------
+        filtered = [
+            tid for tid in order
+            if (status is None or tasks[tid]["status"] == status)
+            and (kind is None or tasks[tid]["kind"] == kind)
+        ]
+        page_ids = filtered[page_offset:page_offset + page_limit]
+        page_id_set = set(page_ids)
+
+        nodes: list[dict[str, Any]] = []
+        for tid in page_ids:
+            info = tasks[tid]
+            path, path_truncated = _blocking_path(tid)
+            unmet = _unmet(tid)
+            dto: dict[str, Any] = {
+                "id": tid,
+                "kind": info["kind"],
+                "role": info["kind"],
+                "status": info["status"],
+                "risk": info["risk"],
+                "priority": info["priority"],
+                "paused": info["paused"],
+                "depth": depth[tid],
+                "depends_on": sorted(depends[tid]),
+                "required_by": sorted(required_by[tid]),
+                "assignees": assignees.get(tid, []),
+                "unmet_dependencies": unmet,
+                "blocking_path": path,
+                "blocking_path_truncated": path_truncated,
+                "blocked_by_dependencies": bool(unmet),
+                "status_blocked": info["status"] == "blocked",
+            }
+            dto.update(_text_field(info["title"], MAX_TITLE_BYTES, "title"))
+            nodes.append(dto)
+
+        edges: list[dict[str, Any]] = []
+        outside: list[dict[str, str]] = []
+        for source, target in edges_all:
+            if source in page_id_set and target in page_id_set:
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "satisfied": tasks[source]["status"] == "done",
+                })
+            elif len(outside) < MAX_OUTSIDE_PAGE_EDGES:
+                outside.append({"source": source, "target": target})
+
+        depths = [depth[tid] for tid in order if depth[tid] is not None]
+        return {
+            "project_id": str(project[0]),
+            "filters": {"status": status, "kind": kind},
+            "edge_semantics": (
+                "source -> target means source must reach DONE before the "
+                "target is dependency-clear; edges are read verbatim from "
+                "task_dependencies and never editable through this surface"
+            ),
+            "acyclic": visited == len(order),
+            "cycle_nodes": cycle_nodes,
+            "nodes": nodes,
+            "edges": edges,
+            "edges_outside_page": outside,
+            "stats": {
+                "tasks_total": len(order),
+                "edges_total": len(edges_all),
+                "nodes_in_view": len(nodes),
+                "edges_in_view": len(edges),
+                "edges_outside_page": len(outside),
+                "blocked_tasks": sum(
+                    1 for tid in order if tasks[tid]["status"] == "blocked"),
+                "dependency_blocked_tasks": sum(
+                    1 for tid in order if _unmet(tid)),
+                "roots": sum(1 for tid in order if depth[tid] == 0),
+                "max_depth": max(depths) if depths else None,
+            },
+            "page": {
+                "limit": page_limit,
+                "offset": page_offset,
+                "total": len(filtered),
+                "has_more": page_offset + len(page_ids) < len(filtered),
+            },
+            "notes": [
+                "every arrow is a durable task_dependencies row — identical "
+                "to GET /tasks/{id}/dependencies; this view writes nothing "
+                "and cannot create cycles (the Core's add_dependency check is "
+                "the only edge authority)",
+                "unmet_dependencies lists depends-on tasks whose status is "
+                "not DONE (the same predicate the Core uses to refuse "
+                "dispatch); an empty list means dependency-clear, not done",
+                "status 'blocked' is the Core's own Task state and may come "
+                "from Core transitions beyond dependencies — the two facts "
+                "are reported separately and never merged",
+                "depth is the longest dependency-chain level over the FULL "
+                "project graph, so filters reposition nothing they hide",
+            ],
+        }
 
     # -- Attempts --------------------------------------------------------------
 

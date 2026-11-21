@@ -33,6 +33,11 @@ becomes a Git argv, path, or shell argument.  Behavior stays honest:
   fail-closed; this surface never truncates a "complete" digest), and a
   tampered/missing artifact surfaces as 503/404 rather than a lie;
 * absolute workspace paths never appear in any response body.
+
+M6-01 adds the read-only project dependency DAG
+(:meth:`teamcraft.query.QueryService.project_dependency_graph`): durable
+edges plus status/role/blocker facts for the console visualization — no
+edge can be written through this surface.
 """
 
 from __future__ import annotations
@@ -556,6 +561,29 @@ def build_query_router(
     @router.get("/projects/{project_id}/capabilities")
     def get_project_capabilities(project_id: str) -> Any:
         return _run(lambda: service.get_project_capabilities(project_id))
+
+    # -- Dependency DAG (M6-01) -------------------------------------------------
+    #
+    # Read-only graph over ``tasks`` + ``task_dependencies`` for the console's
+    # DAG view.  Route params/filters are ids and closed-set enum values only;
+    # the payload is the same durable edges the per-task dependency route
+    # serves, plus derived depth/blocker facts.  There is no write twin: no
+    # method here (or anywhere on this router) can add, move or delete an
+    # edge, so the UI physically cannot manufacture a cycle.
+
+    @router.get("/projects/{project_id}/dependency-graph")
+    def get_project_dependency_graph(
+        project_id: str,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> Any:
+        return _run(
+            lambda: service.project_dependency_graph(
+                project_id, status=status, kind=kind, limit=limit, offset=offset
+            )
+        )
 
     # -- Tasks ------------------------------------------------------------------
 
