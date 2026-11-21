@@ -4,6 +4,17 @@ This module consumes the append-only project Event stream under the existing
 Scheduler Leader lease.  It persists deterministic Wake batches and explicit
 acknowledgement cursors, but deliberately performs no Herdr calls.  Any future
 delivery or acknowledgement path must pass the M2-08 CEO initialization gate.
+
+M5-03 adds an optional wake budget to the admission boundary.  When no budget
+is configured (the default, ``budget=None``) admission behaves exactly as the
+pre-budget M2-09 contract: identical deferred reasons, identical events, and
+no budget accounting.  When a budget IS configured, ``admit_pending_wake``
+consults the pure ``teamcraft.escalation`` layer against durable consumption
+already persisted in this project's Wake rows before any external dispatch is
+bound, so a budget cannot be bypassed by any delivery driver.  An urgent wake
+may interrupt a working CEO only when the budget has remaining allowance AND
+the caller explicitly opts in through ``EscalationPolicy.allow_urgent_interrupt``
+— the "dedicated policy and budget path" the M2-09 hold referred to.
 """
 
 from __future__ import annotations
@@ -13,8 +24,9 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
-from . import ceo_initialization, commands, domain, events, leader, storage
+from . import ceo_initialization, commands, domain, escalation, events, leader, storage
 from .clock import Clock, SystemClock, require_utc
 from .errors import NotFoundError, ValidationError
 from .ids import DEFAULT_ID_FACTORY
@@ -106,6 +118,323 @@ class AdmissionResult:
     wake: Wake
     command: commands.Command | None
     deferred_reason: str | None = None
+    #: SHA-256 digest of the M5-03 ``escalation.WakeDecision`` that
+    #: authorized or deferred this admission.  ``None`` whenever no budget
+    #: was configured, keeping pre-budget results byte-identical.
+    decision_digest: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# M5-03 wake budget (durable enforcement before external dispatch)
+# ---------------------------------------------------------------------------
+
+DEFAULT_WAKE_BUDGET_WINDOW_SECONDS = 3600
+MAX_WAKE_BUDGET_WINDOW_SECONDS = 86400
+
+#: States that represent a wake which reached (or may have reached) the CEO
+#: transport and therefore conservatively consumes window allowance.  Pending
+#: wakes never count; ``blocked`` (explicitly reconciled NOT delivered) never
+#: consumed attention and stays excluded.
+_CONSUMING_WAKE_STATES = ("sending", "submitted", "acknowledged", "processed",
+                         "unknown")
+
+
+@dataclass(frozen=True)
+class WakeBudgetConfig:
+    """Explicit per-target wake allowance enforced at admission.
+
+    Consumption is derived from durable Wake rows — never from process memory
+    — so restarts and leader changes replay the same allowance.  In-flight
+    ``sending``/``unknown`` rows count as spent because the prompt may already
+    have reached the CEO; deferring rather than double-spending is the
+    conservative direction.  ``max_wakes_per_window == 0`` deliberately freezes
+    automatic dispatch without freezing intake.
+    """
+
+    max_wakes_per_window: int
+    window_seconds: int = DEFAULT_WAKE_BUDGET_WINDOW_SECONDS
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.max_wakes_per_window, bool)
+                or not isinstance(self.max_wakes_per_window, int)
+                or self.max_wakes_per_window < 0):
+            raise ValidationError("max_wakes_per_window must be an integer >= 0")
+        if (isinstance(self.window_seconds, bool)
+                or not isinstance(self.window_seconds, int)
+                or not 1 <= self.window_seconds <= MAX_WAKE_BUDGET_WINDOW_SECONDS):
+            raise ValidationError(
+                f"window_seconds must be an integer in 1..{MAX_WAKE_BUDGET_WINDOW_SECONDS}")
+
+
+def _budget_window(now: datetime, seconds: int) -> tuple[str, str]:
+    """Deterministic (floor_iso, window_id) bucket for the budget window.
+
+    The id equals the floor timestamp so a replayed evaluation binds the same
+    persisted rows the decision saw.
+    """
+    epoch = int(now.timestamp())
+    bucket = epoch - epoch % seconds
+    floor_iso = _iso(datetime.fromtimestamp(bucket, timezone.utc))
+    return floor_iso, floor_iso
+
+
+def _consumed_in_window(conn: TeamCraftConnection, project_id: str,
+                        target_ceo_name: str, floor_iso: str) -> int:
+    placeholders = ",".join("?" for _ in _CONSUMING_WAKE_STATES)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM wakes WHERE project_id=? AND target_ceo_name=? "
+        f"AND state IN ({placeholders}) AND COALESCE(submitted_at, updated_at) >= ?",
+        (project_id, target_ceo_name, *_CONSUMING_WAKE_STATES, floor_iso),
+    ).fetchone()
+    return int(row[0])
+
+
+def wake_budget_usage(
+    conn: TeamCraftConnection, project_id: str, *,
+    target_ceo_name: str = "ceo",
+    window_seconds: int = DEFAULT_WAKE_BUDGET_WINDOW_SECONDS,
+    clock: Clock | None = None,
+) -> int:
+    """Read-only audit view: wakes consumed within the current budget window.
+
+    Every counted row is one that reached (or ambiguously may have reached)
+    the transport inside the window; this never mutates state.
+    """
+    domain.require_head(conn)
+    target_ceo_name = _validate_target(target_ceo_name)
+    if (isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or not 1 <= window_seconds <= MAX_WAKE_BUDGET_WINDOW_SECONDS):
+        raise ValidationError(
+            f"window_seconds must be an integer in 1..{MAX_WAKE_BUDGET_WINDOW_SECONDS}")
+    floor_iso, _ = _budget_window(_now(clock), window_seconds)
+    return _consumed_in_window(conn, project_id, target_ceo_name, floor_iso)
+
+
+#: Durable source of truth for the project wake budget (M5-01 precedent:
+#: append-only events as config snapshots).  The kind starts with ``wake.``
+#: so event ingestion ignores it — recording a budget can never wake the CEO.
+WAKE_BUDGET_CONFIG_EVENT = "wake.budget_config"
+_WAKE_CONFIG_ACTOR_MAX_BYTES = 64
+_WAKE_CONFIG_REASON_MAX_BYTES = 512
+
+
+@dataclass(frozen=True)
+class WakeBudgetPolicy:
+    """Persisted budget plus the urgent-interrupt policy evaluated with it."""
+
+    budget: WakeBudgetConfig
+    policy: escalation.EscalationPolicy
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "max_wakes_per_window": self.budget.max_wakes_per_window,
+            "window_seconds": self.budget.window_seconds,
+            "allow_urgent_interrupt": self.policy.allow_urgent_interrupt,
+            "urgent_priority": self.policy.urgent_priority,
+        }
+
+
+def _config_audit_text(value: str, field: str, *, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field} must not be blank")
+    text = value.strip()
+    if len(text.encode("utf-8")) > limit:
+        raise ValidationError(f"{field} exceeds {limit} bytes")
+    if re.search(r"\bBearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}", text, re.I):
+        raise ValidationError(f"{field} contains credential-shaped text")
+    return text
+
+
+def record_wake_budget(
+    conn: TeamCraftConnection,
+    project_id: str,
+    lease: leader.Lease,
+    *,
+    max_wakes_per_window: int,
+    window_seconds: int = DEFAULT_WAKE_BUDGET_WINDOW_SECONDS,
+    allow_urgent_interrupt: bool = False,
+    urgent_priority: int = escalation.DEFAULT_URGENT_WAKE_PRIORITY,
+    actor: str,
+    reason: str,
+    clock: Clock | None = None,
+) -> WakeBudgetPolicy:
+    """Durably set the project wake budget; the newest record is authoritative.
+
+    This writes one audited ``wake.budget_config`` Event under the project
+    Leader lease — no Command, no transport, no CEO interaction.  Because the
+    budget lives in the durable event store, EVERY later
+    :func:`admit_pending_wake` enforces it even if its caller (for example
+    the pre-M5-03 CLI dispatch loop) knows nothing about budget parameters;
+    changing or lifting a budget is itself a lease-fenced, actor-attributed
+    event, never a silent per-call bypass of persisted state by omission.
+    """
+    domain.require_head(conn)
+    if lease.scope != leader.project_scope(project_id):
+        raise leader.StaleLeaderError("lease scope does not match project",
+                                     scope=lease.scope, epoch=lease.epoch)
+    audit_actor = _config_audit_text(actor, "actor",
+                                    limit=_WAKE_CONFIG_ACTOR_MAX_BYTES)
+    audit_reason = _config_audit_text(reason, "reason",
+                                     limit=_WAKE_CONFIG_REASON_MAX_BYTES)
+    # Validate before any write so a bad policy can never persist halfway.
+    proposed = WakeBudgetPolicy(
+        budget=WakeBudgetConfig(max_wakes_per_window=max_wakes_per_window,
+                               window_seconds=window_seconds),
+        policy=escalation.EscalationPolicy(
+            urgent_priority=urgent_priority,
+            allow_urgent_interrupt=allow_urgent_interrupt),
+    )
+    payload = proposed.payload() | {"actor": audit_actor, "reason": audit_reason}
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+    if conn.in_transaction:
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        events.append_event(conn, WAKE_BUDGET_CONFIG_EVENT,
+                           project_id=project_id, payload_json=body,
+                           clock=clock)
+        return proposed
+    with transaction(conn):
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        events.append_event(conn, WAKE_BUDGET_CONFIG_EVENT,
+                           project_id=project_id, payload_json=body,
+                           clock=clock)
+        return proposed
+
+
+def get_wake_budget(
+    conn: TeamCraftConnection, project_id: str,
+) -> WakeBudgetPolicy | None:
+    """Return the newest durable budget policy, or ``None`` when unset.
+
+    A present-but-invalid config raises (fail closed): admissions must not
+    silently run unenforced because the audit row could not be understood.
+    """
+    domain.require_head(conn)
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE kind=? AND project_id=?"
+        " ORDER BY seq DESC LIMIT 1",
+        (WAKE_BUDGET_CONFIG_EVENT, project_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+        if not isinstance(payload, dict):
+            raise TypeError("config payload is not an object")
+        return WakeBudgetPolicy(
+            budget=WakeBudgetConfig(
+                max_wakes_per_window=payload["max_wakes_per_window"],
+                window_seconds=payload["window_seconds"]),
+            policy=escalation.EscalationPolicy(
+                urgent_priority=payload["urgent_priority"],
+                allow_urgent_interrupt=payload["allow_urgent_interrupt"]),
+        )
+    except (KeyError, TypeError, ValueError, ValidationError) as exc:
+        raise ValidationError(
+            "persisted wake budget config is invalid; repair it before "
+            "admitting wakes") from exc
+
+
+#: Reason prefix that marks a deferral as "a human has to act": the decision
+#: layer classifies an urgent item the per-window budget refused as
+#: ``needs_human`` (``urgent_wake_budget_exhausted:<used>/<max>``).
+URGENT_WAKE_BUDGET_EXHAUSTED_REASON = "urgent_wake_budget_exhausted"
+
+#: Durable human-escalation record for that refusal.  Like the budget config
+#: kind it starts with ``wake.``, so event ingestion ignores it and an
+#: escalation can never wake the CEO itself.
+URGENT_WAKE_ESCALATION_EVENT = "wake.urgent_escalated"
+_URGENT_ESCALATION_DETAIL_MAX_BYTES = 512
+
+
+def record_urgent_wake_escalation(
+    conn: TeamCraftConnection,
+    project_id: str,
+    wake_id: str,
+    lease: leader.Lease,
+    *,
+    detail: str | None = None,
+    clock: Clock | None = None,
+) -> tuple[events.Event, bool]:
+    """Durably record that a human must act on an over-budget urgent Wake.
+
+    :func:`admit_pending_wake` deliberately only *defers* when the budget
+    refused an urgent item — it never drops the Wake and never silently
+    resolves it — so the dispatch path that observed the refusal records the
+    human escalation here.  The Event is idempotent per Wake and budget
+    window: repeated dispatch attempts under the same window and allowance
+    collapse into the one existing record, while a genuinely new exhaustion
+    (a later window, or different durable limits) produces a new record.
+
+    It never changes Wake state, never emits a Command, and never touches
+    the transport: the Wake stays ``pending`` so a later window can still
+    deliver it, and reconciliation/ack rules are untouched.
+    """
+    domain.require_head(conn)
+    if lease.scope != leader.project_scope(project_id):
+        raise leader.StaleLeaderError(
+            "lease scope does not match project", scope=lease.scope,
+            epoch=lease.epoch)
+
+    def _record() -> tuple[events.Event, bool]:
+        leader.require_project_lease(conn, lease, project_id, clock=clock)
+        row = conn.execute(
+            f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=? AND project_id=?",
+            (wake_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise ValidationError(
+                "urgent Wake escalation target is not a Wake of this project")
+        if str(row[7]) != "pending":
+            raise ValidationError(
+                "only pending Wakes can escalate an urgent budget refusal;"
+                f" wake {wake_id} is {row[7]}")
+        payload: dict[str, Any] = {
+            "version": 1,
+            "escalation": "needs_human",
+            "reason_code": URGENT_WAKE_BUDGET_EXHAUSTED_REASON,
+            "wake_id": wake_id,
+            "target_ceo_name": str(row[2]),
+            "wake_state": str(row[7]),
+            "priority": int(row[6]),
+            "first_seq": int(row[8]),
+            "last_seq": int(row[9]),
+            "event_digest": str(row[11]),
+        }
+        try:
+            persisted = get_wake_budget(conn, project_id)
+        except ValidationError:
+            # A corrupt budget config must not block the escalation itself:
+            # admission already refused fail-closed, and losing the human
+            # signal would be the worse failure.
+            payload["budget_config_invalid"] = True
+        else:
+            if persisted is not None:
+                floor_iso, window_id = _budget_window(
+                    _now(clock), persisted.budget.window_seconds)
+                payload["max_wakes_per_window"] = (
+                    persisted.budget.max_wakes_per_window)
+                payload["window_seconds"] = persisted.budget.window_seconds
+                payload["window_id"] = window_id
+        if detail is not None:
+            payload["detail"] = _config_audit_text(
+                detail, "detail", limit=_URGENT_ESCALATION_DETAIL_MAX_BYTES)
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+        # A content-addressed key keeps identical repeated attempts at one
+        # record while letting a genuinely changed context be recorded again.
+        event_id = ("wake_urgent_escalated_"
+                   + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32])
+        return events.append_event_idempotent(
+            conn, URGENT_WAKE_ESCALATION_EVENT, project_id=project_id,
+            payload_json=body, event_id=event_id, clock=clock)
+
+    if conn.in_transaction:
+        return _record()
+    with transaction(conn):
+        return _record()
 
 
 def _now(clock: Clock | None) -> datetime:
@@ -343,6 +672,8 @@ def admit_pending_wake(
     lease: leader.Lease,
     *,
     clock: Clock | None = None,
+    budget: WakeBudgetConfig | None = None,
+    policy: escalation.EscalationPolicy | None = None,
 ) -> AdmissionResult:
     """Bind one eligible Wake to an idempotent CEO Command and reserve sending.
 
@@ -351,8 +682,43 @@ def admit_pending_wake(
     command or Wake state is changed.  A future sender must reconcile a
     persisted ``sending`` row after interruption; it must never call this API
     as a way to blindly resend that row.
+
+    M5-03 budget semantics:
+
+    * ``budget=None`` and no persisted config — the pre-budget M2-09 path,
+      unchanged: working CEO defers as ``ceo_working``, non-idle CEO
+      isolates as ``ceo_<state>``, and no counting or decision digest is
+      produced.
+    * Persisted config — the newest durable ``wake.budget_config`` Event
+      (see :func:`record_wake_budget`) is enforced even when the caller
+      never passes budget parameters, so legacy dispatch loops cannot
+      dispatch over budget.
+    * An explicit ``budget`` overrides the persisted budget for this call;
+      the accompanying urgent policy comes from ``policy`` when given,
+      otherwise the persisted policy when the budget was persisted,
+      otherwise the conservative default (urgent interrupt off).
+    * Configured ``budget`` — window consumption is re-derived from durable
+      Wake rows under the same write transaction, and the pure
+      :func:`teamcraft.escalation.decide_wake` layer adjudicates before a
+      Command is created.  A denied admission writes nothing: the Wake stays
+      ``pending``, no cursor or state moves, and the reason carries the
+      stable code plus consumed/max counts (for example
+      ``wake_budget_exhausted:2/2``).  An exhausted *urgent* item surfaces
+      as ``urgent_wake_budget_exhausted:<n>/<max>`` for the caller to
+      escalate through the recovery path — this module never fabricates a
+      NEEDS_HUMAN transition itself.
+    * A working CEO is interrupted only by an ``urgent_bypass`` decision,
+      which requires urgency (priority at/above ``policy.urgent_priority``),
+      remaining budget allowance, AND the explicit
+      ``policy.allow_urgent_interrupt`` opt-in (default off).  All M2-08
+      identity gates still apply to a bypass.
     """
     domain.require_head(conn)
+    if budget is not None and not isinstance(budget, WakeBudgetConfig):
+        raise ValidationError("budget must be a WakeBudgetConfig or None")
+    if policy is not None and not isinstance(
+            policy, escalation.EscalationPolicy):
+        raise ValidationError("policy must be an EscalationPolicy or None")
     if lease.scope != leader.project_scope(project_id):
         raise leader.StaleLeaderError("lease scope does not match project", scope=lease.scope, epoch=lease.epoch)
     with transaction(conn):
@@ -373,14 +739,78 @@ def admit_pending_wake(
         session = domain.get_session(conn, initialization.teamcraft_session_id or "")
         if session.native_session_id != initialization.native_session_id:
             raise ValidationError("CEO Session native identity does not match initialization")
+
+        current = _now(clock)
+        budget_decision = None
+        budget_audit = None
+        consumed = 0
+        budget_source = "parameter" if budget is not None else None
+        if budget is None:
+            # Enforceability: even callers that predate M5-03 (and therefore
+            # never pass a budget) are governed by the newest durable
+            # wake.budget_config event.  An explicit parameter overrides the
+            # persisted budget, and its policy defaults stay conservative
+            # (no urgent interrupt) unless passed or persisted alongside.
+            persisted = get_wake_budget(conn, project_id)
+            if persisted is not None:
+                budget = persisted.budget
+                if policy is None:
+                    policy = persisted.policy
+                budget_source = "persisted"
+        if budget is not None:
+            floor_iso, window_id = _budget_window(current, budget.window_seconds)
+            consumed = _consumed_in_window(conn, project_id, item.target_ceo_name,
+                                          floor_iso)
+            # A configuration shrunk below durable consumption must defer, not
+            # crash the admission; the raw count still reports the truth.
+            counted = min(consumed, budget.max_wakes_per_window)
+            budget_decision = escalation.decide_wake(
+                escalation.WakeRequest(
+                    priority=item.priority,
+                    ceo_state=session.state,
+                    budget=escalation.WakeBudget(
+                        budget.max_wakes_per_window, counted, window_id),
+                ),
+                policy=policy if policy is not None
+                else escalation.EscalationPolicy(),
+            )
+            budget_audit = {
+                "source": budget_source,
+                "max_wakes_per_window": budget.max_wakes_per_window,
+                "window_seconds": budget.window_seconds,
+                "window_id": window_id,
+                "consumed_in_window": consumed,
+                "action": budget_decision.action,
+                "decision_digest": budget_decision.decision_digest,
+            }
+        decision_digest = (None if budget_decision is None
+                          else budget_decision.decision_digest)
+
         if session.state == "working":
-            # Even urgent notifications are held until a dedicated policy and
-            # budget path can prove that an interrupt is safe.
-            return AdmissionResult(item, None, "ceo_working")
-        if session.state != "idle":
+            # The M2-09 hold stays the default.  M5-03 releases an interrupt
+            # ONLY through an in-budget, explicitly opted-in urgent bypass.
+            if budget_decision is None or budget_decision.action != "urgent_bypass":
+                reason = ("ceo_working" if budget_decision is None
+                        else budget_decision.reason_code)
+                if reason != "ceo_working":
+                    reason = (f"{reason}:{consumed}/"
+                            f"{budget.max_wakes_per_window}")
+                return AdmissionResult(item, None, reason, decision_digest)
+        elif session.state != "idle":
             # Unknown, missing, or exited sessions are isolated.  This path
             # never starts a replacement session.
-            return AdmissionResult(item, None, f"ceo_{session.state}")
+            return AdmissionResult(item, None, f"ceo_{session.state}",
+                                 decision_digest)
+        elif budget_decision is not None and budget_decision.action != "deliver":
+            # Idle CEO but the window budget denies dispatch.  Nothing is
+            # written: the Wake remains pending for a later window, and the
+            # urgent variant carries the escalation code for the caller.
+            return AdmissionResult(
+                item, None,
+                f"{budget_decision.reason_code}:{consumed}/"
+                f"{budget.max_wakes_per_window}",
+                decision_digest,
+            )
 
         active = conn.execute(
             "SELECT id,state FROM wakes WHERE project_id=? AND target_ceo_name=? "
@@ -389,9 +819,10 @@ def admit_pending_wake(
             (project_id, item.target_ceo_name, item.id),
         ).fetchone()
         if active is not None:
-            return AdmissionResult(item, None, f"wake_{active[1]}:{active[0]}")
+            return AdmissionResult(item, None, f"wake_{active[1]}:{active[0]}",
+                                 decision_digest)
 
-        now = _iso(_now(clock))
+        now = _iso(current)
         payload = {
             "action": "wake_ceo",
             "project_id": project_id,
@@ -403,6 +834,12 @@ def admit_pending_wake(
             "priority": item.priority,
             "event_digest": item.event_digest,
         }
+        if budget_audit is not None:
+            # Additive only when a budget is configured: the durable audit
+            # binds this dispatch to the exact window allowance it consumed.
+            payload["wake_budget"] = budget_audit
+            payload["urgent_bypass"] = (
+                budget_decision.action == "urgent_bypass")
         submission = commands.submit_command(
             conn,
             idempotency_key=f"wake:{project_id}:{item.id}:send:v1",
@@ -430,15 +867,24 @@ def admit_pending_wake(
             raise storage.StorageError("Wake admission lost its pending-state compare-and-swap")
         updated_row = conn.execute(f"SELECT {_WAKE_COLUMNS} FROM wakes WHERE id=?", (item.id,)).fetchone()
         assert updated_row is not None
+        sending_payload = {"wake_id": item.id, "command_id": command.id,
+                           "target_session_id": initialization.native_session_id,
+                           "first_seq": item.first_seq, "last_seq": item.last_seq}
+        if budget_audit is not None:
+            # Durable audit binds the reserved dispatch to the exact window
+            # allowance it consumed; absent without a configured budget.
+            sending_payload["wake_budget"] = budget_audit
+            sending_payload["urgent_bypass"] = (
+                budget_decision.action == "urgent_bypass")
         events.append_event(
             conn, "wake.sending", project_id=project_id,
-            payload_json=json.dumps({"wake_id": item.id, "command_id": command.id,
-                                     "target_session_id": initialization.native_session_id,
-                                     "first_seq": item.first_seq, "last_seq": item.last_seq},
-                                    ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            payload_json=json.dumps(sending_payload,
+                                    ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")),
             clock=clock,
         )
-        return AdmissionResult(_row_wake(updated_row), command)
+        return AdmissionResult(_row_wake(updated_row), command, None,
+                              decision_digest)
 
 
 def record_submission_result(

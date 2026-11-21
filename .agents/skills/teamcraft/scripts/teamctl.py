@@ -3532,7 +3532,14 @@ def wake_dispatch(args: argparse.Namespace) -> int:
                 raise TeamctlError("initialized CEO member is absent; no new session will be started")
             _, agent = _verify_wake_herdr_target(member, initialized)
             observed_state = live_state(agent)
-            if observed_state not in {"idle", "done"}:
+            # M5-03: a busy CEO still defers ordinary Wakes before Core is
+            # consulted, but an urgent item under the durably opted-in policy
+            # is handed to Core, which alone decides the interrupt from
+            # durable state (session state, priority floor, remaining budget).
+            urgent_candidate = (observed_state == "working"
+                               and _urgent_interrupt_candidate(store, project_id,
+                                                            item))
+            if observed_state not in {"idle", "done"} and not urgent_candidate:
                 print(json.dumps({"status": "deferred", "wake_id": item.id,
                                   "reason": f"ceo_{observed_state}"}, sort_keys=True))
                 return 0
@@ -3544,19 +3551,39 @@ def wake_dispatch(args: argparse.Namespace) -> int:
             finally:
                 conn.close()
             if admitted.command is None:
-                print(json.dumps({"status": "deferred", "wake_id": item.id,
-                                  "reason": admitted.deferred_reason}, sort_keys=True))
-                return 0
+                raise _WakeDeferred({
+                    "status": "deferred", "wake_id": item.id,
+                    "reason": admitted.deferred_reason or "wake_deferred"})
+            command_payload = json.loads(admitted.command.payload_json or "{}")
+            # Core marks the only dispatch that may interrupt a busy CEO, and
+            # the flag is durable (command payload + wake.sending event), so
+            # this transport decision stays auditable after the fact.
+            urgent_bypass = command_payload.get("urgent_bypass") is True
             prompt_text = _wake_prompt(store, admitted.wake, initialized.native_session_id)
             _admit_wake_effect(store, project_id, item.id, admitted.command.id, lease)
             # Recheck the exact runtime occupant immediately adjacent to the
-            # name-addressed Herdr prompt call.
+            # name-addressed Herdr prompt call.  An opted-in urgent bypass is
+            # the sanctioned way to deliver while the CEO is working, so the
+            # recheck only hard-stops deliveries that are not a bypass.
             _, live_agent = _verify_wake_herdr_target(member, initialized)
-            if live_state(live_agent) not in {"idle", "done"}:
+            if live_state(live_agent) not in {"idle", "done"} and not urgent_bypass:
                 raise TeamctlError("CEO became active before Wake delivery; delivery is uncertain")
             result = _herdr_adapter().prompt_agent(
                 item.target_ceo_name, prompt_text, wait=False, timeout_ms=args.timeout_ms,
             )
+        except _WakeDeferred as deferred_signal:
+            output = dict(deferred_signal.output)
+            # An urgent item the durable window budget refused must reach a
+            # human.  This runs outside the delivery-ambiguous path: nothing
+            # was prompted, the Wake stays pending, and the record is
+            # idempotent per wake and budget window.
+            if str(output.get("reason", "")).startswith(
+                    URGENT_WAKE_BUDGET_EXHAUSTED_REASON):
+                output["urgent_escalation"] = _record_urgent_wake_escalation(
+                    store, project_id, str(output["wake_id"]), lease,
+                    detail=str(output["reason"]))
+            print(json.dumps(output, sort_keys=True))
+            return 0
         except Exception as exc:
             conn = store._connect()
             try:
@@ -3592,9 +3619,14 @@ def wake_dispatch(args: argparse.Namespace) -> int:
             raise TeamctlError(f"Prompt returned success but Wake is UNKNOWN: {exc}") from exc
         finally:
             conn.close()
-        print(json.dumps({"status": submitted.state, "wake_id": submitted.id,
-                          "command_id": submitted.command_id,
-                          "target_session_id": submitted.target_session_id}, sort_keys=True))
+        submitted_output = {"status": submitted.state, "wake_id": submitted.id,
+                            "command_id": submitted.command_id,
+                            "target_session_id": submitted.target_session_id}
+        if urgent_bypass:
+            # Additive only on the opted-in interrupt path: the legacy
+            # dispatch output stays byte-for-byte unchanged.
+            submitted_output["urgent_bypass"] = True
+        print(json.dumps(submitted_output, sort_keys=True))
         return 0
     finally:
         store.release_lease(lease)
@@ -3684,6 +3716,86 @@ def wake_status(args: argparse.Namespace) -> int:
     print(json.dumps({"wakes": [item.__dict__ for item in wakes],
                       "cursor": None if cursor is None else cursor.__dict__},
                      ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def wake_budget_set(args: argparse.Namespace) -> int:
+    """wake-budget-set: durably configure the CEO wake budget (M5-03).
+
+    Writes one lease-fenced ``wake.budget_config`` audit event; the newest
+    record is authoritative and EVERY later ``wake-dispatch`` enforces it —
+    including urgent CEO interrupts, which additionally require the explicit
+    ``--allow-urgent-interrupt`` opt-in plus the priority floor.  This never
+    contacts Herdr, never emits a Command, and never drops existing Wakes;
+    consumption already spent inside the current window is reported so the
+    effect of a shrink is visible immediately.
+    """
+
+    if not args.actor.strip() or not args.reason.strip():
+        raise TeamctlError("actor and reason must not be blank")
+    _require_m503_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = store.ensure_project()
+    lease = store.acquire_lease("wake-budget-set", args.lease_ttl_seconds)
+    try:
+        conn = store._connect()
+        try:
+            policy = _wake.record_wake_budget(
+                conn, project_id, lease,
+                max_wakes_per_window=args.max_wakes_per_window,
+                window_seconds=args.window_seconds,
+                allow_urgent_interrupt=args.allow_urgent_interrupt,
+                urgent_priority=args.urgent_priority,
+                actor=args.actor, reason=args.reason,
+            )
+            consumed = _wake.wake_budget_usage(
+                conn, project_id,
+                window_seconds=policy.budget.window_seconds)
+        except _CoreError as exc:
+            raise TeamctlError(str(exc)) from exc
+        finally:
+            conn.close()
+    finally:
+        store.release_lease(lease)
+    result = dict(policy.payload())
+    result["source"] = "persisted"
+    result["consumed_in_window"] = consumed
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def wake_budget_get(args: argparse.Namespace) -> int:
+    """wake-budget-get: read the durable wake budget and current usage.
+
+    Read-only.  ``configured: false`` means no budget has ever been set, so
+    dispatch behaves exactly as it did before M5-03 (no counting, no
+    interrupt).  A persisted but unreadable configuration fails closed here
+    and in ``wake-dispatch`` rather than silently running unenforced.
+    """
+
+    _require_m503_core()
+    store = StateStore(resolve_project_root(args.cwd))
+    project_id = store.ensure_project()
+    conn = store._connect()
+    try:
+        try:
+            current = _wake.get_wake_budget(conn, project_id)
+            consumed = (None if current is None else _wake.wake_budget_usage(
+                conn, project_id,
+                window_seconds=current.budget.window_seconds))
+        except _CoreError as exc:
+            raise TeamctlError(str(exc)) from exc
+    finally:
+        conn.close()
+    remaining = None
+    if current is not None and consumed is not None:
+        remaining = max(0, current.budget.max_wakes_per_window - consumed)
+    print(json.dumps({
+        "configured": current is not None,
+        "budget": None if current is None else current.payload(),
+        "consumed_in_window": consumed,
+        "remaining_in_window": remaining,
+    }, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -4684,6 +4796,28 @@ def build_parser() -> argparse.ArgumentParser:
                  "processed", "unknown", "blocked"))
     wake_status_parser.add_argument("--limit", type=int, default=100)
     wake_status_parser.set_defaults(handler=wake_status)
+
+    wake_budget_set_parser = commands.add_parser("wake-budget-set")
+    add_cwd(wake_budget_set_parser)
+    wake_budget_set_parser.add_argument("--max-wakes-per-window", type=int,
+        required=True,
+        help="CEO wakes allowed per window; 0 freezes dispatch until raised")
+    wake_budget_set_parser.add_argument("--window-seconds", type=int,
+        default=3600, help="deterministic budget window length (1..86400)")
+    wake_budget_set_parser.add_argument("--allow-urgent-interrupt",
+        action="store_true",
+        help="allow in-budget urgent Wakes to interrupt a working CEO")
+    wake_budget_set_parser.add_argument("--urgent-priority", type=int,
+        default=100, help="priority at or above which a Wake is urgent")
+    wake_budget_set_parser.add_argument("--actor", required=True)
+    wake_budget_set_parser.add_argument("--reason", required=True)
+    wake_budget_set_parser.add_argument("--lease-ttl-seconds", type=int,
+        default=60)
+    wake_budget_set_parser.set_defaults(handler=wake_budget_set)
+
+    wake_budget_get_parser = commands.add_parser("wake-budget-get")
+    add_cwd(wake_budget_get_parser)
+    wake_budget_get_parser.set_defaults(handler=wake_budget_get)
 
     verifier_config_parser = commands.add_parser("verifier-configure")
     add_cwd(verifier_config_parser)
