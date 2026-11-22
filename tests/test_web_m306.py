@@ -1347,9 +1347,25 @@ class _E2EBase(unittest.TestCase):
             what="gate replaced after token save")
 
     def goto_view(self, tab: str) -> None:
-        self.page.click_button(tab)
-        self.page.wait("document.querySelector('#main').innerText.length > 0",
-                      what=f"{tab} view rendered")
+        label = json.dumps(tab)
+        active = (
+            "Array.from(document.querySelectorAll('#nav .tab.active'))"
+            f".some(button => button.textContent.trim() === {label})"
+        )
+        # CDP coordinates can become stale between hit-testing and input
+        # delivery when the header reflows. Retry only read-only navigation,
+        # and check the selected tab instead of accepting the previous view.
+        for retry in range(3):
+            self.page.click_button(tab)
+            try:
+                self.page.wait(
+                    f"({active}) && document.querySelector('#main').innerText.length > 0",
+                    timeout=2, what=f"{tab} tab selected",
+                )
+                return
+            except AssertionError:
+                if retry == 2:
+                    raise
 
     def select_project(self) -> None:
         values = json.loads(self.page.rpc("optionValues"))
