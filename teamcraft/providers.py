@@ -31,6 +31,14 @@ HEALTH_STATES = frozenset({"healthy", "unhealthy", "unknown", "unsupported"})
 CAPABILITY_STATES = frozenset({"supported", "unsupported", "unknown"})
 DEFAULT_TTL_SECONDS = 300
 MAX_HARNESS_VERSION_OUTPUT_BYTES = 4096
+#: Explicit M6-06 compatibility contract registry (P3 fills this deliberately
+#: once a pinned target version's skill/rules semantics are established).
+#: While empty, Claude snapshots stay ``unsupported`` no matter what the
+#: version probe observes — observing a version is NOT claiming support.
+CLAUDE_COMPATIBLE_VERSIONS: frozenset[str] = frozenset()
+#: A contract version alone is insufficient: skill discovery must also pass.
+#: (Kept as an explicit named requirement for the P3 contract review.)
+CLAUDE_CONTRACT_REQUIRES_SKILL = True
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,199}\Z")
 _SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,199}\Z")
 _VERSION_DIAGNOSTIC = re.compile(r"(?:warning|warn|error|platformerror)\b", re.I)
@@ -219,15 +227,57 @@ def _bounded_version(output: str) -> str | None:
 
 def probe_harness(name: str, project_root: str | Path, *, runner: ProcessRunner | None = None,
                   clock: Clock | None = None, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> CapabilitySnapshot:
+    """Probe one local harness into a capability snapshot.
+
+    Claude policy (M6-06 P1, offline): without an explicitly injected runner
+    the historical static ``unsupported/adapter_pending`` snapshot is returned
+    unchanged — no process is spawned.  With an injected runner the probe
+    performs ONLY the bounded ``claude --version`` observation plus project
+    skill/rules file checks and records what it SEES; health stays
+    ``unsupported`` until :data:`CLAUDE_COMPATIBLE_VERSIONS` establishes an
+    explicit contract, and ``event_stream``/``prompt_ack`` stay ``unknown`` —
+    this path never claims live Claude support or ack capability.
+    """
+
     name = str(_safe_name(name, "harness"))
     if ttl_seconds <= 0:
         raise ValidationError("ttl_seconds must be positive")
     observed = _now(clock)
     if name == "claude":
-        return CapabilitySnapshot("harness", name, None, None, (),
-            {"skill_rules": "unsupported", "project_rules": "unsupported"},
+        if runner is None:
+            # Historical static policy preserved exactly: no probe, no facts.
+            return CapabilitySnapshot("harness", name, None, None, (),
+                {"skill_rules": "unsupported", "project_rules": "unsupported"},
+                {"event_stream": "unknown", "prompt_ack": "unknown"},
+                "unsupported", "adapter_pending", "static_policy", _iso(observed),
+                _iso(observed + timedelta(seconds=ttl_seconds)))
+        root = Path(project_root).resolve()
+        code, output = runner(("claude", "--version"), str(root), 5.0)
+        version = _bounded_version(output) if code == 0 else None
+        skill = (root / ".claude/skills/teamcraft-ceo/SKILL.md").is_file()
+        rules = (root / "CLAUDE.md").is_file()
+        contract_ok = (
+            code == 0 and version is not None
+            and version in CLAUDE_COMPATIBLE_VERSIONS
+            and (skill or not CLAUDE_CONTRACT_REQUIRES_SKILL)
+        )
+        if code != 0:
+            reason = ("executable_missing" if code == 127
+                     else "version_probe_failed")
+        elif version is None:
+            reason = "version_unparsable"
+        elif contract_ok:
+            reason = "ok"
+        else:
+            reason = "adapter_pending_version_seen"
+        # Contract is required for health; observation alone never upgrades it,
+        # and ack/event capabilities are deliberately left unmeasured.
+        health = "healthy" if contract_ok else "unsupported"
+        return CapabilitySnapshot("harness", name, version, None, (),
+            {"skill_rules": "supported" if skill else "unsupported",
+             "project_rules": "supported" if rules else "unsupported"},
             {"event_stream": "unknown", "prompt_ack": "unknown"},
-            "unsupported", "adapter_pending", "static_policy", _iso(observed),
+            health, reason, "local_process", _iso(observed),
             _iso(observed + timedelta(seconds=ttl_seconds)))
     executable = {"codex": "codex", "opencode": "opencode"}.get(name)
     if executable is None:
@@ -404,5 +454,6 @@ def get_attempt_capabilities(conn: storage.TeamCraftConnection, attempt_id: str)
 
 
 __all__ = ["ATTEMPT_CAPABILITY_EVENT", "CAPABILITY_PROBE_EVENT", "CapabilitySnapshot",
+           "CLAUDE_COMPATIBLE_VERSIONS", "CLAUDE_CONTRACT_REQUIRES_SKILL",
            "bind_attempt_capabilities", "get_attempt_capabilities", "latest_capability_probes",
            "probe_harness", "probe_omlx", "record_capability_probe"]

@@ -1,4 +1,13 @@
-"""M5-01 capability registry, health, and Attempt snapshot acceptance."""
+"""M5-01 capability registry, health, and Attempt snapshot acceptance.
+
+M6-06 P1 additions (Claude offline discovery probe, tests at the bottom): the
+no-runner Claude path must remain the historical static
+``unsupported/adapter_pending`` snapshot; an injected runner yields ONLY bounded
+version + project skill/rules observations, health stays ``unsupported`` until
+:data:`providers.CLAUDE_COMPATIBLE_VERSIONS` establishes an explicit contract,
+and ``event_stream``/``prompt_ack`` remain ``unknown`` — nothing here proves or
+claims live Claude support.
+"""
 
 from __future__ import annotations
 
@@ -289,6 +298,162 @@ class ProviderCapabilitiesM501Tests(unittest.TestCase):
             (providers.CAPABILITY_PROBE_EVENT, providers.ATTEMPT_CAPABILITY_EVENT),
         ).fetchone()[0])
         self.assertEqual(after, before, "rejected credential metadata must write no event")
+
+
+class ClaudeProbeM606P1Tests(unittest.TestCase):
+    """Offline bounded Claude version/discovery reporting (M6-06 P1).
+
+    No test in this class runs a real ``claude`` binary: every probe uses an
+    injected runner.  Health and ack outcomes are asserted to stay conservative
+    regardless of probe output.
+    """
+
+    PINNED = "Claude Code 2.1.284"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="teamcraft-m606p1-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "checkout"
+        self.repo.mkdir()
+        self.clock = FixedClock(datetime(2026, 11, 22, 9, 0, tzinfo=timezone.utc))
+
+    def _with_skill(self) -> None:
+        (self.repo / ".claude/skills/teamcraft-ceo").mkdir(parents=True)
+        (self.repo / ".claude/skills/teamcraft-ceo/SKILL.md").write_text(
+            "skill", encoding="utf-8")
+
+    def _recording_runner(self, code: int, output: str):
+        calls: list[tuple[tuple[str, ...], str, float]] = []
+
+        def run(argv, cwd, timeout):
+            calls.append((tuple(argv), cwd, timeout))
+            return code, output
+
+        return run, calls
+
+    # -- static policy preservation -----------------------------------------
+
+    def test_static_path_without_runner_is_unchanged(self) -> None:
+        self._with_skill()
+        snapshot = providers.probe_harness("claude", self.repo, clock=self.clock)
+        self.assertEqual(snapshot.health, "unsupported")
+        self.assertEqual(snapshot.reason_code, "adapter_pending")
+        self.assertEqual(snapshot.source, "static_policy")
+        self.assertIsNone(snapshot.version)
+        self.assertEqual(snapshot.discovery,
+                         {"skill_rules": "unsupported",
+                          "project_rules": "unsupported"})
+        self.assertEqual(snapshot.capabilities,
+                         {"event_stream": "unknown", "prompt_ack": "unknown"})
+        self.assertFalse(
+            snapshot.effective_health(now=self.clock.now())["healthy"])
+
+    def test_contract_registry_is_empty_guard(self) -> None:
+        # Pins the CURRENT reality: no explicit compatible installed contract
+        # has been established, so nothing can report a healthy Claude.
+        self.assertEqual(providers.CLAUDE_COMPATIBLE_VERSIONS, frozenset())
+        self.assertTrue(providers.CLAUDE_CONTRACT_REQUIRES_SKILL)
+
+    # -- injected-runner observation ----------------------------------------
+
+    def test_version_seen_reports_facts_without_claiming_support(self) -> None:
+        self._with_skill()
+        (self.repo / "CLAUDE.md").write_text("rules", encoding="utf-8")
+        run, calls = self._recording_runner(0, f"{self.PINNED}\n")
+        snapshot = providers.probe_harness("claude", self.repo, runner=run,
+                                          clock=self.clock)
+        self.assertEqual(calls, [(("claude", "--version"),
+                                 str(self.repo.resolve()), 5.0)])
+        self.assertEqual(snapshot.version, self.PINNED)
+        self.assertEqual(snapshot.discovery,
+                         {"skill_rules": "supported",
+                          "project_rules": "supported"})
+        # Observation must NOT upgrade health or invent ack/stream claims.
+        self.assertEqual(snapshot.health, "unsupported")
+        self.assertEqual(snapshot.reason_code, "adapter_pending_version_seen")
+        self.assertEqual(snapshot.capabilities,
+                         {"event_stream": "unknown", "prompt_ack": "unknown"})
+        self.assertEqual(snapshot.source, "local_process")
+        self.assertFalse(
+            snapshot.effective_health(now=self.clock.now())["healthy"])
+        # clock/TTL honored on the new path
+        self.assertEqual(snapshot.observed_at, self.clock.now().isoformat())
+        self.assertGreater(snapshot.valid_until, snapshot.observed_at)
+
+    def test_skill_absent_is_reported_as_observed(self) -> None:
+        run, _ = self._recording_runner(0, f"{self.PINNED}\n")
+        snapshot = providers.probe_harness("claude", self.repo, runner=run,
+                                          clock=self.clock)
+        self.assertEqual(snapshot.version, self.PINNED)
+        self.assertEqual(snapshot.discovery,
+                         {"skill_rules": "unsupported",
+                          "project_rules": "unsupported"})
+        self.assertEqual(snapshot.health, "unsupported")
+
+    def test_failure_shapes_classified_and_stay_unsupported(self) -> None:
+        cases = (
+            (127, "", "executable_missing", None),
+            (1, "boom\n", "version_probe_failed", None),
+            (0, "no digits in this output\n", "version_unparsable", None),
+        )
+        for code, output, reason, version in cases:
+            with self.subTest(code=code):
+                run, _ = self._recording_runner(code, output)
+                snapshot = providers.probe_harness("claude", self.repo,
+                                                 runner=run, clock=self.clock)
+                self.assertEqual(snapshot.health, "unsupported")
+                self.assertEqual(snapshot.reason_code, reason)
+                self.assertEqual(snapshot.version, version)
+                self.assertEqual(snapshot.capabilities,
+                                 {"event_stream": "unknown",
+                                  "prompt_ack": "unknown"})
+
+    def test_credential_shaped_probe_output_fails_closed(self) -> None:
+        # digits keep the line version-shaped, so the credential text reaches
+        # snapshot validation, where the secret rule refuses it fail-closed.
+        run, _ = self._recording_runner(0, "Bearer tokensecret123 v2.1.0\n")
+        with self.assertRaisesRegex(ValidationError, "credential-shaped"):
+            providers.probe_harness("claude", self.repo, runner=run,
+                                   clock=self.clock)
+
+    # -- future contract path (registry deliberately empty today) ----------
+
+    def test_contract_path_flags_health_but_never_ack(self) -> None:
+        self._with_skill()
+        run, _ = self._recording_runner(0, f"{self.PINNED}\n")
+        with mock.patch.object(
+                providers, "CLAUDE_COMPATIBLE_VERSIONS",
+                frozenset({self.PINNED})):
+            snapshot = providers.probe_harness("claude", self.repo, runner=run,
+                                              clock=self.clock)
+        self.assertEqual(snapshot.health, "healthy")
+        self.assertEqual(snapshot.reason_code, "ok")
+        # Even contract-conformant observations leave ack/stream unmeasured;
+        # P4 must close PG-3 with real evidence, never this constant.
+        self.assertEqual(snapshot.capabilities,
+                         {"event_stream": "unknown", "prompt_ack": "unknown"})
+
+    def test_contract_version_without_skill_discovery_stays_unsupported(self) -> None:
+        run, _ = self._recording_runner(0, f"{self.PINNED}\n")
+        with mock.patch.object(
+                providers, "CLAUDE_COMPATIBLE_VERSIONS",
+                frozenset({self.PINNED})):
+            snapshot = providers.probe_harness("claude", self.repo, runner=run,
+                                              clock=self.clock)
+        self.assertEqual(snapshot.health, "unsupported")
+        self.assertEqual(snapshot.reason_code, "adapter_pending_version_seen")
+
+    def test_unhealthy_claude_can_never_bind_an_attempt(self) -> None:
+        run, _ = self._recording_runner(0, f"{self.PINNED}\n")
+        snapshot = providers.probe_harness("claude", self.repo, runner=run,
+                                          clock=self.clock)
+        self.assertFalse(
+            snapshot.effective_health(now=self.clock.now())["healthy"])
+        # Routing-layer consumers see no healthy claude candidate either.
+        self.assertEqual(
+            snapshot.effective_health(now=self.clock.now())["reason_code"],
+            "adapter_pending_version_seen")
 
 
 if __name__ == "__main__":
