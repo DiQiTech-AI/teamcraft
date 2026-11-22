@@ -213,6 +213,135 @@ def harness_inventory() -> dict[str, str]:
             for name in ("codex", "opencode", "herdr", "claude")}
 
 
+#: Real (symlink-resolved) system temp directory: the only place a disposable
+#: root of this fixture may ever live.
+TEMP_BASE = Path(os.path.realpath(tempfile.gettempdir()))
+
+
+class RootRemovedError(RuntimeError):
+    """A cleanup target failed validation; nothing was deleted."""
+
+
+class TempTray:
+    """Removes EXACTLY the directories this process created, and nothing else.
+
+    Discipline (the anti-leak contract of M6-06):
+
+    * ``create()`` records the path ONLY after ``mkdtemp`` returned success, and
+      stores both the literal path and its realpath, so a later removal can
+      prove it targets the same directory it was handed;
+    * ``register()`` admits sub-directories the fixture itself mkdirs; the
+      caller asserts the parent is a directory it created, so a run can only
+      ever enqueue its own subtree;
+    * ``remove()`` refuses (``RootRemovedError``) any path that was not issued
+      by this instance, that escapes the system temp base, that resolves
+      differently than at creation, that has been replaced, or that is
+      a symlink — so ``m606-e2e-*`` roots left by EARLIER processes
+      are structurally untouchable, never swept;
+    * a directory already gone is success, so removal is IDEMPOTENT;
+    * ``remove_all()`` drains the tray past individual failures and reports
+      whether everything we created is gone, so one stuck root cannot hide the
+      rest or short-circuit the others.
+    """
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+        self._created: dict[str, str] = {}   # realpath -> raw created path
+        self._identities: dict[str, tuple[int, int]] = {}
+        self._order: list[str] = []         # realpath, creation order
+        self._done: set[str] = set()        # realpath already removed/absent
+
+    # -- creation / registration -----------------------------------------------
+
+    def create(self, suffix: str = "") -> Path:
+        """Create and record one temp root. Recording precedes any use."""
+        raw = Path(tempfile.mkdtemp(prefix=f"{self.prefix}{suffix}-"))
+        real = os.path.realpath(str(raw))
+        if real == str(TEMP_BASE) or not real.startswith(
+                str(TEMP_BASE) + os.sep):
+            # Cannot happen with mkdtemp, but refuse before returning it.
+            raw.rmdir()
+            raise RootRemovedError(f"mkdtemp escaped the temp base: {real}")
+        self._created[real] = str(raw)
+        info = os.stat(real, follow_symlinks=False)
+        self._identities[real] = (info.st_dev, info.st_ino)
+        self._order.append(real)
+        return Path(real)
+
+    def register(self, path: Path) -> Path:
+        """Record an existing directory this fixture itself just created."""
+        real = os.path.realpath(str(path))
+        if real not in self._created and not any(
+                real.startswith(p + os.sep) for p in self._created):
+            raise RootRemovedError(
+                f"refusing to adopt {real}: not inside a directory this run "
+                f"created ({sorted(self._created)})")
+        if real not in self._created:
+            self._created[real] = str(path)
+            info = os.stat(real, follow_symlinks=False)
+            self._identities[real] = (info.st_dev, info.st_ino)
+            self._order.append(real)
+        return Path(real)
+
+    # -- inspection -----------------------------------------------------------
+
+    def paths(self) -> list[Path]:
+        """Every directory issued by this instance, in creation order."""
+        return [Path(p) for p in self._order]
+
+    def outstanding(self) -> list[Path]:
+        """Recorded directories that still exist (i.e. still need removal)."""
+        return [Path(p) for p in self._order if p not in self._done]
+
+    # -- removal --------------------------------------------------------------
+
+    def _validate(self, path: Path) -> str:
+        real = os.path.realpath(str(path))
+        raw = self._created.get(real)
+        if raw is None:
+            raise RootRemovedError(
+                f"refusing to remove {path}: never created by this run; "
+                f"pre-existing or foreign roots are never swept")
+        if os.path.islink(str(path)):
+            raise RootRemovedError(
+                f"refusing to remove {path}: it is now a symlink")
+        if real == str(TEMP_BASE) or not real.startswith(
+                str(TEMP_BASE) + os.sep):
+            raise RootRemovedError(
+                f"refusing to remove {path}: resolves to {real}, outside "
+                f"{TEMP_BASE}")
+        return real
+
+    def remove(self, path: Path) -> bool:
+        """Remove one recorded directory. Idempotent; raises on refusal."""
+        real = self._validate(path)
+        if real in self._done:
+            return True                                  # already cleaned
+        try:
+            info = os.stat(real, follow_symlinks=False)
+        except FileNotFoundError:
+            self._done.add(real)
+            return True                                  # already gone
+        if (info.st_dev, info.st_ino) != self._identities[real]:
+            raise RootRemovedError(f"refusing to remove replaced directory: {real}")
+        shutil.rmtree(real)
+        self._done.add(real)
+        return True
+
+    def remove_all(self) -> bool:
+        """Drain every recorded directory; True only if all are really gone."""
+        problems: list[str] = []
+        for real in reversed(self._order):
+            try:
+                self.remove(Path(real))
+            except (RootRemovedError, OSError) as exc:
+                problems.append(f"{real}: {exc}")
+        if problems:
+            raise RootRemovedError(
+                "disposable roots left behind: " + "; ".join(problems))
+        return True
+
+
 # ---------------------------------------------------------------------------
 # The disposable run
 # ---------------------------------------------------------------------------
@@ -225,10 +354,26 @@ class M606Run:
         self.name = name
         self.claims = list(claims)
         self.rec = RecordingRunner()
-        self._closed = False
+        self._disposed = False
+        self._conn_closed = False
+        self.conn: Any = None
+        # Every disposable directory is issued through the tray, so a failure
+        # ANYWHERE in provisioning still removes exactly what was created here
+        # — and only that (never a root left behind by an earlier process).
+        self.tmp = TempTray(f"{RUN_PREFIX}{name}")
+        try:
+            self._provision(install=install)
+        except BaseException:
+            try:
+                self.dispose()
+            except (RootRemovedError, OSError) as cleanup_exc:
+                # Never mask the real provisioning failure with a cleanup error.
+                print(f"WARNING: disposable root left behind: {cleanup_exc}",
+                    file=sys.stderr)
+            raise
 
-        raw = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}{name}-"))
-        self.root = guard_outside_protected(raw)
+    def _provision(self, *, install: bool) -> None:
+        self.root = guard_outside_protected(self.tmp.create())
         (self.root / "evidence").mkdir(parents=True, exist_ok=True)
 
         # PRE-7 git fixture: bare origin + clone, seeded with a base commit.
@@ -254,7 +399,7 @@ class M606Run:
         self.additionals: list[Any] = []
 
         self.project_row = domain.create_project(
-            self.conn, f"m606-{name}", str(self.project))
+            self.conn, f"m606-{self.name}", str(self.project))
         self.manifest = self._write_manifest()
 
     # -- provisioning ---------------------------------------------------------
@@ -267,6 +412,10 @@ class M606Run:
         """
         git("init", "-q", "--bare", str(self.origin), cwd=self.root)
         seed = self.root / "seed"
+        # Create the directory ourselves so registration binds its identity.
+        # The parent tray entry covers failures before registration.
+        seed.mkdir()
+        self.tmp.register(seed)
         git("init", "-q", str(seed), cwd=self.root)
         git("remote", "add", "origin", str(self.origin), cwd=seed)
         (seed / ".gitignore").write_text("/.teamcraft/\n", encoding="utf-8")
@@ -278,7 +427,7 @@ class M606Run:
         git("commit", "-q", "-m", "base", cwd=seed)
         git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=seed)
         self.base_sha = git("rev-parse", "refs/heads/main", cwd=self.origin)
-        shutil.rmtree(seed)
+        self.tmp.remove(seed)
         git("clone", "-q", str(self.origin), str(self.project), cwd=self.root)
         self.clone_head = git("rev-parse", "HEAD", cwd=self.project)
         # A real operator's clone has an author identity; delivery refuses to
@@ -589,10 +738,38 @@ class M606Run:
     def artifact_root(self) -> str:
         return verification.default_artifact_root(str(self.project))
 
-    def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self.conn.close()
+    @property
+    def disposed(self) -> bool:
+        return self._disposed
+
+    def dispose(self) -> bool:
+        """Remove every directory THIS run created.  Idempotent.
+
+        Safe on a half-built run (no connection yet), safe from a test's
+        cleanup, and safe to call repeatedly: the connection guard plus the
+        tray's "already gone counts as removed" rule make repeats no-ops.  If
+        something is genuinely left behind this raises, and ``_disposed`` stays
+        False so a later call tries again.
+        """
+        conn = getattr(self, "conn", None)
+        if conn is not None and not getattr(self, "_conn_closed", False):
+            try:
+                conn.close()
+            except Exception:      # cleanup must proceed even if close() complains
+                pass
+            self._conn_closed = True
+        clean = self.tmp.remove_all()
+        self._disposed = True
+        return clean
+
+    def close(self) -> bool:
+        """Close the run-local DB and remove the disposable root(s).
+
+        Idempotent, so the ``addCleanup(self.run.close)`` in every ``setUp``
+        reclaims the run even when a test fails or aborts halfway — which is
+        precisely the leak this had (roots survived, one per test per run).
+        """
+        return self.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1312,131 @@ class UnknownClassificationTests(unittest.TestCase):
         self.assertEqual(created_task.kind, "ship")
         self.assertFalse(set(FORBIDDEN_VERBS) & set(failing.verbs()))
         self.assertEqual(task.status, "verifying")
+
+
+class FixtureHygieneTests(unittest.TestCase):
+    """The fixture must leave NOTHING behind, and must touch NOTHING else.
+
+    Regression cover for the leak this fixture shipped with: closing the DB
+    without removing the run root left one `m606-e2e-*` directory per test per
+    run (measured 23 per suite run, 621 MB accumulated).
+    """
+
+    def _preexisting_roots(self) -> set[str]:
+        """Roots left by EARLIER processes — ours to prove untouched, never to
+        sweep (cleaning them up is an operator action, see HG-A in the
+        host-gate doc)."""
+        base = Path(TEMP_BASE)
+        return {p.name for p in base.glob(f"{RUN_PREFIX}*") if p.is_dir()}
+
+    def test_close_removes_exactly_the_roots_this_run_created(self):
+        before = self._preexisting_roots()
+        run = M606Run("hyg")
+        # A hygiene test that fails must not itself become a leaker.
+        self.addCleanup(run.dispose)
+        root = run.root
+        seed = root / "seed"
+        self.assertTrue(root.is_dir(), "root must exist while the run lives")
+        # root + seed were both issued by this run and both stay accounted for;
+        # the seed is already reclaimed mid-provision, so only the root is left
+        # outstanding for close() to take.
+        self.assertEqual({str(p) for p in run.tmp.paths()},
+                         {str(root), str(seed)}, run.tmp.paths())
+        self.assertEqual(run.tmp.outstanding(), [root])
+
+        run.close()
+
+        self.assertFalse(root.exists(), f"run root leaked: {root}")
+        self.assertFalse(seed.exists(), f"seed dir leaked: {seed}")
+        self.assertEqual(run.tmp.outstanding(), [])
+        # Pre-existing roots from earlier processes are exactly as found: the
+        # fixture reclaims its own garbage and nothing else.
+        self.assertEqual(self._preexisting_roots(), before)
+
+    def test_close_and_dispose_are_idempotent(self):
+        run = M606Run("idem")
+        self.addCleanup(run.dispose)
+        root = run.root
+        self.assertFalse(run.disposed)
+        self.assertTrue(run.close())
+        self.assertTrue(run.disposed)
+        # Repeated closes are no-ops, not errors, even after the disk is gone.
+        self.assertTrue(run.close())
+        self.assertTrue(run.dispose())
+        self.assertTrue(run.dispose())
+        self.assertFalse(root.exists())
+        self.assertEqual(run.tmp.outstanding(), [])
+
+    def test_constructor_failure_still_removes_every_root_it_made(self):
+        """A run that dies mid-provision must not orphan its directories."""
+        before = self._preexisting_roots()
+        original = ceo_protocol.verify_protocol
+        boom_raised = {}
+
+        def boom(*_args, **_kwargs):
+            boom_raised["hit"] = True
+            raise AssertionError("forced protocol failure (leak probe)")
+
+        ceo_protocol.verify_protocol = boom
+        self.addCleanup(setattr, ceo_protocol, "verify_protocol", original)
+        # Belt and braces: should the run unexpectedly construct successfully,
+        # this test's own namespace is reclaimed (only this test uses -crash-).
+        self.addCleanup(lambda: [shutil.rmtree(p, ignore_errors=True)
+                                for p in Path(TEMP_BASE).glob(
+                                    f"{RUN_PREFIX}crash-*") if p.is_dir()])
+        with self.assertRaises(AssertionError) as ctx:
+            M606Run("crash")
+        self.assertTrue(boom_raised.get("hit"),
+                        "the injected failure did not run as intended")
+        # The real error propagates; the root does not survive it.
+        self.assertIn("forced protocol failure", str(ctx.exception))
+        survivor = [p for p in Path(TEMP_BASE).glob(f"{RUN_PREFIX}crash-*")
+                    if p.is_dir()]
+        self.assertEqual(survivor, [], f"constructor failure leaked {survivor}")
+        self.assertEqual(self._preexisting_roots(), before)
+
+    def test_foreign_and_preexisting_roots_are_never_swept(self):
+        # A root that exists but was never issued by this tray.
+        decoy = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}decoy-"))
+        self.addCleanup(shutil.rmtree, decoy, True)
+        tray = TempTray(f"{RUN_PREFIX}guard")
+        self.addCleanup(tray.remove_all)
+
+        # Nothing recorded ⇒ remove_all is a clean no-op, and cannot sweep.
+        self.assertTrue(tray.remove_all())
+        self.assertTrue(decoy.is_dir(), "an untracked root must survive")
+        with self.assertRaises(RootRemovedError):
+            tray.remove(decoy)
+        self.assertTrue(decoy.is_dir())
+
+        # Refusals: temp base itself, foreign paths, shallow paths, symlinks.
+        for hostile in (TEMP_BASE, Path(PROTECTED_ROOT), Path(os.sep) / "tmp",
+                       Path("/etc"), Path.home()):
+            with self.assertRaises(RootRemovedError):
+                tray.remove(hostile)
+
+        mine = tray.create("mine")
+        self.addCleanup(lambda: shutil.rmtree(mine, ignore_errors=True))
+        # A symlink that RESOLVES to a legitimately recorded root is still
+        # refused: cleanup follows only the exact directory it created.
+        link = Path(str(mine) + "-link")
+        os.symlink(str(mine), str(link))
+        self.addCleanup(link.unlink)
+        self.assertEqual(os.path.realpath(str(link)), str(mine))
+        with self.assertRaises(RootRemovedError):
+            tray.remove(link)
+        self.assertTrue(mine.is_dir(), "a refusal must delete nothing")
+
+        # Registering outside our own subtree is refused too.
+        with self.assertRaises(RootRemovedError):
+            tray.register(Path(PROTECTED_ROOT) / "teamcraft")
+
+        # Idempotent, and idempotent under repeat.
+        self.assertTrue(tray.remove(mine))
+        self.assertTrue(tray.remove(mine))
+        self.assertTrue(tray.remove_all())
+        self.assertFalse(mine.exists())
+        self.assertTrue(decoy.is_dir(), "sweeping pre-existing roots is a bug")
 
 
 if __name__ == "__main__":
