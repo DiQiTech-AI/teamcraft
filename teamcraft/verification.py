@@ -168,8 +168,51 @@ def _run_bounded(
                 # case where a detached descendant inherited either pipe.
                 cleanup_deadline = now + 1.0
             if cleanup_deadline is not None and now >= cleanup_deadline:
-                if not terminated and proc.poll() is not None:
-                    cleanup_error = _terminate_verifier(proc) or "verifier child retained an output pipe after the parent exited"
+                # Retention deadline reached.  Drain whatever readiness is
+                # ALREADY pending before condemning the run: when the verifier
+                # exited it closed both write ends atomically, so an EOF may be
+                # sitting unread purely because this loop was descheduled
+                # (CI flake at 83a3ab8: without this drain a healthy PASS was
+                # labelled "retained an output pipe", and the SIGKILL below
+                # raced a recycled process group -> EPERM cleanup_error).
+                # Limit the final drain so an inherited pipe with a
+                # continuous producer cannot extend the cleanup indefinitely.
+                for key in list(selector.get_map().values()):
+                    stream = key.fileobj
+                    fd = stream.fileno()
+                    reached_eof = False
+                    for _ in range(64):
+                        try:
+                            chunk = os.read(fd, 64 * 1024)
+                        except BlockingIOError:
+                            break  # write end still open: genuine retention
+                        except OSError as exc:
+                            cleanup_error = f"could not drain verifier output: {exc}"
+                            break
+                        if not chunk:
+                            reached_eof = True
+                            break
+                        if not terminated:
+                            # Honour the capture bound exactly as the main
+                            # loop does; oversized output stays truncated.
+                            remaining = MAX_CAPTURE_BYTES - sum(
+                                len(value) for value in outputs.values())
+                            accepted = min(len(chunk), max(0, remaining))
+                            outputs[fd].extend(chunk[:accepted])
+                            if len(chunk) > accepted:
+                                truncated = True
+                                break
+                    if reached_eof:
+                        try:
+                            selector.unregister(stream)
+                            stream.close()
+                        except OSError:
+                            pass
+                if (selector.get_map() and not terminated
+                        and proc.poll() is not None):
+                    stop_error = _terminate_verifier(proc)
+                    cleanup_error = (cleanup_error or stop_error
+                                     or "verifier child retained an output pipe after the parent exited")
                 for key in list(selector.get_map().values()):
                     try:
                         selector.unregister(key.fileobj)
@@ -205,7 +248,20 @@ def _run_bounded(
                         truncated = True
                         terminate()
         if proc.poll() is None:
-            terminate()
+            # Both pipes reached EOF, yet waitpid has not reported the exit.
+            # The kernel closes pipe write ends slightly before a finished
+            # child's termination status becomes collectable, so this is the
+            # normal state for an exit caught mid-signal (CI flake at
+            # 83a3ab8: SIGKILLing that already-exited process raced a
+            # recycled process group -> EPERM, and terminate() mislabelled
+            # a passed run with a cleanup error).  Give the imminent exit a
+            # short bounded grace; a process that CLOSED its pipes and keeps
+            # running past the grace is the genuine runaway and is still
+            # terminated here.
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                terminate()
         if hard_cleanup_deadline is None:
             # The process exited naturally; wait(0) only collects its already
             # available return code and cannot extend the process deadline.
