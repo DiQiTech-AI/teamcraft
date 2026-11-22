@@ -343,6 +343,22 @@ class InertModeTests(unittest.TestCase):
         self.assertTrue((root / "someone-elses-file").exists(),
                         "a refusal must not have deleted anything")
 
+    def test_a_root_awaiting_phase_two_points_at_resume_not_deletion(self) -> None:
+        """An allocated handoff root must never be described as cleanup fodder."""
+        root = self.tray.root("allocated-then-forgotten")
+        (root / "evidence").mkdir(parents=True)
+        (root / "evidence" / "journal.jsonl").write_text("", encoding="utf-8")
+        (root / "evidence" / "handoff.json").write_text(
+            json.dumps({"phase": "allocated-awaiting-operator"}), encoding="utf-8")
+        with self.assertRaises(m606.GuardError) as ctx:
+            m606.validate_root(str(root), allow_non_temp=False)
+        message = str(ctx.exception)
+        self.assertIn("--resume-handoff", message)
+        self.assertIn("phase-1 handoff", message)
+        self.assertNotIn("not empty", message)
+        # Cleanup stays available, but only as an explicit, deliberate choice.
+        self.assertIn("only if you intend to discard", message)
+
     def test_loopback_url_guards(self) -> None:
         bad = ("https://127.0.0.1:8000/v1", "http://localhost:8000/v1",
                "http://192.168.1.10:8000/v1", "http://u:t@127.0.0.1:8000/v1",

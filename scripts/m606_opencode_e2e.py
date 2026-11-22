@@ -353,6 +353,17 @@ def validate_root(raw_root: str, *, allow_non_temp: bool,
             raise GuardError(f"--root {resolved} exists and is not a directory")
         leftovers = sorted(p.name for p in Path(resolved).iterdir())
         if leftovers and not (for_cleanup or for_resume):
+            # An allocated phase-1 root is a live handoff, not debris: telling the
+            # operator to reclaim it would invite deleting the very scenario they
+            # are about to continue.  Point at --resume-handoff when we can prove
+            # the root is ours and awaiting phase 2.
+            if (Path(resolved) / "evidence" / "handoff.json").is_file():
+                raise GuardError(
+                    f"--root {resolved} is an allocated phase-1 handoff "
+                    f"({leftovers[:4]}…), not a fresh root: continue it with "
+                    f"--resume-handoff (see its evidence/handoff.json for the "
+                    f"pane, cwd and attestation it is waiting on). Use "
+                    f"--cleanup-only only if you intend to discard that handoff")
             raise GuardError(
                 f"--root {resolved} is not empty ({leftovers[:6]}…); pass a "
                 f"fresh directory, or use --cleanup-only to reclaim a journalled "
