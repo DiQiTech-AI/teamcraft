@@ -1,0 +1,2713 @@
+#!/usr/bin/env python3
+"""M6-06 — reusable OpenCode LIVE end-to-end runner for a disposable host root.
+
+WHAT THIS IS
+    A repeatable runner for the *harness-host* scenario of
+    ``doc/M6_06_LOCAL_E2E_PREFLIGHT.md`` §3 (S0…S6) with the honesty contract of
+    ``doc/M6_06_HOST_GATE_RESULTS.md``.  It provisions an isolated Git + SQLite
+    world, pins the CEO protocol and one local model, drives the OpenCode leg
+    through Herdr, verifies and delivers locally, and captures **postcondition**
+    evidence — every claim is re-read from an authoritative source (git, SQLite,
+    the Herdr socket, file digests) instead of being asserted from intent.
+
+WHAT IT CANNOT DO (enforced, not merely promised)
+    * ``--plan`` (the DEFAULT) creates nothing, opens no DB, sends no input and
+      issues no Herdr command at all — it only prints the plan and validates
+      arguments and guards.
+    * Topology is operator-owned.  The runner **never** creates, closes, focuses,
+      renames, resizes or attaches panes/tabs/sessions/workspaces: those verbs
+      are refused by :data:`FORBIDDEN_HERDR`.  It can only read identity and,
+      with explicit dispatch consent, submit a prompt to an **existing** agent.
+    * No cloud fallback, ever.  Only a literal-IP loopback oMLX URL is accepted,
+      the pinned model must be present in that loopback catalog, and no credential
+      is read, accepted or propagated.  An unhealthy local route aborts.
+    * Delivery is reported as ``submitted`` (or ``unknown``) and
+      ``human_accepted=false`` unless a *separate* acknowledgement is supplied.
+      The delivery path contains no push at all; the only push in this file is
+      the bootstrap seed → the run's own local bare origin, and ``audit_git``
+      proves that target is local, unforced, and this run's own.
+    * Cleanup removes ONLY what this invocation created, tracked in an on-disk
+      journal, so a crashed run stays precise and pre-existing garbage from other
+      processes is never swept.
+
+USAGE
+    .venv/bin/python scripts/m606_opencode_e2e.py --plan --root /tmp/m606-live-x
+    .venv/bin/python scripts/m606_opencode_e2e.py --preflight --root /tmp/m606-live-x
+    .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
+        --stop-after provision
+    # phase 1 — allocate and hand off (no prompt is submitted here):
+    .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
+        --stop-after allocate --keep-root
+    # operator: cd an existing OpenCode pane into evidence/handoff.json's
+    #           allocated_cwd, confirm it is idle, attest its model, note its
+    #           native session id
+    # phase 2 — re-prove everything, gate the pane, submit ONCE:
+    .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
+        --resume-handoff --consent-dispatch --herdr-pane w3:p2Q \
+        --pane-model-evidence attestation.json --expect-session-id ses_xxxx
+    # offline rehearsal of the whole pipeline, no pane and no model at all:
+    .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
+        --scripted-worker-change
+    .venv/bin/python scripts/m606_opencode_e2e.py --cleanup-only --root <root>
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from teamcraft import (  # noqa: E402  (path bootstrap must precede imports)
+    briefs,
+    ceo_initialization,
+    ceo_protocol,
+    delivery,
+    diagnostics,
+    domain,
+    leader,
+    providers,
+    storage,
+    verification,
+    wake,
+    worker_reports,
+    workspaces,
+    worktrees,
+)
+
+# ---------------------------------------------------------------------------
+# Pins and policy constants
+# ---------------------------------------------------------------------------
+
+#: Canonical CEO protocol (doc/M6_06_LOCAL_E2E_PREFLIGHT.md §1.2).
+CANONICAL_PROTOCOL_VERSION = "1.0.0"
+CANONICAL_PROTOCOL_SHA256 = (
+    "c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742")
+
+#: Loopback oMLX.  Only a literal IP is acceptable (never ``localhost``): the
+#: trust decision must not depend on mutable hosts/DNS resolution.
+LOOPBACK_OMLX_URL = "http://127.0.0.1:8000/v1"
+
+#: Model pinned for the OpenCode leg; must appear in the loopback catalog.
+DEFAULT_MODEL = "Qwen3.8-Flash-Next-oQ4e-mtp"
+
+RUN_PREFIX = "m606-live-"
+MARKER = "M606-LIVE"
+
+#: Read-only Herdr invocations.  Two-token form for subcommand groups.
+READ_ONLY_HERDR = frozenset({
+    ("status", ""), ("session", "list"), ("tab", "list"), ("tab", "get"),
+    ("pane", "list"), ("pane", "get"), ("pane", "read"), ("pane", "current"),
+    ("pane", "layout"), ("pane", "process-info"),
+    ("agent", "list"), ("agent", "get"), ("agent", "read"), ("agent", "wait"),
+    ("api", "snapshot"), ("api", "schema"),
+})
+
+#: Consent-gated: submits input into an EXISTING agent.  Never with a new pane.
+DISPATCH_HERDR = frozenset({("agent", "prompt"), ("agent", "send-keys")})
+
+#: Structurally unavailable: topology mutation, lifecycle and self updates.
+FORBIDDEN_HERDR = frozenset({
+    "create", "close", "focus", "rename", "resize", "zoom", "split", "kill",
+    "attach", "detach", "stop", "start", "delete", "add", "remove", "set",
+    "new", "update", "reload-config", "reset-keys", "send-text",
+})
+
+#: Git verbs that must never appear in a local-only delivery.
+FORBIDDEN_GIT = frozenset({
+    "push", "pull", "fetch", "clone", "merge", "rebase", "reset", "clean",
+    "checkout", "switch", "restore", "prune", "gc", "filter-branch", "tag",
+    "notes", "mv",
+})
+
+#: Leg names whose disposition is "submitted" unless separately acknowledged.
+DELIVERY_SUBMITTED = "submitted"
+DELIVERY_ACCEPTED = "accepted"
+DELIVERY_UNKNOWN = "unknown"
+
+#: Conservative model-id shape, used only to report what a terminal screen shows.
+MODEL_ID_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9._-]+\b")
+
+STAGES = ("provision", "allocate", "dispatch", "deliver", "cleanup", "close")
+
+#: Why live dispatch is a TWO-PHASE operation, stated once and enforced.
+#:
+#: An attempt worktree does not exist until ``allocate`` creates it, and an
+#: operator cannot cd a pane into a directory that does not exist yet.  So the
+#: gate "the pane's cwd is exactly the allocated worktree" can never be
+#: satisfied inside the invocation that allocates it.  Rather than relax the gate
+#: (which would let a prompt land in the wrong tree) or silently pretend it
+#: passed, live dispatch is refused in a single invocation and the run hands off:
+#:
+#:   phase 1  --confirm-live-run --stop-after allocate …
+#:            → creates the worktree, writes evidence/handoff.json naming the
+#:              exact cwd, branch, base sha and what to attest
+#:   (operator)  cd the existing OpenCode pane into that cwd, note its model
+#:   phase 2  --confirm-live-run --resume-handoff --consent-dispatch
+#:            --herdr-pane <pane> --pane-model-evidence <attestation.json>
+#:            --expect-session-id <session>
+#:            → re-validates everything from durable state, then submits ONCE.
+HANDOFF_REQUIRED = (
+    "live dispatch cannot run in the same invocation that allocates the "
+    "worktree: the operator has no window to place the pane in the allocated "
+    "cwd, so the cwd gate would be unverifiable. Run phase 1 "
+    "(--stop-after allocate), place the existing pane in the allocated cwd from "
+    "evidence/handoff.json, then phase 2 (--resume-handoff --consent-dispatch "
+    "--herdr-pane <pane> --pane-model-evidence <file> --expect-session-id <id>)")
+
+
+class GuardError(RuntimeError):
+    """A safety guard refused the request; no mutation had happened."""
+
+
+class PostconditionError(RuntimeError):
+    """A re-read of authoritative state did not match the claimed outcome."""
+
+
+class CleanupError(RuntimeError):
+    """A cleanup target failed validation, or a resource survived cleanup."""
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(Path(path).read_bytes())
+
+
+def canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False)
+
+
+def jsonable(obj: Any) -> Any:
+    """Normalize values so a postcondition can always be written as JSON.
+
+    Sets and Paths appear naturally in git observations; silently dropping them
+    would weaken the record, so they are converted deterministically instead.
+    """
+    if isinstance(obj, (set, frozenset)):
+        return sorted(jsonable(v) for v in obj)
+    if isinstance(obj, os.PathLike):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def plain(obj: Any) -> Any:
+    """Best-effort JSON-safe view of a dataclass/namespace for evidence."""
+    import dataclasses
+    if dataclasses.is_dataclass(obj):
+        return dataclasses.asdict(obj)
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return {k: v for k, v in vars(obj).items()
+            if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
+
+
+def field(obj: Any, *names: str, default: Any = None) -> Any:
+    """First present attribute among ``names`` (schema tolerance)."""
+    for name in names:
+        if getattr(obj, name, None) is not None:
+            return getattr(obj, name)
+    return default
+
+
+def real(path: Path | str) -> str:
+    return os.path.realpath(str(path))
+
+
+def git(repo: Path, *args: str, check: bool = True) -> tuple[int, str]:
+    argv = ["git", "-c", "core.autocrlf=false", "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main",
+            *args]
+    proc = subprocess.run(argv, cwd=str(repo), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False)
+    out = proc.stdout.decode("utf-8", "surrogateescape").strip()
+    if check and proc.returncode != 0:
+        raise PostconditionError(
+            f"git {' '.join(args)} failed ({proc.returncode}) in {repo}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return proc.returncode, out
+
+
+def leak_shapes(text: str) -> list[str]:
+    """Secret/path shapes via the M6-03 scanner patterns (scan, never scrub)."""
+    hits: list[str] = []
+    if diagnostics._POSIX_PATH_RE.search(text):
+        hits.append("path")
+    if diagnostics._WINDOWS_PATH_RE.search(text):
+        hits.append("path")
+    for pattern in diagnostics._SECRET_SHAPE_PATTERNS:
+        if pattern.search(text):
+            hits.append("secret")
+            break
+    if diagnostics._KV_SECRET_RE.search(text):
+        hits.append("secret")
+    return sorted(set(hits))
+
+
+# ---------------------------------------------------------------------------
+# Isolation guards
+# ---------------------------------------------------------------------------
+
+def guard_outside_repo(path: Path | str, what: str) -> str:
+    """Resolve ``path`` and refuse anything at/inside the project repository."""
+    resolved = real(path)
+    repo = real(REPO_ROOT)
+    if resolved == repo or resolved.startswith(repo + os.sep):
+        raise GuardError(
+            f"{what} targets {resolved}, which is the live project repository "
+            f"({repo}) or inside it; the disposable scenario must never touch "
+            f"the project tree, its worktrees or its runtime DB")
+    return resolved
+
+
+def runtime_db_targets(root: Path | str) -> list[str]:
+    """Any argument that resolves to a live ``.teamcraft`` runtime location."""
+    resolved = real(root)
+    repo = real(REPO_ROOT)
+    hits: list[str] = []
+    if resolved == repo + os.sep + ".teamcraft" or resolved.startswith(
+            repo + os.sep + ".teamcraft" + os.sep):
+        hits.append(resolved)
+    live_db = Path(repo) / ".teamcraft" / "teamcraft.db"
+    if live_db.exists() and resolved == real(live_db):
+        hits.append(resolved)
+    return hits
+
+
+def validate_root(raw_root: str, *, allow_non_temp: bool,
+                  for_cleanup: bool = False,
+                  for_resume: bool = False) -> Path:
+    """Validate the explicit isolated root.  Every refusal is pre-I/O.
+
+    The root must be explicitly supplied, absolute, outside this repository,
+    outside any live ``.teamcraft`` runtime, outside the repo's registered
+    worktrees, not a filesystem corner (``/``, ``$HOME``, temp base, ``/tmp``),
+    and either absent or an empty directory.  ``for_cleanup`` relaxes ONLY the
+    emptiness rule, because reclaiming a populated root is the whole point of
+    ``--cleanup-only`` — and even then nothing is deleted without the journal.
+    """
+    if not raw_root or not raw_root.strip():
+        raise GuardError("--root is required and must be an explicit non-empty "
+                        "path; there is no default disposable location")
+    candidate = Path(raw_root).expanduser()
+    if not candidate.is_absolute():
+        raise GuardError(f"--root must be an absolute path, got {raw_root!r}")
+    resolved = guard_outside_repo(candidate, "--root")
+    if runtime_db_targets(resolved):
+        raise GuardError(f"--root resolves onto a live runtime location: {resolved}")
+
+    base = real(tempfile.gettempdir())
+    protected_named = {base, real(Path.home()), os.sep, real("/tmp"), "/private"}
+    if resolved in protected_named:
+        raise GuardError(f"--root {resolved} is a shared/system location; "
+                        "refusing to treat it as disposable")
+    if len(resolved.rstrip(os.sep).split(os.sep)) < 3:
+        raise GuardError(f"--root {resolved} is too shallow to be disposable")
+    if not resolved.startswith(base + os.sep) and not allow_non_temp:
+        raise GuardError(
+            f"--root {resolved} is outside the system temp base {base}; pass "
+            f"--allow-non-temp-root only when you deliberately target another "
+            f"disposable volume")
+
+    repo_worktrees = {real(p) for p in repo_worktree_paths()}
+    if resolved in repo_worktrees or any(
+            r.startswith(resolved + os.sep) for r in repo_worktrees):
+        raise GuardError(f"--root {resolved} overlaps a registered worktree of "
+                        "this repository")
+
+    if Path(resolved).exists():
+        if not Path(resolved).is_dir():
+            raise GuardError(f"--root {resolved} exists and is not a directory")
+        leftovers = sorted(p.name for p in Path(resolved).iterdir())
+        if leftovers and not (for_cleanup or for_resume):
+            raise GuardError(
+                f"--root {resolved} is not empty ({leftovers[:6]}…); pass a "
+                f"fresh directory, or use --cleanup-only to reclaim a journalled "
+                f"earlier run")
+        if leftovers and (for_cleanup or for_resume):
+            # Reclaim/resume mode still refuses to touch a root we cannot
+            # account for.
+            if not (Path(resolved) / "evidence" / "journal.jsonl").is_file():
+                raise GuardError(
+                    f"--root {resolved} is populated ({leftovers[:6]}…) but has "
+                    f"no journal; without proof of what was created, nothing is "
+                    f"removed and nothing is resumed")
+    return Path(resolved)
+
+
+def repo_worktree_paths() -> list[Path]:
+    proc = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                         cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, check=False)
+    paths: list[Path] = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line[len("worktree "):]))
+    return paths
+
+
+def validate_loopback(url: str) -> str:
+    """Literal-IP loopback http only, no userinfo/query/fragment, no https."""
+    try:
+        endpoint = urllib.parse.urlsplit(url)
+        port = endpoint.port
+        ip = ipaddress.ip_address(endpoint.hostname or "")
+    except ValueError as exc:
+        raise GuardError("malformed oMLX endpoint or nonliteral host") from exc
+    if (endpoint.scheme != "http" or not ip.is_loopback or not port
+            or endpoint.username is not None or endpoint.password is not None
+            or "?" in url or "#" in url
+            or endpoint.path.rstrip("/") != "/v1"
+            or any(character.isspace() for character in url)):
+        raise GuardError("oMLX endpoint must be literal loopback HTTP with an "
+                         "explicit port and /v1, without credentials or query")
+    return url
+
+
+# ---------------------------------------------------------------------------
+# Evidence (postconditions, digests, honest non-claims)
+# ---------------------------------------------------------------------------
+
+def secret_shapes(text: str) -> list[str]:
+    """Credential shapes only — applied to every artifact we persist."""
+    hits: list[str] = []
+    for pattern in diagnostics._SECRET_SHAPE_PATTERNS:
+        if pattern.search(text):
+            hits.append("secret-shape")
+            break
+    if diagnostics._KV_SECRET_RE.search(text):
+        hits.append("kv-secret")
+    return hits
+
+
+def sanitize(text: str, root: str) -> tuple[str, dict[str, int]]:
+    """Rewrite run-root-absolute paths as ``<ROOT>/…`` and mask secrets.
+
+    Redaction is counted and reported in the evidence index: nothing is
+    silently rewritten.
+    """
+    counts = {"path_redactions": 0, "secret_redactions": 0}
+
+    def path_sub(match: re.Match[str]) -> str:
+        found = match.group(0)
+        if found.startswith(root):
+            counts["path_redactions"] += 1
+            return "<ROOT>" + found[len(root):]
+        return found
+
+    out = diagnostics._POSIX_PATH_RE.sub(path_sub, text)
+    for pattern in diagnostics._SECRET_SHAPE_PATTERNS:
+        out = pattern.sub(lambda m: (counts.__setitem__(
+            "secret_redactions", counts["secret_redactions"] + 1),
+            "***REDACTED***")[1], out)
+    out = diagnostics._KV_SECRET_RE.sub(
+        lambda m: (counts.__setitem__("secret_redactions",
+                                     counts["secret_redactions"] + 1),
+                   f"{m.group(1)}: ***REDACTED***")[1], out)
+    return out, counts
+
+
+class Evidence:
+    """Writes ``evidence/`` artifacts and records digest-bound postconditions.
+
+    Two-tier hygiene: structural artifacts (paths the runner itself chose) are
+    scanned for credential shapes only; artifacts carrying text from outside the
+    runner — harness output, operator acknowledgement, verifier output — are
+    sanitized first, and any surviving secret shape withholds the artifact.
+    """
+
+    #: Content that originated outside this runner.
+    UNTRUSTED = frozenset({"dispatch.json", "prompt-ack.json",
+                           "verification.json", "wake.json"})
+
+    def __init__(self, root: Path, run_id: str, *, resume: bool = False) -> None:
+        self.root = root
+        self.dir = root / "evidence"
+        self.run_id = run_id
+        self.postconditions: list[dict[str, Any]] = []
+        self.files: dict[str, str] = {}
+        self.redactions: dict[str, dict[str, int]] = {}
+        if resume:
+            # Phase 2 of a handoff: the directory and its earlier artifacts are
+            # ours, created by phase 1 of this same scenario; re-attach and keep
+            # appending.  Absent journal ⇒ not ours, so refuse.
+            if not (self.dir / "journal.jsonl").is_file():
+                raise GuardError(
+                    f"cannot resume: no journal in {self.dir}; a run may only "
+                    f"continue evidence it can prove it started")
+            prior = self.dir / "postconditions.json"
+            if prior.is_file():
+                self.postconditions = json.loads(prior.read_text("utf-8"))
+            for path in sorted(self.dir.glob("*.json")):
+                self.files[path.name] = sha256_file(path)
+        elif self.dir.exists():
+            # The ledger legitimately creates this directory first to hold its
+            # journal. Anything else means we are not the owner: refuse.
+            strays = sorted(p.name for p in self.dir.iterdir()
+                           if p.name != "journal.jsonl")
+            if strays:
+                raise GuardError(
+                    f"evidence dir {self.dir} already holds foreign content "
+                    f"{strays}; refusing to write into a run we did not create")
+        else:
+            self.dir.mkdir(parents=True)
+
+    def save_postconditions(self) -> None:
+        """Persist postconditions so a later phase can extend, not replace, them."""
+        self.write("postconditions.json", self.postconditions)
+
+    def write(self, name: str, payload: Any, *,
+              untrusted: bool = False) -> Path:
+        path = self.dir / name
+        try:
+            text = (payload if isinstance(payload, str)
+                    else json.dumps(payload, sort_keys=True, indent=2) + "\n")
+        except TypeError as exc:
+            # An artifact we cannot serialize is a defect in this runner, not a
+            # reason to lose the whole run's report: fail with a clear message.
+            raise PostconditionError(
+                f"evidence {name} is not JSON-serializable ({exc}); the run's "
+                f"report would be incomplete, so it is not claimed") from exc
+        if untrusted or name in self.UNTRUSTED:
+            text, counts = sanitize(text, str(self.root))
+            if any(counts.values()):
+                self.redactions[name] = counts
+        secrets = secret_shapes(text)
+        if secrets:
+            # Refuse to persist credential-shaped content at all.
+            raise PostconditionError(
+                f"evidence {name} carries {secrets}; artifact withheld — the run "
+                f"is inconclusive until the source is clean")
+        path.write_text(text, encoding="utf-8")
+        self.files[name] = sha256_file(path)
+        return path
+
+    def post(self, step: str, claim: str, *, expected: Any, observed: Any,
+             detail: str = "") -> bool:
+        """Record a re-read observation; raise when it contradicts the claim."""
+        # A bool expectation is an assertion about truthiness (expected=False is
+        # a real assertion, not "ignored"); anything else compares by equality.
+        ok = (bool(observed) == expected) if isinstance(expected, bool) \
+            else (expected == observed)
+        entry = {"step": step, "claim": claim, "expected": jsonable(expected),
+                 "observed": jsonable(observed), "ok": ok, "at": now_iso()}
+        if detail:
+            entry["detail"] = detail
+        self.postconditions.append(entry)
+        # Persist on every assertion: a phase that dies mid-way still leaves the
+        # evidence of what it had already proven.
+        self.save_postconditions()
+        if not ok:
+            self.write("postconditions.json", self.postconditions)
+            raise PostconditionError(
+                f"[{step}] {claim}: expected {expected!r}, observed {observed!r}"
+                + (f" ({detail})" if detail else ""))
+        return True
+
+    def index(self) -> Path:
+        return self.write("evidence-index.json", {
+            "run_id": self.run_id,
+            "generated_at": now_iso(),
+            "files": self.files,
+            "redactions": self.redactions,
+            "postconditions_total": len(self.postconditions),
+            "postconditions_passed": sum(1 for p in self.postconditions
+                                        if p["ok"]),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Journal-backed resource ledger: clean exactly what THIS invocation created
+# ---------------------------------------------------------------------------
+
+class Ledger:
+    """Provenance-bound cleanup with an on-disk journal.
+
+    Each created resource is appended to ``journal.jsonl`` *after* it exists, so
+    a crash mid-creation still leaves a precise record.  Removal validates every
+    target against the journal (plus realpath identity and the isolation rules)
+    and refuses anything else, so roots left by OTHER processes are structurally
+    untouchable.  Already-absent resources count as removed, so cleanup is
+    idempotent and safely resumable via ``--cleanup-only``.
+    """
+
+    def __init__(self, root: Path, run_id: str, journal: Path | None = None,
+                 *, owns_root: bool = False) -> None:
+        self.root = root
+        self.run_id = run_id
+        self.journal = journal or (root / "evidence" / "journal.jsonl")
+        self.entries: list[dict[str, Any]] = []
+        self.done: set[str] = set()
+        self.owns_root = owns_root
+        self.git_calls: list[list[str]] = []
+
+    # -- journal ------------------------------------------------------------
+
+    def load_journal(self) -> list[dict[str, Any]]:
+        """Replay a previous run's journal for --cleanup-only."""
+        entries: list[dict[str, Any]] = []
+        if not self.journal.is_file():
+            raise CleanupError(
+                f"no journal at {self.journal}; refusing to guess what to remove "
+                f"— a run that cannot prove what it created must delete nothing")
+        for line in self.journal.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                entries.append(json.loads(line))
+        self.entries = entries
+        # The journal is the proof: if it recorded a root it created, reclaim it.
+        self.owns_root = any(e.get("kind") == "root" for e in entries)
+        return entries
+
+    def _append(self, record: dict[str, Any]) -> None:
+        self.journal.parent.mkdir(parents=True, exist_ok=True)
+        with self.journal.open("a", encoding="utf-8") as handle:
+            handle.write(canonical(record) + "\n")
+
+    # -- creation -----------------------------------------------------------
+
+    def adopt_root(self, path: Path) -> Path:
+        """Claim a root this invocation created (it was validated empty)."""
+        self.owns_root = True
+        self._record("root", path)
+        return path
+
+    def track(self, path: Path, kind: str = "dir") -> Path:
+        self._record(kind, path)
+        return path
+
+    def _record(self, kind: str, path: Path) -> None:
+        r = real(path)
+        guard_outside_repo(r, f"tracked {kind}")
+        entry = {"kind": kind, "path": r, "run_id": self.run_id, "at": now_iso()}
+        self.entries.append(entry)
+        self._append(entry)
+
+    def track_git_worktree_add(self, worktree_path: str, branch: str,
+                              base_sha: str) -> None:
+        entry = {"kind": "worktree", "path": real(worktree_path),
+                 "branch": branch, "base_sha": base_sha,
+                 "run_id": self.run_id, "at": now_iso()}
+        self.entries.append(entry)
+        self._append(entry)
+
+    def untrack_path(self, path: Path) -> None:
+        self.done.add(real(path))
+
+    # -- validation ---------------------------------------------------------
+
+    def _validate(self, target: str) -> None:
+        recorded = {real(e["path"]) for e in self.entries}
+        if target not in recorded:
+            raise CleanupError(
+                f"refusing to remove {target}: not created by this run "
+                f"(journal covers {sorted(recorded)}); resources from other "
+                f"processes are never swept")
+        if os.path.islink(target):
+            raise CleanupError(f"refusing to remove {target}: it is a symlink")
+        guard_outside_repo(target, f"cleanup target {target}")
+        base = real(tempfile.gettempdir())
+        home = real(Path.home())
+        if target in {base, home, os.sep, real("/tmp")}:
+            raise CleanupError(f"refusing to remove shared location {target}")
+        if not target.startswith(self.root_real + os.sep) and target != self.root_real:
+            raise CleanupError(
+                f"refusing to remove {target}: outside this run root "
+                f"{self.root_real}")
+        if len(target.rstrip(os.sep).split(os.sep)) < 3:
+            raise CleanupError(f"refusing implausibly shallow target {target}")
+
+    @property
+    def root_real(self) -> str:
+        return real(self.root)
+
+    # -- removal ------------------------------------------------------------
+
+    def remove_worktrees(self) -> list[str]:
+        """Remove git worktrees this run added (never --force), then branches."""
+        removed: list[str] = []
+        for entry in reversed(self.entries):
+            if entry["kind"] != "worktree":
+                continue
+            wt = real(entry["path"])
+            if wt in self.done:
+                continue
+            self._validate(wt)
+            if not Path(wt).exists():
+                self.done.add(wt)
+                removed.append(wt)
+                continue
+            argv = ["worktree", "remove", wt]
+            self.git_calls.append(argv)
+            code, err = self._git(self.root, *argv, check=False)
+            if code != 0:
+                # Unmerged/uncommitted content is a legitimate refusal: keep it.
+                self.done.add(wt)
+                removed.append(f"{wt} (retained: {err[:120]})")
+                continue
+            self.done.add(wt)
+            removed.append(wt)
+            if entry.get("branch"):
+                self.git_calls.append(["branch", "-D", entry["branch"]])
+                self._git(self.root, "branch", "-D", entry["branch"],
+                         check=False)
+        return removed
+
+    def _git(self, repo: Path, *args: str, check: bool = True) -> tuple[int, str]:
+        return git(repo, *args, check=check)
+
+    @staticmethod
+    def _remove_any(target: str) -> None:
+        """Remove a directory OR a file (the journal tracks both)."""
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        elif os.path.exists(target) or os.path.islink(target):
+            os.remove(target)
+
+    def dispose(self) -> dict[str, Any]:
+        """Remove journalled resources in reverse order.  Idempotent.
+
+        Individual failures are collected, not short-circuited: one stuck path
+        must not strand everything after it.
+        """
+        problems: list[str] = []
+        worktrees_removed = self.remove_worktrees()
+        for entry in reversed(self.entries):
+            kind, target = entry["kind"], real(entry["path"])
+            if kind == "worktree" or target in self.done:
+                continue
+            try:
+                self._validate(target)
+            except CleanupError as exc:
+                problems.append(str(exc))
+                continue
+            if not Path(target).exists():
+                self.done.add(target)
+                continue
+            if kind == "root" and not self.owns_root:
+                continue
+            try:
+                self._remove_any(target)
+            except OSError as exc:
+                problems.append(f"{target}: {exc}")
+                continue
+            self.done.add(target)
+        if self.owns_root and self.root_real not in self.done:
+            try:
+                self._validate(self.root_real)
+                self._remove_any(self.root_real)
+                self.done.add(self.root_real)
+            except (CleanupError, OSError) as exc:
+                problems.append(str(exc))
+        still = [e["path"] for e in self.entries
+                 if e["kind"] != "worktree" and real(e["path"]) not in self.done
+                 and Path(real(e["path"])).exists()]
+        result = {"run_id": self.run_id, "removed": sorted(self.done),
+                  "worktrees": worktrees_removed, "retained": still,
+                  "journal": str(self.journal)}
+        if still or problems:
+            raise CleanupError(
+                "cleanup incomplete; retained for inspection: "
+                + "; ".join(problems + still))
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Herdr: read-only identity, consent-gated submit
+# ---------------------------------------------------------------------------
+
+class GitAudit:
+    """Runner passed into TeamCraft services so THEIR git calls are auditable.
+
+    Without this, the delivery/cleanup code would issue git commands through its
+    own default runner and the local-only claim would be unverifiable.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args, cwd) -> bytes:
+        self.calls.append([str(cwd), *[str(a) for a in args]])
+        return workspaces._default_run_git(args, str(cwd))
+
+    def verbs(self) -> list[str]:
+        return sorted({c[1] for c in self.calls if len(c) > 1})
+
+    def force_flags(self) -> list[list[str]]:
+        return [c for c in self.calls
+                if "--force" in c or any(a == "-f" for a in c[2:])]
+
+
+class Herdr:
+    """Audited Herdr client.  Topology mutation is structurally impossible."""
+
+    def __init__(self, *, allow_dispatch: bool,
+                 expected_agent: str = "opencode") -> None:
+        self.allow_dispatch = allow_dispatch
+        self.expected_agent = expected_agent
+        self.calls: list[list[str]] = []
+
+    def _classify(self, args: list[str]) -> str:
+        head = args[0] if args else ""
+        second = args[1] if len(args) > 1 else ""
+        if head in FORBIDDEN_HERDR or second in FORBIDDEN_HERDR:
+            return "forbidden"
+        if (head, second) in READ_ONLY_HERDR:
+            return "read"
+        if (head, second) in DISPATCH_HERDR:
+            return "dispatch"
+        return "unknown"
+
+    def run(self, *args: str, timeout: float = 30.0) -> tuple[int, str]:
+        kind = self._classify(list(args))
+        if kind == "forbidden":
+            raise GuardError(
+                f"herdr {' '.join(args)}: topology/lifecycle verbs are forbidden; "
+                f"this runner never creates, closes, focuses or attaches panes")
+        if kind == "unknown":
+            raise GuardError(f"herdr {' '.join(args)}: not on the read-only "
+                            "allowlist; refusing to guess")
+        if kind == "dispatch" and not self.allow_dispatch:
+            raise GuardError(
+                f"herdr {' '.join(args)}: submitting input to an agent requires "
+                f"--confirm-live-run AND --consent-dispatch (gate G1)")
+        self.calls.append([*args])
+        proc = subprocess.run(["herdr", *args],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, timeout=timeout, check=False)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    def snapshot(self) -> dict[str, Any]:
+        code, out = self.run("api", "snapshot")
+        if code != 0:
+            raise PostconditionError(f"herdr api snapshot failed: {out[:200]}")
+        return json.loads(out)["result"]["snapshot"]
+
+    def identity(self, pane_id: str) -> dict[str, Any]:
+        """Bind one existing pane to its native agent session, pre-dispatch."""
+        snap = self.snapshot()
+        panes = {p.get("pane_id"): p for p in snap.get("panes", [])}
+        agents = {a.get("pane_id"): a for a in snap.get("agents", [])}
+        if pane_id not in panes:
+            raise PostconditionError(
+                f"pane {pane_id} is not present in the live snapshot "
+                f"({sorted(p for p in panes if p)}); the runner targets an "
+                f"existing pane and never creates one")
+        agent = agents.get(pane_id) or {}
+        session = agent.get("agent_session") or {}
+        tab = next((t for t in snap.get("tabs", [])
+                    if t.get("tab_id") == panes[pane_id].get("tab_id")), {})
+        binding = {
+            "workspace_id": panes[pane_id].get("workspace_id"),
+            "tab_id": panes[pane_id].get("tab_id"),
+            "tab_label": tab.get("label"),
+            "pane_id": pane_id,
+            "terminal_id": agent.get("terminal_id"),
+            "agent": agent.get("agent"),
+            "agent_name": agent.get("name"),
+            "agent_status": agent.get("agent_status"),
+            "session_kind": session.get("kind"),
+            "session_source": session.get("source"),
+            "session_id": session.get("value"),
+            "cwd": agent.get("cwd") or panes[pane_id].get("cwd"),
+            "observed_at": now_iso(),
+        }
+        if binding["agent"] != self.expected_agent:
+            raise PostconditionError(
+                f"pane {pane_id} hosts agent {binding['agent']!r}, not "
+                f"{self.expected_agent!r}; refusing to prompt the wrong agent")
+        if not binding["session_id"]:
+            raise PostconditionError(
+                f"pane {pane_id} exposes no native session id; identity cannot be "
+                f"bound, so dispatch evidence would be unverifiable")
+        return binding
+
+    def read_pane(self, pane_id: str, limit: int = 4000) -> tuple[int, str]:
+        """Read a pane's terminal text (read-only; supplements attestation)."""
+        return self.run("pane", "read", pane_id)
+
+    def status(self) -> dict[str, str]:
+        """Parse ``herdr status`` into flat ``section.key`` fields."""
+        code, out = self.run("status")
+        if code != 0:
+            raise PostconditionError(f"herdr status failed: {out[:200]}")
+        fields: dict[str, str] = {}
+        section = ""
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            key, sep, value = line.partition(":")
+            if not sep:
+                continue
+            key, value = key.strip(), value.strip()
+            if line[:1] in (" ", "\t") and section:
+                fields[f"{section}.{key}"] = value
+            else:
+                section = key
+                if value:
+                    fields[key] = value
+        return fields
+
+    def topology_digest(self) -> str:
+        """Digest of the structural snapshot (identity, minus volatile counters)."""
+        snap = self.snapshot()
+        stable = {
+            "workspaces": sorted(str(w.get("workspace_id"))
+                                for w in snap.get("workspaces", [])),
+            "tabs": sorted((str(t.get("tab_id")), str(t.get("pane_count")))
+                          for t in snap.get("tabs", [])),
+            "panes": sorted(str(p.get("pane_id")) for p in snap.get("panes", [])),
+            "agents": sorted((str(a.get("pane_id")), str(a.get("agent")),
+                             str((a.get("agent_session") or {}).get("value")))
+                          for a in snap.get("agents", [])),
+        }
+        return sha256_bytes(canonical(stable).encode("utf-8"))
+
+    def submit(self, target: str, prompt: str, *, wait: bool = False,
+               until: tuple[str, ...] = (), timeout_ms: int = 5000,
+               ) -> dict[str, Any]:
+        """Submit to an EXISTING agent via ``herdr agent prompt <T> <TEXT>``.
+
+        Herdr's own contract is explicit that this "does not track turns" and
+        that ``--wait`` only observes a state after submission — so the result is
+        a *transport observation*, never a host-trusted acknowledgement:
+        ``prompt_ack`` stays ``unknown`` unless the operator supplies evidence.
+        The prompt text itself is not persisted; only its digest and length are.
+        """
+        if not self.allow_dispatch:
+            raise GuardError("dispatch not consented (see --consent-dispatch)")
+        before = self.identity(target)
+        argv = ["agent", "prompt", target, prompt]
+        if wait:
+            argv.append("--wait")
+            for state in until:
+                argv += ["--until", state]
+            argv += ["--timeout", str(timeout_ms)]
+        code, out = self.run(*argv)
+        after = self.identity(target)
+
+        # Classify herdr's documented refusal/stall outcomes by observation.
+        lowered = out.lower()
+        outcome = "accepted" if code == 0 else "rejected"
+        for token in ("agent_blocked", "agent_prompt_stalled", "timeout"):
+            if token in lowered:
+                outcome = token
+                break
+        else:
+            if code != 0 and "not found" in lowered:
+                outcome = "target_not_found"
+        return {
+            "submitted_at": now_iso(),
+            # argv shape recorded WITHOUT the prompt text (which may quote repo
+            # content); the digest binds the exact bytes that were sent.
+            "argv_shape": ["herdr", "agent", "prompt", target, "<TEXT>"]
+            + ([] if not wait else ["--wait", "--timeout", str(timeout_ms)]
+               + ([] if not until else ["--until", ",".join(until)])),
+            "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
+            "prompt_chars": len(prompt),
+            "returncode": code,
+            "transport_observation": outcome,
+            "wait_requested": wait,
+            "until": list(until),
+            "timeout_ms": timeout_ms if wait else None,
+            "output_head": out[:400],
+            "identity_before": before,
+            "identity_after": after,
+            "session_stable": before["session_id"] == after["session_id"],
+            # Observation of an exit code or a state change is NOT an ack.
+            "prompt_ack": "unknown",
+            "event_stream": "unknown",
+            "host_trusted_receipt": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Host gate checks (loopback only)
+# ---------------------------------------------------------------------------
+
+def check_omlx(url: str, model: str, *, getter: Any = None) -> dict[str, Any]:
+    """Require a healthy loopback oMLX serving the pinned model. No fallback.
+
+    ``getter`` is a transport seam (an HTTP GET) for offline validation; the
+    health, catalog and loopback-source rules are applied identically either way.
+    """
+    validate_loopback(url)
+    snapshot = providers.probe_omlx(url, getter=getter)
+    result = {
+        "url": url, "health": snapshot.health, "reason_code": snapshot.reason_code,
+        "source": snapshot.source, "models": list(snapshot.models),
+        "pinned_model_present": model in snapshot.models,
+        "capabilities": dict(snapshot.capabilities),
+    }
+    if snapshot.health != "healthy":
+        raise GuardError(
+            f"loopback oMLX at {url} is {snapshot.health} "
+            f"({snapshot.reason_code}); the run aborts — this runner has NO "
+            f"cloud fallback and will not substitute another provider")
+    if not result["pinned_model_present"]:
+        raise GuardError(
+            f"pinned model {model!r} is not served by loopback oMLX "
+            f"(catalog: {sorted(snapshot.models)}); refusing to fall back to a "
+            f"cloud route or an unlisted model")
+    if snapshot.name != "omlx" or not any(
+            m in snapshot.source for m in ("127.0.0.1", "::1")):
+        raise GuardError(
+            f"provider snapshot is not a loopback oMLX source "
+            f"({snapshot.name!r} @ {snapshot.source!r})")
+    return result
+
+
+def check_protocol(references_dir: Path, version: str, sha256: str) -> dict[str, Any]:
+    """Pin the exact protocol pair; any drift aborts."""
+    snapshot = ceo_protocol.verify_protocol(
+        str(references_dir), expected_version=version, expected_sha256=sha256)
+    return {"protocol_version": snapshot.version, "sha256": snapshot.sha256,
+            "references": str(references_dir), "pinned_match": True}
+
+
+# ---------------------------------------------------------------------------
+# The runner
+# ---------------------------------------------------------------------------
+
+class M606LiveRun:
+    """Disposable OpenCode live E2E: provision → dispatch → deliver → cleanup."""
+
+    def __init__(self, args: argparse.Namespace, *, herdr: Any = None,
+                 omlx_getter: Any = None, harness_runner: Any = None) -> None:
+        """``herdr`` / ``omlx_getter`` / ``harness_runner`` are offline seams.
+
+        They replace only the *transport* (a pane, an HTTP GET, a subprocess),
+        never a rule: every snapshot obtained through them is validated by the
+        same loopback / health / model checks, and every pane gate still runs.
+        Offline validation therefore proves real logic, not a stub's compliance.
+        """
+        self.args = args
+        self.resuming = bool(getattr(args, "resume_handoff", False))
+        self.root = validate_root(args.root, allow_non_temp=args.allow_non_temp_root,
+                                 for_cleanup=bool(args.cleanup_only),
+                                 for_resume=self.resuming)
+        self.model = args.model
+        self.omlx_url = args.omlx_url
+        self.protocol_version = args.protocol_version
+        self.protocol_sha256 = args.protocol_sha256
+        self.run_id = sha256_bytes(
+            f"{self.root}|{now_iso()}|{os.getpid()}".encode())[:16]
+        self.stage = "init"
+        self.evidence: Evidence | None = None
+        self.ledger = Ledger(self.root, self.run_id)
+        self.herdr = herdr or Herdr(
+            allow_dispatch=bool(args.consent_dispatch and args.confirm_live_run),
+            expected_agent=args.herdr_agent)
+        self.omlx_getter = omlx_getter
+        self.harness_runner = harness_runner
+        self.conn: Any = None
+        self.task: Any = None
+        self.attempt: Any = None
+        self.allocation: Any = None
+        self.brief: Any = None
+        self.bootstrap_calls: list[list[str]] = []
+        self.git_audit = GitAudit()
+        self._finalised = False
+        self.model_proof: dict[str, Any] = {}
+        self.worker_report: Any = None
+        self.probes: dict[str, Any] = {}
+        self.dispatch_state: str | None = None
+        # "live-agent" only once a prompt has actually been submitted; the
+        # scripted harness leg stamps "scripted" so the two can never be confused.
+        self.evidence_class = "none"
+
+    # -- helpers ------------------------------------------------------------
+
+    @property
+    def project(self) -> Path:
+        return self.root / "project"
+
+    @property
+    def origin(self) -> Path:
+        return self.root / "origin.git"
+
+    @property
+    def references(self) -> Path:
+        return (self.project / ".agents" / "skills" / "teamcraft-ceo"
+                / "references")
+
+    def lease(self) -> Any:
+        return leader.acquire_or_renew(
+            self.conn, leader.project_scope(self.project_row.id),
+            f"m606-live-{self.run_id}", ttl_seconds=3700)
+
+    def git(self, *args: str, check: bool = True) -> tuple[int, str]:
+        """A delivery-path git call: strictly no push/clone/merge/reset/rewrite."""
+        code, out = git(self.project, *args, check=check)
+        self.ledger.git_calls.append([str(self.project), *args])
+        return code, out
+
+    def bgit(self, cwd: Path, *args: str, check: bool = True) -> tuple[int, str]:
+        """A bootstrap git call, recorded separately for the local-only audit."""
+        code, out = git(cwd, *args, check=check)
+        self.bootstrap_calls.append([str(cwd), *args])
+        return code, out
+
+    def _remote_target(self, cwd: str, token: str) -> str | None:
+        """Resolve a remote NAME (e.g. ``origin``) to its filesystem path."""
+        code, url = git(Path(cwd), "remote", "get-url", token, check=False)
+        return url if code == 0 and url else None
+
+    def audit_git(self, where: str) -> dict[str, Any]:
+        """Prove local-only behavior from the recorded argv, not from intent.
+
+        Delivery-path calls may not use any powerful verb at all.  Bootstrap
+        calls may ``init``/``clone``/``push`` ONLY against this run's own local
+        bare origin (remote names are resolved before judging), never a URL,
+        and never forced.
+        """
+        delivery_used = {c[1] for c in self.ledger.git_calls if len(c) > 1}
+        delivery_used |= set(self.git_audit.verbs())
+        bad = delivery_used & FORBIDDEN_GIT
+        if bad:
+            raise PostconditionError(
+                f"{where}: delivery path issued forbidden git verbs "
+                f"{sorted(bad)}; a local-only run never pushes, merges, resets "
+                f"or rewrites")
+        forced = self.git_audit.force_flags()
+        if forced:
+            raise PostconditionError(
+                f"{where}: forced git operation(s) issued: {forced[:3]}")
+        offenders: list[str] = []
+        local_origin = real(self.origin)
+        for call in self.bootstrap_calls:
+            if len(call) < 2:
+                continue
+            cwd, verb, rest = call[0], call[1], call[2:]
+            if verb in {"merge", "rebase", "reset", "filter-branch", "clean",
+                        "gc", "prune", "tag", "notes"}:
+                offenders.append(f"powerful verb {verb}: {' '.join(call)}")
+            if "--force" in call or any(a == "-f" for a in rest):
+                offenders.append(f"forced operation: {' '.join(call)}")
+            if verb in ("push", "clone"):
+                token = next((a for a in rest if not a.startswith("-")), "")
+                if not token:
+                    offenders.append(f"{verb} with no target: {' '.join(call)}")
+                    continue
+                if "://" in token or token.startswith("git@"):
+                    offenders.append(f"{verb} to an external URL: "
+                                   f"{' '.join(call)}")
+                    continue
+                resolved = self._remote_target(cwd, token) or token
+                if real(resolved) != local_origin:
+                    offenders.append(
+                        f"{verb} target {token!r} (→ {real(resolved)}) is not "
+                        f"this run's local origin {local_origin}")
+        if offenders:
+            raise PostconditionError(
+                f"{where}: git activity exceeded the local-only envelope: "
+                f"{offenders[:4]}")
+        return {"delivery_verbs": sorted(delivery_used),
+                "bootstrap_verbs": sorted({c[1] for c in self.bootstrap_calls
+                                          if len(c) > 1}),
+                "bootstrap_calls": len(self.bootstrap_calls),
+                "local_origin_only": True,
+                "origin": str(self.origin)}
+
+    # -- G0: read-only host preflight -----------------------------------------
+
+    def preflight(self) -> dict[str, Any]:
+        self.stage = "preflight"
+        out: dict[str, Any] = {"stage": self.stage, "writable": False}
+        out["omlx"] = check_omlx(self.omlx_url, self.model,
+                                getter=self.omlx_getter)
+        out["protocol_canonical"] = check_protocol(
+            REPO_ROOT / ".agents" / "skills" / "teamcraft-ceo" / "references",
+            self.protocol_version, self.protocol_sha256)
+        binaries = {n: (shutil.which(n) or "absent")
+                    for n in ("opencode", "codex", "herdr", "claude")}
+        out["binaries"] = binaries
+        if binaries["opencode"] == "absent":
+            raise GuardError("opencode is not on PATH; the OpenCode leg cannot run")
+        if binaries["herdr"] == "absent":
+            raise GuardError("herdr is not on PATH; identity cannot be bound")
+        if binaries["claude"] != "absent":
+            # Not a blocker, but recorded: Claude legs stay out of scope (PG-1).
+            out["claude_present_note"] = ("claude binary present; Claude legs "
+                                         "remain out of scope (PG-1)")
+        out["herdr_status"] = self.herdr.status()
+        status = out["herdr_status"]
+        # G3 transport precondition: matched client/server, compatible protocol,
+        # nothing pending restart. Any of these failing means dispatch evidence
+        # could not be trusted, so the run aborts here rather than mid-leg.
+        required_yes = ("server.endpoint_compatible",
+                        "server.private_protocol_compatible",)
+        for key in required_yes:
+            if status.get(key) != "yes":
+                raise GuardError(
+                    f"herdr {key}={status.get(key)!r}: client/server protocol is "
+                    f"not compatible, so dispatch identity could not be trusted")
+        if status.get("update.restart_needed") != "no":
+            raise GuardError(
+                f"herdr update.restart_needed={status.get('update.restart_needed')!r}"
+                f"; a pending restart makes session behavior unverifiable")
+        if status.get("server.status") != "running":
+            raise GuardError(f"herdr server is {status.get('server.status')!r}")
+        if status.get("client.version") != status.get("server.version"):
+            raise GuardError(
+                f"herdr client {status.get('client.version')!r} != server "
+                f"{status.get('server.version')!r}; version skew invalidates the "
+                f"session contract")
+        out["herdr_protocol"] = (status.get("server.private_protocol")
+                                or status.get("client.protocol"))
+        out["herdr_topology_digest"] = self.herdr.topology_digest()
+        out["root"] = str(self.root)
+        out["root_would_be_created"] = not self.root.exists()
+        out["repo_dirty_entries"] = len(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE, text=True, check=False).stdout.splitlines())
+        return out
+
+    # -- G1: provision -------------------------------------------------------
+
+    def provision(self) -> dict[str, Any]:
+        self.stage = "provision"
+        # The route gate runs BEFORE anything is created: a dead loopback or an
+        # absent pinned model must abort a pristine filesystem, not leave a
+        # half-built world behind (and never falls back to a cloud route).
+        route = check_omlx(self.omlx_url, self.model, getter=self.omlx_getter)
+        self.root.mkdir(parents=True, exist_ok=False)
+        self.ledger.adopt_root(self.root)
+        ev = Evidence(self.root, self.run_id)
+        self.evidence = ev
+        ev.write("route-gate.json", {
+            **route, "model": self.model,
+            "capabilities_bound_in": "allocate",
+            "cloud_fallback": "not-permitted",
+            "gated_before": "any filesystem or database write",
+        })
+        ev.write("isolation.json", {
+            "run_id": self.run_id, "root": str(self.root),
+            "outside_repo": True, "repo_root": str(REPO_ROOT),
+            "created_at": now_iso(), "owns_root": True,
+        })
+
+        # Git world: bare origin + seeded base + clone.  Every push/clone here
+        # targets this run's own local paths; the audit below proves it.
+        self.bgit(self.root, "init", "-q", "--bare", str(self.origin))
+        self.ledger.track(self.origin, "bare-repo")
+        seed = self.root / "seed"
+        seed.mkdir()
+        self.ledger.track(seed, "seed")
+        self.bgit(seed, "init", "-q")
+        self.bgit(seed, "remote", "add", "origin", str(self.origin))
+        (seed / ".gitignore").write_text("/.teamcraft/\n", encoding="utf-8")
+        (seed / "src").mkdir()
+        (seed / "src" / "app.py").write_text("print('app')\n", encoding="utf-8")
+        (seed / "docs").mkdir()
+        (seed / "docs" / "guide.md").write_text("guide\n", encoding="utf-8")
+        self.bgit(seed, "add", "-A")
+        self.bgit(seed, "-c", "user.name=M606 Live",
+                  "-c", "user.email=m606@example.invalid", "commit", "-q",
+                  "-m", "base")
+        self.bgit(seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+        self.base_sha = git(self.origin, "rev-parse", "refs/heads/main")[1]
+        self.bgit(self.root, "clone", "-q", str(self.origin), str(self.project))
+        self.ledger.track(self.project, "clone")
+        # An operator's clone has an author identity; delivery refuses to
+        # fabricate one, so it is configured locally (never globally).
+        git(self.project, "config", "user.name", "M606 Live")
+        git(self.project, "config", "user.email", "m606@example.invalid")
+        git_audit = self.audit_git("provision")
+        ev.write("git-locality.json", {
+            **git_audit,
+            "note": ("bootstrap push/clone are permitted only against this "
+                    "run's own local bare origin; the delivery path may never "
+                    "push, and the seed push exists solely to give the clone a "
+                    "base commit"),
+        })
+        ev.post("provision", "seed push targeted the local bare origin only",
+                expected=True, observed=git_audit["local_origin_only"])
+        ev.post("provision", "clone HEAD equals the seeded base",
+                expected=self.base_sha,
+                observed=git(self.project, "rev-parse", "HEAD")[1])
+
+        # Managed install into the disposable clone only, then protocol pin.
+        installer = REPO_ROOT / "scripts" / "install.sh"
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent),
+                                       env.get("PATH", "")])
+        dry = subprocess.run(["bash", str(installer), "--target",
+                             str(self.project), "--dry-run"], cwd=str(REPO_ROOT),
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, check=False)
+        real_run = subprocess.run(["bash", str(installer), "--target",
+                                  str(self.project)], cwd=str(REPO_ROOT), env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, check=False)
+        if real_run.returncode != 0:
+            raise PostconditionError(
+                f"installer into {self.project} failed: {real_run.stderr[:300]}")
+        ev.write("installer.json", {
+            "dry_run_returncode": dry.returncode,
+            "dry_run_planned": sum(1 for line in dry.stdout.splitlines()
+                                  if "create" in line),
+            "run_returncode": real_run.returncode,
+            "changes": sum(1 for line in real_run.stdout.splitlines()
+                           if "create" in line),
+            "target": str(self.project),
+        })
+        ev.post("provision", "installer dry-run wrote nothing",
+                expected=dry.returncode, observed=0)
+        self.protocol = check_protocol(self.references, self.protocol_version,
+                                     self.protocol_sha256)
+        ev.write("protocol-verify.json", self.protocol)
+
+        # Run-local DB at head (never the live runtime DB).
+        self.db = self.root / "teamcraft.db"
+        self.migration = storage.migrate_to_head(self.db,
+                                                 allow_unverified_location=True)
+        self.conn = storage.connect(self.db, allow_unverified_location=True)
+        self.ledger.track(self.db, "db")
+        self.project_row = domain.create_project(
+            self.conn, f"m606-live-{self.run_id[:8]}", str(self.project))
+
+        # Re-read the route from a fresh probe (the gate above proved it before
+        # any write; this confirms it still holds after the DB exists).
+        # Probes are recorded and bound later in capture_and_bind_capabilities(),
+        # so an Attempt binds to exactly the snapshots that are durably
+        # registered — never to a later re-probe.
+        provider = self._provider_snapshot()
+        ev.post("provision", "provider still loopback oMLX after provisioning",
+                expected="healthy", observed=provider.health)
+        ev.post("provision", "pinned model still in loopback catalog",
+                expected=True, observed=(self.model in provider.models))
+        ev.post("provision", "catalog presence alone is not pane proof",
+                expected=False, observed=bool(self.model_proof.get("attested")))
+        ev.post("provision", "fresh DB at schema head",
+                expected=storage.SCHEMA_VERSION, observed=self.migration.to_version)
+
+        self.manifest = {
+            "schema_version": 1, "run_id": self.run_id, "milestone": "M6-06",
+            "created_at": now_iso(), "root": str(self.root),
+            "protected_root": str(REPO_ROOT),
+            "stage_matrix": {**{s: "pending" for s in STAGES},
+                            "provision": "executed"},
+            "protocol": self.protocol, "model": self.model,
+            "omlx_url": self.omlx_url,
+            "database": {"path": str(self.db), "fresh": self.migration.fresh,
+                        "from": self.migration.from_version,
+                        "to": self.migration.to_version,
+                        "schema_head": storage.SCHEMA_VERSION},
+            "git": {"origin": str(self.origin), "project": str(self.project),
+                   "base_sha": self.base_sha},
+            # Nothing has run yet: no agent evidence, no pane model proof.
+            "evidence_class": self.evidence_class,
+            "pane_model_proof": {"status": "pending", "attested": False},
+            "evidence_class": "none",
+            "pane_model_proof": {"status": "pending", "attested": False},
+            "delivery": {"disposition": DELIVERY_UNKNOWN,
+                        "human_accepted": False, "ack_source": None},
+            "non_claims": {
+                "prompt_ack": "unknown", "event_stream": "unknown",
+                "host_trusted_receipt": False, "push": False,
+                "claude": "pending:PG-1", "cloud": "not-permitted",
+            },
+        }
+        # The manifest carries the postconditions recorded SO FAR, so a
+        # provision-only run still shows the evidence it produced.
+        ev.post("provision", "root is outside the project repository",
+                expected=False,
+                observed=str(self.root).startswith(str(REPO_ROOT) + os.sep))
+        self.manifest["postconditions"] = ev.postconditions
+        ev.write("run-manifest.json", self.manifest)
+        return {"stage": self.stage, "root": str(self.root),
+                "base_sha": self.base_sha, "protocol": self.protocol,
+                "manifest": self.manifest}
+
+    # -- worker leg: real (dispatch) or explicitly scripted --------------------
+
+    def run_worker_leg(self) -> dict[str, Any]:
+        return (self.scripted_worker_leg() if self.args.scripted_worker_change
+                else self.dispatch())
+
+    def provision_attempt_resources(self) -> tuple[Any, Any, Any, Any]:
+        """Task → attempt → allocated worktree → session → brief (run-local DB)."""
+        pane = self.args.herdr_pane
+        task = domain.create_task(
+            self.conn, self.project_row.id,
+            f"m606 {'scripted' if self.args.scripted_worker_change else 'live'}"
+            f" read-mostly leg",
+            kind="ship", ownership_json=json.dumps(["src/**"]))
+        task = domain.apply_task_event(self.conn, task.id,
+                                      "dependencies_satisfied",
+                                      expected_version=task.version)
+        task = domain.set_execution_policy(
+            self.conn, task.id, expected_version=task.version,
+            policy={"delivery": "local_only"}, actor="ceo",
+            reason="M6-06 local-only scenario policy")
+        attempt = domain.create_attempt(
+            self.conn, task.id, expected_version=task.version,
+            protocol_version=self.protocol["protocol_version"],
+            protocol_hash=self.protocol["sha256"])
+        allocation, _created = worktrees.allocate_attempt_worktree(
+            self.conn, task_id=task.id, attempt_id=attempt.id,
+            repo_root=str(self.project), run_git=self.git_audit)
+        self.ledger.track_git_worktree_add(allocation.worktree_path,
+                                          allocation.branch,
+                                          allocation.base_sha)
+        # Session binding semantics differ by phase, and are never overstated:
+        # the scripted harness genuinely works in-process; a live attempt has no
+        # confirmed pane/session until phase 2 gates and submits it.
+        if self.args.scripted_worker_change:
+            native, pane_id, state = f"scripted-{attempt.id}", None, "working"
+        elif pane:
+            native = self.herdr.identity(pane)["session_id"]
+            pane_id, state = pane, "idle"
+        else:
+            native, pane_id, state = None, None, "unknown"
+        domain.register_session(self.conn, attempt.id, "opencode",
+                               native_session_id=native, pane_id=pane_id,
+                               state=state)
+        domain.transition_attempt(self.conn, attempt.id, "start")
+        domain.transition_attempt(self.conn, attempt.id, "activated")
+        brief = briefs.create_attempt_brief(
+            self.conn, attempt.id,
+            content=("Read-mostly task: describe the structure of docs/ in this "
+                    "repository and add one line to src/feature.py containing "
+                    f"{MARKER}. Do not edit any other path."))
+        return task, attempt, allocation, brief
+
+    def finish_attempt_if_open(self, attempt_id: str) -> str:
+        """Move the attempt to ``finished`` unless the report path did it already.
+
+        ``worker_reported_done`` may itself settle the attempt, so this reads the
+        current state instead of forcing a transition that could be illegal.
+        """
+        current = domain.get_attempt(self.conn, attempt_id).status
+        if current == "finished":
+            return "already-finished"
+        domain.transition_attempt(self.conn, attempt_id, "finish")
+        return "finished-now"
+
+    def write_worker_report(self, task: Any, attempt: Any, brief: Any,
+                           summary: str) -> Any:
+        report = worker_reports.record_worker_report(self.conn, {
+            "schema_version": 1, "task_id": task.id, "attempt_id": attempt.id,
+            "task_version": brief.task_version, "brief_digest": brief.brief_digest,
+            "report_kind": "final", "outcome": "completed",
+            "milestone_id": "final", "summary": summary,
+            "artifact_digest": None, "usage": {"total_tokens": None},
+        })
+        domain.apply_task_event(
+            self.conn, task.id, "worker_reported_done",
+            expected_version=domain.get_task(self.conn, task.id).version)
+        self.worker_report = report
+        return report
+
+    def scripted_worker_leg(self) -> dict[str, Any]:
+        """OFFLINE leg: THIS harness writes the change and reports as the worker.
+
+        Only valid for harness validation. ``evidence_class`` is stamped
+        ``scripted`` so no downstream reader can mistake it for real-agent
+        evidence, and it is mutually exclusive with dispatch consent.
+        """
+        self.stage = "dispatch"
+        ev = self._need_evidence()
+        marker = self.args.scripted_marker or MARKER
+        task, attempt, allocation, brief = self.provision_attempt_resources()
+        self.capture_and_bind_capabilities(attempt.id)
+        worktree = Path(allocation.worktree_path)
+        (worktree / "src" / "feature.py").write_text(
+            f"{marker}: authored by the scripted harness leg\n", encoding="utf-8")
+        report = self.write_worker_report(
+            task, attempt, brief,
+            f"SCRIPTED leg: this harness wrote {marker!r}; no agent ran")
+        how = self.finish_attempt_if_open(attempt.id)
+        self._task, self._attempt, self._allocation = (
+            domain.get_task(self.conn, task.id),
+            domain.get_attempt(self.conn, attempt.id), allocation)
+        self.attempt, self.task, self.allocation = self._attempt, self._task, \
+            allocation
+        self.dispatch_state = "scripted-complete"
+        self.evidence_class = "scripted"
+        record = {
+            "leg": "scripted", "evidence_class": "scripted",
+            "real_agent_evidence": False, "task_id": task.id,
+            "attempt_id": attempt.id,
+            "task_status_after": self._task.status,
+            "attempt_status_after": self._attempt.status,
+            "attempt_finish_path": how,
+            "worker_report_digest": report.report_digest,
+            "brief_digest": brief.brief_digest,
+            "marker_written": marker,
+            "worktree_path": allocation.worktree_path,
+        }
+        ev.write("scripted-worker-leg.json", record)
+        ev.post("dispatch", "scripted leg never claims a real agent",
+                expected=False, observed=record["real_agent_evidence"])
+        return record
+
+    def ingest_worker_report(self) -> None:
+        """Persist an externally produced WorkerReport, if one was supplied."""
+        if not self.args.worker_report_file:
+            return
+        path = Path(self.args.worker_report_file).expanduser()
+        if not path.is_file():
+            raise GuardError(f"--worker-report-file {path} does not exist")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise GuardError(f"worker report file is not valid JSON: {exc}")
+        self.worker_report = worker_reports.record_worker_report(self.conn, data)
+
+    # -- phase 1: allocate and hand off ---------------------------------------
+
+    def allocate(self) -> dict[str, Any]:
+        """Create the attempt worktree, bind capabilities, hand off to a human.
+
+        Nothing is submitted here, and nothing can be: live dispatch requires a
+        separate resumed invocation, because the operator needs the window between
+        phases to place an existing pane in the allocated cwd and to attest the
+        model that pane is actually running.
+        """
+        self.stage = "allocate"
+        ev = self._need_evidence()
+        task, attempt, allocation, brief = self.provision_attempt_resources()
+        binding = self.capture_and_bind_capabilities(attempt.id)
+        self.task, self.attempt, self.allocation, self.brief = (
+            task, attempt, allocation, brief)
+        cwd = real(allocation.worktree_path)
+        handoff = {
+            "phase": "allocated-awaiting-operator",
+            "run_id": self.run_id, "created_at": now_iso(),
+            "root": str(self.root), "project_id": self.project_row.id,
+            "task_id": task.id, "attempt_id": attempt.id,
+            "allocation_id": allocation.allocation_id,
+            "allocated_cwd": cwd, "branch": allocation.branch,
+            "base_sha": allocation.base_sha,
+            "claims": list(allocation.claims),
+            "brief_digest": brief.brief_digest,
+            "protocol": self.protocol, "model": self.model,
+            "omlx_url": self.omlx_url,
+            "capability_digests": {
+                "provider": binding["provider_digest"],
+                "harness": binding["harness_digest"]},
+            "operator_actions": [
+                f"cd an existing OpenCode pane into {cwd}",
+                "confirm that pane is idle and note its native session id",
+                "write an attestation JSON naming pane_id, terminal_id, "
+                "session_id, agent, and the model that pane is running",
+                "re-run with --resume-handoff --consent-dispatch --herdr-pane "
+                "<pane> --pane-model-evidence <file> --expect-session-id <id>",
+            ],
+            "submit_allowed_in_this_invocation": False,
+            "why": HANDOFF_REQUIRED,
+        }
+        ev.write("handoff.json", handoff)
+        ev.post("allocate", "handoff names the exact allocated cwd",
+                expected=cwd, observed=handoff["allocated_cwd"])
+        ev.post("allocate", "phase 1 submitted no prompt",
+                expected=False, observed=self.dispatch_state is not None)
+        ev.post("allocate", "phase 1 created no worker evidence",
+                expected="none", observed=self.evidence_class)
+        return handoff
+
+    # -- phase 2: resume, re-validate, then gate and submit -----------------
+
+    def resume(self) -> dict[str, Any]:
+        """Re-prove every durable fact, then gate the pane and submit once."""
+        self.stage = "dispatch"
+        path = self.root / "evidence" / "handoff.json"
+        if not path.is_file():
+            raise GuardError(
+                f"--resume-handoff but no handoff at {path}: phase 1 "
+                "(--stop-after allocate) must complete first")
+        handoff = json.loads(path.read_text("utf-8"))
+        self.run_id = str(handoff.get("run_id") or self.run_id)
+        self.ledger = Ledger(self.root, self.run_id)
+        self.ledger.load_journal()
+        self.evidence = Evidence(self.root, self.run_id, resume=True)
+        ev = self.evidence
+        prior = self.root / "evidence" / "run-manifest.json"
+        if not prior.is_file():
+            raise GuardError(f"resume: no run manifest at {prior}")
+        self.manifest = json.loads(prior.read_text("utf-8"))
+        if self.manifest.get("run_id") != self.run_id:
+            raise GuardError(
+                f"resume: manifest run_id {self.manifest.get('run_id')!r} does "
+                f"not match handoff run_id {self.run_id!r}")
+        self.manifest["resumed_at"] = now_iso()
+
+        db = self.root / "teamcraft.db"
+        if not db.is_file():
+            raise GuardError(f"resume: the run-local database {db} is missing")
+        self.db = db
+        self.conn = storage.connect(db, allow_unverified_location=True)
+        self.project_row = self._load_project(str(handoff["project_id"]))
+        self.protocol = check_protocol(self.references, self.protocol_version,
+                                     self.protocol_sha256)
+        self.base_sha = str(handoff["base_sha"])
+        task = domain.get_task(self.conn, str(handoff["task_id"]))
+        attempt = domain.get_attempt(self.conn, str(handoff["attempt_id"]))
+        allocation = worktrees.load_allocation(self.conn, attempt.id)
+        brief = briefs.get_attempt_brief(self.conn, attempt.id)
+        if allocation is None:
+            raise GuardError("resume: the allocation record is gone")
+        drift = [f"{label}: {want!r} -> {got!r}" for label, want, got in (
+            ("allocated cwd", str(handoff["allocated_cwd"]),
+             real(allocation.worktree_path)),
+            ("branch", str(handoff["branch"]), allocation.branch),
+            ("base sha", str(handoff["base_sha"]), allocation.base_sha),
+            ("brief digest", str(handoff["brief_digest"]), brief.brief_digest),
+            ("model", str(handoff["model"]), self.model),
+        ) if want != got]
+        if drift:
+            raise GuardError(
+                "resume: durable facts drifted between phases "
+                f"({'; '.join(drift)}); this handoff is void")
+        if not Path(allocation.worktree_path).exists():
+            raise GuardError(
+                f"resume: allocated worktree {allocation.worktree_path} no longer "
+                f"exists; refusing to prompt a pane whose workspace is gone")
+        binding = self.verify_durable_binding(handoff)
+        self.task, self.attempt, self.allocation, self.brief = (
+            task, attempt, allocation, brief)
+        ev.write("resume-verification.json", {
+            "phase": "resumed", "at": now_iso(), "run_id": self.run_id,
+            "task_id": task.id, "attempt_id": attempt.id,
+            "allocation_id": allocation.allocation_id,
+            "allocated_cwd": real(allocation.worktree_path),
+            "durable_facts_match": True,
+            "consent": bool(self.args.consent_dispatch),
+        })
+        if not self.args.consent_dispatch:
+            # Read-only gate rehearsal: prove the gates WITHOUT writing input.
+            gate = self.gate_dispatch_target()
+            proof = self.pane_model_proof(gate)
+            report = {"phase": "resumed", "submit": "not-consented",
+                     "pane_gate": gate, "pane_model_proof": proof,
+                     "would_submit": bool(proof.get("attested")),
+                     "note": ("all gates evaluated read-only; submitting requires "
+                            "--consent-dispatch")}
+            ev.write("dispatch.json", report)
+            return report
+        return self._submit_core(task, attempt, allocation, brief, binding, ev)
+
+    def _load_project(self, project_id: str) -> Any:
+        project = domain.get_project(self.conn, project_id)
+        if real(str(project.repo_path)) != real(self.project):
+            raise GuardError(
+                f"resume: project {project_id} points at {project.repo_path!r}, "
+                f"not this root's project {self.project}; wrong database or a "
+                f"moved root")
+        return project
+
+    def verify_durable_binding(self, handoff: dict[str, Any]) -> dict[str, Any]:
+        """Prove phase 1's probes are still durable, without re-probing."""
+        durable = self._durable_probe_digests(self.conn, self.project_row.id)
+        want = handoff.get("capability_digests") or {}
+        binding: dict[str, Any] = {"attempt_id": str(handoff["attempt_id"]),
+                                   "model": self.model,
+                                   "revalidated_on_resume": True}
+        for label in ("provider", "harness"):
+            digest = str(want.get(label) or "")
+            if digest not in durable:
+                raise GuardError(
+                    f"resume: the {label} probe digest recorded in phase 1 "
+                    f"({digest[:16]}…) is no longer registered as an event; the "
+                    f"capability binding is unverifiable")
+            binding[f"{label}_digest"] = digest
+        binding["durable_before_bind"] = True
+        ev = self._need_evidence()
+        ev.write("capability-binding-resume.json", binding)
+        return binding
+
+    # -- G2: live dispatch ---------------------------------------------------
+
+    def dispatch(self) -> dict[str, Any]:
+        """LIVE dispatch: only reachable as phase 2 (``--resume-handoff``).
+
+        This refusal is deliberate, not a limitation to design away: in the same
+        invocation that allocates the worktree, no operator could have placed a
+        pane in that cwd, so the cwd gate could not be honestly satisfied.
+        """
+        if not self.resuming:
+            raise GuardError(HANDOFF_REQUIRED)
+        return self.resume()
+
+    def _submit_core(self, task: Any, attempt: Any, allocation: Any,
+                    brief: Any, binding: dict[str, Any],
+                    ev: Evidence) -> dict[str, Any]:
+        topology_before = self.herdr.topology_digest()
+        # Gate FIRST, and reuse the identity the gate verified.  A separate
+        # pre-gate read would shift the observation window and could mask a
+        # session that flickers exactly when it matters.
+        gate = self.gate_dispatch_target()
+        identity_before = {k: gate[k] for k in
+                          ("pane_id", "terminal_id", "agent", "agent_status",
+                           "session_id", "cwd", "workspace_id", "tab_id")}
+        ev.write("identity-binding.json", identity_before)
+        proof = self.pane_model_proof(gate)
+        if not proof.get("attested"):
+            raise GuardError(
+                "pane-local model is unproven"
+                + (f" ({proof.get('reason')})" if proof.get("reason") else
+                   " (no --pane-model-evidence supplied)")
+                + f"; the loopback catalog only proves what the server serves, not"
+                  f" what pane {gate['pane_id']} has selected — refusing to "
+                  f"submit rather than assuming the model")
+
+        # Now the pane is proven idle, in the allocated cwd, on the pinned model:
+        # record the CONFIRMED session binding (phase 1 could only record an
+        # unconfirmed placeholder, since no pane had been designated yet).
+        domain.register_session(
+            self.conn, attempt.id, "opencode",
+            native_session_id=gate["session_id"], pane_id=gate["pane_id"],
+            state="idle")
+
+        # The prompt carries the allocation it belongs to: an agent told to edit
+        # "src/feature.py" without the worktree path can act in the wrong tree.
+        prompt = "\n".join([
+            f"M6-06 disposable task {task.id} / attempt {attempt.id}",
+            f"Allocated worktree (work ONLY here): {allocation.worktree_path}",
+            f"Task branch: {allocation.branch}",
+            f"Base commit: {allocation.base_sha}",
+            f"Owned paths: {', '.join(allocation.claims)}",
+            f"Brief digest: {brief.brief_digest}",
+            f"Protocol: {self.protocol['protocol_version']} "
+            f"{self.protocol['sha256']}",
+            f"Model (local loopback only): {self.model}",
+            "",
+            brief.content,
+            "",
+            "Constraints: work only inside the allocated worktree above; do not "
+            "push; do not touch paths outside the owned list; reply with one "
+            "short summary line when done.",
+        ])
+        submit = self.herdr.submit(
+            self.args.herdr_pane, prompt, wait=self.args.submit_wait,
+            until=tuple(self.args.submit_until),
+            timeout_ms=self.args.submit_timeout_ms)
+        topology_after = self.herdr.topology_digest()
+
+        # A lost submit is UNKNOWN, never a retry: quarantine and halt this leg.
+        observation = submit["transport_observation"]
+        state = ("submitted" if submit["returncode"] == 0
+                 and observation == "accepted" else "unknown")
+        submit["state"] = state
+        if self.args.ack_evidence_file:
+            ack_path = Path(self.args.ack_evidence_file).expanduser()
+            submit["prompt_ack"] = "acknowledged-by-operator"
+            submit["ack_evidence_digest"] = sha256_file(ack_path)
+            ev.write("prompt-ack.json", {
+                "source": str(ack_path), "digest": sha256_file(ack_path),
+                "text_head": ack_path.read_text(encoding="utf-8")[:400],
+            })
+
+        wake_report = self.wake_leg(ev, state)
+
+        ev.write("dispatch.json", {
+            **submit, "task_id": task.id, "attempt_id": attempt.id,
+            "allocation_id": allocation.allocation_id,
+            "worktree_path": allocation.worktree_path, "branch": allocation.branch,
+            "brief_digest": brief.brief_digest, "model": self.model,
+            "pane_gate": gate, "pane_model_proof": proof,
+            "capability_binding": binding,
+            "topology_digest_before": topology_before,
+            "topology_digest_after": topology_after,
+            "topology_unchanged": topology_before == topology_after,
+            "wake": wake_report,
+        })
+        ev.post("dispatch", "pane was idle before the prompt",
+                expected=True, observed=gate["was_idle"])
+        ev.post("dispatch", "pane cwd is exactly the allocated worktree",
+                expected=True,
+                observed=real(gate["cwd"]) == real(allocation.worktree_path))
+        ev.post("dispatch", "pane-local model attested as the pinned model",
+                expected=self.model, observed=proof["model"])
+        ev.post("dispatch", "capability probes were durable before bind",
+                expected=True, observed=binding["durable_before_bind"])
+        ev.post("dispatch", "herdr accepted the submission (else UNKNOWN: leg "
+                            "halts, never auto-retries)",
+                expected="accepted", observed=observation)
+        ev.post("dispatch", "native session id stable across submit",
+                expected=True, observed=submit["session_stable"])
+        ev.post("dispatch", "topology unchanged by dispatch",
+                expected=True, observed=(topology_before == topology_after))
+        ev.post("dispatch", "prompt_ack stays unknown without operator evidence",
+                expected="unknown",
+                observed="unknown" if not self.args.ack_evidence_file
+                else "acknowledged-by-operator")
+        # Prove the prompt carried its allocation WITHOUT persisting the text:
+        # the digests below are recomputed from the same string that was sent.
+        prompt_binding = {
+            "prompt_sha256": submit["prompt_sha256"],
+            "prompt_chars": submit["prompt_chars"],
+            "carries_alloc_path": allocation.worktree_path in prompt,
+            "carries_branch": allocation.branch in prompt,
+            "carries_base_sha": allocation.base_sha in prompt,
+            "carries_brief_digest": brief.brief_digest in prompt,
+            "carries_pinned_model": self.model in prompt,
+            "carries_protocol": self.protocol["sha256"] in prompt,
+        }
+        ev.write("prompt-binding.json", prompt_binding)
+        ev.post("dispatch", "prompt carried the allocated path and brief binding",
+                expected=[True] * 6,
+                observed=[prompt_binding["carries_alloc_path"],
+                        prompt_binding["carries_branch"],
+                        prompt_binding["carries_base_sha"],
+                        prompt_binding["carries_brief_digest"],
+                        prompt_binding["carries_pinned_model"],
+                        prompt_binding["carries_protocol"]])
+        self.dispatch_state = state
+        self.model_proof = proof
+        self.evidence_class = "live-agent"
+        self.attempt, self.task, self.allocation = (
+            domain.get_attempt(self.conn, attempt.id),
+            domain.get_task(self.conn, task.id), allocation)
+        return {"stage": self.stage, "state": state, "attempt_id": attempt.id,
+                "task_id": task.id, "identity": identity_before,
+                "submit": submit, "wake": wake_report,
+                "pane_gate": gate, "pane_model_proof": proof,
+                "capability_binding": binding,
+                "prompt_binding": prompt_binding,
+                "topology_digest_before": topology_before,
+                "topology_digest_after": topology_after,
+                "topology_unchanged": topology_before == topology_after,
+                "worktree_path": allocation.worktree_path,
+                "branch": allocation.branch}
+
+    def wake_leg(self, ev: Evidence, submit_state: str) -> dict[str, Any]:
+        """One ``ceo.wake``: ingest → admit → record the transport result.
+
+        :func:`teamcraft.wake.record_submission_result` is explicitly *not* a CEO
+        acknowledgement, and neither is a herdr exit code, so the wake is recorded
+        as submitted/unknown with ``ceo_acknowledged=false``.  No duplicate send,
+        no auto-retry.
+        """
+        lease = self.lease()
+        try:
+            ingested = wake.ingest_events(self.conn, self.project_row.id, lease)
+        except ceo_initialization.CEOInitializationGateClosed as exc:
+            # The CEO initialization handshake has not been performed in this
+            # disposable world.  That is a real, recorded precondition of the
+            # scenario (roadmap row PG-7 / gate G3), NOT something to fake by
+            # self-initializing a CEO: the wake is reported as blocked.
+            report = {"wake_id": None, "state": "blocked:ceo-initialization",
+                     "reason": str(exc)[:200], "ceo_acknowledged": False,
+                     "duplicate_sends": 0,
+                     "note": ("wake ingestion requires the CEO initialization gate "
+                             "to be open; the submitted prompt is unaffected and "
+                             "is still recorded as submitted/unknown")}
+            ev.write("wake.json", report)
+            return report
+        pending = wake.list_wakes(self.conn, self.project_row.id,
+                                 states=("pending",))
+        if not pending:
+            report = {"wake_id": None, "state": "no-pending-wake",
+                      "ingested": plain(ingested), "ceo_acknowledged": False,
+                      "note": "no eligible event produced a pending wake row"}
+            ev.write("wake.json", report)
+            return report
+        wake_id = field(pending[0], "wake_id", "id")
+        try:
+            admission = wake.admit_pending_wake(self.conn, self.project_row.id,
+                                              str(wake_id), lease)
+        except ceo_initialization.CEOInitializationGateClosed as exc:
+            # A Wake row exists and is durable, but admitting it requires the CEO
+            # initialization gate to be open — an operator/CEO action this runner
+            # never performs.  Recorded as pending, never as acknowledged.
+            report = {"wake_id": wake_id, "state": "pending:admission-blocked",
+                      "reason": str(exc)[:200], "ingested": plain(ingested),
+                      "outcome": submit_state, "ceo_acknowledged": False,
+                      "duplicate_sends": 1,
+                      "note": ("the Wake row is durable; admitting it needs CEO "
+                              "initialization (roadmap PG-7), which this runner "
+                              "does not perform on an operator's behalf")}
+            ev.write("wake.json", report)
+            return report
+        recorded = wake.record_submission_result(
+            self.conn, self.project_row.id, str(wake_id), lease,
+            outcome=submit_state,
+            detail=("herdr agent prompt exit observed; CEO ack not asserted"
+                   if not self.args.ack_evidence_file
+                   else "operator ack artifact supplied"))
+        report = {"wake_id": wake_id, "outcome": submit_state,
+                  "state_after": field(recorded, "state", default=None),
+                  "admission": plain(admission), "ingested": plain(ingested),
+                  "ceo_acknowledged": False,
+                  "duplicate_sends": 1}
+        ev.write("wake.json", report)
+        return report
+
+    # -- capability probes: durable BEFORE bind -------------------------------
+
+    def _provider_snapshot(self) -> Any:
+        return providers.probe_omlx(self.omlx_url, getter=self.omlx_getter)
+
+    def _harness_snapshot(self) -> Any:
+        return providers.probe_harness("opencode", str(self.project),
+                                      runner=self.harness_runner)
+
+    @staticmethod
+    def _durable_probe_digests(conn: Any, project_id: str) -> set[str]:
+        rows = conn.execute(
+            "SELECT json_extract(payload_json,'$.snapshot_digest') FROM events"
+            " WHERE project_id=? AND kind=?",
+            (project_id, providers.CAPABILITY_PROBE_EVENT)).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def capture_and_bind_capabilities(self, attempt_id: str) -> dict[str, Any]:
+        """Probe → persist durably → prove durability → bind. Never bind first.
+
+        ``bind_attempt_capabilities`` only accepts snapshots whose digests are
+        already registered as probe events, so recording and binding must reuse
+        the SAME objects: re-probing in between would produce different TTL
+        timestamps and a different digest, and the bind would fail closed.
+        """
+        provider = self._provider_snapshot()
+        harness = self._harness_snapshot()
+        providers.record_capability_probe(self.conn, self.project_row.id, provider)
+        providers.record_capability_probe(self.conn, self.project_row.id, harness)
+
+        durable = self._durable_probe_digests(self.conn, self.project_row.id)
+        for label, snap in (("harness", harness), ("provider", provider)):
+            self._need_evidence().post(
+                "capabilities", f"{label} probe persisted durably before bind",
+                expected=True, observed=snap.snapshot_digest in durable)
+        if provider.name != "omlx" or not any(
+                host in provider.source for host in ("127.0.0.1", "::1")):
+            raise GuardError(
+                f"provider snapshot is not loopback oMLX ({provider.name!r} @ "
+                f"{provider.source!r}); no cloud route may be bound")
+        if provider.health != "healthy":
+            raise GuardError(
+                f"loopback provider is {provider.health} "
+                f"({provider.reason_code}); refusing to bind an unhealthy route")
+        if self.model not in provider.models:
+            raise GuardError(
+                f"pinned model {self.model!r} absent from the recorded provider "
+                f"catalog; refusing to bind a model the route does not list")
+        providers.bind_attempt_capabilities(
+            self.conn, attempt_id, harness=harness, provider=provider,
+            model=self.model)
+        self.probes = {"provider": provider.payload(),
+                       "harness": harness.payload()}
+        binding = {
+            "attempt_id": attempt_id,
+            "harness": harness.name, "provider": provider.name,
+            "model": self.model,
+            "harness_digest": harness.snapshot_digest,
+            "provider_digest": provider.snapshot_digest,
+            "durable_before_bind": True,
+            "cloud_fallback": "not-permitted",
+        }
+        self._need_evidence().write("capability-binding.json", binding)
+        return binding
+
+    # -- pane gating before any prompt -----------------------------------------
+
+    def gate_dispatch_target(self) -> dict[str, Any]:
+        """Prove the pane is idle, stable, and bound to THIS run's worktree.
+
+        Prompts are never injected into a busy pane, a different directory, or a
+        session whose identity flickers between reads: any failure here is
+        fail-closed BEFORE submission, so nothing needs unwinding.
+        """
+        pane = self.args.herdr_pane
+        if not pane:
+            raise GuardError("--herdr-pane is required before dispatch")
+        first = self.herdr.identity(pane)
+        second = self.herdr.identity(pane)
+        evidence = self._need_evidence()
+        evidence.write("pane-identity.json", {"first": first, "second": second})
+        if not first.get("session_id") or first["session_id"] != second.get(
+                "session_id"):
+            raise GuardError(
+                f"pane {pane} session identity is absent or unstable "
+                f"({first.get('session_id')!r} vs {second.get('session_id')!r}); "
+                f"a dispatch could not be attributed afterwards")
+        if self.args.expect_session_id and \
+                first["session_id"] != self.args.expect_session_id:
+            raise GuardError(
+                f"pane session {first['session_id']!r} != --expect-session-id "
+                f"{self.args.expect_session_id!r}; the operator designated a "
+                f"different pane")
+        if first.get("agent_status") != "idle":
+            raise GuardError(
+                f"pane {pane} is {first.get('agent_status')!r}, not idle; a "
+                f"prompt would interleave with whatever is already running")
+        want = real(self.allocation.worktree_path)
+        pane_cwd = real(first.get("cwd") or "")
+        fg_cwd = real(first.get("foreground_cwd") or "") if first.get(
+            "foreground_cwd") else None
+        if not pane_cwd or pane_cwd != want:
+            raise GuardError(
+                f"pane {pane} cwd is {pane_cwd or '(unknown)'!r}, not this run's "
+                f"allocated worktree {want!r}; refusing to prompt a pane that is "
+                f"not standing in the disposable worktree")
+        if fg_cwd not in (None, want):
+            raise GuardError(
+                f"pane {pane} foreground cwd {fg_cwd!r} differs from the "
+                f"allocated worktree {want!r}")
+        gate = {**first, "allocated_worktree": want,
+                "cwd_matches_allocation": True, "session_stable": True,
+                "was_idle": True}
+        return gate
+
+    def pane_model_proof(self, binding: dict[str, Any]) -> dict[str, Any]:
+        """Prove the pane itself is on the pinned local model, else fail closed.
+
+        The loopback HTTP catalog proves what the SERVER serves, never what this
+        pane has selected, so catalog presence alone is insufficient: dispatch
+        requires an operator attestation whose pane/terminal/session fields match
+        the live identity we just read. The result is recorded as
+        ``operator-attested`` — explicitly NOT host-trusted.
+        """
+        evidence = self._need_evidence()
+        raw_path = self.args.pane_model_evidence
+        observation: dict[str, Any] = {}
+        try:
+            code, screen = self.herdr.read_pane(binding["pane_id"])
+            text = screen or ""
+            observation = {
+                "screen_captured": code == 0,
+                "screen_mentions_pinned_model": self.model in text,
+                "model_ids_observed_on_screen": sorted(
+                    set(MODEL_ID_RE.findall(text))),
+                "terminal_lines": len(text.splitlines()),
+                "conclusive": False,
+                "note": ("terminal screen text is a non-conclusive observation; "
+                        "it supplements but never replaces attestation"),
+            }
+            evidence.write("pane-screen-observation.json",
+                          {"pane_id": binding["pane_id"], **observation},
+                          untrusted=True)
+        except GuardError as exc:
+            evidence.write("pane-screen-observation.json", {
+                "pane_id": binding["pane_id"], "screen_captured": False,
+                "reason": str(exc)[:200], "conclusive": False})
+
+        if not raw_path:
+            return {"status": "missing", "attested": False,
+                    "cloud_fallback": "not-permitted", **observation}
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            raise GuardError(
+                f"--pane-model-evidence {path} does not exist; dispatch fails "
+                f"closed rather than assuming the pane's model")
+        try:
+            attestation = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise GuardError(f"pane model evidence is not valid JSON: {exc}")
+        declared = str(attestation.get("model", ""))
+        if declared != self.model:
+            raise GuardError(
+                f"pane attests model {declared!r}, not the pinned {self.model!r}; "
+                f"refusing to submit (no model substitution)")
+        for field_name, live_field in (("pane_id", "pane_id"),
+                                      ("terminal_id", "terminal_id"),
+                                      ("session_id", "session_id"),
+                                      ("agent", "agent")):
+            claimed = attestation.get(field_name)
+            if claimed is not None and str(claimed) != str(binding.get(live_field)):
+                raise GuardError(
+                    f"pane model evidence claims {field_name}={claimed!r} but the "
+                    f"live pane is {binding.get(live_field)!r}; the attestation "
+                    f"does not belong to this pane")
+        provenance = str(attestation.get("provenance") or "")
+        if not provenance:
+            raise GuardError(
+                "pane model evidence lacks 'provenance'; an unattributed claim is "
+                "not evidence")
+        proof = {
+            "status": "operator-attested",
+            "attested": True,
+            "model": declared,
+            "provenance": provenance,
+            "evidence_file": str(path),
+            "evidence_sha256": sha256_file(path),
+            "identity_fields_matched": [f for f, k in
+                                       (("pane_id", "pane_id"),
+                                        ("terminal_id", "terminal_id"),
+                                        ("session_id", "session_id"),
+                                        ("agent", "agent"))
+                                       if attestation.get(f) is not None],
+            "host_trusted": False,
+            **observation,
+        }
+        evidence.write("pane-model-proof.json", proof)
+        return proof
+
+    # -- deliver ------------------------------------------------------------
+
+    def approve_profiles(self) -> None:
+        """Approve local ``lint``/``test`` profiles that read REPO FACTS.
+
+        The verdict therefore comes from the repository, not from the worker's
+        self-report: a WorkerReport claiming more than the tree proves loses.
+        """
+        lint = (
+            "import pathlib,sys;"
+            "p=pathlib.Path('src/feature.py');"
+            f"needle={MARKER!r};"
+            "ok=p.is_file() and needle in p.read_text(encoding='utf-8');"
+            "print('lint: src/feature.py ' + ('ok' if ok else 'MISSING/MARKER-ABSENT'));"
+            "sys.exit(0 if ok else 1)")
+        test = (
+            "import pathlib,sys;"
+            "d=pathlib.Path('docs/guide.md');"
+            "ok=d.is_file() and d.read_text(encoding='utf-8')=='guide\\n';"
+            "print('test: docs/guide.md ' + ('unchanged' if ok else 'MOVED'));"
+            "sys.exit(0 if ok else 1)")
+        for profile, script, key in (("lint", lint, "lint"), ("test", test, "test")):
+            verification.configure_verifier_profile(
+                self.conn, self.project_row.id, profile=profile,
+                argv=[sys.executable, "-c", script], timeout_seconds=30,
+                actor="human-reviewer", idempotency_key=f"{self.run_id}-{key}",
+                lease=self.lease())
+
+    def deliver(self) -> dict[str, Any]:
+        self.stage = "deliver"
+        ev = self._need_evidence()
+        if self.attempt is None or self.allocation is None:
+            raise GuardError(
+                "deliver: no attempt/allocation in this invocation — run allocate "
+                "(phase 1) and, for a live leg, resume (phase 2) first; delivery "
+                "never invents a workspace")
+        attempt_id = self.attempt.id
+
+        # Delivery needs the worker's own durable final report; nothing here
+        # fabricates one on the worker's behalf.
+        if self.worker_report is None:
+            self.ingest_worker_report()
+        if self.worker_report is None:
+            raise GuardError(
+                f"no durable final WorkerReport for {attempt_id}: delivery would "
+                f"be unverifiable. Wait for the agent to report, or pass "
+                f"--worker-report-file <json>; this runner never authors a "
+                f"worker's claims except under --scripted-worker-change "
+                f"(which is labelled scripted)")
+        attempt_now = domain.get_attempt(self.conn, attempt_id)
+        if attempt_now.status != "finished":
+            raise GuardError(
+                f"attempt {attempt_id} is {attempt_now.status!r}, not finished; "
+                f"verification and delivery require a finished attempt")
+
+        # Verifiers first: ship evidence is only admissible on a local pass.
+        self.approve_profiles()
+        suite = verification.run_worktree_suite(
+            self.conn, attempt_id, idempotency_key=f"suite-{attempt_id}",
+            lease=self.lease(), profiles=["lint", "test"])
+        ev.write("verification.json", {
+            "verdict": suite["verdict"],
+            "profiles": {name: state["status"]
+                        for name, state in suite["profiles"].items()},
+        })
+        if suite["verdict"] != "pass":
+            raise PostconditionError(
+                f"local verifier verdict is {suite['verdict']!r}; delivery is "
+                f"refused because the repository does not prove the change")
+        gate = workspaces.run_diff_gate(self.allocation.worktree_path,
+                                        list(self.allocation.claims),
+                                        run_git=self.git_audit)
+        if not gate.ok:
+            ev.write("diff-gate.json", {"ok": False,
+                                       "violations": list(gate.violations)})
+            raise PostconditionError(
+                f"Diff Gate refused: {list(gate.violations)[:6]} — the refusal "
+                f"stands; delivery does not proceed")
+        ev.write("diff-gate.json", {
+            "ok": True, "base_sha": gate.base_sha, "branch": gate.branch,
+            "paths": [c.path for c in gate.changes],
+        })
+        commit = delivery.create_local_commit(
+            self.conn, attempt_id, idempotency_key=f"commit-{attempt_id}",
+            lease=self.lease(), run_git=self.git_audit)
+        ship = delivery.record_ship_evidence(
+            self.conn, attempt_id, idempotency_key=f"ship-{attempt_id}",
+            lease=self.lease(), run_git=self.git_audit)
+        git_audit = self.audit_git("deliver")
+
+        # Default posture: SUBMITTED, not accepted. Acceptance requires a
+        # separate, attributed acknowledgement.
+        disposition = DELIVERY_SUBMITTED
+        accepted = False
+        ack_source: str | None = None
+        if self.args.human_accept:
+            if not (self.args.accept_actor and self.args.accept_reason):
+                raise GuardError(
+                    "--human-accept requires --accept-actor and --accept-reason; "
+                    "acceptance is a separate, attributed acknowledgement")
+            approval = delivery.approve_local_delivery(
+                self.conn, ship.id, decision="accept",
+                commit_sha=commit.commit_sha, branch=commit.branch,
+                actor=self.args.accept_actor, reason=self.args.accept_reason,
+                idempotency_key=f"accept-{attempt_id}",
+                lease=self.lease(), run_git=self.git_audit)
+            accepted = approval.task_status_after == "done"
+            disposition = DELIVERY_ACCEPTED if accepted else DELIVERY_UNKNOWN
+            ack_source = f"human:{self.args.accept_actor}"
+        ev.write("delivery.json", {
+            "commit_sha": commit.commit_sha, "base_sha": commit.base_sha,
+            "parent_sha": commit.parent_sha, "branch": commit.branch,
+            "file_count": commit.file_count,
+            "diff_digest": commit.diff_digest, "diff_bytes": ship.diff_bytes,
+            "diff_relpath": ship.diff_relpath,
+            "disposition": disposition, "human_accepted": accepted,
+            "ack_source": ack_source, "git_audit": git_audit,
+        })
+        # Postconditions re-read from git and SQLite, not from intent.
+        head = git(Path(self.allocation.worktree_path), "rev-parse", "HEAD")[1]
+        ev.post("deliver", "commit sha is the branch head",
+                expected=commit.commit_sha, observed=head)
+        ev.post("deliver", "exactly one commit above the verified base",
+                expected="1", observed=git(self.project, "rev-list", "--count",
+                                          f"{commit.base_sha}..{commit.commit_sha}")[1])
+        refs = self.origin_refs()
+        ev.post("deliver", "origin gained no ref (no push)",
+                expected=["refs/heads/main"], observed=sorted(refs))
+        task_after = domain.get_task(self.conn, self.task.id)
+        expected_status = "done" if accepted else "verifying"
+        ev.post("deliver", "task status reflects acknowledgement level",
+                expected=expected_status, observed=task_after.status)
+        self.disposition = disposition
+        return {"stage": self.stage, "disposition": disposition,
+                "commit_sha": commit.commit_sha, "refs": refs}
+
+    def origin_refs(self) -> dict[str, str]:
+        code, out = git(self.root, "ls-remote", str(self.origin), check=False)
+        refs: dict[str, str] = {}
+        for line in out.splitlines():
+            sha, sep, ref = line.partition("\t")
+            if sep and ref.startswith("refs/heads/"):
+                refs[ref] = sha
+        return refs
+
+    # -- cleanup ------------------------------------------------------------
+
+    def cleanup(self) -> dict[str, Any]:
+        """Reclaim the attempt workspace ONLY if the domain grants eligibility.
+
+        ``evaluate_cleanup_eligibility`` requires a terminal attempt, a CLEANABLE
+        workspace and a ``done`` task.  A merely *submitted* delivery is not
+        accepted work, so its workspace is PRESERVED — that is the safe outcome,
+        not a failure, and this stage reports it as such instead of forcing
+        removal.  Root removal is then skipped too, because the preserved
+        workspace lives inside it and stays available for inspection; an operator
+        can still reclaim the whole root explicitly via ``--cleanup-only``.
+        """
+        self.stage = "cleanup"
+        ev = self._need_evidence()
+        attempt_id = self.attempt.id
+        worktrees.mark_worktree_cleanable(self.conn, attempt_id,
+                                         run_git=self.git_audit)
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt_id, run_git=self.git_audit)
+        audit = self.audit_git("cleanup")
+
+        if not verdict.eligible:
+            report = {
+                "stage": self.stage, "action": "preserved",
+                "eligible": False, "state": verdict.state,
+                "reasons": list(verdict.reasons), "git_audit": audit,
+                "worktree_path": self.allocation.worktree_path,
+                "root_retained": True,
+                "note": ("workspace preserved: cleanup eligibility requires a "
+                       "terminal attempt + CLEANABLE workspace + done task, and "
+                       "delivery here is only "
+                       f"{getattr(self, 'disposition', DELIVERY_UNKNOWN)}; "
+                       "reclaim explicitly with --cleanup-only once reviewed"),
+            }
+            ev.write("worktree-cleanup.json", report)
+            ev.post("cleanup", "ineligible workspace preserved, not deleted",
+                    expected=True,
+                    observed=Path(self.allocation.worktree_path).exists())
+            self.cleanup_preserved = True
+            self.cleanup_report = report
+            return report
+
+        result = delivery.cleanup_attempt_worktree(
+            self.conn, attempt_id, lease=self.lease(),
+            run_git=self.git_audit)
+        ev.write("worktree-cleanup.json", {
+            "stage": self.stage, "action": "removed", "eligible": True,
+            "state": verdict.state, "disposition": result["disposition"],
+            "cleaned": result["cleaned"], "git_audit": audit,
+        })
+        ev.post("cleanup", "worktree path removed",
+                expected=False,
+                observed=Path(self.allocation.worktree_path).exists())
+        self.ledger.untrack_path(Path(self.allocation.worktree_path))
+        # Refs survive the workspace; the local origin keeps the delivery.
+        refs = self.origin_refs()
+        ev.post("cleanup", "delivered branch still resolvable locally",
+                expected=result["cleaned"]["commit_sha"],
+                observed=git(self.project, "rev-parse", "--verify",
+                            f"refs/heads/{result['cleaned']['branch']}")[1])
+        self.cleanup_preserved = False
+        self.cleanup_report = {"stage": self.stage, "action": "removed",
+                               "disposition": result["disposition"], "refs": refs}
+        return self.cleanup_report
+
+    # -- close --------------------------------------------------------------
+
+    def finalise(self) -> dict[str, Any]:
+        ev = self.evidence
+        if ev is None:
+            return {"stage": "close", "note": "nothing provisioned; no evidence"}
+        disposition = getattr(self, "disposition", DELIVERY_UNKNOWN)
+        # Stage completion by declared ORDER, not alphabetical string compare.
+        reached = STAGES.index(self.stage) if self.stage in STAGES else -1
+        self.manifest["stage_matrix"].update(
+            {s: "executed" for i, s in enumerate(STAGES) if i <= reached})
+        self.manifest["stage_reached"] = self.stage
+        self.manifest["delivery"] = {
+            "disposition": disposition,
+            "human_accepted": disposition == DELIVERY_ACCEPTED,
+            "ack_source": ("human" if disposition == DELIVERY_ACCEPTED else None),
+        }
+        self.manifest["evidence_class"] = self.evidence_class
+        self.manifest["pane_model_proof"] = {
+            "status": self.model_proof.get("status", "not-attempted"),
+            "attested": bool(self.model_proof.get("attested")),
+            "host_trusted": False,
+            "model": self.model_proof.get("model"),
+        }
+        self.manifest["non_claims"] = {
+            "prompt_ack": "unknown" if not self.args.ack_evidence_file
+            else "acknowledged-by-operator",
+            "event_stream": "unknown",
+            "host_trusted_receipt": False,
+            "push": False, "claude": "pending:PG-1",
+            "cloud": "not-permitted",
+            "real_agent_ack": "unknown",
+        }
+        self.manifest["cleanup"] = getattr(self, "cleanup_report",
+                                          {"action": "not-attempted"})
+        self.manifest["finished_at"] = now_iso()
+        self.manifest["postconditions"] = ev.postconditions
+        ev.write("run-manifest.json", self.manifest)
+        # Final hygiene sweep across everything this run persisted.
+        residual: dict[str, Any] = {}
+        for name in sorted(ev.files):
+            hits = secret_shapes((ev.dir / name).read_text(encoding="utf-8"))
+            if hits:
+                residual[name] = hits
+        self.manifest["bundle_scan"] = {
+            "files_scanned": len(ev.files),
+            "secret_hits": residual,
+            "bundle_withheld": bool(residual),
+            "redactions": ev.redactions,
+        }
+        ev.write("run-manifest.json", self.manifest)
+        ev.index()
+        return {"stage": "close", "disposition": disposition,
+                "postconditions": len(ev.postconditions),
+                "bundle_withheld": bool(residual)}
+
+    def close(self, *, remove_roots: bool) -> dict[str, Any]:
+        if self._finalised:
+            return {"stage": "closed", "idempotent": True}
+        report: dict[str, Any] = {"stage": "close"}
+        try:
+            report["finalise"] = self.finalise()
+        except Exception as exc:      # noqa: BLE001 — report must still close
+            report["finalise_error"] = f"{type(exc).__name__}: {exc}"
+            print(f"WARNING: could not write the final manifest: {exc}",
+                  file=sys.stderr)
+        finally:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:      # cleanup must proceed regardless
+                    pass
+            if remove_roots:
+                report["ledger"] = self.ledger.dispose()
+            else:
+                report["retained_root"] = str(self.root)
+        self._finalised = True
+        return report
+
+    def _need_evidence(self) -> Evidence:
+        if self.evidence is None:
+            raise GuardError("no evidence context: provision must run first "
+                            "(--stop-after provision or earlier)")
+        return self.evidence
+
+    # -- orchestration ------------------------------------------------------
+
+    def execute(self) -> dict[str, Any]:
+        """Run the stages, always closing, and never losing the primary reason.
+
+        Cleanup runs even when a stage aborts, but a cleanup problem can never
+        mask the abort that caused it: both are reported, and ``ok`` says so.
+        """
+        report: dict[str, Any] = {"run_id": self.run_id, "root": str(self.root),
+                                 "mode": "live", "ok": False}
+
+        def stages() -> None:
+            if self.resuming:
+                # Phase 2: the world already exists; every fact is re-proved.
+                self.resume()
+            else:
+                report["preflight"] = self.preflight()
+                self.provision()
+                report["provisioned"] = True
+                if self.args.stop_after == "provision":
+                    return
+                self.allocate()
+                report["handoff"] = str(self.root / "evidence" / "handoff.json")
+                if self.args.stop_after == "allocate":
+                    return
+                # Reaching here without resuming means a live dispatch was asked
+                # for in the allocating invocation: run_worker_leg refuses it.
+                self.run_worker_leg()
+            if self.args.stop_after == "dispatch":
+                return
+            self.deliver()
+            if self.args.stop_after == "deliver":
+                return
+            self.cleanup()
+
+        abort: Exception | None = None
+        try:
+            stages()
+            report["ok"] = True
+        except Exception as exc:      # noqa: BLE001 — reported, never swallowed
+            abort = exc
+            report["aborted"] = {"type": type(exc).__name__, "message": str(exc),
+                                "stage": self.stage}
+        try:
+            # Provenance rule: an invocation may remove only what IT created.
+            # A resumed phase-2 never created the root, so it leaves the world
+            # (and its evidence) in place — a refused gate must not destroy the
+            # scenario the operator is mid-way through.  Explicit reclaim stays
+            # available via --cleanup-only.
+            keep = (self.args.keep_root
+                   or bool(getattr(self, "cleanup_preserved", False))
+                   or self.resuming)
+            report["root_retained"] = keep
+            report["close"] = self.close(remove_roots=not keep)
+        except CleanupError as exc:
+            report["cleanup_error"] = str(exc)
+            print(f"WARNING: cleanup incomplete: {exc}", file=sys.stderr)
+        if abort is not None:
+            report["stage_reached"] = self.stage
+            print(json.dumps(report, sort_keys=True, indent=True)[:2000],
+                  file=sys.stderr)
+            raise abort
+        return report
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="m606_opencode_e2e.py",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--plan", action="store_true",
+                    help="DEFAULT: print the plan and validate guards; creates "
+                         "nothing, opens no DB, issues no Herdr command")
+    mode.add_argument("--preflight", action="store_true",
+                    help="read-only host checks (loopback oMLX, protocol, herdr "
+                         "identity); creates nothing")
+    mode.add_argument("--confirm-live-run", action="store_true",
+                    help="execute the disposable scenario (G1 partial: still no "
+                         "agent submit without --consent-dispatch)")
+    mode.add_argument("--cleanup-only", action="store_true",
+                    help="reclaim exactly the journalled resources of a previous "
+                         "run at --root, then stop")
+
+    p.add_argument("--root", required=True,
+                   help="explicit isolated root; must be absolute, outside this "
+                        "repository, and empty or absent")
+    p.add_argument("--omlx-url", default=LOOPBACK_OMLX_URL,
+                   help="loopback oMLX base URL (literal IP only)")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help="pinned model id; must be served by the loopback catalog")
+    p.add_argument("--protocol-version", default=CANONICAL_PROTOCOL_VERSION)
+    p.add_argument("--protocol-sha256", default=CANONICAL_PROTOCOL_SHA256)
+    p.add_argument("--stop-after", choices=STAGES, default="cleanup")
+    worker = p.add_mutually_exclusive_group()
+    worker.add_argument("--consent-dispatch", action="store_true",
+                      help="GATE G1: allow submitting one prompt to an EXISTING "
+                           "agent pane (needs --confirm-live-run, --herdr-pane "
+                           "and --pane-model-evidence)")
+    worker.add_argument("--scripted-worker-change", action="store_true",
+                      help="OFFLINE validation leg: this harness authors the "
+                           "owned-path change and files the WorkerReport itself, "
+                           "stamped evidence_class=scripted / "
+                           "real_agent_evidence=false. Mutually exclusive with "
+                           "--consent-dispatch: a scripted leg cannot pretend to "
+                           "be agent evidence")
+    p.add_argument("--resume-handoff", action="store_true",
+                   help="phase 2: continue the scenario already provisioned and "
+                        "allocated at --root, re-proving every durable fact "
+                        "before gating the pane (the ONLY way to reach a live "
+                        "prompt)")
+    p.add_argument("--scripted-marker", default=None,
+                   help=f"text the scripted leg writes (default {MARKER}); "
+                        "use a WRONG marker to prove verifiers refuse")
+    p.add_argument("--worker-report-file", default=None,
+                   help="path to an externally produced final WorkerReport JSON "
+                        "to persist before delivery (required for a live leg "
+                        "unless --scripted-worker-change)")
+    p.add_argument("--pane-model-evidence", default=None,
+                   help="operator attestation JSON naming the pane/terminal/"
+                        "session/agent and the model that pane is running; "
+                        "REQUIRED before any prompt (fail-closed)")
+    p.add_argument("--expect-session-id", default=None,
+                   help="the exact native session id the operator designates for "
+                        "this leg; a mismatch refuses dispatch")
+    p.add_argument("--herdr-agent", default="opencode",
+                   help="expected agent kind on the target pane (identity check)")
+    p.add_argument("--herdr-pane", default=None,
+                   help="existing pane id used as the prompt TARGET, e.g. w3:p2Q "
+                        "(from `herdr agent list`); never created by this runner")
+    p.add_argument("--submit-wait", action="store_true",
+                   help="ask herdr to observe a post-submit state (transport "
+                        "observation only; still not an acknowledgement)")
+    p.add_argument("--submit-until", action="append", default=[],
+                   choices=["idle", "working", "blocked", "done", "unknown"],
+                   help="state(s) to wait for with --submit-wait (repeatable)")
+    p.add_argument("--submit-timeout-ms", type=int, default=5000,
+                   help="herdr --wait timeout in milliseconds")
+    p.add_argument("--ack-evidence-file", default=None,
+                   help="optional operator-supplied acknowledgement artifact; "
+                        "without it prompt_ack stays unknown")
+    p.add_argument("--human-accept", action="store_true",
+                   help="separate acknowledgement that promotes submitted→accepted")
+    p.add_argument("--accept-actor", default=None)
+    p.add_argument("--accept-reason", default=None)
+    p.add_argument("--keep-root", action="store_true",
+                   help="leave the disposable root in place for inspection "
+                        "(default: remove what this run created)")
+    p.add_argument("--allow-non-temp-root", action="store_true",
+                   help="permit --root outside the system temp base (still never "
+                        "inside this repository)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    return p
+
+
+def validate_pins(version: str, sha: str) -> dict[str, str]:
+    """Pin shape check — run even in inert modes, before any I/O."""
+    import re
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version or ""):
+        raise GuardError(f"--protocol-version must be MAJOR.MINOR.PATCH, got "
+                        f"{version!r}")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+        raise GuardError(f"--protocol-sha256 must be 64 lowercase hex, got "
+                        f"{sha!r}")
+    if version != CANONICAL_PROTOCOL_VERSION or sha != CANONICAL_PROTOCOL_SHA256:
+        # Not fatal, but recorded: the run is pinning a non-canonical pair.
+        print(f"NOTE: pins differ from canonical {CANONICAL_PROTOCOL_VERSION}/"
+              f"{CANONICAL_PROTOCOL_SHA256[:16]}… — expected for a forked "
+              f"protocol, unexpected otherwise", file=sys.stderr)
+    return {"protocol_version": version, "protocol_sha256": sha}
+
+
+def validate_arg_combinations(args: argparse.Namespace) -> dict[str, Any]:
+    """Refuse unsafe flag combinations in EVERY mode, before any I/O.
+
+    These are the acceptance gates expressed as argument rules, so an
+    under-specified invocation fails at parse time rather than mid-run.
+    """
+    notes: list[str] = []
+    if args.resume_handoff:
+        if not args.confirm_live_run:
+            raise GuardError("--resume-handoff continues a run on disk, so it "
+                            "requires --confirm-live-run")
+        if args.scripted_worker_change:
+            raise GuardError("--resume-handoff drives the LIVE leg; it cannot be "
+                            "combined with --scripted-worker-change")
+        if args.stop_after in ("provision", "allocate"):
+            raise GuardError(
+                f"--resume-handoff with --stop-after {args.stop_after} is "
+                "contradictory: phase 2 begins after allocation")
+    if args.consent_dispatch:
+        if not args.confirm_live_run:
+            raise GuardError("--consent-dispatch without --confirm-live-run: "
+                            "submitting input requires both explicit flags")
+        if not args.resume_handoff:
+            raise GuardError(
+                "--consent-dispatch requires --resume-handoff: " + HANDOFF_REQUIRED)
+        if not args.herdr_pane:
+            raise GuardError("--consent-dispatch requires --herdr-pane: the "
+                            "runner targets one operator-designated existing pane")
+        if not args.pane_model_evidence:
+            raise GuardError(
+                "--consent-dispatch requires --pane-model-evidence: the pane's "
+                "actual local model must be attested before any prompt (the "
+                "loopback catalog proves the server, not the pane)")
+        if not args.expect_session_id:
+            raise GuardError(
+                "--consent-dispatch requires --expect-session-id: the operator "
+                "must name the exact native session the prompt may enter")
+    if args.scripted_worker_change:
+        if not args.confirm_live_run:
+            raise GuardError("--scripted-worker-change writes to disk, so it "
+                            "still requires --confirm-live-run")
+        notes.append("scripted leg: harness-authored change, stamped "
+                    "evidence_class=scripted (NOT real agent evidence)")
+    if args.human_accept and not (args.accept_actor and args.accept_reason):
+        raise GuardError("--human-accept requires --accept-actor and "
+                       "--accept-reason; acceptance is a separate, attributed "
+                       "acknowledgement")
+    if args.submit_wait and not args.consent_dispatch:
+        raise GuardError("--submit-wait only applies to a dispatched prompt")
+    return {"arg_rules_passed": True, "notes": notes}
+
+
+def plan_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "mode": "plan",
+        "would_execute": False,
+        "created_or_mutation_issued": "none",
+        "root": args.root,
+        "pins": {"protocol_version": args.protocol_version,
+                 "protocol_sha256": args.protocol_sha256, "model": args.model,
+                 "omlx_url": args.omlx_url},
+        "gates": {
+            "G1_agent_submit": "released only in phase 2 (--resume-handoff + "
+            "--consent-dispatch)" if (args.confirm_live_run and
+                                     args.consent_dispatch and
+                                     args.resume_handoff)
+            else "not-released",
+            "G2_local_model_route": "required-healthy-at-run-start,"
+            "checked-before-any-write",
+            "G3_herdr_identity": "read-only-bind-required",
+            "G4_pane_idle_and_cwd": "idle-existing-pane-in-allocated-worktree,"
+            "session-stable-across-two-reads",
+            "G5_pane_local_model": "operator-attestation-required,"
+            "catalog-presence-insufficient,fail-closed",
+            "G6_capability_probes": "durable-before-bind_attempt_capabilities",
+            "operator_handoff": {
+                "why": "an operator cannot cd a pane into a worktree before it "
+                     "exists, so the cwd gate is unverifiable in the allocating "
+                     "invocation",
+                "phase_1": "--confirm-live-run --stop-after allocate",
+                "between_phases": "place the existing pane in handoff.json's "
+                                 "allocated_cwd, attest its model, note its session",
+                "phase_2": "--confirm-live-run --resume-handoff --consent-dispatch "
+                         "--herdr-pane <pane> --pane-model-evidence <file> "
+                         "--expect-session-id <id>",
+                "single_invocation_live_dispatch": "refused by design",
+            },
+            "worker_evidence": ("scripted (harness-authored, not real agent)"
+                               if args.scripted_worker_change else
+                               "external WorkerReport required for delivery"),
+            "human_accept": "separate-acknowledgement-required"
+            if not args.human_accept else "requested",
+        },
+        "stages": [
+            "preflight: loopback oMLX + canonical protocol + herdr identity",
+            "provision: root, bare origin+clone, installer, protocol pin, "
+            "fresh DB at head, capability + model binding",
+            "dispatch: identity bind, one prompt into an EXISTING pane, wake",
+            "deliver: Diff Gate → local commit → ship evidence "
+            f"→ disposition {DELIVERY_SUBMITTED}",
+            "cleanup: CLEANABLE → worktree removal → journalled root removal",
+            "close: manifest with honest non-claims + evidence index",
+        ],
+        "hard_rules": [
+            "topology mutation verbs structurally forbidden",
+            "no cloud fallback; loopback only; no credentials read",
+            "delivery is submitted/unknown unless --human-accept",
+            "cleanup removes only journalled paths of this invocation",
+            "project repo, its worktrees and its live DB are untouchable",
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    emit = (lambda obj: print(json.dumps(obj, sort_keys=True, indent=2))) \
+        if args.json else (lambda obj: [print(f"{k}: {v}")
+                                       for k, v in obj.items()])
+    try:
+        # Guards run in EVERY mode, including the inert default: validation is
+        # pure computation, so an unsafe target is refused before anything else.
+        validate_pins(args.protocol_version, args.protocol_sha256)
+        validated_root = validate_root(args.root,
+                                      allow_non_temp=args.allow_non_temp_root,
+                                      for_cleanup=bool(args.cleanup_only))
+        validate_loopback(args.omlx_url)
+        arg_rules = validate_arg_combinations(args)
+
+        if args.plan or not (args.preflight or args.confirm_live_run
+                             or args.cleanup_only):
+            # Inert by default: guards validated, nothing created, nothing sent.
+            payload = plan_payload(args)
+            payload["root_validated"] = str(validated_root)
+            payload["root_would_be_created"] = not validated_root.exists()
+            emit(payload)
+            return 0
+
+        run = M606LiveRun(args)
+
+        if args.cleanup_only:
+            if not validated_root.exists():
+                # Nothing to remove and nothing was ever removed by someone else
+                # in a way we can see: report success without deleting anything.
+                emit({"mode": "cleanup-only", "already_cleaned": True,
+                    "root": str(validated_root), "removed": [],
+                    "note": "the run root is already absent; no deletion was "
+                           "needed or performed"})
+                return 0
+            journal = run.root / "evidence" / "journal.jsonl"
+            ledger = Ledger(run.root, run.run_id, journal)
+            ledger.load_journal()
+            emit({"mode": "cleanup-only", **ledger.dispose()})
+            return 0
+
+        if args.preflight:
+            emit(run.preflight())
+            return 0
+
+        emit(run.execute())
+        return 0
+    except (GuardError, PostconditionError, CleanupError) as exc:
+        print(f"ABORT [{type(exc).__name__}]: {exc}", file=sys.stderr)
+        return 2
+    except (domain.AttemptSlotOccupiedError, ceo_protocol.ProtocolError,
+            ceo_initialization.CEOInitializationError,
+            workspaces.WorkspacePathError, RuntimeError) as exc:
+        print(f"ABORT [{type(exc).__name__}]: {exc}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
