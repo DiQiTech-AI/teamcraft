@@ -63,6 +63,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,6 +84,7 @@ from teamcraft import (  # noqa: E402  (path bootstrap must precede imports)
     domain,
     leader,
     providers,
+    runtime_adapter,
     storage,
     verification,
     wake,
@@ -109,6 +111,10 @@ DEFAULT_MODEL = "Qwen3.8-Flash-Next-oQ4e-mtp"
 
 RUN_PREFIX = "m606-live-"
 MARKER = "M606-LIVE"
+
+#: CLI stop points: ``ceo`` is deliberately absent — the CEO leg is part of the
+#: phase-2 dispatch phase and has no meaning as a stop point for phase 1.
+STOP_POINTS = ("provision", "allocate", "dispatch", "deliver", "cleanup", "close")
 
 #: Read-only Herdr invocations.  Two-token form for subcommand groups.
 READ_ONLY_HERDR = frozenset({
@@ -144,7 +150,19 @@ DELIVERY_UNKNOWN = "unknown"
 #: Conservative model-id shape, used only to report what a terminal screen shows.
 MODEL_ID_RE = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9._-]+\b")
 
-STAGES = ("provision", "allocate", "dispatch", "deliver", "cleanup", "close")
+STAGES = ("provision", "allocate", "ceo", "dispatch", "deliver", "cleanup",
+          "close")
+
+#: PG-7 (CEO bootstrap) placement, stated once.
+#:
+#: The canonical-CEO challenge cannot be pre-staged: ``discover_and_issue`` hands
+#: out the nonce plaintext exactly once (only its hash is stored, and it expires),
+#: the fence must be applied immediately before a real prompt, and acceptance pins
+#: the *post-submit* native session id.  So the CEO leg lives in phase 2, after
+#: the operator has designated a live pane — never in phase 1, and never replayed.
+CEO_STAGE_NOTE = ("PG-7 CEO bootstrap is phase-2 only: the one-shot nonce, the "
+                 "pre-prompt fence, and the post-submit session pin all require a "
+                 "live designated pane")
 
 #: Why live dispatch is a TWO-PHASE operation, stated once and enforced.
 #:
@@ -1048,6 +1066,14 @@ class M606LiveRun:
         self.attempt: Any = None
         self.allocation: Any = None
         self.brief: Any = None
+        #: PG-7 leg state: "not-requested" | "executed" | "already-initialized"
+        #: | "refused" — reported in the manifest so a skipped leg is never
+        #: silently counted as an executed stage.
+        self.ceo_stage = "not-requested"
+        self.ceo_report: dict[str, Any] | None = None
+        #: one-use secrets (the CEO nonce) that must never reach disk; finalise
+        #: sweeps every persisted artifact for them and reports the result.
+        self._ephemeral: list[str] = []
         self.bootstrap_calls: list[list[str]] = []
         self.git_audit = GitAudit()
         self._finalised = False
@@ -1538,6 +1564,10 @@ class M606LiveRun:
                 "session_id, agent, and the model that pane is running",
                 "re-run with --resume-handoff --consent-dispatch --herdr-pane "
                 "<pane> --pane-model-evidence <file> --expect-session-id <id>",
+                "optional (PG-7): add --ceo-pane <pane> "
+                "--ceo-expect-session-id <ceo-session> to bootstrap the canonical "
+                "CEO here first; add --wake-deliver to actually deliver the "
+                "resulting Wake to that CEO pane",
             ],
             "submit_allowed_in_this_invocation": False,
             "why": HANDOFF_REQUIRED,
@@ -1661,6 +1691,368 @@ class M606LiveRun:
         ev.write("capability-binding-resume.json", binding)
         return binding
 
+    # -- PG-7: canonical CEO identity, one-shot challenge, fenced prompt,
+    #         honest assumed_default acceptance
+    #
+    # Everything below runs against the run-local database only, and reaches a
+    # pane exclusively through the same gated submit path as the worker leg.
+    # -----------------------------------------------------------------------
+
+    def _ceo_record(self) -> Any:
+        return ceo_initialization.get_initialization(self.conn,
+                                                    self.project_row.id)
+
+    def gate_ceo_target(self) -> dict[str, Any]:
+        """Prove the designated CEO pane is free, stable, and inside this world.
+
+        The domain's own CEO bindings deliberately do not inspect a pane cwd, so
+        the runner adds the check: a prompt that establishes project-wide CEO
+        authority must not land in an arbitrary directory.  The canonical CEO
+        location is the disposable project root; the allocated worktree is also
+        accepted, but only when the CEO is the very pane the worker leg targets.
+        """
+        pane = self.args.ceo_pane
+        if not pane:
+            raise GuardError("--ceo-pane is required for the PG-7 CEO leg")
+        first = self.herdr.identity(pane)
+        second = self.herdr.identity(pane)
+        ev = self._need_evidence()
+        ev.write("ceo-pane-identity.json", {"first": first, "second": second})
+        if not first.get("session_id") or first["session_id"] != second.get(
+                "session_id"):
+            raise GuardError(
+                f"CEO pane {pane} session identity is absent or unstable "
+                f"({first.get('session_id')!r} vs {second.get('session_id')!r}); "
+                f"an initialization could not be attributed to a session later")
+        expect = self.args.ceo_expect_session_id or (
+            self.args.expect_session_id
+            if pane == self.args.herdr_pane else None)
+        if not expect:
+            raise GuardError(
+                f"CEO pane {pane} has no operator-named session to match; pass "
+                f"--ceo-expect-session-id")
+        if first["session_id"] != expect:
+            raise GuardError(
+                f"CEO pane session {first['session_id']!r} != the designated "
+                f"{expect!r}; refusing to initialize a CEO the operator did not "
+                f"name")
+        if first.get("agent_status") != "idle":
+            raise GuardError(
+                f"CEO pane {pane} is {first.get('agent_status')!r}, not idle; a "
+                f"bootstrap prompt would interleave with the CEO's current work")
+        same_pane = pane == self.args.herdr_pane
+        allowed = [real(str(self.project))]
+        if same_pane and self.allocation is not None:
+            allowed.append(real(self.allocation.worktree_path))
+        cwd = real(first.get("cwd") or "")
+        if cwd not in allowed:
+            raise GuardError(
+                f"CEO pane {pane} cwd is {cwd or '(unknown)'!r}, outside this "
+                f"run's disposable world; the CEO prompt must stand in "
+                f"{allowed[0]!r}"
+                + (f" or {allowed[1]!r}" if len(allowed) > 1 else ""))
+        return {**first, "expected_session_id": expect,
+                "same_pane_as_worker": same_pane,
+                "cwd_kind": ("project_root" if cwd == allowed[0]
+                            else "allocated_worktree"),
+                "was_idle": True, "session_stable": True}
+
+    def _ceo_team_state(self, gate: dict[str, Any]) -> dict[str, Any]:
+        """Authoritative runtime state for the canonical CEO member.
+
+        Built from this run's facts plus the just-gated live pane identity, then
+        written through :func:`teamcraft.runtime_adapter.sync_state` — the only
+        sanctioned writer, which enforces team-identity immutability, one CEO per
+        project, and legal Task/Attempt/Session lineage.  No row is hand-rolled.
+        """
+        name = self.args.ceo_name
+        native = str(gate["session_id"])
+        herdr_session = {
+            "workspace_id": str(gate.get("workspace_id") or ""),
+            "tab_id": str(gate.get("tab_id") or ""),
+            "pane_id": str(gate["pane_id"]),
+            "terminal_id": str(gate.get("terminal_id") or ""),
+            "kind": str(gate.get("session_kind") or "id"),
+            "source": str(gate.get("session_source") or "herdr:opencode"),
+            "value": native,
+        }
+        cwd = (real(str(self.project)) if gate["cwd_kind"] == "project_root"
+               else real(str(gate["cwd"])))
+        member = {
+            "name": name, "role": "ceo",
+            "responsibility": ("coordinate this disposable project; answer the "
+                              "initialization challenge; own no source path"),
+            "kind": str(gate.get("agent") or "opencode"),
+            "task": ("PG-7 disposable: establish the canonical CEO identity for "
+                    "this project"),
+            "ownership": [], "read_only": False, "cwd": cwd,
+            "from_pane_id": None, "pane_id": str(gate["pane_id"]),
+            "terminal_id": str(gate.get("terminal_id") or ""),
+            "agent_session": {"kind": herdr_session["kind"],
+                             "source": herdr_session["source"],
+                             "value": native},
+            "agent_args": [], "direction": None,
+            "start_timeout_ms": 30_000,
+            # ``pane_created`` is the earliest lineage phase that creates the
+            # Attempt and registers the Session: it asserts that a pane exists and
+            # is occupied, which is exactly what was observed — nothing more.
+            "phase": "pane_created", "prompt_may_have_been_delivered": False,
+            "live_state": "idle", "error": None,
+            "task_id": None, "attempt_id": None, "session_id": None,
+            "created_at": int(time.time()),
+        }
+        return {
+            "team_id": f"m606-{self.run_id[:12]}",
+            "project_root": str(self.project),
+            "created_at": int(time.time()),
+            "herdr_session": herdr_session,
+            "members": {name: member},
+        }
+
+    def ceo_bootstrap_leg(self) -> dict[str, Any]:
+        """One PG-7 bootstrap: identity -> challenge -> fence -> prompt -> accept.
+
+        Honest by construction:
+
+        * acceptance records ``assumed_default`` — the domain's explicit temporary
+          default — and never ``host_verified``; the column is immutable after it
+          is written, so this cannot be quietly upgraded later;
+        * the nonce plaintext is used to build the prompt and is never persisted
+          (only its digest, which is what the database itself stores);
+        * the challenge is fenced to ``unknown`` BEFORE the prompt, so a crash or
+          a lost submit leaves a durable, non-replayable fact rather than an
+          invitation to resend;
+        * an agent self-claim is retained as unverified audit material that can
+          neither initialize the project nor upgrade the receipt.
+        """
+        ev = self._need_evidence()
+        name = self.args.ceo_name
+        pid = self.project_row.id
+        lease = self.lease()
+        gate = self.gate_ceo_target()
+
+        runtime_adapter.sync_state(self.conn, self._ceo_team_state(gate))
+        ceos = self.conn.execute(
+            "SELECT name, role, kind, task_id, attempt_id, session_id,"
+            " terminal_id FROM members WHERE role='ceo'").fetchall()
+        ev.post("ceo", "exactly one canonical CEO member is registered",
+                expected=1, observed=len(ceos))
+        ceo = ceos[0]
+        ev.post("ceo", "CEO harness kind supports the protocol discovery contract",
+                expected="opencode", observed=str(ceo[2]))
+        ev.post("ceo", "CEO binds a TeamCraft Session, terminal and Attempt",
+                expected=True,
+                observed=all(v is not None for v in (ceo[4], ceo[5], ceo[6])))
+        attempt = domain.get_attempt(self.conn, str(ceo[4]))
+        ev.post("ceo", "CEO attempt carries the immutable protocol pin",
+                expected=[self.protocol["protocol_version"],
+                         self.protocol["sha256"]],
+                observed=[attempt.protocol_version, attempt.protocol_hash])
+        meta = self.conn.execute(
+            "SELECT team_id, project_root FROM runtime_meta WHERE id=1").fetchone()
+        ev.post("ceo", "team identity points at this run's disposable project",
+                expected=str(self.project), observed=str(meta[1]))
+
+        existing = self._ceo_record()
+        if existing is not None and existing.state == "initialized":
+            # An initialized CEO is never re-bootstrapped, and a challenge is
+            # never re-issued for it: report and move on without any prompt.
+            self.ceo_stage = "already-initialized"
+            report = {"stage": "ceo", "action": "not-replayed",
+                      "state": existing.state,
+                      "receipt_source": existing.receipt_source,
+                      "identity_mode": existing.identity_mode,
+                      "ceo_acknowledged": False,
+                      "note": ("the project already has an initialized CEO; this "
+                              "runner does not re-bootstrap or re-send")}
+            ev.write("ceo-bootstrap.json", report)
+            self.ceo_report = report
+            return report
+
+        record, nonce = ceo_initialization.discover_and_issue(self.conn, pid,
+                                                             name)
+        if nonce is None:
+            raise GuardError(
+                f"CEO initialization is {record.state}; no fresh challenge was "
+                "issued, and one may never be re-sent for a consumed nonce")
+        fields = ceo_initialization.bootstrap_prompt_fields(record, nonce)
+        stored = self.conn.execute(
+            "SELECT nonce_hash, nonce_expires_at FROM ceo_initializations"
+            " WHERE project_id=?", (pid,)).fetchone()
+        self._ephemeral.append(nonce)
+        ev.write("ceo-challenge.json", {
+            "ceo_name": name, "state": record.state, "team_id": record.team_id,
+            "teamcraft_session_id": record.teamcraft_session_id,
+            "terminal_id": record.terminal_id,
+            "native_session_id": record.native_session_id,
+            "protocol_version": record.protocol_version,
+            "protocol_hash": record.protocol_hash,
+            "runtime_skill_hash": record.runtime_skill_hash,
+            "snapshot_digest": record.snapshot_digest,
+            "nonce_sha256": str(stored[0]), "nonce_chars": len(nonce),
+            "nonce_expires_at": str(stored[1]),
+            "prompt_field_names": sorted(fields),
+            "note": ("only the challenge digest is recorded; the plaintext exists "
+                    "solely in the prompt bytes handed to the transport"),
+        })
+        ev.post("ceo", "recorded challenge digest equals the stored hash",
+                expected=str(stored[0]),
+                observed=sha256_bytes(nonce.encode("utf-8")))
+        ev.post("ceo", "the challenge is not expired at issue time",
+                expected=True,
+                observed=str(stored[1]) > now_iso(), detail=str(stored[1]))
+
+        # Fence first: the durable pre-I/O boundary makes a lost submit provably
+        # recoverable instead of resendable.
+        runtime_adapter.admit_ceo_bootstrap_effect(self.conn, pid, nonce,
+                                                  lease=lease)
+        fenced = self._ceo_record()
+        ev.post("ceo", "challenge fenced to 'unknown' BEFORE any prompt",
+                expected="unknown", observed=fenced.state)
+
+        prompt = "\n".join([
+            f"TeamCraft CEO initialization challenge ({name}) for project "
+            f"{fields['project_id']}.",
+            "Echo these binding values back verbatim as your first reply; do not "
+            "run any command, edit any file, or contact any network endpoint.",
+            *[f"{key}: {fields[key]}" for key in sorted(fields)],
+            f"Model in use for this disposable project (loopback only): "
+            f"{self.model}",
+        ])
+        submit = self.herdr.submit(
+            gate["pane_id"], prompt, wait=self.args.submit_wait,
+            until=tuple(self.args.submit_until),
+            timeout_ms=self.args.submit_timeout_ms)
+        observation = submit["transport_observation"]
+        transport = ("submitted" if submit["returncode"] == 0
+                     and observation == "accepted" else "unknown")
+        submit["state"] = transport
+        after = self.herdr.identity(gate["pane_id"])
+        same_occupant = after.get("session_id") == gate["session_id"]
+        ev.write("ceo-submit.json", {
+            **submit, "pane_gate": gate, "post_submit_identity": after,
+            "occupant_rechecked": True, "occupant_same": same_occupant,
+        })
+
+        status = str(after.get("agent_status") or "")
+        session_state = {"idle": "idle", "done": "idle",
+                         "working": "working"}.get(status)
+        if transport != "submitted" or not same_occupant or session_state is None:
+            # The challenge stays fenced at 'unknown'.  Nothing is assumed, no
+            # acceptance is recorded, and no further prompt may be sent here.
+            self.ceo_stage = "refused"
+            report = {"stage": "ceo", "action": "halted", "transport": transport,
+                      "occupant_same": same_occupant,
+                      "post_submit_status": status or "(unknown)",
+                      "ceo_state": fenced.state,
+                      "receipt_source": "unverified",
+                      "ceo_initialized": False, "ceo_acknowledged": False,
+                      "duplicate_sends": 0,
+                      "note": ("the fenced challenge stays 'unknown' for "
+                              "reconciliation; assumed_default requires a "
+                              "confirmed submit and the same live occupant, and "
+                              "the nonce is never re-sent")}
+            ev.write("ceo-bootstrap.json", report)
+            self.ceo_report = report
+            raise GuardError(
+                f"CEO bootstrap did not complete (transport={transport}, "
+                f"same_occupant={same_occupant}, status={status!r}); halting "
+                "before any further prompt — reconcile the fenced challenge "
+                "instead of resending it")
+
+        accepted = runtime_adapter.record_ceo_bootstrap_submission_assumed(
+            self.conn, pid, nonce, native_session_id=str(after["session_id"]),
+            agent_session={"kind": str(after.get("session_kind") or "id"),
+                          "source": str(after.get("session_source")
+                                       or "herdr:opencode"),
+                          "value": str(after["session_id"])},
+            session_state=session_state, lease=lease)
+        ev.post("ceo", "CEO initialized under the explicit default assumption",
+                expected="initialized", observed=accepted.state)
+        ev.post("ceo", "provenance is assumed_default, never host_verified",
+                expected="assumed_default", observed=accepted.receipt_source)
+        ev.post("ceo", "identity mode is the portable 'native' mode",
+                expected="native", observed=accepted.identity_mode)
+        opened = ceo_initialization.require_initialized(self.conn, pid)
+        ev.post("ceo", "initialization gate is now open for Scheduler/Wake",
+                expected="initialized", observed=opened.state)
+        ev.post("ceo", "CEO state is written to the run-local DB, never the "
+                        "host's live runtime DB",
+                expected=True,
+                observed=(str(self.db).startswith(str(self.root))
+                        and self.db != REPO_ROOT / ".teamcraft" / "teamcraft.db"),
+                detail=str(self.db))
+
+        # A consumed challenge must be inert.  This probe is safe precisely
+        # because the record is initialized: the API refuses before any write.
+        refused: str | None = None
+        try:
+            runtime_adapter.record_ceo_bootstrap_submission_assumed(
+                self.conn, pid, nonce, native_session_id=str(after["session_id"]),
+                session_state=session_state, lease=lease)
+        except (ceo_initialization.CEOInitializationError,
+                runtime_adapter.RuntimeAdapterError) as exc:
+            refused = str(exc)[:160]
+        ev.post("ceo", "a second acceptance of the same challenge is refused",
+                expected=True, observed=refused is not None,
+                detail=refused or "not refused — unexpected")
+
+        claim: dict[str, Any] = {"supplied": False}
+        if self.args.ceo_claim_file:
+            path = Path(self.args.ceo_claim_file).expanduser()
+            if not path.is_file():
+                raise GuardError(f"--ceo-claim-file {path} does not exist")
+            raw = path.read_text(encoding="utf-8")
+            try:
+                json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise GuardError(f"CEO claim file is not valid JSON: {exc}")
+            before = self._ceo_record()
+            claimed = runtime_adapter.record_ceo_agent_claim(self.conn, pid, raw,
+                                                            lease=lease)
+            ev.post("ceo", "an agent self-claim cannot initialize the project",
+                    expected=before.state, observed=claimed.state)
+            ev.post("ceo", "an agent self-claim cannot upgrade the receipt",
+                    expected="assumed_default", observed=claimed.receipt_source)
+            claim = {"supplied": True, "file": str(path),
+                     "digest": sha256_file(path),
+                     "state_after": claimed.state,
+                     "receipt_source_after": claimed.receipt_source,
+                     "retained_as": "unverified audit material",
+                     "can_initialize": False}
+
+        leaked = [n for n in sorted(ev.files)
+                  if nonce in (ev.dir / n).read_text(encoding="utf-8")]
+        ev.post("ceo", "the nonce plaintext was not persisted in any evidence",
+                expected=[], observed=leaked)
+
+        report = {
+            "stage": "ceo", "action": "bootstrapped", "ceo_name": name,
+            "pane": gate["pane_id"],
+            "same_pane_as_worker": gate["same_pane_as_worker"],
+            "cwd_kind": gate["cwd_kind"],
+            "challenge": {"nonce_sha256": str(stored[0]),
+                         "nonce_chars": len(nonce),
+                         "nonce_expires_at": str(stored[1]),
+                         "plaintext_persisted": False},
+            "fenced_before_submit": True, "transport": transport,
+            "occupant_rechecked_same": True,
+            "state": accepted.state,
+            "receipt_source": accepted.receipt_source,
+            "identity_mode": accepted.identity_mode,
+            "gate_open_for_wake": True, "replay_refused": refused,
+            "host_trusted": False, "ceo_acknowledged": False,
+            "duplicate_sends": 1, "claim": claim,
+            "note": ("assumed_default is the domain's explicit temporary default: "
+                    "it records that the transport succeeded and the same live "
+                    "occupant was rechecked, NOT that a host-trusted protocol or "
+                    "skill receipt was observed"),
+        }
+        ev.write("ceo-bootstrap.json", report)
+        self.ceo_stage = "executed"
+        self.ceo_report = report
+        return report
+
     # -- G2: live dispatch ---------------------------------------------------
 
     def dispatch(self) -> dict[str, Any]:
@@ -1678,6 +2070,11 @@ class M606LiveRun:
                     brief: Any, binding: dict[str, Any],
                     ev: Evidence) -> dict[str, Any]:
         topology_before = self.herdr.topology_digest()
+        # PG-7 first: the Wake admission below requires an open CEO gate, and a
+        # bootstrap whose transport is unresolved halts the whole leg before the
+        # worker prompt is ever considered.
+        if self.args.ceo_pane:
+            self.ceo_bootstrap_leg()
         # Gate FIRST, and reuse the identity the gate verified.  A separate
         # pre-gate read would shift the observation window and could mask a
         # session that flickers exactly when it matters.
@@ -1817,31 +2214,40 @@ class M606LiveRun:
                 "branch": allocation.branch}
 
     def wake_leg(self, ev: Evidence, submit_state: str) -> dict[str, Any]:
-        """One ``ceo.wake``: ingest → admit → record the transport result.
+        """One ``ceo.wake``: intake -> admit -> (optionally) deliver -> record.
 
-        :func:`teamcraft.wake.record_submission_result` is explicitly *not* a CEO
-        acknowledgement, and neither is a herdr exit code, so the wake is recorded
-        as submitted/unknown with ``ceo_acknowledged=false``.  No duplicate send,
-        no auto-retry.
+        Three things this refuses to do, deliberately:
+
+        * it never borrows the *worker* prompt's transport outcome as the Wake's
+          outcome — admission is a durable pre-I/O boundary, not a delivery;
+        * it never calls ``acknowledge_wake``: CEO acknowledgement requires an
+          explicit CEO response, and Herdr 0.9.3 reports ``prompt_ack`` and
+          ``event_stream`` as unsupported, so ``ceo_acknowledged`` stays false and
+          the acknowledgement cursor must stay where it was;
+        * it never resends: an undelivered Wake is left in its durable state for a
+          sender to reconcile.
         """
         lease = self.lease()
         try:
             ingested = wake.ingest_events(self.conn, self.project_row.id, lease)
         except ceo_initialization.CEOInitializationGateClosed as exc:
-            # The CEO initialization handshake has not been performed in this
-            # disposable world.  That is a real, recorded precondition of the
-            # scenario (roadmap row PG-7 / gate G3), NOT something to fake by
-            # self-initializing a CEO: the wake is reported as blocked.
             report = {"wake_id": None, "state": "blocked:ceo-initialization",
-                     "reason": str(exc)[:200], "ceo_acknowledged": False,
-                     "duplicate_sends": 0,
-                     "note": ("wake ingestion requires the CEO initialization gate "
-                             "to be open; the submitted prompt is unaffected and "
-                             "is still recorded as submitted/unknown")}
+                      "reason": str(exc)[:200], "ceo_acknowledged": False,
+                      "duplicate_sends": 0,
+                      "note": ("wake intake/admission requires the CEO "
+                              "initialization gate to be open; the submitted "
+                              "prompt is unaffected and is still recorded as "
+                              "submitted/unknown")}
             ev.write("wake.json", report)
             return report
         pending = wake.list_wakes(self.conn, self.project_row.id,
                                  states=("pending",))
+        cursor_after_intake = wake.get_cursor(self.conn, self.project_row.id)
+        ev.post("wake", "intake advanced a durable cursor (not in-memory state)",
+                expected=True, observed=cursor_after_intake is not None,
+                detail=(f"scanned={ingested.scanned_events} "
+                       f"created={ingested.created_wakes} "
+                       f"merged={ingested.merged_events}"))
         if not pending:
             report = {"wake_id": None, "state": "no-pending-wake",
                       "ingested": plain(ingested), "ceo_acknowledged": False,
@@ -1853,31 +2259,125 @@ class M606LiveRun:
             admission = wake.admit_pending_wake(self.conn, self.project_row.id,
                                               str(wake_id), lease)
         except ceo_initialization.CEOInitializationGateClosed as exc:
-            # A Wake row exists and is durable, but admitting it requires the CEO
-            # initialization gate to be open — an operator/CEO action this runner
-            # never performs.  Recorded as pending, never as acknowledged.
             report = {"wake_id": wake_id, "state": "pending:admission-blocked",
                       "reason": str(exc)[:200], "ingested": plain(ingested),
-                      "outcome": submit_state, "ceo_acknowledged": False,
-                      "duplicate_sends": 1,
+                      "worker_transport_reference": submit_state,
+                      "transport": "not-attempted",
+                      "outcome": None, "ceo_acknowledged": False,
+                      "duplicate_sends": 0,
                       "note": ("the Wake row is durable; admitting it needs CEO "
-                              "initialization (roadmap PG-7), which this runner "
-                              "does not perform on an operator's behalf")}
+                              "initialization (roadmap PG-7). Nothing was sent, so "
+                              "no transport outcome is claimed here")}
             ev.write("wake.json", report)
             return report
+
+        bound = getattr(admission.wake, "state", None)
+        deferred = getattr(admission, "deferred_reason", None)
+        cursor_before = wake.get_cursor(self.conn, self.project_row.id)
+        if bound != "sending":
+            # Budget/policy deferred it: no Command was bound, so there is no
+            # transport to record and nothing may be reported as sent.
+            report = {"wake_id": wake_id, "state": bound,
+                      "deferred_reason": deferred,
+                      "decision_digest": getattr(admission, "decision_digest",
+                                                None),
+                      "ingested": plain(ingested),
+                      "transport": "not-attempted:deferred", "outcome": None,
+                      "ceo_acknowledged": False, "duplicate_sends": 0,
+                      "note": ("admission was denied by budget/policy; the Wake "
+                              "stays pending and no outcome is recorded")}
+            ev.write("wake.json", report)
+            ev.post("wake", "a deferred Wake is not reported as delivered",
+                    expected=False, observed=(bound == "submitted"))
+            return report
+
+        ev.post("wake", "admission bound an idempotent Command (pre-I/O)",
+                expected="sending", observed=bound)
+
+        if not self.args.wake_deliver:
+            report = {"wake_id": wake_id, "state": bound,
+                      "command_bound": True, "ingested": plain(ingested),
+                      "transport": "admitted-not-delivered", "outcome": None,
+                      "ceo_acknowledged": False, "duplicate_sends": 0,
+                      "note": ("admit_pending_wake is the durable pre-I/O "
+                              "boundary and does not contact Herdr; this run did "
+                              "not deliver a Wake prompt (--wake-deliver not "
+                              "given), so NO transport outcome is recorded and the "
+                              "row stays 'sending' for a sender to reconcile — "
+                              "never re-sent blindly")}
+            ev.write("wake.json", report)
+            stored = self.conn.execute(
+                "SELECT state FROM wakes WHERE id=?", (str(wake_id),)).fetchone()
+            ev.post("wake", "durable Wake state matches the reported state",
+                    expected=str(stored[0]), observed=report["state"])
+            self._assert_no_fake_ack(ev, report)
+            return report
+
+        # Explicit, consented delivery to the canonical CEO pane.
+        ceo_gate = self.gate_ceo_target()
+        top = self.herdr.topology_digest()
+        prompt = "\n".join([
+            f"TeamCraft Wake for {self.args.ceo_name}: "
+            f"{ingested.created_wakes} new event(s) since the last scan.",
+            f"Project: {self.project_row.id}",
+            f"Wake id: {wake_id}",
+            "Acknowledge by reviewing pending items; this notification carries no "
+            "instructions to edit files, commit, or contact any network endpoint.",
+        ])
+        sent = self.herdr.submit(ceo_gate["pane_id"], prompt,
+                                wait=self.args.submit_wait,
+                                until=tuple(self.args.submit_until),
+                                timeout_ms=self.args.submit_timeout_ms)
+        delivered = (sent["returncode"] == 0
+                     and sent["transport_observation"] == "accepted")
+        outcome = "submitted" if delivered else "unknown"
         recorded = wake.record_submission_result(
             self.conn, self.project_row.id, str(wake_id), lease,
-            outcome=submit_state,
-            detail=("herdr agent prompt exit observed; CEO ack not asserted"
-                   if not self.args.ack_evidence_file
-                   else "operator ack artifact supplied"))
-        report = {"wake_id": wake_id, "outcome": submit_state,
-                  "state_after": field(recorded, "state", default=None),
-                  "admission": plain(admission), "ingested": plain(ingested),
-                  "ceo_acknowledged": False,
-                  "duplicate_sends": 1}
+            outcome=outcome,
+            detail=(None if delivered else
+                    f"wake transport observation was "
+                    f"{sent['transport_observation']!r}; effect may have happened, "
+                    f"must be reconciled and must not be re-sent"),
+            receipt_json=json.dumps({"transport_observation":
+                                    sent["transport_observation"],
+                                    "returncode": sent["returncode"]},
+                                   sort_keys=True))
+        report = {"wake_id": wake_id, "state": field(recorded, "state",
+                                                    default=None),
+                  "command_bound": True, "ingested": plain(ingested),
+                  "transport": "delivered" if delivered else "unresolved",
+                  "outcome": outcome,
+                  "delivery": {**{k: sent[k] for k in
+                                 ("prompt_sha256", "prompt_chars", "returncode",
+                                  "transport_observation")},
+                              "target_pane": ceo_gate["pane_id"],
+                              "topology_unchanged":
+                                  top == self.herdr.topology_digest()},
+                  "ceo_acknowledged": False, "duplicate_sends": 1}
         ev.write("wake.json", report)
+        ev.post("wake", ("a confirmed transport is recorded as submitted, "
+                         "otherwise unknown (never a retry)"),
+                expected=outcome,
+                observed=self.conn.execute(
+                    "SELECT state FROM wakes WHERE id=?",
+                    (str(wake_id),)).fetchone()[0])
+        self._assert_no_fake_ack(ev, report)
         return report
+
+    def _assert_no_fake_ack(self, ev: Evidence, report: dict[str, Any]) -> None:
+        """Prove no acknowledgement was fabricated: the cursor must not have moved.
+
+        ``acknowledged_seq`` only advances through ``acknowledge_wake``, which the
+        runner never calls.  If it ever moved, an ack was invented somewhere.
+        """
+        cursor = wake.get_cursor(self.conn, self.project_row.id)
+        acked = None if cursor is None else int(getattr(cursor,
+                                                       "acknowledged_seq", 0))
+        ev.post("wake", "no CEO acknowledgement was fabricated "
+                        "(acknowledged cursor stayed at 0)",
+                expected=0, observed=acked,
+                detail=f"wake state: {report.get('state')}, "
+                     f"transport: {report.get('transport')}")
 
     # -- capability probes: durable BEFORE bind -------------------------------
 
@@ -2299,7 +2799,16 @@ class M606LiveRun:
         # Stage completion by declared ORDER, not alphabetical string compare.
         reached = STAGES.index(self.stage) if self.stage in STAGES else -1
         self.manifest["stage_matrix"].update(
-            {s: "executed" for i, s in enumerate(STAGES) if i <= reached})
+            {s: "executed" for i, s in enumerate(STAGES)
+             if i <= reached and s != "ceo"})
+        # The CEO leg is not implied by reaching dispatch: it runs only when the
+        # operator designated a CEO pane, and its own outcome is reported.
+        self.manifest["stage_matrix"]["ceo"] = self.ceo_stage
+        self.manifest["ceo"] = self.ceo_report or {
+            "stage": "ceo", "action": self.ceo_stage,
+            "why": ("no --ceo-pane designated; PG-7 not attempted, so Scheduler "
+                   "and Wake admission remain gated" if self.ceo_stage ==
+                   "not-requested" else self.ceo_stage)}
         self.manifest["stage_reached"] = self.stage
         self.manifest["delivery"] = {
             "disposition": disposition,
@@ -2313,6 +2822,19 @@ class M606LiveRun:
             "host_trusted": False,
             "model": self.model_proof.get("model"),
         }
+        wake_claim = "not-attempted"
+        if (ev.dir / "wake.json").is_file():
+            try:
+                wake_claim = str(json.loads(
+                    (ev.dir / "wake.json").read_text(encoding="utf-8")
+                ).get("transport") or "not-attempted")
+            except json.JSONDecodeError:
+                wake_claim = "unreadable"
+        ceo_receipt = {
+            "executed": "assumed_default (transport succeeded; NOT host-verified)",
+            "already-initialized": "pre-existing record, not re-assumed",
+            "refused": "unverified — challenge left fenced at 'unknown'",
+        }.get(self.ceo_stage, "not-attempted (no --ceo-pane)")
         self.manifest["non_claims"] = {
             "prompt_ack": "unknown" if not self.args.ack_evidence_file
             else "acknowledged-by-operator",
@@ -2321,6 +2843,27 @@ class M606LiveRun:
             "push": False, "claude": "pending:PG-1",
             "cloud": "not-permitted",
             "real_agent_ack": "unknown",
+            "ceo_receipt": ceo_receipt,
+            "ceo_acknowledgement": "not-asserted (never inferred from transport)",
+            "wake_transport": wake_claim,
+            "pg7": ("bootstrap+wake-executed" if self.ceo_stage == "executed"
+                   else f"open:{self.ceo_stage}"),
+        }
+        # One-use secrets must never reach disk.  Tokens are named only by digest
+        # prefix in the report, so the sweep itself cannot leak them.
+        ephemeral: dict[str, Any] = {}
+        for token in self._ephemeral:
+            hits = [name for name in sorted(ev.files)
+                   if token in (ev.dir / name).read_text(encoding="utf-8")]
+            if hits:
+                ephemeral[sha256_bytes(token.encode("utf-8"))[:12] + "…"] = hits
+        ev.post("close", "no one-use secret (the CEO nonce) reached disk",
+                expected={}, observed=ephemeral)
+        self.manifest["ephemeral_leak_scan"] = {
+            "tokens_checked": len(self._ephemeral),
+            "tokens": [sha256_bytes(t.encode("utf-8"))[:12] + "…"
+                       for t in self._ephemeral],
+            "leaks": ephemeral,
         }
         self.manifest["cleanup"] = getattr(self, "cleanup_report",
                                           {"action": "not-attempted"})
@@ -2471,7 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pinned model id; must be served by the loopback catalog")
     p.add_argument("--protocol-version", default=CANONICAL_PROTOCOL_VERSION)
     p.add_argument("--protocol-sha256", default=CANONICAL_PROTOCOL_SHA256)
-    p.add_argument("--stop-after", choices=STAGES, default="cleanup")
+    p.add_argument("--stop-after", choices=STOP_POINTS, default="cleanup")
     worker = p.add_mutually_exclusive_group()
     worker.add_argument("--consent-dispatch", action="store_true",
                       help="GATE G1: allow submitting one prompt to an EXISTING "
@@ -2508,6 +3051,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--herdr-pane", default=None,
                    help="existing pane id used as the prompt TARGET, e.g. w3:p2Q "
                         "(from `herdr agent list`); never created by this runner")
+    p.add_argument("--ceo-pane", default=None,
+                   help="PG-7: existing pane designated as the project's canonical "
+                        "CEO. Enables the CEO bootstrap leg (issue challenge -> "
+                        "fence -> one prompt -> assumed_default acceptance). "
+                        "Phase 2 only; the runner never creates a pane")
+    p.add_argument("--ceo-name", default="ceo",
+                   help="canonical CEO member name (Wake targets this name); must "
+                        "be the only CEO in the project")
+    p.add_argument("--ceo-expect-session-id", default=None,
+                   help="exact native session id the operator designates as the "
+                        "CEO; defaults to --expect-session-id when the CEO is the "
+                        "same pane as the worker")
+    p.add_argument("--ceo-claim-file", default=None,
+                   help="optional agent self-claim JSON to retain as UNVERIFIED "
+                        "audit material; it can never initialize a project nor "
+                        "upgrade the receipt source")
+    p.add_argument("--wake-deliver", action="store_true",
+                   help="actually deliver one Wake prompt to the CEO pane and "
+                        "record its transport outcome; without it the Wake is "
+                        "admitted (durable pre-I/O boundary) and honestly left "
+                        "undelivered instead of borrowing the worker's outcome")
     p.add_argument("--submit-wait", action="store_true",
                    help="ask herdr to observe a post-submit state (transport "
                         "observation only; still not an acknowledgement)")
@@ -2557,6 +3121,45 @@ def validate_arg_combinations(args: argparse.Namespace) -> dict[str, Any]:
     under-specified invocation fails at parse time rather than mid-run.
     """
     notes: list[str] = []
+    if args.ceo_pane:
+        # PG-7 leg: it submits a prompt, so it inherits every consent rule and
+        # adds its own.  A scripted leg has no real pane and no real agent, so
+        # recording an initialization against it would fabricate PG-7 evidence.
+        if not args.confirm_live_run:
+            raise GuardError("--ceo-pane runs the PG-7 CEO bootstrap, which "
+                            "submits a prompt; it requires --confirm-live-run")
+        if args.scripted_worker_change:
+            raise GuardError("--ceo-pane cannot combine with "
+                            "--scripted-worker-change: a harness-authored leg has "
+                            "no live CEO, and initializing under it would invent "
+                            "PG-7 evidence")
+        if not args.consent_dispatch:
+            raise GuardError("--ceo-pane requires --consent-dispatch: the CEO "
+                            "challenge is answered by a real prompt")
+        if args.ceo_pane == args.herdr_pane:
+            if not args.expect_session_id and not args.ceo_expect_session_id:
+                raise GuardError(
+                    "--ceo-pane reusing the worker pane needs "
+                    "--expect-session-id (or --ceo-expect-session-id): the "
+                    "designated CEO session must be named by the operator")
+        elif not args.ceo_expect_session_id:
+            raise GuardError("--ceo-pane designates a second pane, so it needs "
+                            "--ceo-expect-session-id naming that CEO's native "
+                            "session id")
+        notes.append("PG-7 CEO leg: canonical identity -> one-shot challenge -> "
+                    "fence -> one prompt -> assumed_default (never host_verified)")
+    if args.ceo_expect_session_id and not args.ceo_pane:
+        raise GuardError("--ceo-expect-session-id requires --ceo-pane")
+    if args.ceo_claim_file and not args.ceo_pane:
+        raise GuardError("--ceo-claim-file requires --ceo-pane: a claim without a "
+                        "designated CEO has nothing to attach to")
+    if args.wake_deliver:
+        if not args.ceo_pane:
+            raise GuardError("--wake-deliver requires --ceo-pane: a Wake is a "
+                            "delivery TO the canonical CEO, and no CEO is "
+                            "designated")
+        notes.append("wake transport: one prompt to the CEO pane, outcome recorded "
+                    "as submitted|unknown; CEO acknowledgement is never inferred")
     if args.resume_handoff:
         if not args.confirm_live_run:
             raise GuardError("--resume-handoff continues a run on disk, so it "
@@ -2625,6 +3228,30 @@ def plan_payload(args: argparse.Namespace) -> dict[str, Any]:
             "G5_pane_local_model": "operator-attestation-required,"
             "catalog-presence-insufficient,fail-closed",
             "G6_capability_probes": "durable-before-bind_attempt_capabilities",
+            "G7_ceo_bootstrap": (
+                "requested — phase 2 only, fenced, assumed_default"
+                if args.ceo_pane else f"not-requested ({CEO_STAGE_NOTE})"),
+            "G7_ceo_bootstrap_policy": (
+                "canonical-CEO-via-sync_state,one-shot-nonce,fence-before-prompt,"
+                "assumed_default-only,never-host_verified,never-resent,"
+                "agent-claim-is-audit-only"),
+            "G8_wake": ("delivered-to-ceo-pane,submitted|unknown"
+                        if args.wake_deliver else
+                        "intake+admission-only,admitted-not-delivered,"
+                        "never-borrows-worker-outcome,ceo-ack-never-fabricated"),
+            "pg7_ceo": {
+                "why_phase2_only": CEO_STAGE_NOTE,
+                "command": ("--confirm-live-run --resume-handoff --consent-dispatch"
+                           " --herdr-pane <worker-pane> --pane-model-evidence <f>"
+                           " --expect-session-id <worker-session>"
+                           " --ceo-pane <ceo-pane>"
+                           " --ceo-expect-session-id <ceo-session>"
+                           " [--wake-deliver --ceo-claim-file <agent-echo.json>]"),
+                "identity": "one canonical CEO member named 'ceo' (kind opencode), "
+                           "bound session+terminal+attempt with the protocol pin",
+                "receipt": "assumed_default — transport success, not a host receipt",
+                "acknowledgement": "never inferred; acknowledged cursor must stay 0",
+            },
             "operator_handoff": {
                 "why": "an operator cannot cd a pane into a worktree before it "
                      "exists, so the cwd gate is unverifiable in the allocating "
@@ -2647,6 +3274,8 @@ def plan_payload(args: argparse.Namespace) -> dict[str, Any]:
             "preflight: loopback oMLX + canonical protocol + herdr identity",
             "provision: root, bare origin+clone, installer, protocol pin, "
             "fresh DB at head, capability + model binding",
+            "ceo (phase 2, PG-7, opt-in): canonical CEO identity → one-shot "
+            "challenge → fence → one prompt → assumed_default acceptance",
             "dispatch: identity bind, one prompt into an EXISTING pane, wake",
             "deliver: Diff Gate → local commit → ship evidence "
             f"→ disposition {DELIVERY_SUBMITTED}",

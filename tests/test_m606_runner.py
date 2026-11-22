@@ -33,14 +33,18 @@ WHAT THIS NEVER DOES
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +54,14 @@ for _p in (str(REPO), str(REPO / "scripts")):
         sys.path.insert(0, _p)
 
 import m606_opencode_e2e as m606  # noqa: E402
-from teamcraft import domain, providers, storage  # noqa: E402
+from teamcraft import (  # noqa: E402
+    ceo_initialization,
+    domain,
+    providers,
+    runtime_adapter,
+    storage,
+    wake,
+)
 
 MODEL = m606.DEFAULT_MODEL
 OTHER_MODEL = "Qwen3.8-Flash-Next-4bit-mtp"
@@ -100,6 +111,10 @@ class FakeHerdr:
         self.screen = screen
         self.status_overrides = status_overrides or {}
         self.submit_outcome = submit_outcome
+        #: optional (nth, outcome) plan: the Nth submit (1-based) reports
+        #: something other than the default, so a specific leg's transport can be
+        #: made unresolved while earlier legs succeed.
+        self.fail_submit_on: tuple[int, str] | None = None
         self.identity_reads = 0
         self.submits: list[tuple[str, str]] = []
         self.reads: list[str] = []
@@ -161,16 +176,19 @@ class FakeHerdr:
                timeout_ms: int = 5000) -> dict[str, Any]:
         self.submits.append((target, prompt))
         ident = self._identity(target, self.sessions[0])
-        code = 0 if self.submit_outcome == "accepted" else 1
+        outcome = self.submit_outcome
+        if self.fail_submit_on is not None and len(self.submits) == self.fail_submit_on[0]:
+            outcome = self.fail_submit_on[1]
+        code = 0 if outcome == "accepted" else 1
         return {
             "submitted_at": "2026-11-22T00:00:00+00:00",
             "argv_shape": ["herdr", "agent", "prompt", target, "<TEXT>"],
             "prompt_sha256": m606.sha256_bytes(prompt.encode("utf-8")),
             "prompt_chars": len(prompt), "returncode": code,
-            "transport_observation": self.submit_outcome,
+            "transport_observation": outcome,
             "wait_requested": wait, "until": list(until),
             "timeout_ms": timeout_ms if wait else None,
-            "output_head": self.submit_outcome, "identity_before": ident,
+            "output_head": outcome, "identity_before": ident,
             "identity_after": ident, "session_stable": True,
             "prompt_ack": "unknown", "event_stream": "unknown",
             "host_trusted_receipt": False,
@@ -418,6 +436,37 @@ class InertModeTests(unittest.TestCase):
             "resume stopping before it resumes":
                 ["--confirm-live-run", "--root", root, "--resume-handoff",
                  "--stop-after", "allocate"],
+            "ceo-pane without live-run":
+                ["--root", root, "--resume-handoff", "--consent-dispatch",
+                 "--herdr-pane", PANE, "--pane-model-evidence", ref,
+                 "--expect-session-id", SESSION, "--ceo-pane", PANE],
+            "ceo-pane with a scripted leg (fabricates a CEO)":
+                ["--confirm-live-run", "--root", root, "--scripted-worker-change",
+                 "--ceo-pane", PANE],
+            "ceo-pane without dispatch consent":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--herdr-pane", PANE, "--pane-model-evidence", ref,
+                 "--expect-session-id", SESSION, "--ceo-pane", PANE],
+            "separate CEO pane without its own named session":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--consent-dispatch", "--herdr-pane", PANE,
+                 "--pane-model-evidence", ref, "--expect-session-id", SESSION,
+                 "--ceo-pane", "w9:p2"],
+            "wake delivery without a designated CEO":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--consent-dispatch", "--herdr-pane", PANE,
+                 "--pane-model-evidence", ref, "--expect-session-id", SESSION,
+                 "--wake-deliver"],
+            "CEO session id without a CEO pane":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--consent-dispatch", "--herdr-pane", PANE,
+                 "--pane-model-evidence", ref, "--expect-session-id", SESSION,
+                 "--ceo-expect-session-id", SESSION],
+            "CEO claim file without a CEO pane":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--consent-dispatch", "--herdr-pane", PANE,
+                 "--pane-model-evidence", ref, "--expect-session-id", SESSION,
+                 "--ceo-claim-file", ref],
         }
         for label, argv in refused.items():
             with self.subTest(case=label):
@@ -1230,6 +1279,600 @@ class ManifestHonestyTests(unittest.TestCase):
             text = path.read_text("utf-8")
             self.assertEqual(m606.secret_shapes(text), [],
                             f"{path.name} carries credential-shaped content")
+
+
+# ---------------------------------------------------------------------------
+# G. PG-7 CEO bootstrap and Wake integration (disposable DB only)
+#
+# These exercise the REAL lifecycle APIs — runtime_adapter.sync_state,
+# ceo_initialization.discover_and_issue / mark_bootstrap_unknown /
+# record_bootstrap_submitted_assumed, wake.ingest_events / admit_pending_wake /
+# record_submission_result — against the run-local SQLite file, with only the pane
+# transport faked.  Nothing here patches a gate to pass.
+# ---------------------------------------------------------------------------
+
+def ceo_state_dict(project: Path, *, pane: str = PANE, session: str = SESSION,
+                   terminal: str = TERMINAL, name: str = "ceo",
+                   kind: str = "opencode") -> dict[str, Any]:
+    """A canonical-CEO runtime state, built independently of the runner.
+
+    Written by the tests so that ``sync_state``'s own rules (one CEO per project,
+    immutable team identity, lineage legality) are checked against something that
+    is not the code under test's own assumptions.
+    """
+    herdr_session = {"workspace_id": "w9", "tab_id": "w9:t1", "pane_id": pane,
+                     "terminal_id": terminal, "kind": "id",
+                     "source": "herdr:opencode", "value": session}
+    member = {"name": name, "role": "ceo",
+              "responsibility": "coordinate", "kind": kind,
+              "task": "coordinate the disposable project", "ownership": [],
+              "read_only": False, "cwd": str(project), "from_pane_id": None,
+              "pane_id": pane, "terminal_id": terminal,
+              "agent_session": {"kind": "id", "source": "herdr:opencode",
+                               "value": session},
+              "agent_args": [], "direction": None, "start_timeout_ms": 30_000,
+              "phase": "pane_created", "prompt_may_have_been_delivered": False,
+              "live_state": "idle", "error": None, "task_id": None,
+              "attempt_id": None, "session_id": None, "created_at": 1}
+    return {"team_id": "m606-test-team", "project_root": str(project),
+            "created_at": 1, "herdr_session": herdr_session,
+            "members": {name: member}}
+
+
+def q(conn: Any, sql: str, *params: Any) -> list[tuple[Any, ...]]:
+    return [tuple(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def ceo_row(conn: Any) -> tuple[Any, ...] | None:
+    rows = q(conn, "SELECT state, receipt_source, identity_mode,"
+                   " canonical_ceo_name, nonce_consumed_at, protocol_version,"
+                   " protocol_hash, nonce_hash FROM ceo_initializations")
+    return rows[0] if rows else None
+
+
+def wake_state(conn: Any, wake_id: str) -> str | None:
+    rows = q(conn, "SELECT state FROM wakes WHERE id=?", wake_id)
+    return rows[0][0] if rows else None
+
+
+def ack_cursor(conn: Any, project_id: str) -> int:
+    cursor = wake.get_cursor(conn, project_id)
+    return 0 if cursor is None else int(getattr(cursor, "acknowledged_seq", 0))
+
+
+def nonce_leaks(root: Path, nonce_hash: str) -> list[str]:
+    """Return evidence files holding a token that hashes to the stored nonce.
+
+    The plaintext is never available to the test, so this proves absence the only
+    way it can be proved: every 40-60 char token persisted on disk is hashed and
+    compared against the digest the database itself stores.
+    """
+    token = re.compile(r"[A-Za-z0-9_-]{40,60}")
+    hits = []
+    for path in sorted((root / "evidence").glob("*.json")):
+        for candidate in set(token.findall(path.read_text("utf-8"))):
+            if hashlib.sha256(candidate.encode("utf-8")).hexdigest() == nonce_hash:
+                hits.append(path.name)
+    return hits
+
+
+class CeoBootstrapTests(unittest.TestCase):
+    """PG-7: canonical CEO identity, one-shot challenge, fence, honest receipt."""
+
+    def setUp(self) -> None:
+        self.tray = Tray()
+        self.ack = attestation(self.tray, "ceo-model-proof")
+
+    def tearDown(self) -> None:
+        self.tray.close()
+
+    def _allocated(self, herdr: FakeHerdr, name: str) -> tuple[Path, dict]:
+        root, handoff = phase1(self.tray, name, herdr)
+        herdr.stand_in(handoff["allocated_cwd"])
+        return root, handoff
+
+    def _ceo_run(self, root: Path, herdr: FakeHerdr, *, session: str = SESSION,
+                 ceo_pane: str = PANE, ceo_session: str | None = None,
+                 wake_deliver: bool = False, claim: Path | None = None,
+                 attest: str | None = None,
+                 extra: tuple[str, ...] = ()) -> m606.M606LiveRun:
+        args = ["--resume-handoff", "--consent-dispatch", "--herdr-pane", PANE,
+                "--pane-model-evidence", attest or str(self.ack),
+                "--expect-session-id", session, "--ceo-pane", ceo_pane]
+        if ceo_session:
+            args += ["--ceo-expect-session-id", ceo_session]
+        if wake_deliver:
+            args.append("--wake-deliver")
+        if claim:
+            args += ["--ceo-claim-file", str(claim)]
+        return make_run(self.tray, root, *args, *extra, herdr=herdr)
+
+    def test_ceo_bootstrap_reaches_initialized_under_assumed_default(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-ok")
+        run = self._ceo_run(root, herdr, extra=("--stop-after", "dispatch"))
+        report = run.resume()
+        pid = run.project_row.id
+
+        self.assertEqual(run.ceo_stage, "executed")
+        self.assertEqual(report["state"], "submitted")
+        # Canonical identity: exactly one CEO, bound session/terminal/attempt.
+        ceos = q(run.conn, "SELECT name, role, kind, terminal_id, task_id,"
+                           " attempt_id, session_id FROM members"
+                           " WHERE role='ceo'")
+        self.assertEqual(len(ceos), 1, "exactly one canonical CEO")
+        self.assertEqual(ceos[0][0], "ceo")
+        self.assertEqual(ceos[0][2], "opencode")
+        self.assertTrue(all(v is not None for v in ceos[0][3:]),
+                        "CEO must bind terminal, task, attempt and session")
+        self.assertEqual(
+            q(run.conn, "SELECT project_root FROM runtime_meta WHERE id=1")[0][0],
+            str(run.project), "team identity points at the disposable project")
+        self.assertEqual(
+            q(run.conn, "SELECT protocol_version, protocol_hash FROM attempts"
+                        " WHERE id=?", ceos[0][5])[0],
+            ("1.0.0", m606.CANONICAL_PROTOCOL_SHA256),
+            "the CEO attempt carries the immutable protocol pin")
+
+        row = ceo_row(run.conn)
+        self.assertIsNotNone(row, "an initialization record must exist")
+        state, receipt, mode, name, consumed, _pv, _ph, _nh = row[:8]
+        self.assertEqual((state, receipt, mode, name),
+                         ("initialized", "assumed_default", "native", "ceo"))
+        self.assertIsNotNone(consumed, "the challenge must be marked consumed")
+        # The gate the Scheduler/Wake paths consult is genuinely open now.
+        self.assertEqual(ceo_initialization.require_initialized(run.conn, pid)
+                         .state, "initialized")
+        # Three distinct prompts, each sent once: CEO, worker, wake.
+        digests = [m606.sha256_bytes(p.encode()) for _, p in herdr.submits]
+        self.assertEqual(len(herdr.submits), 2,
+                         "without --wake-deliver only CEO + worker are sent")
+        self.assertEqual(len(set(digests)), len(digests), "no prompt is repeated")
+        self.assertIs(report["wake"]["ceo_acknowledged"], False)
+        self.assertEqual(ack_cursor(run.conn, pid), 0,
+                        "no CEO acknowledgement may be fabricated")
+        self.assertFalse(nonce_leaks(root, row[7]),
+                        "the nonce plaintext must never reach disk")
+        challenge = evidence(run, "ceo-challenge.json")
+        self.assertEqual(challenge["nonce_sha256"], row[7])
+        self.assertNotIn("nonce", challenge, "only the digest is recorded")
+        self.assertEqual(challenge["state"], "discovered")
+        bootstrap = evidence(run, "ceo-bootstrap.json")
+        self.assertIs(bootstrap["fenced_before_submit"], True)
+        self.assertIs(bootstrap["host_trusted"], False)
+        self.assertIs(bootstrap["duplicate_sends"], 1)
+
+    def test_busy_ceo_pane_issues_no_challenge_at_all(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-busy")
+        herdr.agent_status = "working"
+        run = self._ceo_run(root, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("not idle", str(ctx.exception))
+        self.assertIsNone(ceo_row(run.conn),
+                        "no nonce may be issued for a busy pane")
+        self.assertEqual(herdr.submits, [])
+
+    def test_ceo_session_mismatch_issues_no_challenge(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-others-session")
+        run = self._ceo_run(root, herdr, ceo_session="ses_not_the_designated_one")
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("did not name", str(ctx.exception))
+        self.assertIsNone(ceo_row(run.conn))
+        self.assertEqual(herdr.submits, [])
+
+    def test_ceo_pane_outside_the_disposable_world_is_refused(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-foreign-cwd")
+        herdr.stand_in(Path(tempfile.gettempdir()))
+        run = self._ceo_run(root, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("disposable world", str(ctx.exception))
+        self.assertIsNone(ceo_row(run.conn))
+        self.assertEqual(herdr.submits, [])
+
+    def test_a_lost_ceo_submit_leaves_the_challenge_fenced(self) -> None:
+        """Fencing precedes the prompt, so an unresolved submit is recoverable."""
+        herdr = FakeHerdr(submit_outcome="agent_blocked")
+        root, _ = self._allocated(herdr, "ceo-lost-submit")
+        run = self._ceo_run(root, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("did not complete", str(ctx.exception))
+        pid = run.project_row.id
+        state, receipt, _mode, _name, consumed, *_rest = ceo_row(run.conn)
+        self.assertEqual(state, "unknown",
+                         "the challenge stays fenced, it is not reset or replayed")
+        self.assertIsNone(consumed)
+        self.assertEqual(receipt, "unverified",
+                         "nothing may be assumed from an unresolved transport")
+        with self.assertRaises(ceo_initialization.CEOInitializationGateClosed):
+            ceo_initialization.require_initialized(run.conn, pid)
+        self.assertEqual(len(herdr.submits), 1,
+                        "the worker prompt must not follow an unresolved bootstrap")
+        report = evidence(run, "ceo-bootstrap.json")
+        self.assertEqual(report["action"], "halted")
+        self.assertEqual(report["transport"], "unknown")
+        self.assertIs(report["ceo_initialized"], False)
+        self.assertEqual(report["duplicate_sends"], 0)
+
+    def test_a_consumed_challenge_cannot_be_reissued(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-no-resend")
+        run = self._ceo_run(root, herdr)
+        run.resume()
+        pid = run.project_row.id
+        record, nonce = ceo_initialization.discover_and_issue(run.conn, pid, "ceo")
+        self.assertIsNone(nonce, "an initialized CEO never receives a new nonce")
+        self.assertEqual(record.state, "initialized")
+        self.assertEqual(len(herdr.submits), 2, "no further prompt was sent")
+
+    def test_agent_claim_never_initializes_nor_upgrades_the_receipt(
+            self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-claim")
+        claim = self.tray.base / "ceo-echo.json"
+        claim.write_text(json.dumps({"project_id": "echoed",
+                                    "protocol_version": "1.0.0",
+                                    "nonce": "an-agent-echoed-value"}),
+                         encoding="utf-8")
+        run = self._ceo_run(root, herdr, claim=claim)
+        run.resume()
+        row = ceo_row(run.conn)
+        self.assertEqual(row[0], "initialized")
+        self.assertEqual(row[1], "assumed_default",
+                         "a self-claim may not upgrade the receipt source")
+        report = evidence(run, "ceo-bootstrap.json")
+        self.assertEqual(report["claim"]["retained_as"],
+                         "unverified audit material")
+        self.assertIs(report["claim"]["can_initialize"], False)
+        # The provenance the domain recorded is immutable at the schema level:
+        # it can never be erased to 'unverified' (nor quietly restated) later.
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            with storage.transaction(run.conn):
+                run.conn.execute(
+                    "UPDATE ceo_initializations SET receipt_source='unverified'")
+                run.conn.commit()
+        self.assertIn("immutable", str(ctx.exception))
+
+    def test_missing_claim_file_fails_closed_before_any_claim_is_recorded(
+            self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-claim-missing")
+        run = self._ceo_run(root, herdr,
+                           claim=self.tray.base / "absent-echo.json")
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("does not exist", str(ctx.exception))
+        # The bootstrap itself succeeded; only the optional claim was refused.
+        self.assertEqual(ceo_row(run.conn)[0], "initialized")
+
+    def test_claim_file_with_invalid_json_is_refused(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = self._allocated(herdr, "ceo-claim-broken")
+        bad = self.tray.base / "broken-echo.json"
+        bad.write_text("{not json", encoding="utf-8")
+        run = self._ceo_run(root, herdr, claim=bad)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume()
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_ceo_leg_happens_before_the_worker_prompt(self) -> None:
+        """Ordering is observable in durable state, not just in a report flag."""
+        herdr = FakeHerdr(submit_outcome="agent_blocked")
+        root, _ = self._allocated(herdr, "ceo-order")
+        run = self._ceo_run(root, herdr)
+        with self.assertRaises(m606.GuardError):
+            run.resume()
+        # The single submit that happened was the CEO challenge, and the CEO
+        # record advanced to 'unknown' — which only the pre-prompt fence does.
+        self.assertEqual(len(herdr.submits), 1)
+        self.assertEqual(ceo_row(run.conn)[0], "unknown")
+        self.assertEqual(q(run.conn, "SELECT COUNT(*) FROM attempts"
+                                    " WHERE protocol_version IS NOT NULL")[0][0], 2,
+                         "CEO attempt created alongside the worker attempt")
+        self.assertFalse((root / "evidence" / "dispatch.json").exists(),
+                        "the worker leg must not have run")
+
+
+class WakeIntegrationTests(unittest.TestCase):
+    """Wake intake/admission/delivery, recorded without overstating anything."""
+
+    def setUp(self) -> None:
+        self.tray = Tray()
+        self.ack = attestation(self.tray, "wake-model-proof")
+
+    def tearDown(self) -> None:
+        self.tray.close()
+
+    def _bootstrapped(self, name: str, *, wake_deliver: bool,
+                     herdr: FakeHerdr | None = None
+                     ) -> tuple[m606.M606LiveRun, FakeHerdr, Path]:
+        herdr = herdr or FakeHerdr()
+        root, _ = phase1(self.tray, name, herdr)
+        herdr.stand_in(json.loads((root / "evidence"
+                                  / "handoff.json").read_text())["allocated_cwd"])
+        args = ["--resume-handoff", "--consent-dispatch", "--herdr-pane", PANE,
+                "--pane-model-evidence", str(self.ack),
+                "--expect-session-id", SESSION, "--ceo-pane", PANE]
+        if wake_deliver:
+            args.append("--wake-deliver")
+        run = make_run(self.tray, root, *args, "--stop-after", "dispatch",
+                      herdr=herdr)
+        run.resume()
+        return run, herdr, root
+
+    def test_admission_without_delivery_is_reported_as_undelivered(
+            self) -> None:
+        run, herdr, _root = self._bootstrapped("wake-admit-only",
+                                               wake_deliver=False)
+        report = evidence(run, "wake.json")
+        pid = run.project_row.id
+        self.assertEqual(report["transport"], "admitted-not-delivered")
+        self.assertIsNone(report["outcome"],
+                         "no transport outcome may be claimed for an undelivered "
+                         "wake — the worker's outcome is not the wake's")
+        self.assertEqual(report["duplicate_sends"], 0)
+        self.assertEqual(wake_state(run.conn, report["wake_id"]), "sending",
+                         "admission leaves a durable 'sending' row for a sender")
+        self.assertEqual(len(herdr.submits), 2, "CEO + worker only")
+        self.assertEqual(ack_cursor(run.conn, pid), 0)
+
+    def test_delivered_wake_records_submitted_but_never_acknowledged(
+            self) -> None:
+        run, herdr, _root = self._bootstrapped("wake-deliver",
+                                               wake_deliver=True)
+        report = evidence(run, "wake.json")
+        pid = run.project_row.id
+        self.assertEqual(report["transport"], "delivered")
+        self.assertEqual(report["outcome"], "submitted")
+        self.assertEqual(wake_state(run.conn, report["wake_id"]), "submitted")
+        self.assertIs(report["ceo_acknowledged"], False)
+        self.assertEqual(ack_cursor(run.conn, pid), 0,
+                         "transport success is not CEO acknowledgement")
+        self.assertEqual(len(herdr.submits), 3)
+        self.assertNotEqual(report["delivery"]["prompt_sha256"],
+                           evidence(run, "dispatch.json")["prompt_sha256"],
+                           "the wake prompt is its own message, not a re-send")
+
+    def test_an_unresolved_wake_delivery_is_unknown_not_a_retry(self) -> None:
+        """A wake whose transport is unresolved lands on 'unknown', once."""
+        herdr = FakeHerdr()
+        herdr.fail_submit_on = (3, "agent_blocked")   # CEO, worker, then the wake
+        run, _herdr, _root = self._bootstrapped("wake-unresolved",
+                                               wake_deliver=True, herdr=herdr)
+        report = evidence(run, "wake.json")
+        pid = run.project_row.id
+        self.assertEqual(report["outcome"], "unknown")
+        self.assertEqual(report["transport"], "unresolved")
+        self.assertEqual(wake_state(run.conn, report["wake_id"]), "unknown",
+                        "an unresolved effect must be durable, not optimistic")
+        self.assertIs(report["ceo_acknowledged"], False)
+        self.assertEqual(report["duplicate_sends"], 1,
+                        "the runner never re-sends an unresolved wake")
+        self.assertEqual(len(herdr.submits), 3, "CEO + worker + one wake")
+        self.assertEqual(ack_cursor(run.conn, pid), 0)
+        detail = run.conn.execute(
+            "SELECT detail FROM wakes WHERE id=?",
+            (report["wake_id"],)).fetchone()[0]
+        self.assertIn("reconciled", str(detail))
+        self.assertIn("must not be re-sent", str(detail))
+
+    def test_a_second_wake_cannot_be_admitted_while_one_is_unresolved(
+            self) -> None:
+        """The domain refuses a second in-flight delivery; nothing is claimed."""
+        run, herdr, _root = self._bootstrapped("wake-inflight",
+                                              wake_deliver=False)
+        self.assertEqual(len(herdr.submits), 2)
+        first = evidence(run, "wake.json")["wake_id"]
+        self.assertEqual(wake_state(run.conn, first), "sending")
+        # Same run, fresh intake: a second wake exists, but delivery of it must
+        # wait for the first to be reconciled — the honest report says so.
+        report = run.wake_leg(run.evidence, "submitted")
+        self.assertEqual(report["state"], "pending")
+        self.assertEqual(report["transport"], "not-attempted:deferred")
+        self.assertIsNone(report["outcome"])
+        self.assertIn("wake_sending", str(report["deferred_reason"]),
+                      "the deferral must name the in-flight wake")
+        self.assertEqual(report["duplicate_sends"], 0)
+        self.assertEqual(len(herdr.submits), 2,
+                        "a deferred wake must not touch the transport at all")
+        self.assertEqual(wake_state(run.conn, first), "sending",
+                        "the first wake's durable state is untouched")
+
+    def test_deferred_admission_claims_nothing(self) -> None:
+        run, _herdr, _root = self._bootstrapped("wake-deferred",
+                                                wake_deliver=False)
+        pid = run.project_row.id
+        if not [r for r in q(run.conn, "SELECT id FROM wakes"
+                                      " WHERE state='pending'")]:
+            self.skipTest("no pending wake left to defer")
+        lease = run.lease()
+        wake.record_wake_budget(run.conn, pid, lease, max_wakes_per_window=0,
+                               actor="test", reason="exhaust the allowance")
+        report = run.wake_leg(run.evidence, "submitted")
+        self.assertEqual(report["transport"], "not-attempted:deferred")
+        self.assertIsNone(report["outcome"])
+        self.assertEqual(report["state"], "pending",
+                         "a deferred wake stays pending; nothing is sent")
+        self.assertEqual(report["duplicate_sends"], 0)
+        self.assertIs(report["ceo_acknowledged"], False)
+
+    def test_without_a_designated_ceo_the_wake_stays_gated(self) -> None:
+        herdr = FakeHerdr()
+        root, _ = phase1(self.tray, "wake-no-ceo", herdr)
+        herdr.stand_in(json.loads((root / "evidence"
+                                  / "handoff.json").read_text())["allocated_cwd"])
+        run = make_run(self.tray, root, "--resume-handoff", "--consent-dispatch",
+                      "--herdr-pane", PANE, "--pane-model-evidence", str(self.ack),
+                      "--expect-session-id", SESSION, "--stop-after", "dispatch",
+                      herdr=herdr)
+        run.resume()
+        report = evidence(run, "wake.json")
+        self.assertEqual(report["state"], "pending:admission-blocked")
+        self.assertEqual(report["transport"], "not-attempted")
+        self.assertIsNone(report["outcome"],
+                         "no outcome may be recorded for a wake that was gated")
+        self.assertIsNone(ceo_row(run.conn))
+        self.assertEqual(len(herdr.submits), 1, "only the worker prompt was sent")
+        self.assertEqual(run.ceo_stage, "not-requested",
+                         "no CEO leg may run without a designated CEO pane")
+        run.close(remove_roots=False)
+        claims = evidence(run, "run-manifest.json")["non_claims"]
+        self.assertEqual(claims["wake_transport"], "not-attempted")
+        self.assertEqual(claims["pg7"], "open:not-requested")
+        self.assertIn("not-attempted (no --ceo-pane)", claims["ceo_receipt"])
+
+    def test_acknowledge_wake_is_never_called(self) -> None:
+        calls: list[Any] = []
+        original = wake.acknowledge_wake
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append((args, kwargs))
+            raise AssertionError("the runner must never acknowledge a wake")
+
+        m606.wake.acknowledge_wake = spy          # type: ignore[assignment]
+        try:
+            self._bootstrapped("wake-no-ack", wake_deliver=True)
+        finally:
+            m606.wake.acknowledge_wake = original  # type: ignore[assignment]
+        self.assertEqual(calls, [],
+                         "CEO acknowledgement must never be inferred or fabricated")
+
+    def test_manifest_reports_ceo_and_wake_honestly(self) -> None:
+        run, _herdr, root = self._bootstrapped("wake-manifest",
+                                               wake_deliver=True)
+        run.close(remove_roots=False)
+        manifest = evidence(run, "run-manifest.json")
+        claims = manifest["non_claims"]
+        self.assertEqual(claims["ceo_receipt"],
+                         "assumed_default (transport succeeded; NOT host-verified)")
+        self.assertEqual(claims["wake_transport"], "delivered")
+        self.assertIn("not-asserted", claims["ceo_acknowledgement"])
+        self.assertEqual(claims["pg7"], "bootstrap+wake-executed")
+        self.assertIs(claims["host_trusted_receipt"], False)
+        self.assertEqual(manifest["stage_matrix"]["ceo"], "executed")
+        self.assertEqual(manifest["ceo"]["receipt_source"], "assumed_default")
+        self.assertIs(manifest["ceo"]["host_trusted"], False)
+        scan = manifest["ephemeral_leak_scan"]
+        self.assertEqual(scan["tokens_checked"], 1)
+        self.assertEqual(scan["leaks"], {})
+        # One-use secrets are named only by digest prefix, never in the clear.
+        self.assertTrue(all(t.endswith("…" ) and len(t) == 13
+                            for t in scan["tokens"]))
+        self.assertTrue((root / "evidence" / "ceo-bootstrap.json").is_file())
+
+
+class FixedClock:
+    """A clock whose reading the test controls (the domain calls ``.now()``)."""
+
+    def __init__(self, at: datetime) -> None:
+        self._at = at
+
+    def now(self) -> datetime:
+        return self._at
+
+
+class CeoDomainGuaranteesTests(unittest.TestCase):
+    """The guarantees the PG-7 leg relies on, proven against the real domain."""
+
+    def setUp(self) -> None:
+        self.tray = Tray()
+
+    def tearDown(self) -> None:
+        self.tray.close()
+
+    def _world(self, name: str) -> tuple[m606.M606LiveRun, str]:
+        herdr = FakeHerdr()
+        run = make_run(self.tray, self.tray.root(name), "--stop-after",
+                      "allocate", "--keep-root", herdr=herdr)
+        run.provision()
+        run.allocate()
+        pid = str(run.project_row.id)
+        runtime_adapter.sync_state(run.conn, ceo_state_dict(run.project))
+        return run, pid
+
+    def test_an_expired_challenge_can_never_be_accepted(self) -> None:
+        run, pid = self._world("ceo-expiry")
+        _record, nonce = ceo_initialization.discover_and_issue(run.conn, pid, "ceo")
+        self.assertIsNotNone(nonce)
+        lease = run.lease()
+        runtime_adapter.admit_ceo_bootstrap_effect(run.conn, pid, nonce,
+                                                  lease=lease)
+        later = FixedClock(datetime.now(timezone.utc) + timedelta(minutes=10))
+        # The domain itself refuses the replay…
+        with self.assertRaises(ceo_initialization.CEOInitializationReplayError):
+            ceo_initialization.record_bootstrap_submitted_assumed(
+                run.conn, pid, nonce, native_session_id=SESSION,
+                session_state="idle", lease=lease, clock=later)
+        # …and so does the runner-facing adapter, in its own vocabulary.
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError) as ctx:
+            runtime_adapter.record_ceo_bootstrap_submission_assumed(
+                run.conn, pid, nonce, native_session_id=SESSION,
+                session_state="idle", lease=lease, clock=later)
+        self.assertIn("expired", str(ctx.exception))
+        self.assertEqual(ceo_row(run.conn)[0], "unknown",
+                        "an expired challenge stays fenced, it is never reset")
+        with self.assertRaises(ceo_initialization.CEOInitializationGateClosed):
+            ceo_initialization.require_initialized(run.conn, pid)
+
+    def test_two_canonical_ceos_are_refused(self) -> None:
+        run, _pid = self._world("ceo-second")
+        state = ceo_state_dict(run.project)
+        state["members"]["ceo-two"] = dict(state["members"]["ceo"],
+                                          name="ceo-two")
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError) as ctx:
+            runtime_adapter.sync_state(run.conn, state)
+        self.assertIn("only one canonical CEO", str(ctx.exception))
+        self.assertEqual([r[0] for r in q(run.conn, "SELECT name FROM members"
+                                                   " WHERE role='ceo'")], ["ceo"],
+                         "the rejected state wrote nothing")
+        # A "CEO" observed in some other pane/terminal cannot be adopted either:
+        # the durable team identity is pinned to the Herdr session it was created
+        # in, and existing history may not silently disappear.
+        other = ceo_state_dict(run.project, pane="w9:p2", terminal="term_two",
+                               name="ceo-two")
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError):
+            runtime_adapter.sync_state(run.conn, other)
+        self.assertEqual(len(q(run.conn, "SELECT name FROM members"
+                                        " WHERE role='ceo'")), 1)
+
+    def test_team_identity_is_immutable_once_set(self) -> None:
+        run, _pid = self._world("ceo-team-immutable")
+        state = ceo_state_dict(run.project)
+        state["team_id"] = "a-different-team"
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError):
+            runtime_adapter.sync_state(run.conn, state)
+
+    def test_a_second_ceo_harness_kind_is_refused(self) -> None:
+        run, pid = self._world("ceo-bad-kind")
+        with self.assertRaises(ceo_initialization.CEOInitializationError):
+            ceo_initialization.discover_and_issue(run.conn, pid, "not-the-ceo")
+
+    def test_initialized_record_survives_a_reconnect(self) -> None:
+        """The gate opens from durable state, not from in-memory goodwill."""
+        herdr = FakeHerdr()
+        root, _ = phase1(self.tray, "ceo-durable", herdr)
+        herdr.stand_in(json.loads((root / "evidence"
+                                  / "handoff.json").read_text())["allocated_cwd"])
+        run = make_run(self.tray, root, "--resume-handoff", "--consent-dispatch",
+                      "--herdr-pane", PANE, "--pane-model-evidence",
+                      str(attestation(self.tray, "dur-proof")),
+                      "--expect-session-id", SESSION, "--ceo-pane", PANE,
+                      "--stop-after", "dispatch", herdr=herdr)
+        run.resume()
+        pid = run.project_row.id
+        run.conn.close()
+        fresh = storage.connect(root / "teamcraft.db",
+                               allow_unverified_location=True)
+        self.tray.track(type("C", (), {"conn": fresh})())
+        self.assertEqual(ceo_initialization.require_initialized(fresh, pid)
+                         .receipt_source, "assumed_default")
+        self.assertEqual(ceo_row(fresh)[0], "initialized")
 
 
 if __name__ == "__main__":
