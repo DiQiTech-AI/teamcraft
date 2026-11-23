@@ -55,6 +55,7 @@ for _p in (str(REPO), str(REPO / "scripts")):
 
 import m606_opencode_e2e as m606  # noqa: E402
 from teamcraft import (  # noqa: E402
+    briefs,
     ceo_initialization,
     domain,
     providers,
@@ -293,6 +294,11 @@ def evidence_text(run: Any, name: str) -> str:
     return (run.root / "evidence" / name).read_text("utf-8")
 
 
+def evidence_of(root: Any, name: str) -> dict[str, Any]:
+    """Read an evidence artifact straight from a root (no run object needed)."""
+    return json.loads((Path(root) / "evidence" / name).read_text("utf-8"))
+
+
 def origin_refs(run: Any) -> dict[str, str]:
     return run.origin_refs()
 
@@ -467,6 +473,40 @@ class InertModeTests(unittest.TestCase):
                  "--consent-dispatch", "--herdr-pane", PANE,
                  "--pane-model-evidence", ref, "--expect-session-id", SESSION,
                  "--ceo-claim-file", ref],
+            "post-dispatch without live-run":
+                ["--root", root, "--post-dispatch", "--resume-handoff",
+                 "--worker-report-file", ref],
+            "post-dispatch without resume":
+                ["--confirm-live-run", "--root", root, "--post-dispatch",
+                 "--worker-report-file", ref],
+            "post-dispatch with consent (would double-dispatch)":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--consent-dispatch",
+                 "--worker-report-file", ref],
+            "post-dispatch with scripted leg (would author the report)":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--scripted-worker-change",
+                 "--worker-report-file", ref],
+            "post-dispatch with ceo-pane (submits a prompt)":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--worker-report-file", ref,
+                 "--ceo-pane", PANE],
+            "post-dispatch with wake-deliver (submits a prompt)":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--worker-report-file", ref,
+                 "--wake-deliver", "--ceo-pane", PANE,
+                 "--ceo-expect-session-id", SESSION],
+            "post-dispatch without a report file":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch"],
+            "post-dispatch stopping before dispatch":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--worker-report-file", ref,
+                 "--stop-after", "dispatch"],
+            "post-dispatch with a pane designation (implies a prompt)":
+                ["--confirm-live-run", "--root", root, "--resume-handoff",
+                 "--post-dispatch", "--worker-report-file", ref,
+                 "--herdr-pane", PANE],
         }
         for label, argv in refused.items():
             with self.subTest(case=label):
@@ -485,9 +525,21 @@ class InertModeTests(unittest.TestCase):
                         "--consent-dispatch", "--herdr-pane", PANE,
                         "--pane-model-evidence", ref, "--expect-session-id",
                         SESSION],
+            "post-dispatch continuation": ["--confirm-live-run", "--root", root,
+                                          "--resume-handoff", "--post-dispatch",
+                                          "--worker-report-file", ref],
         }.items():
             with self.subTest(allowed=label):
                 m606.validate_arg_combinations(parser.parse_args(argv))
+        # Every post-dispatch refusal must name the mode it is protecting, so a
+        # future refactor cannot silently drop the guard while still raising.
+        for label, argv in refused.items():
+            if "post-dispatch" not in label:
+                continue
+            with self.subTest(marker=label):
+                with self.assertRaises(m606.GuardError) as ctx:
+                    m606.validate_arg_combinations(parser.parse_args(argv))
+                self.assertIn("--post-dispatch", str(ctx.exception))
 
     def test_forbidden_herdr_verbs_issue_zero_commands(self) -> None:
         forbidden = [("tab", "create"), ("tab", "close"), ("pane", "focus"),
@@ -1223,6 +1275,319 @@ class DeliveryCleanupTests(unittest.TestCase):
         self.assertIs(report["root_retained"], True,
                       "phase 2 did not create the root, so it may not delete it")
         self.assertTrue(root.exists())
+
+
+# ---------------------------------------------------------------------------
+# E2. Post-dispatch continuation: continue a dispatched attempt, never re-send
+# ---------------------------------------------------------------------------
+
+class PostDispatchContinuationTests(unittest.TestCase):
+    """A dispatched attempt is CONTINUED, never re-dispatched.
+
+    The post-dispatch path must submit nothing, re-prove the prior dispatch, bind
+    an external FINAL WorkerReport exactly, and refuse UNKNOWN / missing /
+    mismatched evidence.  After the narrow completion guard, a ``blocked`` or
+    ``failed`` final report is retained as durable audit evidence WITHOUT moving
+    the Task into ``verifying`` or proceeding to delivery.  The fake pane sends no
+    change, so each test simulates the agent's on-disk effect itself.
+    """
+
+    def setUp(self) -> None:
+        self.tray = Tray()
+
+    def tearDown(self) -> None:
+        self.tray.close()
+
+    # -- fixtures -----------------------------------------------------------
+
+    def _dispatched(self, name, *, submit_outcome: str = "accepted"):
+        """phase 1 + one real dispatch; returns (herdr, root, handoff)."""
+        herdr = FakeHerdr(submit_outcome=submit_outcome)
+        root, handoff = phase1(self.tray, name, herdr)
+        herdr.stand_in(handoff["allocated_cwd"])
+        ack = str(attestation(self.tray, name + "-ack"))
+        run = make_run(self.tray, root, "--resume-handoff", "--consent-dispatch",
+                       "--herdr-pane", PANE, "--pane-model-evidence", ack,
+                       "--expect-session-id", SESSION, "--stop-after", "dispatch",
+                       herdr=herdr)
+        if submit_outcome == "accepted":
+            report = run.execute()
+            self.assertIs(report["ok"], True, report.get("aborted"))
+        else:
+            # an unresolved transport halts the dispatch leg, never auto-retries
+            with self.assertRaises(m606.PostconditionError):
+                run.execute()
+        self.assertEqual(len(herdr.submits), 1, "the single real dispatch")
+        return herdr, root, handoff
+
+    def _continuation(self, root, report_path, herdr, *, extra=()):
+        return make_run(self.tray, root, "--resume-handoff", "--post-dispatch",
+                       "--worker-report-file", str(report_path), *extra,
+                       herdr=herdr)
+
+    def _report(self, name, root, *, outcome="completed", kind="final",
+                milestone="final", version_delta=0, **over):
+        """Write an externally produced WorkerReport bound to THIS attempt."""
+        conn = storage.connect(root / "teamcraft.db",
+                               allow_unverified_location=True)
+        dj = json.loads((root / "evidence" / "dispatch.json").read_text("utf-8"))
+        br = briefs.get_attempt_brief(conn, dj["attempt_id"])
+        conn.close()
+        doc = {"schema_version": 1, "task_id": dj["task_id"],
+               "attempt_id": dj["attempt_id"],
+               "task_version": br.task_version + version_delta,
+               "brief_digest": br.brief_digest, "report_kind": kind,
+               "milestone_id": milestone, "summary": f"{kind} {outcome}"}
+        if outcome is not None:
+            doc["outcome"] = outcome
+        doc.update(over)
+        path = self.tray.base / (name + ".json")
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path, dj["attempt_id"]
+
+    def _handoff_report(self, name, handoff):
+        """A final report bound to an allocated attempt that was never dispatched."""
+        conn = storage.connect(handoff["_root"] / "teamcraft.db",
+                               allow_unverified_location=True)
+        br = briefs.get_attempt_brief(conn, handoff["attempt_id"])
+        conn.close()
+        doc = {"schema_version": 1, "task_id": handoff["task_id"],
+               "attempt_id": handoff["attempt_id"], "task_version": br.task_version,
+               "brief_digest": br.brief_digest, "report_kind": "final",
+               "outcome": "completed", "milestone_id": "final", "summary": "x"}
+        path = self.tray.base / (name + ".json")
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    def _write_agent_change(self, handoff) -> Path:
+        wt = Path(handoff["allocated_cwd"])
+        (wt / "src").mkdir(parents=True, exist_ok=True)
+        (wt / "src" / "feature.py").write_text(
+            f"{m606.MARKER}: written by the agent\n", encoding="utf-8")
+        return wt
+
+    def _state(self, root, task_id, attempt_id):
+        conn = storage.connect(root / "teamcraft.db",
+                               allow_unverified_location=True)
+        ts = domain.get_task(conn, task_id).status
+        ats = domain.get_attempt(conn, attempt_id).status
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM worker_reports WHERE attempt_id=?"
+            " AND report_kind='final'", (attempt_id,)).fetchone()[0]
+        conn.close()
+        return ts, ats, rows
+
+    @staticmethod
+    def _commits(worktree, base) -> str:
+        proc = subprocess.run(["git", "-C", str(worktree), "rev-list", "--count",
+                               f"{base}..HEAD"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, check=False)
+        return proc.stdout.strip()
+
+    # -- happy path ---------------------------------------------------------
+
+    def test_continuation_delivers_with_zero_prompts_one_original_submit(self):
+        herdr, root, handoff = self._dispatched("pd-ok")
+        wt = self._write_agent_change(handoff)
+        rp, att = self._report("rp-ok", root, outcome="completed")
+        run = self._continuation(root, rp, herdr,
+                                extra=("--stop-after", "deliver", "--keep-root"))
+        report = run.execute()                       # a completion never raises
+        self.assertIs(report["ok"], True, report.get("aborted"))
+        # exactly one submit EVER; this invocation added none
+        self.assertEqual(len(herdr.submits), 1)
+        self.assertEqual(run._submit_count, 0)
+        self.assertIs(run._submit_lock, True)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run._submit_to_pane(PANE, "must never leave", wait=False,
+                                until=(), timeout_ms=1000)
+        self.assertIn("continuation", str(ctx.exception))
+        self.assertEqual(len(herdr.submits), 1, "the locked door refused a prompt")
+        ts, ats, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(ts, "verifying")
+        self.assertEqual(ats, "finished")
+        self.assertEqual(rows, 1)
+        self.assertEqual(self._commits(wt, handoff["base_sha"]), "1")
+        self.assertEqual(evidence(run, "delivery.json")["disposition"],
+                         m606.DELIVERY_SUBMITTED)
+        pd = evidence(run, "post-dispatch.json")
+        self.assertEqual(pd["prompts_submitted_by_this_invocation"], 0)
+        self.assertIs(pd["dispatch_replayed"], False)
+        self.assertIsNone(pd["failure"])
+        self.assertEqual(pd["worker_report"]["task_projection"],
+                         "applied-from-durable-final-report")
+        # the recorded dispatch survived the continuation, byte-for-byte meaningful
+        self.assertEqual(evidence(run, "dispatch.json")["state"], "submitted")
+        mf = evidence(run, "run-manifest.json")
+        self.assertEqual(mf["evidence_class"], "live-agent")
+        self.assertEqual(mf["continuation"]["dispatch_replayed"], False)
+        self.assertEqual(mf["continuation"]["prompts_submitted_by_this_invocation"],
+                         0)
+        self.assertEqual(mf["non_claims"]["dispatch_replay"],
+                         "none — a continuation submits no prompt")
+        self.assertIn("prior-dispatch-evidence", mf["evidence_origin"])
+
+    def test_second_continuation_is_zero_herdr_activity_and_idempotent(self):
+        herdr, root, handoff = self._dispatched("pd-twice")
+        wt = self._write_agent_change(handoff)
+        rp, att = self._report("rp-twice", root, outcome="completed")
+        self.assertIs(self._continuation(
+            root, rp, herdr,
+            extra=("--stop-after", "deliver", "--keep-root")).execute()["ok"], True)
+        snap = (len(herdr.submits), len(herdr.reads), herdr.identity_reads)
+        second = self._continuation(root, rp, herdr)
+        rr = second.resume_post_dispatch()           # already-recorded: no re-ingest
+        self.assertEqual(second._submit_count, 0)
+        self.assertEqual((len(herdr.submits), len(herdr.reads),
+                          herdr.identity_reads), snap,
+                         "a second continuation touched no Herdr transport at all")
+        self.assertEqual(rr["task_status"], "verifying")
+        _, _, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 1, "no duplicate WorkerReport row")
+        self.assertEqual(self._commits(wt, handoff["base_sha"]), "1",
+                       "no duplicate commit")
+
+    # -- fail-closed --------------------------------------------------------
+
+    def test_unknown_dispatch_is_refused_and_never_resent(self):
+        herdr, root, handoff = self._dispatched("pd-unknown",
+                                               submit_outcome="unknown")
+        self.assertEqual(evidence_of(root, "dispatch.json")["state"], "unknown")
+        rp, _att = self._report("rp-unknown", root, outcome="completed")
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("UNKNOWN", str(ctx.exception))
+        self.assertEqual(len(herdr.submits), 1,
+                        "an unresolved dispatch is reconciled, never re-sent")
+
+    def test_missing_dispatch_evidence_is_refused(self):
+        herdr = FakeHerdr()
+        root, handoff = phase1(self.tray, "pd-missing", herdr)
+        handoff["_root"] = root
+        rp = self._handoff_report("rp-missing", handoff)
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("no dispatch evidence", str(ctx.exception))
+        self.assertEqual(herdr.submits, [], "the continuation dispatched nothing")
+
+    def test_report_attempt_id_mismatch_is_refused(self):
+        herdr, root, handoff = self._dispatched("pd-bad-att")
+        self._write_agent_change(handoff)
+        rp, att = self._report("rp-bad-att", root, outcome="completed",
+                              attempt_id="att_someone_elses")
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("does not bind this attempt", str(ctx.exception))
+        _, _, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 0, "a mismatched report is never ingested")
+        self.assertEqual(len(herdr.submits), 1)
+
+    def test_report_brief_digest_mismatch_is_refused(self):
+        herdr, root, handoff = self._dispatched("pd-bad-digest")
+        self._write_agent_change(handoff)
+        rp, att = self._report("rp-bad-digest", root, outcome="completed",
+                              brief_digest="ab" * 32)
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("does not bind this attempt", str(ctx.exception))
+        _, _, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 0)
+
+    def test_report_task_version_mismatch_is_refused(self):
+        herdr, root, handoff = self._dispatched("pd-bad-version")
+        self._write_agent_change(handoff)
+        rp, att = self._report("rp-bad-version", root, outcome="completed",
+                              version_delta=5)
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("does not bind this attempt", str(ctx.exception))
+        _, _, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 0)
+
+    def test_progress_report_is_refused(self):
+        """Only a FINAL report may close an execution; a progress report cannot."""
+        herdr, root, handoff = self._dispatched("pd-progress")
+        self._write_agent_change(handoff)
+        rp, att = self._report("rp-progress", root, outcome=None,
+                              kind="progress", milestone="step-1")
+        run = self._continuation(root, rp, herdr)
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.resume_post_dispatch()
+        self.assertIn("only a FINAL report", str(ctx.exception))
+        _, _, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 0)
+
+    # -- completion guard: blocked / failed -----------------------------------
+
+    def test_blocked_report_is_retained_but_does_not_verify_or_ship(self):
+        herdr, root, handoff = self._dispatched("pd-blocked")
+        wt = self._write_agent_change(handoff)
+        rp, att = self._report("rp-blocked", root, outcome="blocked")
+        run = self._continuation(root, rp, herdr,
+                                extra=("--stop-after", "deliver", "--keep-root"))
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.execute()
+        msg = str(ctx.exception)
+        self.assertIn("'blocked'", msg)
+        self.assertIn("report retained", msg)
+        self.assertIn("delivery refused", msg)
+        self.assertEqual(run._submit_count, 0)
+        self.assertEqual(len(herdr.submits), 1, "no prompt sent by the refusal")
+        ts, ats, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 1, "the blocked report is kept as audit evidence")
+        self.assertEqual(ats, "finished")
+        self.assertNotEqual(ts, "verifying",
+                            "a blocked execution must NOT advance to verifying")
+        self.assertEqual(ts, "running")
+        self.assertFalse((root / "evidence" / "delivery.json").exists(),
+                        "delivery must not proceed from a blocked outcome")
+        pd = evidence_of(root, "post-dispatch.json")
+        self.assertEqual(pd["task_status"], "running")
+        self.assertIsNotNone(pd["failure"])
+
+    def test_failed_report_is_retained_but_does_not_verify_or_ship(self):
+        herdr, root, handoff = self._dispatched("pd-failed")
+        wt = self._write_agent_change(handoff)
+        rp, att = self._report("rp-failed", root, outcome="failed")
+        run = self._continuation(root, rp, herdr,
+                                extra=("--stop-after", "deliver", "--keep-root"))
+        with self.assertRaises(m606.GuardError) as ctx:
+            run.execute()
+        msg = str(ctx.exception)
+        self.assertIn("'failed'", msg)
+        self.assertIn("report retained", msg)
+        self.assertIn("delivery refused", msg)
+        self.assertEqual(run._submit_count, 0)
+        self.assertEqual(len(herdr.submits), 1)
+        ts, ats, rows = self._state(root, handoff["task_id"], att)
+        self.assertEqual(rows, 1, "the failed report is kept as audit evidence")
+        self.assertEqual(ats, "finished")
+        self.assertNotEqual(ts, "verifying",
+                            "a failed execution must NOT advance to verifying")
+        self.assertEqual(ts, "running")
+        self.assertFalse((root / "evidence" / "delivery.json").exists())
+
+    def test_rehearsal_does_not_overwrite_a_recorded_dispatch(self):
+        """A consent-free rehearsal must leave the submitted record intact."""
+        herdr, root, handoff = self._dispatched("pd-rehearse")
+        ack = str(attestation(self.tray, "pd-rehearse-ack2"))
+        rehearse = make_run(self.tray, root, "--resume-handoff",
+                           "--herdr-pane", PANE, "--pane-model-evidence", ack,
+                           "--expect-session-id", SESSION, "--stop-after",
+                           "dispatch", herdr=herdr)
+        self.assertIs(rehearse.execute()["ok"], True)
+        self.assertEqual(len(herdr.submits), 1, "a rehearsal submits nothing")
+        self.assertEqual(evidence(rehearse, "dispatch.json")["state"], "submitted",
+                        "the recorded dispatch must survive a rehearsal")
+        rh = evidence(rehearse, "dispatch-rehearsal.json")
+        self.assertIs(rh["overwrote_dispatch_evidence"], False)
+        self.assertEqual(rh["prior_dispatch_state"], "submitted")
+        self.assertIn("--post-dispatch", json.dumps(rh["note"]))
 
 
 # ---------------------------------------------------------------------------

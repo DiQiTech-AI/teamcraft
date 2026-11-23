@@ -308,12 +308,18 @@ set; `milestone_id` must be declared by the Attempt Brief — this scenario uses
   "artifact_digest": null, "usage": {"total_tokens": null}
 }
 ```
-**Current stop point:** the runner has no continuation mode that only ingests a
-WorkerReport and delivers. A second invocation with `--consent-dispatch`
-reenters the submit path. Do not replay Step 7 to supply a report. Retain the
-isolated evidence and defer delivery until a non-submitting continuation
-can bind the report to the existing Attempt. Acceptance still requires a
-separate attributed decision after verification.
+Continue without resubmitting the prompt:
+
+```sh
+.venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run \
+  --root "$ROOT" --resume-handoff --post-dispatch \
+  --worker-report-file "$REPORT" --stop-after deliver --keep-root --json
+```
+
+Set `REPORT` to the path of the final WorkerReport JSON. This mode requires
+proven prior submission and rejects UNKNOWN or a mismatched
+report. It records blocked and failed reports without advancing to verification.
+Acceptance remains a separate attributed decision after verification.
 
 ### 4.6 Step 9 — cleanup
 ```sh

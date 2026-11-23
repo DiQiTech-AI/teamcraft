@@ -48,6 +48,13 @@ USAGE
     # offline rehearsal of the whole pipeline, no pane and no model at all:
     .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
         --scripted-worker-change
+    # the worker's final report arrived after dispatch was recorded: continue the
+    # attempt to verification/delivery WITHOUT issuing any prompt.  This is the
+    # only supported way past a recorded dispatch — never re-run --consent-dispatch
+    # to "pick up" a dispatched attempt, that sends a second real prompt.
+    .venv/bin/python scripts/m606_opencode_e2e.py --confirm-live-run --root <root> \
+        --resume-handoff --post-dispatch --worker-report-file report.json \
+        --stop-after deliver
     .venv/bin/python scripts/m606_opencode_e2e.py --cleanup-only --root <root>
 """
 
@@ -115,6 +122,18 @@ MARKER = "M606-LIVE"
 #: CLI stop points: ``ceo`` is deliberately absent — the CEO leg is part of the
 #: phase-2 dispatch phase and has no meaning as a stop point for phase 1.
 STOP_POINTS = ("provision", "allocate", "dispatch", "deliver", "cleanup", "close")
+
+#: Stage label for the post-dispatch continuation.  It is NOT in :data:`STAGES`:
+#: the continuation re-enters the scenario *after* dispatch, so it must never be
+#: counted as having executed dispatch itself, and an abort during its proof marks
+#: no new stage as executed.
+CONTINUATION_STAGE = "post-dispatch"
+
+#: Why a continuation exists, stated once and reused in help, plan and manifest.
+POST_DISPATCH_NOTE = (
+    "a dispatched attempt is continued, never re-dispatched: the prompt already "
+    "went out once, and resending it would be a second real action against an "
+    "agent that may already be working")
 
 #: Read-only Herdr invocations.  Two-token form for subcommand groups.
 READ_ONLY_HERDR = frozenset({
@@ -263,6 +282,27 @@ def field(obj: Any, *names: str, default: Any = None) -> Any:
 
 def real(path: Path | str) -> str:
     return os.path.realpath(str(path))
+
+
+#: The placeholder :func:`sanitize` substitutes for the run root in written
+#: artifacts.  An absolute path that left the runner is stored redacted, so a
+#: reader comparing a recorded path to a live one must expand this back first.
+ROOT_PLACEHOLDER = "<ROOT>"
+
+
+def unredact_root(value: str, root: Path | str) -> str:
+    """Expand a stored ``<ROOT>/…`` path back against ``root``.
+
+    Sanitization is lossless for the root prefix, so this recovers the exact
+    path the runner recorded; a value that was never redacted passes through
+    unchanged.  Resolution is purely textual — it touches no filesystem.
+    """
+    text = str(value)
+    if text == ROOT_PLACEHOLDER:
+        return str(root)
+    if text.startswith(ROOT_PLACEHOLDER + "/"):
+        return str(root) + text[len(ROOT_PLACEHOLDER):]
+    return text
 
 
 def git(repo: Path, *args: str, check: bool = True) -> tuple[int, str]:
@@ -1044,6 +1084,9 @@ class M606LiveRun:
         """
         self.args = args
         self.resuming = bool(getattr(args, "resume_handoff", False))
+        #: Post-dispatch continuation: this invocation re-enters a scenario that
+        #: ALREADY dispatched, and is structurally incapable of submitting input.
+        self.continuing = bool(getattr(args, "post_dispatch", False))
         self.root = validate_root(args.root, allow_non_temp=args.allow_non_temp_root,
                                  for_cleanup=bool(args.cleanup_only),
                                  for_resume=self.resuming)
@@ -1084,6 +1127,15 @@ class M606LiveRun:
         # "live-agent" only once a prompt has actually been submitted; the
         # scripted harness leg stamps "scripted" so the two can never be confused.
         self.evidence_class = "none"
+        #: Transport lock held by the post-dispatch continuation: while it is set,
+        #: :meth:`_submit_to_pane` refuses, so this process cannot prompt a pane.
+        self._submit_lock = False
+        self._submit_count = 0
+        #: Continuation reporting: how the prior dispatch was proved, how the
+        #: WorkerReport was bound, and how the Task reached ``verifying``.
+        self.continuation_report: dict[str, Any] | None = None
+        self.worker_done: dict[str, Any] = {}
+        self.worker_done_projection = "not-attempted"
 
     # -- helpers ------------------------------------------------------------
 
@@ -1104,6 +1156,24 @@ class M606LiveRun:
         return leader.acquire_or_renew(
             self.conn, leader.project_scope(self.project_row.id),
             f"m606-live-{self.run_id}", ttl_seconds=3700)
+
+    def _submit_to_pane(self, pane_id: str, prompt: str, *, wait: bool,
+                        until: tuple[str, ...], timeout_ms: int) -> dict[str, Any]:
+        """The ONLY door from this runner to Herdr input, and it can be locked.
+
+        :meth:`Herdr.submit` already refuses without dispatch consent, but a
+        lock held by this object makes the guarantee independent of how the
+        transport was constructed or injected: a post-dispatch continuation
+        physically cannot send a prompt, and ``_submit_count`` proves afterwards
+        that it did not.
+        """
+        if self._submit_lock:
+            raise GuardError(
+                "this invocation is a post-dispatch continuation: it submits no "
+                "prompt to any pane (" + POST_DISPATCH_NOTE + ")")
+        self._submit_count += 1
+        return self.herdr.submit(pane_id, prompt, wait=wait, until=until,
+                                timeout_ms=timeout_ms)
 
     def git(self, *args: str, check: bool = True) -> tuple[int, str]:
         """A delivery-path git call: strictly no push/clone/merge/reset/rewrite."""
@@ -1512,10 +1582,10 @@ class M606LiveRun:
                 expected=False, observed=record["real_agent_evidence"])
         return record
 
-    def ingest_worker_report(self) -> None:
+    def ingest_worker_report(self) -> Any:
         """Persist an externally produced WorkerReport, if one was supplied."""
         if not self.args.worker_report_file:
-            return
+            return None
         path = Path(self.args.worker_report_file).expanduser()
         if not path.is_file():
             raise GuardError(f"--worker-report-file {path} does not exist")
@@ -1524,6 +1594,27 @@ class M606LiveRun:
         except json.JSONDecodeError as exc:
             raise GuardError(f"worker report file is not valid JSON: {exc}")
         self.worker_report = worker_reports.record_worker_report(self.conn, data)
+        return self.worker_report
+
+    def _project_worker_done_on_task(self, task: Any) -> str:
+        """Bring the Task to ``verifying`` through the domain's own event.
+
+        ``worker_reported_done`` is refused by :mod:`teamcraft.domain` unless the
+        Task's current Attempt is genuinely ``finished`` — and only a durable FINAL
+        WorkerReport can finish it.  So the projection follows the evidence: no
+        code path here can assert completion that the store does not already
+        support.
+        """
+        now = domain.get_task(self.conn, task.id)
+        if now.status == "verifying":
+            self.worker_done_projection = "already-projected"
+        elif now.status == "running":
+            domain.apply_task_event(self.conn, task.id, "worker_reported_done",
+                                   expected_version=now.version)
+            self.worker_done_projection = "applied-from-durable-final-report"
+        else:
+            self.worker_done_projection = f"not-eligible:{now.status}"
+        return str(domain.get_task(self.conn, task.id).status)
 
     # -- phase 1: allocate and hand off ---------------------------------------
 
@@ -1583,9 +1674,15 @@ class M606LiveRun:
 
     # -- phase 2: resume, re-validate, then gate and submit -----------------
 
-    def resume(self) -> dict[str, Any]:
-        """Re-prove every durable fact, then gate the pane and submit once."""
-        self.stage = "dispatch"
+    def _resume_load(self) -> tuple[Any, Any, Any, Any, dict[str, Any],
+                                   dict[str, Any], "Evidence"]:
+        """Re-open the run that already exists on disk and re-prove its facts.
+
+        Returns ``(task, attempt, allocation, brief, binding, handoff, evidence)``.
+        Shared by both phase-2 paths — the dispatching one and the post-dispatch
+        continuation — because both must fail on exactly the same durable drift.
+        Nothing here contacts a pane: the caller decides whether a prompt happens.
+        """
         path = self.root / "evidence" / "handoff.json"
         if not path.is_file():
             raise GuardError(
@@ -1648,7 +1745,27 @@ class M606LiveRun:
             "allocated_cwd": real(allocation.worktree_path),
             "durable_facts_match": True,
             "consent": bool(self.args.consent_dispatch),
+            "mode": CONTINUATION_STAGE if self.continuing else "dispatch",
         })
+        return task, attempt, allocation, brief, binding, handoff, ev
+
+    def _read_prior_dispatch(self) -> dict[str, Any] | None:
+        """The recorded dispatch evidence, or None when there is none."""
+        ev = self._need_evidence()
+        path = ev.dir / "dispatch.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"state": "unreadable"}
+        return data if isinstance(data, dict) else {"state": "unreadable"}
+
+    def resume(self) -> dict[str, Any]:
+        """Re-prove every durable fact, then gate the pane and submit once."""
+        self.stage = "dispatch"
+        task, attempt, allocation, brief, binding, _handoff, ev = \
+            self._resume_load()
         if not self.args.consent_dispatch:
             # Read-only gate rehearsal: prove the gates WITHOUT writing input.
             gate = self.gate_dispatch_target()
@@ -1658,9 +1775,314 @@ class M606LiveRun:
                      "would_submit": bool(proof.get("attested")),
                      "note": ("all gates evaluated read-only; submitting requires "
                             "--consent-dispatch")}
+            prior = self._read_prior_dispatch()
+            if prior is not None and prior.get("state") in ("submitted", "unknown"):
+                # Integrity: a rehearsal must never overwrite the record of a
+                # dispatch that already happened — that record is the only proof
+                # the prompt went out exactly once.
+                report["prior_dispatch_state"] = str(prior["state"])
+                report["overwrote_dispatch_evidence"] = False
+                report["note"] += (
+                    f"; a dispatch is already recorded ({prior['state']}) and was "
+                    "left intact — continue it with --post-dispatch, never by "
+                    "dispatching again")
+                ev.write("dispatch-rehearsal.json", report)
+                return report
             ev.write("dispatch.json", report)
             return report
         return self._submit_core(task, attempt, allocation, brief, binding, ev)
+
+    # -- post-dispatch continuation ------------------------------------------
+    #
+    # The situation this exists for: dispatch completed and is on record, and the
+    # worker's final report arrives later (an agent finished after the run
+    # returned, or delivery failed after dispatch).  Every alternative would mean
+    # re-running the dispatching invocation, i.e. sending a SECOND prompt to an
+    # agent that may already be doing the work.  So this path:
+    #   * locks its transport (``_submit_lock``) before anything else, so no
+    #     prompt can leave this process by any route;
+    #   * re-proves the prior dispatch from durable artifacts AND the run-local
+    #     database, refusing a missing, unreadable or UNKNOWN record;
+    #   * binds the external final WorkerReport to that exact attempt;
+    #   * then hands over to the ordinary verification/delivery stage.
+    # ----------------------------------------------------------------------
+
+    def resume_post_dispatch(self) -> dict[str, Any]:
+        """Continue an already-dispatched attempt WITHOUT submitting anything."""
+        self.stage = CONTINUATION_STAGE
+        self._submit_lock = True        # nothing may leave this process
+        task, attempt, allocation, brief, _binding, handoff, ev = \
+            self._resume_load()
+        proof: dict[str, Any] = {}
+        failure: dict[str, str] | None = None
+        try:
+            proof = self._prove_prior_dispatch(ev, handoff, task, attempt,
+                                              allocation, brief)
+            self._adopt_final_report(ev, task, attempt, brief)
+        except Exception as exc:
+            # Record WHY the continuation refused, then let it propagate: the
+            # abort reason must stay the primary one, not be masked by reporting.
+            failure = {"type": type(exc).__name__, "message": str(exc)}
+            raise
+        finally:
+            report = {
+                "stage": CONTINUATION_STAGE,
+                "prompts_submitted_by_this_invocation": self._submit_count,
+                "dispatch_replayed": self._submit_count > 0,
+                "prior_dispatch": proof,
+                "worker_report": dict(self.worker_done),
+                "attempt_status": domain.get_attempt(self.conn, attempt.id).status,
+                "task_status": domain.get_task(self.conn, task.id).status,
+                "proof_complete": failure is None,
+                "failure": failure,
+                "note": POST_DISPATCH_NOTE,
+            }
+            ev.write("post-dispatch.json", report)
+            self.continuation_report = report
+            # The no-prompt invariant is asserted on BOTH paths — even a
+            # continuation that refused its proof submitted nothing, and the
+            # transport lock is what guarantees ``_submit_count`` stayed 0.
+            ev.post("post-dispatch", "this continuation issued zero prompts",
+                    expected=0, observed=self._submit_count)
+            ev.post("post-dispatch", "the recorded dispatch was not replayed",
+                    expected=False, observed=report["dispatch_replayed"])
+        return report
+
+    def _prove_prior_dispatch(self, ev: Evidence, handoff: dict[str, Any],
+                             task: Any, attempt: Any, allocation: Any,
+                             brief: Any) -> dict[str, Any]:
+        """Require durable, unambiguous proof that THIS attempt was dispatched."""
+        recorded = self._read_prior_dispatch()
+        if recorded is None:
+            raise GuardError(
+                f"post-dispatch: no dispatch evidence under {ev.dir}"
+                "/dispatch.json — this attempt was never dispatched here, and this "
+                "mode never dispatches (use --resume-handoff --consent-dispatch for "
+                "the one permitted dispatch)")
+        state = str(recorded.get("state") or "missing")
+        if state == "unknown":
+            raise GuardError(
+                "post-dispatch: the recorded dispatch is UNKNOWN (the transport "
+                "outcome was unresolved); an unresolved effect must be reconciled, "
+                "never continued as if it had succeeded and never re-sent")
+        if state != "submitted":
+            raise GuardError(
+                f"post-dispatch: recorded dispatch state is {state!r}, not "
+                "'submitted' — nothing is continued from an unaccepted transport")
+        if int(recorded.get("returncode", -1) or 0) != 0:
+            raise GuardError(
+                "post-dispatch: the recorded dispatch did not return success "
+                f"(returncode {recorded.get('returncode')!r})")
+        if str(recorded.get("transport_observation") or "") != "accepted":
+            raise GuardError(
+                "post-dispatch: transport observation in the record is "
+                f"{recorded.get('transport_observation')!r}, not 'accepted'")
+        if recorded.get("topology_unchanged") is not True:
+            raise GuardError(
+                "post-dispatch: the recorded dispatch does not prove the topology "
+                "was unchanged, so its target pane is unverifiable")
+
+        # Exact binding: the record must describe THIS attempt, from THIS root.
+        mismatches = [
+            f"{label}: dispatch {got!r} != durable {want!r}"
+            for label, want, got in (
+                ("task id", task.id, str(recorded.get("task_id") or "")),
+                ("attempt id", attempt.id, str(recorded.get("attempt_id") or "")),
+                ("allocation id", allocation.allocation_id,
+                 str(recorded.get("allocation_id") or "")),
+                ("brief digest", brief.brief_digest,
+                 str(recorded.get("brief_digest") or "")),
+                ("branch", allocation.branch, str(recorded.get("branch") or "")),
+                ("worktree", real(allocation.worktree_path),
+                 real(unredact_root(str(recorded.get("worktree_path") or ""),
+                                   self.root))),
+                ("model", self.model, str(recorded.get("model") or "")),
+                ("run id", self.run_id, str(handoff.get("run_id") or "")),
+            ) if want != got
+        ]
+        if mismatches:
+            raise GuardError(
+                "post-dispatch: dispatch evidence does not bind this attempt ("
+                + "; ".join(mismatches) + ")")
+
+        # The prompt must have carried its binding, and the pane proof must stand.
+        pb_path = ev.dir / "prompt-binding.json"
+        if not pb_path.is_file():
+            raise GuardError(
+                f"post-dispatch: {pb_path} is missing — without the prompt-binding "
+                "record there is no proof the dispatched prompt carried this "
+                "allocation, so the change cannot be attributed")
+        pb = json.loads(pb_path.read_text(encoding="utf-8"))
+        carries = [k for k, v in pb.items()
+                   if k.startswith("carries_") and v is not True]
+        if pb.get("prompt_sha256") != recorded.get("prompt_sha256"):
+            raise GuardError(
+                "post-dispatch: prompt digest differs between dispatch.json and "
+                "prompt-binding.json — the two records do not describe one prompt")
+        ev.post("post-dispatch", "the dispatched prompt carried its allocation "
+                                "binding", expected=[], observed=sorted(carries))
+        if str(pb.get("carries_brief_digest")) != "True":
+            raise GuardError("post-dispatch: prompt did not carry the brief digest")
+
+        pp_path = ev.dir / "pane-model-proof.json"
+        if not pp_path.is_file():
+            raise GuardError("post-dispatch: pane model proof is missing; the "
+                            "dispatch target's model was never attested")
+        pp = json.loads(pp_path.read_text(encoding="utf-8"))
+        if not pp.get("attested") or str(pp.get("status")) != "operator-attested":
+            raise GuardError(
+                "post-dispatch: pane model proof is not operator-attested "
+                f"(status {pp.get('status')!r})")
+        ev.post("post-dispatch", "pane model proof stayed non-host-trusted",
+                expected=False, observed=bool(pp.get("host_trusted")))
+
+        # Database corroboration: the confirmed session the dispatch registered.
+        rows = self.conn.execute(
+            "SELECT native_session_id, pane_id, state FROM sessions"
+            " WHERE attempt_id=? ORDER BY created_at", (attempt.id,)).fetchall()
+        confirmed = [r for r in rows if r[0]]
+        if not confirmed:
+            raise GuardError(
+                f"post-dispatch: no confirmed native session is registered for "
+                f"attempt {attempt.id} in {self.db}; a dispatch that never bound a "
+                "session cannot be attributed to a worker")
+        gate_rec = recorded.get("pane_gate") if isinstance(
+            recorded.get("pane_gate"), dict) else {}
+        bound = str(gate_rec.get("session_id") or "")
+        if bound and str(confirmed[-1][0]) != bound:
+            raise GuardError(
+                f"post-dispatch: dispatched session {bound!r} is not the session "
+                f"registered in the database ({str(confirmed[-1][0])!r})")
+        proof = {
+            "state": state,
+            "transport_observation": str(recorded["transport_observation"]),
+            "prompt_sha256": str(recorded["prompt_sha256"]),
+            "pane_id": str(gate_rec.get("pane_id") or recorded.get("pane_id") or ""),
+            "bound_native_session": str(confirmed[-1][0]),
+            "prompt_binding_complete": not carries,
+            "identity_fields_match": True,
+            "topology_unchanged": True,
+        }
+        # Provenance is carried FORWARD, not re-earned: the change was produced
+        # under the earlier dispatch that this method just re-proved.  The
+        # manifest keeps both facts apart — evidence_class names the origin,
+        # ``continuation.prompts_submitted_by_this_invocation`` stays at zero.
+        self.evidence_class = "live-agent"
+        self.model_proof = pp
+        ev.post("post-dispatch", "dispatch proof is complete and unambiguous",
+                expected=True,
+                observed=all((state == "submitted", not carries,
+                            bool(confirmed), bound == str(confirmed[-1][0]))))
+        return proof
+
+    def _adopt_final_report(self, ev: Evidence, task: Any, attempt: Any,
+                           brief: Any) -> dict[str, Any]:
+        """Bind the externally produced final WorkerReport to this attempt.
+
+        The report is the only thing that may finish the attempt here; the runner
+        never authors a worker's claims in this mode (``--scripted-worker-change``
+        is refused by the argument rules).
+        """
+        if not self.args.worker_report_file:
+            raise GuardError(
+                "post-dispatch: --worker-report-file is required — continuing a "
+                "dispatched attempt without the worker's own durable final report "
+                "would deliver on nothing")
+        path = Path(self.args.worker_report_file).expanduser()
+        if not path.is_file():
+            raise GuardError(f"post-dispatch: --worker-report-file {path} does not"
+                            " exist")
+        parsed = worker_reports.parse_worker_report(
+            path.read_text(encoding="utf-8"))
+        drift = [f"{label}: report {got!r} != durable {want!r}"
+                for label, want, got in (
+                    ("task id", task.id, parsed["task_id"]),
+                    ("attempt id", attempt.id, parsed["attempt_id"]),
+                    ("task version", brief.task_version, parsed["task_version"]),
+                    ("brief digest", brief.brief_digest, parsed["brief_digest"]),
+                ) if want != got]
+        if drift:
+            raise GuardError("post-dispatch: WorkerReport does not bind this"
+                            " attempt (" + "; ".join(drift) + ")")
+        if parsed["report_kind"] != "final":
+            raise GuardError(
+                f"post-dispatch: report_kind is {parsed['report_kind']!r}; only a"
+                " FINAL report can close an execution for delivery")
+        if parsed.get("outcome") not in ("completed", "blocked", "failed"):
+            raise GuardError(
+                "post-dispatch: a final report must state an outcome of"
+                " completed|blocked|failed")
+
+        digest = str(parsed["report_digest"])
+        before = {str(r[0]) for r in self.conn.execute(
+            "SELECT report_digest FROM worker_reports WHERE attempt_id=?",
+            (attempt.id,)).fetchall()}
+        already = digest in before
+        if already:
+            # The store already holds this exact report, so an earlier pass (this
+            # same attempt) was continued to completion.  Re-submitting would trip
+            # the domain's staleness guard — the Task version moved once worker-done
+            # was projected — so the idempotent action is to recognise the existing
+            # row, NOT replay the write.  Binding was proved against the immutable
+            # brief above, and the prior row is itself proof of acceptance.
+            progress = None
+        else:
+            progress = self.ingest_worker_report()
+        after = {str(r[0]) for r in self.conn.execute(
+            "SELECT report_digest FROM worker_reports WHERE attempt_id=?",
+            (attempt.id,)).fetchall()}
+        fresh = sorted(after - before)
+        attempt_now = domain.get_attempt(self.conn, attempt.id)
+        if attempt_now.status != "finished":
+            raise GuardError(
+                f"post-dispatch: attempt is {attempt_now.status!r} after the final"
+                " report — the domain must finish the execution before delivery")
+        if parsed["outcome"] != "completed":
+            self.worker_done = {
+                "report_digest": digest,
+                "outcome": parsed["outcome"],
+                "already_recorded_before_this_run": already,
+                "newly_recorded_by_this_run": bool(fresh),
+            }
+            raise GuardError(
+                f"post-dispatch: final WorkerReport outcome is "
+                f"{parsed['outcome']!r}; report retained and delivery refused")
+
+        # The Task reaches ``verifying`` only through the domain's own event,
+        # which refuses unless the current Attempt is genuinely finished: the
+        # projection follows the evidence, it never replaces it.
+        status = self._project_worker_done_on_task(task)
+        projection = self.worker_done_projection
+        task_now = domain.get_task(self.conn, task.id)
+        if status != "verifying":
+            raise GuardError(
+                f"post-dispatch: task is {status!r}, not 'verifying'; "
+                "delivery would be unverifiable")
+
+        self.worker_done = {
+            "file": str(path),
+            "file_sha256": sha256_file(path),
+            "report_digest": digest,
+            "outcome": str(parsed["outcome"]),
+            "already_recorded_before_this_run": already,
+            "newly_recorded_by_this_run": bool(fresh),
+            "rows_for_attempt": len(after),
+            "task_projection": projection,
+            "ack_source": None,
+        }
+        ev.post("post-dispatch", "exactly one final WorkerReport row for the"
+                                " attempt", expected=1,
+                observed=int(self.conn.execute(
+                    "SELECT COUNT(*) FROM worker_reports WHERE attempt_id=?"
+                    " AND report_kind='final'", (attempt.id,)).fetchone()[0]))
+        ev.post("post-dispatch", "the report bound this attempt exactly",
+                expected=[attempt.id, brief.brief_digest],
+                observed=[parsed["attempt_id"], parsed["brief_digest"]])
+        ev.post("post-dispatch", "the task reached verifying from the report,"
+                                " not from an assertion",
+                expected="verifying", observed=task_now.status)
+        return self.worker_done
+
 
     def _load_project(self, project_id: str) -> Any:
         project = domain.get_project(self.conn, project_id)
@@ -1919,7 +2341,7 @@ class M606LiveRun:
             f"Model in use for this disposable project (loopback only): "
             f"{self.model}",
         ])
-        submit = self.herdr.submit(
+        submit = self._submit_to_pane(
             gate["pane_id"], prompt, wait=self.args.submit_wait,
             until=tuple(self.args.submit_until),
             timeout_ms=self.args.submit_timeout_ms)
@@ -2120,7 +2542,7 @@ class M606LiveRun:
             "push; do not touch paths outside the owned list; reply with one "
             "short summary line when done.",
         ])
-        submit = self.herdr.submit(
+        submit = self._submit_to_pane(
             self.args.herdr_pane, prompt, wait=self.args.submit_wait,
             until=tuple(self.args.submit_until),
             timeout_ms=self.args.submit_timeout_ms)
@@ -2324,10 +2746,11 @@ class M606LiveRun:
             "Acknowledge by reviewing pending items; this notification carries no "
             "instructions to edit files, commit, or contact any network endpoint.",
         ])
-        sent = self.herdr.submit(ceo_gate["pane_id"], prompt,
-                                wait=self.args.submit_wait,
-                                until=tuple(self.args.submit_until),
-                                timeout_ms=self.args.submit_timeout_ms)
+        sent = self._submit_to_pane(
+            ceo_gate["pane_id"], prompt,
+            wait=self.args.submit_wait,
+            until=tuple(self.args.submit_until),
+            timeout_ms=self.args.submit_timeout_ms)
         delivered = (sent["returncode"] == 0
                      and sent["transport_observation"] == "accepted")
         outcome = "submitted" if delivered else "unknown"
@@ -2632,6 +3055,15 @@ class M606LiveRun:
             raise GuardError(
                 f"attempt {attempt_id} is {attempt_now.status!r}, not finished; "
                 f"verification and delivery require a finished attempt")
+        # The Task reaches ``verifying`` only through the domain's own event, and
+        # that event needs the finished Attempt above: a durable final WorkerReport
+        # is what authorises verification, in either phase-2 path.
+        task_status = self._project_worker_done_on_task(self.task)
+        if task_status != "verifying":
+            raise GuardError(
+                f"deliver: task is {task_status!r}, not 'verifying'; delivery"
+                f" would be unverifiable (worker-done projection:"
+                f" {self.worker_done_projection})")
 
         # Verifiers first: ship evidence is only admissible on a local pass.
         self.approve_profiles()
@@ -2816,6 +3248,17 @@ class M606LiveRun:
             "ack_source": ("human" if disposition == DELIVERY_ACCEPTED else None),
         }
         self.manifest["evidence_class"] = self.evidence_class
+        # A continuation changes what was DONE, never what was SENT: keep the two
+        # facts visibly separate so no reader can mistake delivery for dispatch.
+        self.manifest["continuation"] = self.continuation_report or {
+            "mode": ("post-dispatch" if self.continuing else "none"),
+            "prompts_submitted_by_this_invocation": self._submit_count,
+            "dispatch_replayed": self._submit_count > 0,
+        }
+        self.manifest["worker_done_projection"] = self.worker_done_projection
+        if self.continuing:
+            self.manifest["evidence_origin"] = (
+                "prior-dispatch-evidence (this invocation submitted no prompt)")
         self.manifest["pane_model_proof"] = {
             "status": self.model_proof.get("status", "not-attempted"),
             "attested": bool(self.model_proof.get("attested")),
@@ -2848,6 +3291,14 @@ class M606LiveRun:
             "wake_transport": wake_claim,
             "pg7": ("bootstrap+wake-executed" if self.ceo_stage == "executed"
                    else f"open:{self.ceo_stage}"),
+            # A continuation is defined by what it did NOT do; state both facts
+            # so no reader mistakes verification/delivery for a fresh dispatch.
+            "dispatch_replay": (
+                "none — a continuation submits no prompt" if self.continuing
+                else "one-dispatch-per-attempt-by-construction"),
+            "worker_completion": ("sourced from the external final WorkerReport"
+                                 if self.worker_report is not None or self.worker_done
+                                 else "no worker report on record"),
         }
         # One-use secrets must never reach disk.  Tokens are named only by digest
         # prefix in the report, so the sweep itself cannot leak them.
@@ -2931,7 +3382,11 @@ class M606LiveRun:
         def stages() -> None:
             if self.resuming:
                 # Phase 2: the world already exists; every fact is re-proved.
-                self.resume()
+                # A continuation takes the no-prompt path instead of dispatching.
+                if self.continuing:
+                    report["continuation"] = self.resume_post_dispatch()
+                else:
+                    self.resume()
             else:
                 report["preflight"] = self.preflight()
                 self.provision()
@@ -3032,6 +3487,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "allocated at --root, re-proving every durable fact "
                         "before gating the pane (the ONLY way to reach a live "
                         "prompt)")
+    p.add_argument("--post-dispatch", action="store_true",
+                   help="continue an attempt whose dispatch is ALREADY on record:"
+                       " verify and deliver it from an external final WorkerReport"
+                       " (--worker-report-file). Issues NO prompt (needs"
+                       " --confirm-live-run --resume-handoff; refuses"
+                       " --consent-dispatch / --ceo-pane / --wake-deliver /"
+                       " --scripted-worker-change and any pane designation)")
     p.add_argument("--scripted-marker", default=None,
                    help=f"text the scripted leg writes (default {MARKER}); "
                         "use a WRONG marker to prove verifiers refuse")
@@ -3121,6 +3583,45 @@ def validate_arg_combinations(args: argparse.Namespace) -> dict[str, Any]:
     under-specified invocation fails at parse time rather than mid-run.
     """
     notes: list[str] = []
+    if args.post_dispatch:
+        # A continuation is defined by what it cannot do: it submits nothing.  Any
+        # flag that implies a prompt, or that would author the evidence it is meant
+        # to consume, contradicts the mode and is refused before any I/O.
+        if not args.confirm_live_run:
+            raise GuardError("--post-dispatch writes to the disposable run, so it"
+                            " requires --confirm-live-run")
+        if not args.resume_handoff:
+            raise GuardError("--post-dispatch continues an attempt already on disk,"
+                            " so it requires --resume-handoff")
+        if args.consent_dispatch:
+            raise GuardError("--post-dispatch and --consent-dispatch contradict each"
+                            " other: the continuation exists precisely so that a"
+                            " dispatched attempt is never dispatched twice")
+        if args.scripted_worker_change:
+            raise GuardError("--post-dispatch consumes the worker's own final"
+                            " report; --scripted-worker-change would author it here")
+        if args.ceo_pane:
+            raise GuardError("--post-dispatch submits no prompt, so it cannot run"
+                            " the PG-7 CEO bootstrap (--ceo-pane)")
+        if args.wake_deliver:
+            raise GuardError("--post-dispatch submits no prompt, so it cannot"
+                            " deliver a Wake (--wake-deliver)")
+        if not args.worker_report_file:
+            raise GuardError("--post-dispatch requires --worker-report-file: the"
+                            " external final WorkerReport is the only thing that may"
+                            " close the execution it continues")
+        if args.stop_after in ("provision", "allocate", "dispatch"):
+            raise GuardError(
+                f"--post-dispatch with --stop-after {args.stop_after} is"
+                " contradictory: the continuation begins after dispatch")
+        if args.pane_model_evidence or args.expect_session_id or args.herdr_pane:
+            raise GuardError("--post-dispatch takes no pane designation"
+                            " (--herdr-pane / --expect-session-id /"
+                            " --pane-model-evidence): designating a target implies a"
+                            " prompt, and this mode sends none")
+        notes.append("post-dispatch continuation: zero prompts, prior dispatch must"
+                    " be durably 'submitted', external FINAL WorkerReport must bind"
+                    " this attempt exactly (no duplicate dispatch, no UNKNOWN)")
     if args.ceo_pane:
         # PG-7 leg: it submits a prompt, so it inherits every consent rule and
         # adds its own.  A scripted leg has no real pane and no real agent, so
@@ -3239,6 +3740,11 @@ def plan_payload(args: argparse.Namespace) -> dict[str, Any]:
                         if args.wake_deliver else
                         "intake+admission-only,admitted-not-delivered,"
                         "never-borrows-worker-outcome,ceo-ack-never-fabricated"),
+            "G9_post_dispatch_continuation": (
+                "requested — no prompt; prior dispatch must be durably 'submitted';"
+                " external FINAL WorkerReport must bind this attempt exactly"
+                if args.post_dispatch else
+                f"available (--post-dispatch); {POST_DISPATCH_NOTE}"),
             "pg7_ceo": {
                 "why_phase2_only": CEO_STAGE_NOTE,
                 "command": ("--confirm-live-run --resume-handoff --consent-dispatch"
@@ -3263,6 +3769,10 @@ def plan_payload(args: argparse.Namespace) -> dict[str, Any]:
                          "--herdr-pane <pane> --pane-model-evidence <file> "
                          "--expect-session-id <id>",
                 "single_invocation_live_dispatch": "refused by design",
+                "after_dispatch_report_arrived": (
+                    "--confirm-live-run --resume-handoff --post-dispatch"
+                    " --worker-report-file <final-report.json>"
+                    " --stop-after deliver  (no prompt; " + POST_DISPATCH_NOTE + ")"),
             },
             "worker_evidence": ("scripted (harness-authored, not real agent)"
                                if args.scripted_worker_change else
