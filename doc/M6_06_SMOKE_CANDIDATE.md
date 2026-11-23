@@ -13,7 +13,7 @@ is gated on operator actions and two concrete blockers below.
 | Fact | Value |
 | --- | --- |
 | Commit provisioned from | `a2a76f3` (`Continue M6-06 delivery without replaying dispatch`) |
-| Commit identity | `a2a76f38b63beda3b115b00709fa6074a5202441` (= current `HEAD`) |
+| Commit identity | `a2a76f38b63beda3b115b00709fa6074a5202441` |
 | Source used | pristine `git archive a2a76f3` snapshot (NOT the working tree) |
 | Runner vs commit | `scripts/m606_opencode_e2e.py` byte‑identical to `a2a76f3` |
 | Isolation reason | working tree carries peer edits (`teamcraft/{delivery,domain,recovery,runtime_adapter,worktrees}.py`) — provisioning ran against the committed snapshot only |
@@ -54,9 +54,8 @@ Phase‑1 durable facts (run‑local, disposable; safe to share — contain no s
 | project root (CEO pane target) | `…/m606-smoke-candidate-210949/project` |
 | `submit_allowed_in_this_invocation` | `false` (phase‑1 never submits) |
 
-`handoff.json` carries **no session id** (verified). Only a `--resume-handoff`
-invocation is valid at this root; the operator must place panes and attest models
-before phase‑2.
+`handoff.json` carries no session ID. This allocation is rehearsal-only;
+phase 2 must use a separate allocation made with real probes.
 
 ## 2. Readiness matrix (sanitized)
 
