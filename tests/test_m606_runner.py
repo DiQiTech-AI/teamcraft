@@ -258,7 +258,9 @@ def make_run(tray: Tray, root: Path, *extra: str, herdr: FakeHerdr,
              getter: Any = fake_omlx_getter) -> m606.M606LiveRun:
     return tray.track(m606.M606LiveRun(
         parse_args(root, *extra), herdr=herdr, omlx_getter=getter,
-        harness_runner=fake_harness_runner))
+        harness_runner=fake_harness_runner,
+        executable_lookup={"opencode": "/fake/opencode",
+                           "herdr": "/fake/herdr"}.get))
 
 
 def phase1(tray: Tray, name: str, herdr: FakeHerdr,

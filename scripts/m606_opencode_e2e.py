@@ -1074,8 +1074,9 @@ class M606LiveRun:
     """Disposable OpenCode live E2E: provision → dispatch → deliver → cleanup."""
 
     def __init__(self, args: argparse.Namespace, *, herdr: Any = None,
-                 omlx_getter: Any = None, harness_runner: Any = None) -> None:
-        """``herdr`` / ``omlx_getter`` / ``harness_runner`` are offline seams.
+                 omlx_getter: Any = None, harness_runner: Any = None,
+                 executable_lookup: Any = None) -> None:
+        """Accept injected host probes for offline validation.
 
         They replace only the *transport* (a pane, an HTTP GET, a subprocess),
         never a rule: every snapshot obtained through them is validated by the
@@ -1083,6 +1084,7 @@ class M606LiveRun:
         Offline validation therefore proves real logic, not a stub's compliance.
         """
         self.args = args
+        self.executable_lookup = executable_lookup or shutil.which
         self.resuming = bool(getattr(args, "resume_handoff", False))
         #: Post-dispatch continuation: this invocation re-enters a scenario that
         #: ALREADY dispatched, and is structurally incapable of submitting input.
@@ -1258,7 +1260,7 @@ class M606LiveRun:
         out["protocol_canonical"] = check_protocol(
             REPO_ROOT / ".agents" / "skills" / "teamcraft-ceo" / "references",
             self.protocol_version, self.protocol_sha256)
-        binaries = {n: (shutil.which(n) or "absent")
+        binaries = {n: (self.executable_lookup(n) or "absent")
                     for n in ("opencode", "codex", "herdr", "claude")}
         out["binaries"] = binaries
         if binaries["opencode"] == "absent":
