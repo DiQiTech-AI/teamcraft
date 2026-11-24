@@ -542,6 +542,93 @@ class TeamctlParityTests(unittest.TestCase):
         self.assertEqual(int(nulls), 0)
 
 
+class TeamctlOpenCodeLaunchTests(unittest.TestCase):
+    """Regression coverage for OpenCode's interactive launch boundary."""
+
+    def test_opencode_model_is_configured_for_the_selected_role(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with mock.patch.dict("os.environ", {"OPENCODE_CONFIG_CONTENT": "{}"},
+                             clear=False):
+            raw = TEAMCTL.opencode_config_content(
+                root, "developer", model="deepseek/deepseek-flash"
+            )
+        config = json.loads(raw)
+        self.assertEqual(config["default_agent"], "herdr-developer")
+        self.assertEqual(config["model"], "deepseek/deepseek-flash")
+        self.assertEqual(
+            config["agents"]["herdr-developer"]["model"],
+            "deepseek/deepseek-flash",
+        )
+
+    def test_start_retries_only_an_explicit_busy_response(self) -> None:
+        member = {
+            "name": "dev", "kind": "opencode", "pane_id": "w1:p2",
+            "terminal_id": "term-2", "start_timeout_ms": 30_000,
+        }
+        busy = TEAMCTL.HerdrCommandError(
+            ["herdr"], 1, '{"error":{"code":"agent_pane_busy"}}',
+        )
+        for error, expected_calls in [(busy, 2), (TEAMCTL.CommandTimeout(["herdr"], 1), 1)]:
+            with self.subTest(error=error):
+                store = mock.Mock()
+                adapter = mock.Mock()
+                adapter.start_agent.side_effect = [error, None]
+                adapter.get_pane.return_value = {"terminal_id": "term-2"}
+                adapter.get_agent.return_value = {
+                    "pane_id": "w1:p2", "terminal_id": "term-2", "agent_status": "idle",
+                }
+                with (
+                    mock.patch.object(TEAMCTL, "_herdr_adapter", return_value=adapter),
+                    mock.patch.object(TEAMCTL, "update_member"),
+                    mock.patch.object(TEAMCTL, "wait_for_shell_pane") as wait_for_shell,
+                    mock.patch.object(TEAMCTL.time, "sleep"),
+                ):
+                    if error is busy:
+                        TEAMCTL.start_member(member, store, {}, lease=mock.Mock())
+                        wait_for_shell.assert_called_once()
+                        store.stage_unknown.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(TEAMCTL.TeamctlError, "ambiguous"):
+                            TEAMCTL.start_member(member, store, {}, lease=mock.Mock())
+                        wait_for_shell.assert_not_called()
+                        store.stage_unknown.assert_called_once()
+                self.assertEqual(adapter.start_agent.call_count, expected_calls)
+                self.assertEqual(store.admit_effect.call_count, expected_calls)
+                store.stage_claim.assert_called_once()
+
+    def test_shell_readiness_waits_without_starting_an_agent(self) -> None:
+        unavailable = {"result": {"process_info": {
+            "shell_pid": 10,
+            "foreground_processes": [{"pid": 22, "name": "zsh"}],
+        }}}
+        ready = {"result": {"process_info": {
+            "shell_pid": 10,
+            "foreground_processes": [{"pid": 10, "name": "zsh"}],
+        }}}
+        adapter = mock.Mock()
+        adapter.process_info.side_effect = [unavailable, ready]
+        with mock.patch.object(TEAMCTL, "_herdr_adapter", return_value=adapter), \
+                mock.patch.object(TEAMCTL.time, "sleep") as sleep:
+            TEAMCTL.wait_for_shell_pane("w1:p2", 30_000)
+        self.assertEqual(adapter.process_info.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_shell_readiness_deadline_does_not_start_an_agent(self) -> None:
+        unavailable = {"result": {"process_info": {
+            "shell_pid": 10,
+            "foreground_processes": [{"pid": 22, "name": "zsh"}],
+        }}}
+        adapter = mock.Mock()
+        adapter.process_info.return_value = unavailable
+        with mock.patch.object(TEAMCTL, "_herdr_adapter", return_value=adapter), \
+                mock.patch.object(TEAMCTL.time, "monotonic", side_effect=[0.0, 11.0]), \
+                mock.patch.object(TEAMCTL.time, "sleep") as sleep:
+            with self.assertRaisesRegex(TEAMCTL.TeamctlError, "available shell"):
+                TEAMCTL.wait_for_shell_pane("w1:p2", 30_000)
+        self.assertEqual(adapter.process_info.call_count, 1)
+        sleep.assert_not_called()
+
+
 class TeamctlParserTests(unittest.TestCase):
     """--help must never crash: parser construction is core-version-tolerant.
 

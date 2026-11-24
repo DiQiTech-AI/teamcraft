@@ -122,6 +122,24 @@ test "$HERDR_ENV" = "1"
 herdr --skill
 ```
 
+### OpenCode V2 model and help
+
+Use TeamCraft's `--opencode-model PROVIDER/MODEL` to select a model for a new OpenCode V2 member. It starts a private OpenCode server so that the pane-local role and model settings are loaded before TeamCraft submits the task.
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
+  --role developer --kind opencode --name developer --direction right \
+  --opencode-model deepseek/deepseek-flash --read-only \
+  --task "Confirm the role and model, then wait for an assignment."
+```
+
+When `opencode --help` fails to open its log inside a filesystem sandbox, run the help command with a temporary data directory. The override applies only to this command.
+
+```bash
+probe_dir="$(mktemp -d)"
+XDG_DATA_HOME="$probe_dir" opencode --help
+```
+
 ## Quick start: create an OpenCode team
 
 This example asks the CEO to deliver a plain HTML to-do page. `--agent-arg=--standalone` is passed through to OpenCode unchanged:

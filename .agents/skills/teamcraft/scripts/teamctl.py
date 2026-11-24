@@ -1310,7 +1310,9 @@ def codex_ceo_agent_args(
     ]
 
 
-def opencode_config_content(project_root: Path, role: str) -> str:
+def opencode_config_content(
+    project_root: Path, role: str, model: str | None = None,
+) -> str:
     profile = opencode_profile(role)
     profile_path = project_root / ".opencode" / "agents" / f"{profile}.md"
     if not profile_path.is_file():
@@ -1331,6 +1333,15 @@ def opencode_config_content(project_root: Path, role: str) -> str:
     else:
         config = {}
     config["default_agent"] = profile
+    if model is not None:
+        config["model"] = model
+        agents = config.setdefault("agents", {})
+        if not isinstance(agents, dict):
+            raise TeamctlError("OpenCode agents configuration must be an object")
+        agent = agents.setdefault(profile, {})
+        if not isinstance(agent, dict):
+            raise TeamctlError(f"OpenCode agent configuration for {profile} must be an object")
+        agent["model"] = model
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1403,6 +1414,32 @@ def split_for_member(
             store.release_lease(lease)
 
 
+def wait_for_shell_pane(pane_id: str, timeout_ms: int) -> None:
+    adapter = _herdr_adapter()
+    deadline = time.monotonic() + min(timeout_ms / 1000, 10)
+    while True:
+        response = adapter.process_info(pane_id)
+        try:
+            info = response["result"]["process_info"]
+            shell_pid = info.get("shell_pid")
+            foreground = info["foreground_processes"]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise TeamctlError("Herdr process-info response is malformed") from exc
+        if not isinstance(foreground, list):
+            raise TeamctlError("Herdr process-info response is malformed")
+        if shell_pid and all(
+            isinstance(process, dict) and process.get("pid") == shell_pid
+            for process in foreground
+        ) and info.get("foreground_process_group_id", shell_pid) == shell_pid:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TeamctlError(
+                f"pane {pane_id} did not reach an available shell; use resume to inspect it"
+            )
+        time.sleep(min(0.1, remaining))
+
+
 def start_member(
     member: dict[str, Any], store: StateStore, session: dict[str, Any],
     *, lease: _leader.Lease | None = None,
@@ -1427,14 +1464,29 @@ def start_member(
         command = store.stage_claim(
             name, _adapter.STAGE_START, lease=lease, payload={"argv": args},
         )
-        _admit_effect(store, command.id, lease)
+        adapter = _herdr_adapter()
+        readiness_deadline = time.monotonic() + min(member["start_timeout_ms"] / 1000, 10)
         try:
-            # Lease admission is immediately before I/O, but cannot revoke an
-            # external start already in flight or make it exactly-once.
-            _herdr_adapter().start_agent(
-                name, member["kind"], pane_id, member["start_timeout_ms"],
-                member.get("agent_args", []),
-            )
+            while True:
+                _admit_effect(store, command.id, lease)
+                try:
+                    adapter.start_agent(
+                        name, member["kind"], pane_id, member["start_timeout_ms"],
+                        member.get("agent_args", []),
+                    )
+                    break
+                except HerdrCommandError as exc:
+                    # Herdr explicitly rejected the request before sending input.
+                    # Ambiguous transport failures must go through reconciliation.
+                    remaining = readiness_deadline - time.monotonic()
+                    if _herdr_error_code(exc) != "agent_pane_busy" or remaining <= 0:
+                        raise
+                    time.sleep(min(0.1, remaining))
+                    pane = adapter.get_pane(pane_id)
+                    if pane.get("terminal_id") != member.get("terminal_id"):
+                        raise TeamctlError("recorded terminal changed while waiting for shell") from exc
+                    remaining_ms = max(0, int((readiness_deadline - time.monotonic()) * 1000))
+                    wait_for_shell_pane(pane_id, remaining_ms)
         except TeamctlError as exc:
             store.stage_unknown(
                 command.id, note=f"agent start outcome ambiguous: {exc}"
@@ -1707,6 +1759,18 @@ def validate_common_launch(
 def _launch_operation(args: argparse.Namespace) -> int:
     require_herdr()
     root, task, responsibility, ownership = validate_common_launch(args)
+    model = getattr(args, "opencode_model", None)
+    agent_args = codex_ceo_agent_args(args.role, args.kind, args.agent_arg)
+    if model is not None:
+        if args.kind != "opencode":
+            raise TeamctlError("--opencode-model requires --kind opencode")
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", model):
+            raise TeamctlError("--opencode-model must use provider/model format")
+        conflicting_args = {"--server", "--model", "-m", "--continue", "-c", "--session", "-s"}
+        if any(arg.split("=", 1)[0] in conflicting_args for arg in agent_args):
+            raise TeamctlError("--opencode-model requires a new private OpenCode session")
+        if "--standalone" not in agent_args:
+            agent_args = [*agent_args, "--standalone"]
     preflight_kind(args.kind)
     ensure_live_name_available(args.name)
     parent = resolve_pane(args.from_pane)
@@ -1719,7 +1783,8 @@ def _launch_operation(args: argparse.Namespace) -> int:
         if args.role != "ceo":
             store.require_ceo_initialized()
         opencode_content = (
-            opencode_config_content(root, args.role) if args.kind == "opencode" else None
+            opencode_config_content(root, args.role, model)
+            if args.kind == "opencode" else None
         )
         member = {
             "name": args.name, "role": args.role, "responsibility": responsibility,
@@ -1727,9 +1792,7 @@ def _launch_operation(args: argparse.Namespace) -> int:
             "read_only": args.read_only, "cwd": str(root),
             "from_pane_id": parent["pane_id"], "pane_id": None, "terminal_id": None,
             "agent_session": None,
-            "agent_args": codex_ceo_agent_args(
-                args.role, args.kind, args.agent_arg,
-            ),
+            "agent_args": agent_args,
             "opencode_config_content": opencode_content,
             "direction": args.direction, "start_timeout_ms": args.start_timeout_ms,
             "phase": "reserved", "prompt_may_have_been_delivered": False,
@@ -4612,6 +4675,10 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--ownership", action="append", default=[])
     launch_parser.add_argument("--read-only", action="store_true")
     launch_parser.add_argument("--agent-arg", action="append", default=[])
+    launch_parser.add_argument(
+        "--opencode-model", metavar="PROVIDER/MODEL",
+        help="set a pane-local OpenCode model using a private server",
+    )
     launch_parser.add_argument("--start-timeout-ms", type=int, default=30_000)
     launch_parser.add_argument("--wait", action="store_true")
     launch_parser.add_argument("--timeout-ms", type=int, default=120_000)

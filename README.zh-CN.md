@@ -122,6 +122,24 @@ test "$HERDR_ENV" = "1"
 herdr --skill
 ```
 
+### OpenCode V2 模型选择和帮助命令
+
+用 TeamCraft 的 `--opencode-model PROVIDER/MODEL` 为新建的 OpenCode V2 成员指定模型。TeamCraft 会启动独立 OpenCode 服务，在提交任务前加载该窗格的角色和模型配置。
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
+  --role developer --kind opencode --name developer --direction right \
+  --opencode-model deepseek/deepseek-flash --read-only \
+  --task "确认角色和模型，然后等待派工。"
+```
+
+如果文件系统沙箱阻止 `opencode --help` 打开日志，可以为这条命令单独使用临时数据目录。
+
+```bash
+probe_dir="$(mktemp -d)"
+XDG_DATA_HOME="$probe_dir" opencode --help
+```
+
 ## 快速开始：建立一个 OpenCode 团队
 
 下面的例子让 CEO 负责实现一个纯 HTML 待办页面。`--agent-arg=--standalone` 会原样传给 OpenCode：
