@@ -1,8 +1,71 @@
 # TeamCraft 使用流程
 
-## 1. 在 Herdr 中启动 CEO
+> 本文中的 `teamctl.py` 和 `herdr` 命令是团队运行时或维护者的操作参考。除首次启动 CEO 外，正常使用时用户只与同一个 CEO 对话，不需要把这些命令当作自己的日常步骤。
 
-在目标项目根目录执行。每个项目团队先启动一个 CEO，再按任务需要派工。需要指定右侧窗格时，加 `--direction right`。
+## 1. 推荐方式：只通过同一个 CEO 对话控制团队
+
+正常使用时，用户只需要在目标项目中启动一个 CEO，然后始终回到同一个 CEO 对话表达目标、约束、验收标准和授权范围。CEO 负责把自然语言任务转成团队计划，并在当前 Herdr tab 的 sibling panes（同级窗格）中按需创建成员。**用户不需要，也不应通过 shell 命令逐个启动 developer、tester 等成员。**
+
+后续需求、修正、验收和阻塞处理都回到这个 CEO 对话；不要另起一个 CEO，也不要绕过 CEO 直接给 worker 下命令。这样 CEO 才能维护统一的任务拆解、ownership 分配、状态和验收证据。
+
+### 1.1 首次给 CEO 的完整 prompt 模板
+
+下面模板中的尖括号内容由用户填写。这是一段自然语言任务说明，不是 shell 命令。
+
+```text
+你是本项目的 CEO。请负责从需求澄清、任务拆解、团队组建到独立验收和交付汇报的完整流程。
+
+目标：
+<要交付的可观察结果>
+
+背景与当前状态：
+<相关代码/文档、当前分支、未提交改动、已知问题、已尝试方案>
+
+范围与约束：
+<必须完成的事项；不得修改的范围；兼容性、依赖、时间或风险限制>
+
+验收标准：
+<可执行的检查、预期结果、需要保留的证据>
+
+团队与拓扑授权：
+- 只使用当前 Herdr tab 内的 sibling panes；除非我明确要求，不新建 tab、workspace 或 worktree。
+- 按需创建完成目标所需的最少成员，不要预建闲置角色，也不要让我手动逐个启动成员。
+- 为每个成员写明角色、交付物、验收标准和非重叠的 ownership；不会修改文件的成员标记为 read-only。
+- 你负责独立审查实际 diff、改动文件、命令输出和测试证据，不能只接受成员自述或完成状态。
+- 遇到权限请求、不可逆操作、范围冲突、证据不足或无法验证的结果时，先报告阻塞并等待我的决定。
+
+执行与汇报：
+先给出简短计划、成员拓扑和阶段划分，再开始执行。持续报告里程碑、当前状态、阻塞和下一步；完成后报告交付内容、验证证据和剩余风险。
+```
+
+### 1.2 简短追加指令示例
+
+- `按这个计划继续；只在确有并行收益时增加成员，不要扩大 ownership。`
+- `新增验收项：<具体检查>。请更新对应成员的交付物和测试，先报告是否影响现有范围。`
+- `请让 tester 独立复核实际改动，不要复用实现者的结论；完成后给我证据、状态和剩余风险。`
+- `暂停扩员，先报告当前阻塞、已占用 ownership 和下一步；未经我确认不要执行不可逆操作。`
+
+### 1.3 CEO 必须自动完成的事
+
+1. **自动拆解**：把目标拆成可验收的工作项，识别依赖、风险和不需要做的范围。
+2. **按需组建**：只在确有独立工作时创建成员，并在当前 Herdr tab 的 sibling panes 中启动；不预建闲置成员。
+3. **明确派工**：为每个 worker 写明交付物、验收标准、所需证据，以及互不重叠的项目相对 ownership；只读成员明确标记 read-only。
+4. **独立审查**：由 CEO 检查实际改动范围、diff、命令结果和测试证据，必要时安排独立 tester 复核；worker 的 `done`/`idle` 或自述不等于验收通过。
+5. **持续汇报**：向用户报告里程碑、当前状态、阻塞、需要决策的事项和下一步，不隐藏未验证的结果。
+6. **统一收口**：验收通过后由 CEO 完成任务、释放 ownership，并给出交付摘要和剩余风险。
+
+### 1.4 用户输入与运行时 CLI 的边界
+
+| 层面 | 谁使用 | 典型内容 |
+| --- | --- | --- |
+| 用户 → CEO | 用户 | 自然语言的目标、约束、验收标准、团队拓扑授权和追加决策 |
+| CEO/TeamCraft 运行时 | CEO | `teamctl.py`、`herdr` 等命令，用于拆解、创建成员、派工、检查状态和恢复 |
+
+用户只需在 CEO 对话中表达目标和授权的团队拓扑，不要把命令语法当成用户工作流。不要手工复制 `teamctl.py launch ...` 逐条创建成员，也不要自行维护 worker 的 ownership 或完成状态；这些是 CEO 的运行时职责。手动逐个启动会绕过 CEO 的拆解、去重和 ownership 预留，容易产生重复窗格、范围冲突和失真的进度。
+
+## 2. 在 Herdr 中启动 CEO
+
+正常流程只需要启动一个 CEO。在目标项目根目录执行；需要指定右侧窗格时，加 `--direction right`。这是正常流程中唯一需要用户手动执行的启动步骤。
 
 ```bash
 test "${HERDR_ENV:-}" = 1 && herdr --skill
@@ -11,43 +74,39 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
   --task '担任项目 CEO。初始化后等待我分配任务。'
 ```
 
-等启动命令成功返回，再到 CEO 窗格交代目标和验收标准。用 `teamctl.py status` 检查团队记录，用 `herdr agent get ceo` 核对窗格和运行状态。
+等启动命令成功返回，再到 CEO 窗格发送上面的完整任务 prompt。之后的目标、追加需求和验收都在这个 CEO 对话中完成。用 `teamctl.py status` 检查团队记录，用 `herdr agent get ceo` 核对窗格和运行状态；这些检查通常也由 CEO 执行，用户不必自己操作。
 
-## 2. 由 CEO 按需派工
+## 3. 由 CEO 按需创建成员
 
-每个任务写明交付物、验收标准和需要回报的证据。编辑成员用 `--ownership` 声明互不重叠的项目相对路径，支持精确文件和 `目录/**`。只做调研或验收的成员用 `--read-only`。
+CEO 收到任务后负责拆解和派工。每个成员的任务由 CEO 在运行时创建，用户不需要在 shell 中复制启动命令。派工时 CEO 必须写清：
 
-```bash
-python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
-  --role developer --kind opencode --name api_dev \
-  --ownership 'src/api/**' \
-  --task '为列表接口增加分页。验收覆盖默认值、边界值和非法参数，请回报改动与测试结果。'
-```
+- **交付物**：成员要产出什么，以及允许修改的项目相对路径。
+- **验收标准**：可执行的检查、预期结果和需要回报的证据。
+- **ownership**：互不重叠的项目相对路径，支持精确文件和 `目录/**`；活动编辑成员之间不能重叠。
+- **只读边界**：只做调研、审查或验收的成员必须标记为 read-only，不能同时声明 ownership。
+- **依赖与阻塞**：先完成哪些工作、哪些决定需要用户确认，以及失败时如何报告。
 
-### 给不同成员指定模型
+成员应创建在当前 Herdr tab 的 sibling panes 中。不要预建闲置成员，也不要让多个编辑成员占用相同、父级或子级范围。ownership 是协作元数据，不是操作系统级隔离；CEO 仍需检查成员的实际改动。
 
-角色与运行工具独立选择。一个团队可以同时使用 Codex CEO、DeepSeek Developer 和本地 Qwen Tester。
+### 模型与工具选择
 
-- **OpenCode 按角色设置**：在 `.opencode/agents/herdr-<角色>.md` 中设置 `model`。例如，在 `herdr-developer.md` 中指定 DeepSeek，在 `herdr-tester.md` 中指定本地 Qwen。
-- **OpenCode 按成员设置**：在启动该成员时，通过 `OPENCODE_CONFIG_CONTENT` 设置 `agent.<角色配置名>.model`。TeamCraft 会把配置传给新窗格；如果已有此环境变量，把相应字段合并到原有 JSON 中。
-- **Codex 按成员设置**：在启动命令中追加 `--agent-arg=--model --agent-arg=<模型名>`。
+角色与运行工具相互独立。用户可以在任务 prompt 或追加指令中直接表达偏好，例如：`developer 用 DeepSeek，tester 用本地 Qwen；不确定时先用当前默认配置并报告。` CEO 负责在创建成员时落实，并核对窗格中实际显示的角色和模型。
 
-例如，启动一个使用 DeepSeek 的只读 Developer：
+以下是团队运行时细节，由 CEO 或维护者使用，不是用户步骤：
 
-```bash
-OPENCODE_CONFIG_CONTENT='{"agent":{"herdr-developer":{"model":"deepseek/deepseek-flash"}}}' \
-  python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
-  --role developer --kind opencode --name deepseek_dev --direction right \
-  --read-only --task '检查列表接口的分页逻辑，报告边界条件与风险。'
-```
+- OpenCode 的角色默认模型在 `.opencode/agents/herdr-<角色>.md` 中配置。
+- 单个 OpenCode 成员可由运行时通过 `--opencode-model PROVIDER/MODEL` 指定；不确定模型 ID 时先用 `opencode models` 核对。
+- Codex 成员可通过运行时的 `--agent-arg=--model --agent-arg=<模型名>` 传递模型参数。
 
-启动前用 `opencode models` 核对模型 ID。启动后检查窗格显示的角色和模型。
+不要要求用户为每个成员手工拼装环境变量或逐条执行 `launch` 命令。
 
-## 3. 验收后结束任务
+## 4. 验收后结束任务
 
-CEO 核对改动范围、实际 diff 和测试结果。Herdr 的 `idle` 和 `done` 都表示成员可以接收下一条输入，交付是否通过以验收结果为准。验收通过后，用 `teamctl.py complete api_dev` 完成任务并释放 ownership。成员窗格会保留。
+CEO 核对改动范围、实际 diff 和测试结果。Herdr 的 `idle` 和 `done` 都表示成员可以接收下一条输入，交付是否通过以验收结果为准。用户只需在同一个 CEO 对话中确认是否接受交付；不要把 worker 的完成状态或自述当作验收通过。验收通过后，由 CEO 用 `teamctl.py complete <成员名>` 完成任务并释放 ownership。成员窗格会保留。
 
-## 4. 遇到启动异常时复用原窗格
+## 5. 遇到启动异常时复用原窗格
+
+这些排障操作通常由 CEO 或维护者执行。用户只需在 CEO 对话中说明异常并要求排障，不要自行重启或重发任务。
 
 - 遇到 `agent_pane_busy` 或启动超时，先用 `teamctl.py status` 和 `herdr pane read <pane-id>` 检查。确认原窗格已进入 shell 提示符后，用 `teamctl.py resume ceo` 检查或恢复。
 - 确认初始化提示尚未发送后，才使用 `teamctl.py resume ceo --prompt-action send`。如果提示可能已经送达，先检查投递记录。CEO 的 native Session 延迟出现时，按[身份对账流程](../README.zh-CN.md#ceo-bootstrap-身份对账)处理。
