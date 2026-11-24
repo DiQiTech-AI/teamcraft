@@ -1218,7 +1218,7 @@ class TeamctlTests(unittest.TestCase):
         with self.assertRaisesRegex(teamctl.TeamctlError, "profile is missing"):
             teamctl.opencode_config_content(self.root, "tester")
 
-    def test_codex_ceo_agent_args_allow_only_the_live_herdr_socket(self):
+    def test_codex_ceo_agent_args_allow_herdr_socket_and_github_domains(self):
         socket_path = self.root / 'herdr "team".sock'
         with mock.patch.dict(
             os.environ, {"HERDR_SOCKET_PATH": str(socket_path)}, clear=False,
@@ -1229,7 +1229,9 @@ class TeamctlTests(unittest.TestCase):
 
         expected_profile = (
             'permissions.teamcraft-ceo={extends=":workspace",'
-            'network={enabled=true,unix_sockets={'
+            'network={enabled=true,'
+            'domains={"github.com"="allow","api.github.com"="allow"},'
+            'unix_sockets={'
             f'{json.dumps(str(socket_path.resolve(strict=False)))}="allow"'
             '}}}'
         )

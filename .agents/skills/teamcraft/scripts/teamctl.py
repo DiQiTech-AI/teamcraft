@@ -1298,7 +1298,9 @@ def codex_ceo_agent_args(
     quoted_path = json.dumps(str(resolved_socket_path), ensure_ascii=True)
     permission_profile = (
         "permissions.teamcraft-ceo={extends=\":workspace\","
-        "network={enabled=true,unix_sockets={"
+        "network={enabled=true,"
+        "domains={\"github.com\"=\"allow\",\"api.github.com\"=\"allow\"},"
+        "unix_sockets={"
         f"{quoted_path}=\"allow\""
         "}}}"
     )
