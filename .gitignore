@@ -7,3 +7,4 @@
 __pycache__/
 *.py[cod]
 /.agents/skills/teamcraft/scripts/core/
+.vscode/
