@@ -159,4 +159,19 @@ CEO 用于结清成员任务的 `teamctl.py complete <成员名>` 会释放 owne
 
 回来后，在终端运行 `herdr` 重新连接默认会话。命名会话使用 `herdr session attach <会话名>`。完整停机使用上一节的 `herdr server stop` 流程。 [Herdr 分离与重连文档](https://herdr.dev/tui/docs/persistence-remote/)
 
+### CEO 窗格已关闭后的续接
+
+优先使用上一节的分离方式保留 CEO 窗格和对话。若 CEO 窗格已经关闭、Herdr 服务仍在运行，在同一 Herdr 会话的项目 shell 中执行：
+
+```bash
+PYTHONPATH="$PWD" python3 .agents/skills/teamcraft/scripts/teamctl.py resume ceo \
+  --from-pane "$HERDR_PANE_ID"
+```
+
+该命令会检查记录的窗格和身份；原窗格不可用时可尝试从指定父窗格重建。默认只检查，不会重发已记录的 CEO 任务。重建后的 CEO 身份和会话绑定仍须核对，确认无误后再继续派工。
+
+如需恢复原来的 Codex 对话，在新窗格进入项目目录后执行 `codex resume <原 CEO 的 Codex 会话 ID>`。这会恢复 Codex 对话，TeamCraft 对新窗格和新进程的绑定仍需要对账。
+
+Herdr 服务已经停止时，数据库依然可用于对账。重启服务后可能出现 Herdr 会话身份不匹配，应先检查状态并处理身份对账；为了续接工作不需要执行 `reset`。
+
 已保存的源码、Git 提交和 TeamCraft 数据库可用于下次继续工作。收工时保留数据库，按需对账后再重新派工。
