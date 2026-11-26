@@ -409,6 +409,33 @@ The matching runtime adapter is exposed through six `teamctl` commands: `pr-prep
 
 The final focused local run, `python3 -m unittest discover -s tests -p 'test_*_m405.py'`, passes all **83 M4-05 tests**: 67 Core adapter/domain/delivery tests plus 7 API, 4 runtime-adapter, 4 CLI, and 1 offline-bundle test. The full repository suite passes **988/988 tests, exit code 0**. An independent tester reviewed the implementation and focused safety matrix and returned a PASS recommendation, so M4-05 is recorded as independently accepted. The tester's earlier whole-repository replay hit one load-induced timeout in the pre-existing M4-04 API verifier fixture rather than an M4-05 assertion. The test-only fixture timeout was raised from 10 to 30 seconds, with no production-code change; `test_api_m404.py` then passed twice at 27/27 and the final full suite passed 988/988. No real GitHub integration or GitHub Actions result is claimed.
 
+## Worktree integration conflict & safe cleanup (M4-06 — independently accepted 2026-11-26)
+
+Before a shipped deliverable finishes, TeamCraft must prove there is no base drift or merge conflict between the recorded base and the live worktree, and that a completed worktree is removed only through a complete, evidence-gated cleanup path. M4-06 adds the Core integration checks and the single controlled worktree-removal surface. It never merges, never force-overwrites, never deploys, and — like the M4-06 roadmap — it adds **no HTTP API surface (deferred to M6-02)** and no schema change (all state flows through the append-only event log).
+
+The six `teamctl` commands resolve a recorded member/Attempt and call the same Core functions:
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-check --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-ensure --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-status --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup-status --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup-reconcile --member DEV_MEMBER
+```
+
+`integration-check` compares the recorded base against the live HEAD (`detect_base_drift`) and probes for merge conflicts with `git merge-tree --write-tree` purely in memory, reporting `clean`/`fast_forward`/`ancestor`/`empty`/`conflict`/`unknown`. `integration-ensure` idempotently creates an explicit `itg-`-prefixed integration Task bound to a single `integration_required` fact. `integration-status` reads the durable integration state. `worktree-cleanup-status` evaluates cleanup eligibility with no effect; `worktree-cleanup` runs the fenced sequence (Leader lease → eligibility matrix → evidence re-push → controlled removal); `worktree-cleanup-reconcile` adopts a crash-after-effect outcome.
+
+Safety semantics:
+
+- Conflicts are never merged or overwritten; the worktree and recorded facts stay untouched.
+- A dirty workspace, undelivered commits, a foreign worktree identity, a missing approval, a not-DONE delivery Task, or an already-stale worktree are all preserved. Any refusal keeps the scene and writes a `worktree_cleanup_refused` audit fact.
+- Only a CLEANABLE worktree whose delivery Task is DONE and whose delivery evidence (Commit/Verifier/Approval) is complete is eligible, and removal re-verifies exact worktree identity, a fully clean workspace, no undelivered commits, and the branch tip.
+- `finalize_cleaned_worktree` is the only removal surface: it runs `git worktree remove` and never passes `--force`, so branches and commits are always preserved.
+- After a crash that already removed the worktree, `worktree-cleanup-reconcile` adopts the already-applied effect instead of re-running it.
+
+Audit event kinds written by M4-06: `integration_check`, `integration_required`, `worktree_cleanable` (M4-02), `worktree_cleaned`, and `worktree_cleanup_refused`.
+
 ## Use another harness
 
 Roles and harnesses are independent. Replace `--kind opencode` with another type supported by the active Herdr installation. For example:
@@ -522,6 +549,8 @@ As of 2026-11-11 the repository suite is 693 tests — added since the earlier 4
 
 M4-04 verification and independent acceptance (2026-11-14, local macOS runs): the CEO's full-suite run, `python3 -B -m pytest tests -q -p no:cacheprovider`, completed with **905 passed, 131 subtests passed, exit code 0**. The independent tester additionally recorded **86 M4-04 tests + 6 subtests**, **119 M4-01/M4-02/M4-03 tests + 10 subtests**, **11 M2-06 tests**, and **424 adjacent regression tests + 95 subtests**. That review found one non-blocking runtime-adapter scope-order issue: Commit reconciliation had to reject a foreign member binding before invoking Core. After the guard was moved ahead of the Core effect, the independent recheck passed **25/25 focused adapter/CLI tests**, **2/2 `-k reconcile` tests**, and a direct refusal probe covering foreign Attempt/Task/project bindings, malformed/list/missing evidence keys, wrong Command kind, and read-only members; every refusal observed `core_called=False`. The tester then returned final PASS with no blockers. The 905-test full run and the broader tester matrices preceded this final narrow guard patch; they are not represented as post-fix full-suite runs. Loopback-capable execution is required because SSE/Web tests bind and call `127.0.0.1`; a network-restricted sandbox cannot supply that evidence. GitHub Actions are not claimed here.
 
+M4-06 verification and independent acceptance (2026-11-26, local macOS): the focused run `python3 -B -m unittest discover -s tests -p 'test_m406_integration_cleanup.py'` passes **21 tests OK**; the M4-adjacent regression `python3 -B -m unittest discover -s tests -p 'test_*m40*.py'` passes **318 tests OK**; and the full suite `python3 -B -m unittest discover -s tests`, with the `.[test]` dependencies installed in an isolated venv, runs **1466 tests with 0 failures, 0 errors, and 1 skip**, exit code 0. An independent tester (`tester_m406`, OpenCode + DeepSeek V4 Pro, read-only) re-ran all three commands and returned PASS: all four M4-06 acceptance points (conflicts never merged/overwritten; dirty scenes preserved; only CLEANABLE + delivery-DONE + complete-evidence workspaces cleaned; crash-after-effect reconcile) are covered and green. Real Herdr and GitHub Actions have not been run and remain unverified.
+
 The project has also completed one live OpenCode workflow: the CEO created a developer and a read-only tester, the developer generated [`examples/team-demo/index.html`](examples/team-demo/index.html), and the tester completed acceptance. During that run, the CEO's final polling loop did not converge on its own; the controlling agent stopped the loop manually and completed archival. See [`PROGRESS.md`](PROGRESS.md) for the detailed record.
 
 ## Current limits
@@ -531,7 +560,7 @@ The project has also completed one live OpenCode workflow: the CEO created a dev
 - Both `idle` and `done` can indicate a completed, settled task; do not wait only for `done`.
 - `unknown` means the live state could not be verified and must not be treated as completion.
 - Ownership provides team coordination, not a security sandbox.
-- M4-04 implements local-only Commit/Diff evidence and exact Commit/branch acceptance across Core, CLI, runtime adapter, and authenticated API, and was independently accepted on 2026-11-14 after the focused reconciliation scope-order recheck described above. M4-05 now supplies the bounded Core direct-PR adapter and evidence/approval/merge state machine, plus authenticated API and six `teamctl` surfaces; 83 focused tests and the final 988/988 full run pass, and the independent tester recommended PASS. One load-induced timeout in the pre-existing M4-04 API verifier fixture was stabilized by raising only its test timeout from 10 to 30 seconds; the file then passed twice at 27/27. Real GitHub and GitHub Actions are not claimed. Deployment, worktree cleanup, M4-06 conflict handling, and the rich M6-02 diff UI remain outside this slice.
+- M4-04 implements local-only Commit/Diff evidence and exact Commit/branch acceptance across Core, CLI, runtime adapter, and authenticated API, and was independently accepted on 2026-11-14 after the focused reconciliation scope-order recheck described above. M4-05 now supplies the bounded Core direct-PR adapter and evidence/approval/merge state machine, plus authenticated API and six `teamctl` surfaces; 83 focused tests and the final 988/988 full run pass, and the independent tester recommended PASS. One load-induced timeout in the pre-existing M4-04 API verifier fixture was stabilized by raising only its test timeout from 10 to 30 seconds; the file then passed twice at 27/27. Real GitHub and GitHub Actions are not claimed. Deployment and the rich M6-02 diff UI remain outside this slice.
 - The M3-01 security shell, M3-02 query API, M3-03 SSE resume, M3-04 command API, M3-05 minimal web console, and the M3-06 browser E2E suite are implemented and verified by automated tests, a local loopback HTTP smoke, and repeatable headless-Chromium E2E against Fake Herdr (20 tests green twice consecutively; six real console defects fixed in `teamcraft/api/web/app.js`). Occupied-attempt cancellation is recorded durably but carried out by the fenced runtime executor; the bundled console ships inside normal wheel and sdist installs (declared as `package-data` in `pyproject.toml`; both archives inspected offline and the default installed `WEB_ROOT` verified to resolve and serve the three assets). The Chromium E2E drives the console through real Chrome DevTools Protocol input, but every runtime scenario is Fake Herdr executing the same Core primitives: it is explicitly **not** real-Herdr evidence, and Safari/Firefox behaviour is not covered.
 - Trusted-host receipts for CEO bootstrap, and real-Herdr wake delivery/restart recovery/identity-drift, are deferred and remain unverified; offline/mock regressions do not substitute for them.
 - Use a new member name for a new task after completing or releasing a member. Historical task archival and member reuse are not implemented.

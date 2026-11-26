@@ -406,6 +406,33 @@ merge approval 是独立的人工决定，绑定精确 PR number、head SHA、ba
 
 最终本机定向运行 `python3 -m unittest discover -s tests -p 'test_*_m405.py'`，**83 项 M4-05 测试全部通过**：Core adapter/domain/delivery 67 项，API 7 项、runtime adapter 4 项、CLI 4 项、离线 bundle 1 项。仓库最终全量运行 **988/988 tests、退出码 0**。独立 tester 复核实现与定向安全矩阵后给出 PASS 建议，因此 M4-05 登记为独立验收通过。tester 较早的一轮仓库全量在既有 M4-04 API verifier 测试夹具中出现一次负载诱发的超时，并非 M4-05 断言失败；仅把测试夹具 timeout 从 10 秒放宽到 30 秒，未改生产代码，随后 `test_api_m404.py` 连续两次 27/27 通过，最终全量亦 988/988 通过。本文不声称真实 GitHub 集成或 GitHub Actions 结果。
 
+## Worktree 集成冲突与安全清理（M4-06 — 2026-11-26 独立验收通过）
+
+在 shipped 交付物收尾前，团匠必须先证明记录 base 与 live Worktree 之间不存在 base 漂移或合并冲突，且已完成的 Worktree 只能通过完整、证据门控的清理路径删除。M4-06 增加 Core 集成检查与唯一的受控 Worktree 删除面。它绝不 merge、绝不强制覆盖、绝不部署，并且——与 M4-06 roadmap 一致——**不新增 HTTP API 面（延期至 M6-02）**、无 Schema 变更（全部状态走 append-only 事件流）。
+
+六个 `teamctl` 命令解析已登记 member/Attempt 并调用同一套 Core 函数：
+
+```bash
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-check --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-ensure --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py integration-status --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup-status --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup --member DEV_MEMBER
+python3 .agents/skills/teamcraft/scripts/teamctl.py worktree-cleanup-reconcile --member DEV_MEMBER
+```
+
+`integration-check` 比较记录 base 与 live HEAD（`detect_base_drift`），并用 `git merge-tree --write-tree` 在纯内存中探测合并冲突，返回 `clean`/`fast_forward`/`ancestor`/`empty`/`conflict`/`unknown`。`integration-ensure` 幂等创建显式 `itg-` 前缀集成 Task，绑定单一 `integration_required` 事实。`integration-status` 读取持久集成状态。`worktree-cleanup-status` 只评估清理资格、无副作用；`worktree-cleanup` 执行带 fencing 的顺序（Leader lease → 资格矩阵 → 证据重推 → 受控删除）；`worktree-cleanup-reconcile` 采纳 crash-after-effect 结果。
+
+安全语义：
+
+- 冲突绝不 merge/覆盖，Worktree 与已记录事实保持原样。
+- 脏现场、未交付 commit、外来 Worktree identity、未审批、delivery Task 未 DONE 或已 stale 的 Worktree 一律保留；任何拒绝都保留现场并写 `worktree_cleanup_refused` 审计事实。
+- 仅当 Worktree 处于 CLEANABLE、delivery Task 已 DONE 且交付证据（Commit/Verifier/Approval）齐全时才可清理，删除前再次复核精确 Worktree identity、工作区完全干净、无未交付 commit 与 branch tip。
+- `finalize_cleaned_worktree` 是唯一删除面：只运行 `git worktree remove`，绝不传 `--force`，branch 与 commit 始终保留。
+- 若崩溃时 Worktree 已被删除，`worktree-cleanup-reconcile` 采纳已发生的结果而非重跑。
+
+M4-06 写入的审计事件 kind：`integration_check`、`integration_required`、`worktree_cleanable`（M4-02）、`worktree_cleaned` 与 `worktree_cleanup_refused`。
+
 ## 使用其他 Harness
 
 角色和 harness 是独立的。将 `--kind opencode` 换成当前 Herdr 支持的其他类型即可，例如：
@@ -519,6 +546,8 @@ Skill 套件现有 89 项测试（2026-11-08），覆盖状态恢复、并发 ow
 
 M4-04 验证与独立验收（2026-11-14，macOS 本机）：CEO 全量运行 `python3 -B -m pytest tests -q -p no:cacheprovider`，结果为 **905 passed、131 subtests passed、退出码 0**。独立 tester 另行取得 **M4-04 86 tests + 6 subtests**、**M4-01/M4-02/M4-03 119 tests + 10 subtests**、**M2-06 11 tests**及**相邻回归 424 tests + 95 subtests**。审查发现一项非阻塞的 runtime-adapter scope 顺序问题：Commit reconcile 必须先拒绝 foreign member binding，才可调用 Core。把 guard 移到 Core effect 前后，独立复验通过 **25/25 项 adapter/CLI 定向测试**、**2/2 项 `-k reconcile` 测试**，并以直接 refusal probe 覆盖 foreign Attempt/Task/project binding、畸形/list/缺失 evidence key、错误 Command kind 与只读成员；每项拒绝均观察到 `core_called=False`。tester 随后给出最终 PASS，零阻塞。905 项全量与 tester 的较宽矩阵都早于最后这项窄 guard 补丁，因此不表述为补丁后的全量复跑。SSE/Web 测试需要绑定并访问 `127.0.0.1`，须在允许本机回环网络的执行环境中运行；网络受限沙箱无法提供该证据。本工作树不声称 GitHub Actions 已通过。
 
+M4-06 验证与独立验收（2026-11-26，macOS 本机）：定向运行 `python3 -B -m unittest discover -s tests -p 'test_m406_integration_cleanup.py'` 通过 **21 tests OK**；M4 相邻回归 `python3 -B -m unittest discover -s tests -p 'test_*m40*.py'` 通过 **318 tests OK**；全量 `python3 -B -m unittest discover -s tests`（在隔离 venv 中安装 `.[test]` 依赖后）共 **1466 tests 通过、0 失败、0 error、1 skip，退出码 0**。独立 tester（`tester_m406`，OpenCode + DeepSeek V4 Pro，read-only）复跑三条命令并给出 PASS：四个验收点（冲突绝不 merge/覆盖；脏现场保留；仅 CLEANABLE + delivery-DONE + 证据齐全才清理；crash-after-effect reconcile）全部覆盖且通过。真实 Herdr 与 GitHub Actions 均未运行，维持未验证。
+
 项目还做过一次真实 OpenCode 流程验证：CEO 创建研发和只读测试成员，研发生成 [`examples/team-demo/index.html`](examples/team-demo/index.html)，测试完成验收。该次运行中 CEO 的最终轮询未自行收敛，由当前控制 Agent 人工停止轮询并完成归档。详细记录见 [`PROGRESS.md`](PROGRESS.md)。
 
 ## 当前边界
@@ -528,7 +557,7 @@ M4-04 验证与独立验收（2026-11-14，macOS 本机）：CEO 全量运行 `p
 - `idle` 和 `done` 都可能表示已完成且处于稳定状态；不能只等待 `done`。
 - `unknown` 表示无法核实实时状态，不应据此推断任务完成。
 - ownership 只负责团队协调，不提供安全沙箱。
-- M4-04 已实现 Core、CLI、runtime adapter 与认证 API 的 local-only Commit/Diff evidence 和精确 Commit/分支接受，并在上述 reconcile scope 顺序定向复验后于 2026-11-14 通过独立验收。M4-05 现已提供受限的 Core direct-PR adapter、evidence/approval/merge 状态机、认证 API 与六个 `teamctl` 表面；83 项定向测试和最终 988/988 全量通过，独立 tester 建议 PASS。既有 M4-04 API verifier 测试夹具的一次负载超时通过仅放宽测试 timeout（10→30 秒）稳定，随后该文件连续两次 27/27 通过；本文不声称真实 GitHub 或 GitHub Actions 结果。部署、Worktree 清理、M4-06 冲突处理与 M6-02 丰富 Diff 页面仍不在本切片范围。
+- M4-04 已实现 Core、CLI、runtime adapter 与认证 API 的 local-only Commit/Diff evidence 和精确 Commit/分支接受，并在上述 reconcile scope 顺序定向复验后于 2026-11-14 通过独立验收。M4-05 现已提供受限的 Core direct-PR adapter、evidence/approval/merge 状态机、认证 API 与六个 `teamctl` 表面；83 项定向测试和最终 988/988 全量通过，独立 tester 建议 PASS。既有 M4-04 API verifier 测试夹具的一次负载超时通过仅放宽测试 timeout（10→30 秒）稳定，随后该文件连续两次 27/27 通过；本文不声称真实 GitHub 或 GitHub Actions 结果。部署与 M6-02 丰富 Diff 页面仍不在本切片范围。
 - M3-01 安全壳、M3-02 Query API、M3-03 SSE 恢复、M3-04 Command API、M3-05 最小 Web 控制台与 M3-06 浏览器 E2E 套件均已实现，且经自动化测试、本机 loopback HTTP 冒烟与可重复的 Fake-Herdr 无头 Chromium E2E 验证（连续两次全量 20 项绿色；`teamcraft/api/web/app.js` 修复 6 个真实控制台缺陷）。取消被占用 Attempt 只持久记录、由带 fencing 的 runtime executor 执行；内置控制台随常规 wheel 与 sdist 安装分发（`pyproject.toml` 已声明 `package-data`；两类归档已离线构建并检视，默认安装态 `WEB_ROOT` 已验证可解析并提供三个资产）。Chromium E2E 以真实 Chrome DevTools Protocol 输入驱动控制台，但一切 runtime 场景均为执行同一套 Core 原语的 Fake Herdr：它**不是**真实 Herdr 证据，Safari/Firefox 行为亦未覆盖。
 - CEO bootstrap 的可信宿主回执，以及真实 Herdr 的 Wake 投递/重启恢复/身份漂移验证仍延期且未验证；离线/Mock 回归不能替代。
 - 完成或释放成员后，新任务应使用新的成员名；历史任务归档和成员复用尚未实现。
