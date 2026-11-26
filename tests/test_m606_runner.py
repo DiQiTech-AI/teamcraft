@@ -133,7 +133,8 @@ class FakeHerdr:
             out["foreground_cwd"] = self.foreground_cwd
         return out
 
-    def identity(self, pane_id: str) -> dict[str, Any]:
+    def identity(self, pane_id: str, *,
+                 expected_agent: str | None = None) -> dict[str, Any]:
         """Mirror the real client's identity contract, not just its shape.
 
         ``Herdr.identity`` refuses a wrong agent and a missing native session id;
@@ -147,10 +148,11 @@ class FakeHerdr:
                 f"pane {pane_id} is not present in the live snapshot")
         idx = min(self.identity_reads - 1, len(self.sessions) - 1)
         out = self._identity(pane_id, self.sessions[idx])
-        if out["agent"] != self.expected_agent:
+        want = expected_agent or self.expected_agent
+        if out["agent"] != want:
             raise m606.PostconditionError(
                 f"pane {pane_id} hosts agent {out['agent']!r}, not "
-                f"{self.expected_agent!r}")
+                f"{want!r}")
         if not out["session_id"]:
             raise m606.PostconditionError(
                 f"pane {pane_id} exposes no native session id")
@@ -174,7 +176,8 @@ class FakeHerdr:
 
     def submit(self, target: str, prompt: str, *, wait: bool = False,
                until: tuple[str, ...] = (),
-               timeout_ms: int = 5000) -> dict[str, Any]:
+               timeout_ms: int = 5000,
+               expected_agent: str | None = None) -> dict[str, Any]:
         self.submits.append((target, prompt))
         ident = self._identity(target, self.sessions[0])
         outcome = self.submit_outcome

@@ -888,7 +888,8 @@ class Herdr:
             raise PostconditionError(f"herdr api snapshot failed: {out[:200]}")
         return json.loads(out)["result"]["snapshot"]
 
-    def identity(self, pane_id: str) -> dict[str, Any]:
+    def identity(self, pane_id: str, *,
+                 expected_agent: str | None = None) -> dict[str, Any]:
         """Bind one existing pane to its native agent session, pre-dispatch."""
         snap = self.snapshot()
         panes = {p.get("pane_id"): p for p in snap.get("panes", [])}
@@ -917,10 +918,11 @@ class Herdr:
             "cwd": agent.get("cwd") or panes[pane_id].get("cwd"),
             "observed_at": now_iso(),
         }
-        if binding["agent"] != self.expected_agent:
+        want = expected_agent or self.expected_agent
+        if binding["agent"] != want:
             raise PostconditionError(
                 f"pane {pane_id} hosts agent {binding['agent']!r}, not "
-                f"{self.expected_agent!r}; refusing to prompt the wrong agent")
+                f"{want!r}; refusing to prompt the wrong agent")
         if not binding["session_id"]:
             raise PostconditionError(
                 f"pane {pane_id} exposes no native session id; identity cannot be "
@@ -970,6 +972,7 @@ class Herdr:
 
     def submit(self, target: str, prompt: str, *, wait: bool = False,
                until: tuple[str, ...] = (), timeout_ms: int = 5000,
+               expected_agent: str | None = None,
                ) -> dict[str, Any]:
         """Submit to an EXISTING agent via ``herdr agent prompt <T> <TEXT>``.
 
@@ -981,7 +984,7 @@ class Herdr:
         """
         if not self.allow_dispatch:
             raise GuardError("dispatch not consented (see --consent-dispatch)")
-        before = self.identity(target)
+        before = self.identity(target, expected_agent=expected_agent)
         argv = ["agent", "prompt", target, prompt]
         if wait:
             argv.append("--wait")
@@ -989,7 +992,7 @@ class Herdr:
                 argv += ["--until", state]
             argv += ["--timeout", str(timeout_ms)]
         code, out = self.run(*argv)
-        after = self.identity(target)
+        after = self.identity(target, expected_agent=expected_agent)
 
         # Classify herdr's documented refusal/stall outcomes by observation.
         lowered = out.lower()
@@ -1164,7 +1167,8 @@ class M606LiveRun:
             f"m606-live-{self.run_id}", ttl_seconds=3700)
 
     def _submit_to_pane(self, pane_id: str, prompt: str, *, wait: bool,
-                        until: tuple[str, ...], timeout_ms: int) -> dict[str, Any]:
+                        until: tuple[str, ...], timeout_ms: int,
+                        expected_agent: str | None = None) -> dict[str, Any]:
         """The ONLY door from this runner to Herdr input, and it can be locked.
 
         :meth:`Herdr.submit` already refuses without dispatch consent, but a
@@ -1179,7 +1183,8 @@ class M606LiveRun:
                 "prompt to any pane (" + POST_DISPATCH_NOTE + ")")
         self._submit_count += 1
         return self.herdr.submit(pane_id, prompt, wait=wait, until=until,
-                                timeout_ms=timeout_ms)
+                                timeout_ms=timeout_ms,
+                                expected_agent=expected_agent)
 
     def git(self, *args: str, check: bool = True) -> tuple[int, str]:
         """A delivery-path git call: strictly no push/clone/merge/reset/rewrite."""
@@ -2142,8 +2147,9 @@ class M606LiveRun:
         pane = self.args.ceo_pane
         if not pane:
             raise GuardError("--ceo-pane is required for the PG-7 CEO leg")
-        first = self.herdr.identity(pane)
-        second = self.herdr.identity(pane)
+        ceo_agent = getattr(self.args, "ceo_agent", None) or self.args.herdr_agent
+        first = self.herdr.identity(pane, expected_agent=ceo_agent)
+        second = self.herdr.identity(pane, expected_agent=ceo_agent)
         ev = self._need_evidence()
         ev.write("ceo-pane-identity.json", {"first": first, "second": second})
         if not first.get("session_id") or first["session_id"] != second.get(
@@ -2353,7 +2359,8 @@ class M606LiveRun:
         submit = self._submit_to_pane(
             gate["pane_id"], prompt, wait=self.args.submit_wait,
             until=tuple(self.args.submit_until),
-            timeout_ms=self.args.submit_timeout_ms)
+            timeout_ms=self.args.submit_timeout_ms,
+            expected_agent=getattr(self.args, "ceo_agent", None) or self.args.herdr_agent)
         observation = submit["transport_observation"]
         transport = ("submitted" if submit["returncode"] == 0
                      and observation == "accepted" else "unknown")
@@ -2783,7 +2790,8 @@ class M606LiveRun:
             ceo_gate["pane_id"], prompt,
             wait=self.args.submit_wait,
             until=tuple(self.args.submit_until),
-            timeout_ms=self.args.submit_timeout_ms)
+            timeout_ms=self.args.submit_timeout_ms,
+            expected_agent=getattr(self.args, "ceo_agent", None) or self.args.herdr_agent)
         delivered = (sent["returncode"] == 0
                      and sent["transport_observation"] == "accepted")
         outcome = "submitted" if delivered else "unknown"
@@ -3544,6 +3552,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "this leg; a mismatch refuses dispatch")
     p.add_argument("--herdr-agent", default="opencode",
                    help="expected agent kind on the target pane (identity check)")
+    p.add_argument("--ceo-agent", default=None,
+                   help="expected agent kind on the CEO pane (defaults to "
+                        "--herdr-agent); set this for a cross-harness CEO leg")
     p.add_argument("--herdr-pane", default=None,
                    help="existing pane id used as the prompt TARGET, e.g. w3:p2Q "
                         "(from `herdr agent list`); never created by this runner")

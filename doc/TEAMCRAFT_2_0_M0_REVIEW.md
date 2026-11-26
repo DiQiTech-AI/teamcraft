@@ -1205,3 +1205,19 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 3. 重新跑 dispatch → Wake → verify → local-only deliver，并记录版本/能力矩阵。
 
 **边界**：本轮未发送 Codex 任务 prompt、无交付证据；未伪造。disposable root 已 `--cleanup-only` 清理。
+
+### 12.40 Codex leg 第三轮：跨 harness 适配与 oMLX 502 结论（2026-11-27）
+
+**本轮已实现（runner）**：
+
+- `--ceo-agent`：worker 与 CEO 的 expected agent 可不同，支持 **Codex worker + OpenCode CEO** 的跨 harness 组合。
+- `--submit-timeout-ms` 可提高到 240000；settled 门禁保持 `idle|done`。
+- `test_m606_runner.py`：**95 OK**。
+
+**复跑结果**：
+
+- OpenCode CEO 正常（idle + session `ses_de5d77676ffe…`）。
+- Codex worker 在 oMLX `/v1/responses` 上持续 **502 Bad Gateway**（即使只有一个 Codex 会话、CEO 已 idle 仍复现），无法得到稳定回合。
+- 未发送 Codex 任务 prompt、无交付证据；未伪造。
+
+**结论**：Codex leg 的剩余阻塞是 **oMLX `/v1/responses` 的稳定性/并发能力**，不是 runner 逻辑。runner 的 harness-aware 适配已就绪；需要在更稳定的本地 Responses provider（或 oMLX 修复/限流）上重跑 Codex dispatch → Wake → verify → deliver。M6-06 仍未完全关闭。
