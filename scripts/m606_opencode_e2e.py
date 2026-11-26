@@ -3815,7 +3815,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_pins(args.protocol_version, args.protocol_sha256)
         validated_root = validate_root(args.root,
                                       allow_non_temp=args.allow_non_temp_root,
-                                      for_cleanup=bool(args.cleanup_only))
+                                      for_cleanup=bool(args.cleanup_only),
+                                      for_resume=bool(args.resume_handoff))
         validate_loopback(args.omlx_url)
         arg_rules = validate_arg_combinations(args)
 

@@ -1113,23 +1113,25 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 
 **未决**：D1–D8 已完成实现并经 CEO 全量回归；用户已授权本地 commit 与 remote push。真实派工仍受 HG-F 原生 session 身份绑定阻塞（见 §12.35）。
 
-### 12.35 M6-06 HG-F 真实 pane 派工尝试与当前阻塞（2026-11-26）
+### 12.35 M6-06 HG-F 真实 pane 派工（worker leg PASS，2026-11-26）
 
-**登记口径**：本节记录一次**未发送 prompt**的 HG-F 真实 pane 准备与身份绑定尝试。它不构成 PG-7 通过；真实派工仍未完成。
+**登记口径**：本节记录一次真实的 Herdr **worker-leg** 派工。`--consent-dispatch` 已提交 1 条真实 prompt 到隔离 pane；`prompt_ack`/`event_stream` 仍为 `unknown`，没有 host-trusted receipt。PG-7 CEO bootstrap / `--wake-deliver` 未包含在本轮。
 
 | 阶段 | 结果 | 证据 |
 |---|---|---|
-| `--plan` / `--preflight` | PASS | oMLX loopback healthy；`Qwen3.8-Flash-Next-oQ4e-mtp` 在目录；Herdr 0.9.3 / protocol 22 兼容；协议 `1.0.0` / `c5c358bf…a742`；`repo_dirty_entries=0` |
-| Phase-1 allocation | PASS（无 prompt） | run `2afc64490b6af50e`；`allocated_cwd=…/worktrees/55ee6e24-78c3-49fb-9dd8-8bae207fc448`；`submit_allowed_in_this_invocation=false` |
-| 隔离 pane prep + 真实启动 | 模型已绑定 | 修复后 `tui.jsonc` = `{"plugin":["./herdr-tui-session.js"]}`；pane 页脚 `Build · Qwen3.8-Flash-Next-oQ4e-mtp Local oMLX`；cwd 为 allocated worktree |
-| 原生 session 身份 | **BLOCKED** | `herdr agent get w3:p3K` → `agent_session=None`；`observe` 拒绝绑定；TUI session picker 显示 "No sessions available" |
-| 派工 | **未执行** | 未发送任何 prompt；未写 attestation |
+| `--plan` / `--preflight` | PASS | oMLX healthy；`Qwen3.8-Flash-Next-oQ4e-mtp` 在目录；Herdr 0.9.3 / protocol 22；协议 `1.0.0` / `c5c358bf…a742`；`repo_dirty_entries=0` |
+| Phase-1 allocation | PASS | run `7f1278621d7ac29c`；allocated worktree `480f9878-…` |
+| TUI-only 插件注册 | 确认正确 | `cli.json` = `{"plugins":["./herdr-opencode"]}`；`herdr-opencode/tui.js` 目录入口；隔离 `opencode plugin list --standalone` 输出 `local …/herdr-opencode` |
+| 原生 session 身份 | PASS | 用 `opencode api session.create` 创建 `ses_de7aba48affePSYmJeD5VxBtyu`（无模型调用），`--session` 加载后 `herdr agent get` 返回该 id |
+| 真实派工 | **PASS（worker leg）** | runner `d508bbae4e28037d`：`state=submitted`、`prompt_ack=unknown`、`returncode=0`、`session_stable=true`、`topology_unchanged=true`、`transport_observation=accepted`；pane 进入 `working` |
+| 模型 attestation | PASS | `pane-model-proof`：`operator-attested`，pinned 模型，pane/terminal/session/agent 四项匹配；`host_trusted=false` |
+| Wake | 记录但未投递 | `wake.ceo_acknowledged=false`，created/merged 记录保留；未执行 `--wake-deliver` |
 
-**根因（一项已修复，一项仍 pending）**：
+**根因与修正**：
 
-1. 已修复（commit `16e955b`）：`m606_prepare_opencode_pane.py` 曾把 TUI bridge 注册到 `cli.json` 的 `plugins`；OpenCode v2.4.1 只从 `tui.jsonc` 的 `plugin` 加载。修复后隔离 XDG 正确生成 `tui.jsonc`，全量 `1597` 测试与 `95` Skill 测试通过。
-2. 仍 pending：`opencode --standalone --session <id>` 在**未发送消息前**不会创建一个可被 TUI 选择的 session（picker 显示 "No sessions available"），因此 TUI selection bridge 没有 `route.params.sessionID` 可上报；`--mini` 在 v2.4.1 不存在。下一步需要一条**不触发模型调用**的会话创建/选择路径（例如 `opencode session create` 后由 TUI 选择，或未来的 route 注入），再以 `--consent-dispatch` 执行单次派工。
+1. **TUI-only 插件路径**：v2.4.1 的正确位置是 `cli.json` 的 `"plugins"`（复数）+ **本地目录**（`./herdr-opencode` → `tui.js` 导出 default `{id, tui}`）。`tui.jsonc` / 单文件注册不会被加载。先前 `16e955b` 的 `tui.jsonc` 改法已由 `925721f` 回退；原始 `cli.json` 形式正确。
+2. **Phase-2 abort bug**：`scripts/m606_opencode_e2e.py` 的 `main()` 在预校验 `validate_root` 时未传 `for_resume=args.resume_handoff`，导致 allocated root 被当成 fresh root 拒绝。已修复，并新增 `tests/test_m606_resume_guard.py` 回归。
 
-**清理**：disposable root 已通过 `--cleanup-only` 删除（run `b385c7263a3414e7`）；无 prompt、无 attestation、无 project repo/DB 写入。本次没有把阻塞写成通过；PG-7 / 真实 Herdr pane 身份仍为 **pending**，M6-06 未关闭。
+**证据副本**：`.teamcraft/hg-f-2026-11-26/`（dispatch、pane-model-proof、identity-binding、handoff、run-manifest、postconditions 等）。
 
-**追加尝试（2026-11-26，仍未通过）**：使用 `opencode api --standalone ... session.create` 在 allocated worktree 创建了 session `ses_de7b4712fffeNDrGbeRdXcd5rC`（无模型调用）；TUI session picker 可列出并选中该 session；但 `herdr agent get <pane>` 仍返回 `agent_session=None`，且隔离 XDG 下 `opencode plugin list --standalone` 返回 `No plugins found`。因此 TUI selection bridge 在该隔离 v2.4.1 pane 中未被加载/未上报 session id；本轮仍未发送 prompt，root 已清理（run `59a8813aa932c455`）。下一步需确认 v2.4.1 TUI 插件的实际加载路径/键名（可能需要项目级 `tui.jsonc` 或不同 CLI 版本），再执行 `--consent-dispatch`。
+**边界**：本节只证明 worker-leg 真实 prompt 提交与身份/模型绑定；`prompt_ack=unknown` 与 `host_trusted_receipt=false` 保持不变；PG-7 CEO bootstrap、`--wake-deliver`、真实交付/验证仍为后续项。PG-1（Claude）仍 pending，M6-06 未完全关闭。
