@@ -149,7 +149,7 @@ CEO 用于结清成员任务的 `teamctl.py complete <成员名>` 会释放 owne
      --confirm-project "$PROJECT_ROOT"
    ```
 
-   `--confirm-project` 必须与 `--cwd` 解析后的项目根完全一致。`reset` 会拒绝清理仍在 Herdr 中存活且记录为非终态的 TeamCraft 成员；遇到拒绝时，应返回对应窗格完成收尾并正常退出，再重新检查，而不是绕过保护。成功时，它先创建经过校验的 SQLite 在线备份，并把旧数据库及 WAL 相关工件保留到唯一的 `.teamcraft/archive-*` 归档目录，然后原子安装一个新初始化的空 schema。归档是恢复副本；`reset` 不修改项目源码，也不关闭 Herdr 窗格。
+   `--cwd` 可选，省略时使用当前工作目录；无论是否省略，`--confirm-project` 都必须与解析后的项目根完全一致。`reset` 会拒绝清理仍在 Herdr 中存活且记录为非终态的 TeamCraft 成员；遇到拒绝时，应返回对应窗格完成收尾并正常退出，再重新检查，而不是绕过保护。成功时，它先创建经过校验的 SQLite 在线备份，并把旧数据库及 WAL 相关工件保留到唯一的 `.teamcraft/archive-*` 归档目录，然后原子安装一个新初始化的空 schema。归档是恢复副本；`reset` 不修改项目源码，也不关闭 Herdr 窗格。
 5. 状态检查以及可选的 `reset` 完成后，再关闭已经回到 shell 的成员和 CEO 窗格；本项目独占一个 Herdr 标签页时，也可以关闭该标签页。
 6. 如果还要停止当前 Herdr 服务及它管理的全部窗格进程，把它放在最后。先确认其他标签页和项目也可以停止，再从该会话对应的终端执行 `herdr server stop`；该命令可能影响多个项目。
 
