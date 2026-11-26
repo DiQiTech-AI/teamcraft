@@ -2737,6 +2737,30 @@ class M606LiveRun:
             self._assert_no_fake_ack(ev, report)
             return report
 
+        # The PG-7 bootstrap prompt necessarily leaves the CEO working.  M2-09
+        # defers a Wake while the CEO is busy, so wait bounded for it to settle
+        # instead of aborting the whole run; if it never settles, record an
+        # honest deferral and leave the durable Wake pending.
+        deadline = time.monotonic() + 120.0
+        while True:
+            status = self.herdr.identity(self.args.ceo_pane).get("agent_status")
+            if status == "idle":
+                break
+            if time.monotonic() >= deadline:
+                report = {
+                    "wake_id": wake_id, "state": bound, "command_bound": True,
+                    "ingested": plain(ingested),
+                    "transport": "deferred:ceo_working", "outcome": None,
+                    "ceo_acknowledged": False, "duplicate_sends": 0,
+                    "note": ("the CEO pane stayed busy past the bounded wait; the "
+                             "Wake remains pending and is NOT re-sent blindly "
+                             "(M2-09 defer)"),
+                }
+                ev.write("wake.json", report)
+                self._assert_no_fake_ack(ev, report)
+                return report
+            time.sleep(2.0)
+
         # Explicit, consented delivery to the canonical CEO pane.
         ceo_gate = self.gate_ceo_target()
         top = self.herdr.topology_digest()

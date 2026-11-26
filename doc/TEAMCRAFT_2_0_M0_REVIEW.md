@@ -1135,3 +1135,30 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 **证据副本**：`.teamcraft/hg-f-2026-11-26/`（dispatch、pane-model-proof、identity-binding、handoff、run-manifest、postconditions 等）。
 
 **边界**：本节只证明 worker-leg 真实 prompt 提交与身份/模型绑定；`prompt_ack=unknown` 与 `host_trusted_receipt=false` 保持不变；PG-7 CEO bootstrap、`--wake-deliver`、真实交付/验证仍为后续项。PG-1（Claude）仍 pending，M6-06 未完全关闭。
+
+### 12.36 M6-06 OpenCode 完整 local-only leg（PASS，2026-11-27）
+
+**登记口径**：本节记录一次真实的 OpenCode 全链路 local-only E2E。DONE 仍需 human accept（M4-04），本轮停在 `submitted`。
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| PG-7 CEO bootstrap | PASS | `ceo-bootstrap`：`state=initialized`、`receipt_source=assumed_default`、`identity_mode=native`、`gate_open_for_wake=true` |
+| worker dispatch | PASS | `dispatch`：`state=submitted`、`prompt_ack=unknown`、`returncode=0`、`session_stable=true`、`topology_unchanged=true` |
+| Wake 投递 | PASS | `wake`：`transport=delivered`、`outcome=submitted`、`ceo_acknowledged=false`、`target_pane=w3:p3S` |
+| worker 变更 | PASS | `src/feature.py` = `# M606-LIVE` |
+| verification | PASS | `verification.verdict=pass` |
+| Diff Gate | PASS | `diff-gate.ok=true` |
+| local commit | PASS | `10bb55c` on `tc/6ceb4cb3-…/ffd0f4d0-…` |
+| delivery | submitted | `delivery.disposition=submitted`、`diff_digest=176767ec…` |
+
+**run**：`5c1862e1ba8789d5`（CEO+dispatch+wake）、`845e70d73fffb62c`（post-dispatch deliver）。证据副本：`.teamcraft/hg-f-2026-11-27/`。
+
+**修复**：runner 在 Wake 阶段对 working CEO 改为**有界等待**（M2-09 defer），不再 abort；此前 abort 由 bootstrap 后 CEO 处于 working 触发。
+
+**边界**：`prompt_ack=unknown`、`host_trusted_receipt=false` 保持不变；DONE 需 human accept；direct-PR 未纳入。
+
+### 12.37 M6-06 Claude 范围决策（路径 B，2026-11-27）
+
+Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 延期到后续里程碑（M6-07）。M6-06 的 Claude 行保持 `pending:PG-1`，不宣称三 Harness 全通过。
+
+**M6-06 当前状态**：OpenCode 全链路真实 PASS；**Codex 真实 leg 仍未完成**（目前只有发现冒烟），因此 M6-06 **尚未完全关闭**；剩余项为 Codex 全链路真实 E2E + 矩阵/独立复核。
