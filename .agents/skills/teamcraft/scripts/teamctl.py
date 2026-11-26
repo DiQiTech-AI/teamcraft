@@ -1758,11 +1758,27 @@ def validate_common_launch(
     return root, task, responsibility, ownership
 
 
+def launch_agent_args(
+    role: str, kind: str, user_args: Sequence[str],
+) -> list[str]:
+    """Resolve the harness arguments recorded for a new member.
+
+    OpenCode launches default to ``--auto`` so routine, non-denied project
+    commands do not stall on a TUI permission prompt; the role profile's
+    explicit denies (pip/npm/network/destructive/elevated) still apply. An
+    explicit ``--auto`` from the caller is never duplicated.
+    """
+    args = list(codex_ceo_agent_args(role, kind, user_args))
+    if kind == "opencode" and "--auto" not in args:
+        args.append("--auto")
+    return args
+
+
 def _launch_operation(args: argparse.Namespace) -> int:
     require_herdr()
     root, task, responsibility, ownership = validate_common_launch(args)
     model = getattr(args, "opencode_model", None)
-    agent_args = codex_ceo_agent_args(args.role, args.kind, args.agent_arg)
+    agent_args = launch_agent_args(args.role, args.kind, args.agent_arg)
     if model is not None:
         if args.kind != "opencode":
             raise TeamctlError("--opencode-model requires --kind opencode")

@@ -1250,6 +1250,60 @@ class TeamctlTests(unittest.TestCase):
             ["--standalone"],
         )
 
+    def test_opencode_launch_defaults_to_auto_permissions(self):
+        self.assertEqual(
+            teamctl.launch_agent_args("developer", "opencode", []),
+            ["--auto"],
+        )
+        self.assertEqual(
+            teamctl.launch_agent_args("ceo", "opencode", ["--standalone"]),
+            ["--standalone", "--auto"],
+        )
+        self.assertEqual(
+            teamctl.launch_agent_args("tester", "opencode", ["--auto"]),
+            ["--auto"],
+        )
+        self.assertEqual(
+            teamctl.launch_agent_args("developer", "codex", ["--search"]),
+            ["--search"],
+        )
+
+    def test_opencode_launch_records_auto_before_reserve(self):
+        lease = object()
+
+        class StopAtReserve(Exception):
+            pass
+
+        class Store:
+            def acquire_lease(self, *args): return lease
+
+            def require_ceo_initialized(self): return None
+
+            def release_lease(self, observed): self.asserted_lease = observed
+
+        store = Store()
+        args = argparse.Namespace(
+            name="worker", start_timeout_ms=30_000, wait=False, timeout_ms=10_000,
+            cwd=str(self.root), from_pane="current", role="developer",
+            kind="opencode", read_only=False, ownership=["src/**"],
+            agent_arg=[], direction=None,
+        )
+        with mock.patch.object(teamctl, "require_herdr"), \
+             mock.patch.object(teamctl, "validate_common_launch", return_value=(self.root, "task", "responsibility", ["src/**"])), \
+             mock.patch.object(teamctl, "preflight_kind"), \
+             mock.patch.object(teamctl, "ensure_live_name_available"), \
+             mock.patch.object(teamctl, "resolve_pane", return_value={"pane_id": "w1:p1"}), \
+             mock.patch.object(teamctl, "current_session_identity", return_value=self.session), \
+             mock.patch.object(teamctl, "StateStore", return_value=store), \
+             mock.patch.object(teamctl, "opencode_config_content", return_value="{}"), \
+             mock.patch.object(teamctl, "reserve_member", side_effect=StopAtReserve) as reserve:
+            with self.assertRaises(StopAtReserve):
+                teamctl._launch_operation(args)
+
+        reserve.assert_called_once()
+        self.assertEqual(reserve.call_args.args[2]["agent_args"], ["--auto"])
+        self.assertIs(store.asserted_lease, lease)
+
     def test_codex_ceo_agent_args_reject_invalid_socket_paths(self):
         with mock.patch.dict(
             os.environ, {"HERDR_SOCKET_PATH": "relative/herdr.sock"}, clear=False,
