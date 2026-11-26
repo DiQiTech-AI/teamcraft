@@ -196,7 +196,8 @@ class DeliveryRefusal(ValidationError):
 
     ``kind`` is a stable machine tag: ``identity``, ``unowned``, ``dirty``,
     ``empty``, ``drift``, ``main-branch``, ``size``, ``verifier``,
-    ``ambiguous``, ``policy``, ``stale``, ``settled``, ``mode``.
+    ``ambiguous``, ``policy``, ``stale``, ``settled``, ``mode``,
+    ``legacy-schema``.
     """
 
     def __init__(self, kind: str, message: str) -> None:
@@ -455,12 +456,13 @@ _APPROVAL_PAYLOAD_FIELDS = frozenset({
 
 
 def _require_shape(payload: Any, fields: frozenset[str], kind: str,
-                   where: str) -> dict[str, Any]:
+                   where: str,
+                   schema_version: int = DELIVERY_CONTRACT_VERSION) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != fields:
         raise StorageError(
             f"{kind} payload has unexpected shape ({where}); expected exactly "
             f"{sorted(fields)}")
-    if payload.get("schema_version") != DELIVERY_CONTRACT_VERSION:
+    if payload.get("schema_version") != schema_version:
         raise StorageError(
             f"unsupported {kind} schema_version: {payload.get('schema_version')!r}")
     return payload
@@ -2495,6 +2497,7 @@ class PullRequestEvidence:
     base_sha: str
     commit_sha: str
     commit_evidence_id: str
+    verifier_digest: str
     policy_digest: str
     repo: str
     pr_number: int
@@ -2511,6 +2514,10 @@ class PullRequestEvidence:
     command_id: str
     evidence_digest: str
     occurred_at: str
+    #: The persisted contract version and whether this row is a READ-ONLY legacy
+    #: observation (schema_version 1, before the ``verifier_digest`` pin).
+    schema_version: int = PR_CONTRACT_VERSION
+    legacy: bool = False
 
     @property
     def id(self) -> str:
@@ -2543,6 +2550,8 @@ class PrMergeApproval:
     reason: str
     task_status_after: str
     occurred_at: str
+    schema_version: int = PR_CONTRACT_VERSION
+    legacy: bool = False
 
     @property
     def id(self) -> str:
@@ -2582,6 +2591,8 @@ class PrMergeEvidence:
     source: str          # executed | reconciled
     evidence_digest: str
     occurred_at: str
+    schema_version: int = PR_CONTRACT_VERSION
+    legacy: bool = False
 
     @property
     def id(self) -> str:
@@ -2625,8 +2636,12 @@ _PR_EVIDENCE_FIELDS = frozenset({
     "head_sha", "mergeable", "policy_digest", "pr_number", "pr_url",
     "project_id", "proposed_action", "ready", "repo", "schema_version",
     "source", "task_id", "task_version", "worker_report_digest",
-    "worker_report_id", "worktree_path",
+    "worker_report_id", "worktree_path", "verifier_digest",
 })
+#: v1 PR evidence predates the ``verifier_digest`` pin; it is accepted only by
+#: the READ-ONLY legacy reader and is marked ``legacy=True`` on load.
+_PR_LEGACY_EVIDENCE_FIELDS = _PR_EVIDENCE_FIELDS - {"verifier_digest"}
+_PR_LEGACY_CONTRACT_VERSIONS = domain.PR_DELIVERY_LEGACY_CONTRACT_VERSIONS
 _PR_APPROVAL_FIELDS = frozenset({
     "actor", "attempt_id", "attempt_no", "base_ref", "checks_digest",
     "command_id", "decision", "head_sha", "intended_base",
@@ -2697,9 +2712,22 @@ def _pr_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
             f"PR evidence payload is not valid JSON (seq={seq}): {exc}") from exc
     kind = "PR evidence"
     where = f"seq={seq}"
-    _require_shape(payload, _PR_EVIDENCE_FIELDS, kind, where)
-    if payload.get("schema_version") != PR_CONTRACT_VERSION:
-        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema == PR_CONTRACT_VERSION:
+        _require_shape(payload, _PR_EVIDENCE_FIELDS, kind, where,
+                       schema_version=PR_CONTRACT_VERSION)
+        legacy = False
+    elif isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema in _PR_LEGACY_CONTRACT_VERSIONS:
+        _require_shape(payload, _PR_LEGACY_EVIDENCE_FIELDS, kind, where,
+                       schema_version=schema)
+        legacy = True
+    else:
+        raise StorageError(
+            f"unsupported {kind} schema_version: {schema!r} ({where});"
+            f" current contract is v{PR_CONTRACT_VERSION} and legacy versions"
+            f" are {sorted(_PR_LEGACY_CONTRACT_VERSIONS)}")
     if _payload_digest(payload) != payload.get("evidence_digest"):
         raise StorageError(f"{kind} digest does not recompute ({where})")
     if payload.get("delivery_mode") != "direct_pr":
@@ -2740,6 +2768,8 @@ def _pr_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
         base_sha=_require_sha(payload, "base_sha", kind, where),
         commit_sha=_require_sha(payload, "commit_sha", kind, where),
         commit_evidence_id=_require_str(payload, "commit_evidence_id", kind, where),
+        verifier_digest=("" if legacy else _require_digest64(
+            payload, "verifier_digest", kind, where)),
         policy_digest=_require_digest64(payload, "policy_digest", kind, where),
         repo=_require_str(payload, "repo", kind, where),
         pr_number=_require_int(payload, "pr_number", kind, where, 1),
@@ -2756,6 +2786,8 @@ def _pr_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
         command_id=_require_str(payload, "command_id", kind, where),
         evidence_digest=_require_digest64(payload, "evidence_digest", kind, where),
         occurred_at=occurred_at,
+        schema_version=int(schema),
+        legacy=legacy,
     )
     if evidence.head_sha != evidence.commit_sha:
         raise StorageError(
@@ -2773,9 +2805,22 @@ def _pr_approval_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
             f"PR merge approval payload is not valid JSON (seq={seq}): {exc}") from exc
     kind = "PR merge approval"
     where = f"seq={seq}"
-    _require_shape(payload, _PR_APPROVAL_FIELDS, kind, where)
-    if payload.get("schema_version") != PR_CONTRACT_VERSION:
-        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema == PR_CONTRACT_VERSION:
+        _require_shape(payload, _PR_APPROVAL_FIELDS, kind, where,
+                       schema_version=PR_CONTRACT_VERSION)
+        legacy = False
+    elif isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema in _PR_LEGACY_CONTRACT_VERSIONS:
+        _require_shape(payload, _PR_APPROVAL_FIELDS, kind, where,
+                       schema_version=schema)
+        legacy = True
+    else:
+        raise StorageError(
+            f"unsupported {kind} schema_version: {schema!r} ({where});"
+            f" current contract is v{PR_CONTRACT_VERSION} and legacy versions"
+            f" are {sorted(_PR_LEGACY_CONTRACT_VERSIONS)}")
     decision = payload.get("decision")
     if decision not in ("approve", "reject"):
         raise StorageError(f"{kind}.decision is invalid ({where})")
@@ -2808,6 +2853,8 @@ def _pr_approval_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
         reason=_require_str(payload, "reason", kind, where),
         task_status_after=_require_str(payload, "task_status_after", kind, where),
         occurred_at=occurred_at,
+        schema_version=int(schema),
+        legacy=legacy,
     )
     if approval.task_status_after != "ready_to_merge":
         raise StorageError(
@@ -2829,9 +2876,22 @@ def _merge_evidence_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
             f"PR merge evidence payload is not valid JSON (seq={seq}): {exc}") from exc
     kind = "PR merge evidence"
     where = f"seq={seq}"
-    _require_shape(payload, _PR_MERGE_FIELDS, kind, where)
-    if payload.get("schema_version") != PR_CONTRACT_VERSION:
-        raise StorageError(f"unsupported {kind} schema_version ({where})")
+    schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema == PR_CONTRACT_VERSION:
+        _require_shape(payload, _PR_MERGE_FIELDS, kind, where,
+                       schema_version=PR_CONTRACT_VERSION)
+        legacy = False
+    elif isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema in _PR_LEGACY_CONTRACT_VERSIONS:
+        _require_shape(payload, _PR_MERGE_FIELDS, kind, where,
+                       schema_version=schema)
+        legacy = True
+    else:
+        raise StorageError(
+            f"unsupported {kind} schema_version: {schema!r} ({where});"
+            f" current contract is v{PR_CONTRACT_VERSION} and legacy versions"
+            f" are {sorted(_PR_LEGACY_CONTRACT_VERSIONS)}")
     if payload.get("delivery_mode") != "direct_pr":
         raise StorageError(f"{kind}.delivery_mode must be direct_pr ({where})")
     if payload.get("action") != DIRECT_PR_MERGE_ACTION:
@@ -2877,6 +2937,8 @@ def _merge_evidence_from_row(conn: TeamCraftConnection, seq: int, event_id: str,
         source=str(payload["source"]),
         evidence_digest=_require_digest64(payload, "evidence_digest", kind, where),
         occurred_at=occurred_at,
+        schema_version=int(schema),
+        legacy=legacy,
     )
 
 
@@ -2896,6 +2958,36 @@ def _latest_event_row(conn: TeamCraftConnection, kind: str,
 def get_pr_evidence(conn: TeamCraftConnection, event_id: str) -> PullRequestEvidence:
     row = _event_by_id(conn, PR_EVIDENCE_KIND, require_entity_id(event_id))
     return _pr_from_row(conn, int(row[0]), str(row[1]), str(row[2]))
+
+
+def _refuse_legacy_pr_evidence(evidence: PullRequestEvidence, *,
+                               operation: str) -> None:
+    """Refuse any approval/merge/sync use of a READ-ONLY legacy PR row."""
+    if not getattr(evidence, "legacy", False):
+        return
+    raise DeliveryRefusal(
+        "legacy-schema",
+        f"{operation} refused: PR evidence {evidence.event_id} was recorded"
+        f" under legacy direct-PR contract v{evidence.schema_version} (before"
+        " the verifier_digest pin). Legacy rows are READ-ONLY, are never"
+        " current, and can never authorize approval or merge."
+        f" Re-prepare the pull request under contract v{PR_CONTRACT_VERSION}.")
+
+
+def _pr_command_verifier_digest(payload: dict, command_id: str) -> str:
+    """Pull the verifier pin out of a prepare/sync Command payload.
+
+    Commands written before the v2 contract carry no ``verifier_digest``.  Such
+    a receipt can expire safely when no PR exists, but it can NEVER be adopted
+    as current evidence: the resulting row would have no verifier pin.
+    """
+    if "verifier_digest" not in payload:
+        raise ConflictError(
+            f"PR Command {command_id} predates direct-PR contract"
+            f" v{PR_CONTRACT_VERSION} and carries no verifier_digest pin;"
+            " legacy receipt adoption is refused. Expire the Command and"
+            " re-prepare the pull request under the current contract.")
+    return _require_digest64(payload, "verifier_digest", "PR Command", command_id)
 
 
 def list_pr_evidence(conn: TeamCraftConnection,
@@ -3149,6 +3241,7 @@ def _persist_pr_evidence(conn: TeamCraftConnection, *, task: domain.Task,
                          brief_digest: str, brief_version: int, report_id: int,
                          report_digest: str, allocation: worktrees.WorktreeAllocation,
                          commit: CommitEvidence, policy_digest: str,
+                         verifier_digest: str,
                          facts: github_adapter.PullRequestFacts, source: str,
                          command_id: str, clock: Clock | None) -> PullRequestEvidence:
     checks = [dict(c) for c in facts.checks]
@@ -3172,6 +3265,7 @@ def _persist_pr_evidence(conn: TeamCraftConnection, *, task: domain.Task,
         ready=ready, repo=facts.repo, source=source, task_id=task.id,
         task_version=task.version, worker_report_digest=report_digest,
         worker_report_id=report_id, worktree_path=allocation.worktree_path,
+        verifier_digest=verifier_digest,
     )
     event, _inserted = events.append_event_idempotent(
         conn, PR_EVIDENCE_KIND, project_id=task.project_id, task_id=task.id,
@@ -3257,6 +3351,7 @@ def prepare_direct_pr(
         if replayed is not None:
             evidence = _pr_from_row(conn, int(replayed[0]), str(replayed[1]),
                                    str(replayed[2]))
+            _refuse_legacy_pr_evidence(evidence, operation="PR prepare replay")
             if evidence.attempt_id != attempt_id:
                 raise ConflictError(
                     "idempotency key already owns PR evidence for a different"
@@ -3280,6 +3375,9 @@ def prepare_direct_pr(
         # after readiness must never push, create, or duplicate anything.
         settled_existing = load_latest_pr_evidence(conn, task0.id)
         settled_commit = load_commit_evidence(conn, attempt_id)
+        if settled_existing is not None:
+            _refuse_legacy_pr_evidence(
+                settled_existing, operation="PR prepare convergence")
         if (settled_existing is not None and settled_commit is not None
                 and settled_existing.attempt_id == attempt_id
                 and settled_existing.head_sha == settled_commit.commit_sha):
@@ -3318,6 +3416,8 @@ def prepare_direct_pr(
         _unresolved_other_key(conn, PR_PREPARE_COMMAND_KIND, attempt.id, key)
 
         existing = load_latest_pr_evidence(conn, task.id)
+        if existing is not None:
+            _refuse_legacy_pr_evidence(existing, operation="PR prepare")
         if (existing is not None and existing.attempt_id == attempt.id
                 and existing.head_sha == commit.commit_sha):
             # A PR already exists for this exact delivered commit: never create
@@ -3452,13 +3552,20 @@ def prepare_direct_pr(
                 raise ConflictError(
                     "delivery facts drifted while the PR was formed; refusing to"
                     " record the evidence")
+            current_verifiers, _ = _required_verifier_evidence(
+                conn, current_task, current_attempt, None)
+            if _verifier_digest(current_verifiers) != _verifier_digest(verifiers):
+                raise ConflictError(
+                    "verifier evidence drifted while the PR was formed;"
+                    " refusing to record stale verifier pins")
             evidence = _persist_pr_evidence(
                 conn, task=current_task, attempt=current_attempt,
                 dispatch_ver=dispatch_ver, brief_digest=brief.brief_digest,
                 brief_version=brief.brief_version, report_id=report_id,
                 report_digest=report_digest, allocation=allocation,
                 commit=commit, policy_digest=policy_digest, facts=facts,
-                source=source, command_id=command.id, clock=clock)
+                verifier_digest=_verifier_digest(verifiers), source=source,
+                command_id=command.id, clock=clock)
             outcome = "pending_checks"
             status_after = current_task.status
             if ready:
@@ -3574,6 +3681,7 @@ def sync_direct_pr(
     existing0 = load_latest_pr_evidence(conn, task_id)
     if existing0 is None:
         raise NotFoundError("no durable PR evidence to sync; run prepare_direct_pr first")
+    _refuse_legacy_pr_evidence(existing0, operation="direct-PR sync")
 
     probe = github_adapter.probe_gh(gh, task_repo_root(conn, task0), resolve=which)
     if probe.blocked:
@@ -3589,6 +3697,7 @@ def sync_direct_pr(
         if replayed is not None:
             evidence = _pr_from_row(conn, int(replayed[0]), str(replayed[1]),
                                    str(replayed[2]))
+            _refuse_legacy_pr_evidence(evidence, operation="PR sync replay")
             leader.require_project_lease(conn, lease, evidence.project_id, clock=clock)
             task = domain.get_task(conn, evidence.task_id)
             return DirectPrResult(
@@ -3622,6 +3731,7 @@ def sync_direct_pr(
         if (commit.event_id != existing0.commit_evidence_id
                 or commit.commit_sha != existing0.commit_sha):
             problems.append("commit: evidence chain drifted")
+        problems.extend(_pr_verifier_problems(conn, existing0, task))
         if problems:
             raise ConflictError("direct-PR sync refused: " + "; ".join(problems))
         _unresolved_same_key(conn, PR_SYNC_COMMAND_KIND, key)
@@ -3638,7 +3748,8 @@ def sync_direct_pr(
                 "worker_report_digest": existing0.worker_report_digest,
                 "pr_evidence_id": existing0.event_id, "pr_number": existing0.pr_number,
                 "repo": config["repo"], "intended_base": config["base"],
-                "head_sha": existing0.head_sha, "policy_digest": policy_digest}),
+                "head_sha": existing0.head_sha, "policy_digest": policy_digest,
+                "verifier_digest": existing0.verifier_digest}),
             evidence_json=_evidence_envelope(task, attempt,
                                             existing0.dispatch_task_version,
                                             existing0.evidence_digest),
@@ -3707,6 +3818,7 @@ def sync_direct_pr(
                     report_digest=existing0.worker_report_digest,
                     allocation=worktrees.require_allocation(conn, attempt_id),
                     commit=commit, policy_digest=policy_digest, facts=facts,
+                    verifier_digest=existing0.verifier_digest,
                     source="synced", command_id=command.id, clock=clock)
             status_after = current_task.status
             outcome = "ready_updated" if status_after == "ready_to_merge" \
@@ -3822,6 +3934,7 @@ def approve_direct_pr_merge(
             return approval
 
         evidence = get_pr_evidence(conn, pr_evidence_id)
+        _refuse_legacy_pr_evidence(evidence, operation="PR merge approval")
         task = domain.get_task(conn, evidence.task_id)
         attempt = domain.get_attempt(conn, evidence.attempt_id)
         leader.require_project_lease(conn, lease, task.project_id, clock=clock)
@@ -4029,6 +4142,7 @@ def merge_direct_pr(
             return evidence
 
         pr = get_pr_evidence(conn, pr_evidence_id)
+        _refuse_legacy_pr_evidence(pr, operation="direct-PR merge")
         task = domain.get_task(conn, pr.task_id)
         attempt = domain.get_attempt(conn, pr.attempt_id)
         leader.require_project_lease(conn, lease, task.project_id, clock=clock)
@@ -4456,6 +4570,7 @@ def reconcile_pr_receipt(
             report_id=int(payload.get("worker_report_id") or -1),
             report_digest=str(payload.get("worker_report_digest") or ""),
             allocation=allocation, commit=commit, policy_digest=policy_digest,
+            verifier_digest=_pr_command_verifier_digest(payload, command.id),
             facts=found, source="reconciled", command_id=command.id, clock=clock)
         checks = [dict(c) for c in found.checks]
         checks.sort(key=lambda c: (c["name"], c["status"]))
@@ -4565,6 +4680,7 @@ def reconcile_pr_merge(
                 "this Task already has durable merge evidence"
                 f" ({settled_merge.event_id}); never reconcile a second merge")
         pr = get_pr_evidence(conn, pr_evidence_id)
+        _refuse_legacy_pr_evidence(pr, operation="PR merge reconcile")
         approval = load_pr_merge_approval(conn, pr.id)
         if (approval is None or approval.id != approval_event_id
                 or approval.decision != "approve"):
@@ -4701,18 +4817,110 @@ def reconcile_pr_merge(
 # ---------------------------------------------------------------------------
 
 
+def _pr_verifier_problems(conn: TeamCraftConnection,
+                          evidence: PullRequestEvidence,
+                          task: domain.Task) -> list[str]:
+    """Re-prove the verifier snapshot pinned into one PR observation.
+
+    A Worktree Verification is immutable, but its profile configuration is
+    append-only and can later be replaced or disabled.  Direct-PR cleanup
+    therefore rebuilds the exact evidence digest from the Attempt's PASS rows
+    and the *current* required profile snapshot.  This terminal proof avoids
+    :func:`verification.worktree_verification_is_current`, whose normal
+    pre-delivery view intentionally requires a VERIFYING Task.
+    """
+    problems: list[str] = []
+    rows = verification.list_worktree_verifications(conn, evidence.attempt_id)
+    invalid = [row for row in rows if row.status in ("fail", "error", "stale")]
+    if invalid:
+        problems.append(
+            "verifier: Attempt contains failed/error/stale verifier evidence")
+    required = verification.required_profile_snapshot(conn, task.project_id)
+    if not required:
+        problems.append(
+            "verifier: project has no approved-and-enabled verifier profiles")
+        return problems
+    passing: dict[str, verification.WorktreeVerification] = {}
+    for row in rows:
+        if row.status == "pass":
+            passing.setdefault(row.profile, row)
+    entries: list[dict[str, Any]] = []
+    for profile, (version, config_digest) in sorted(required.items()):
+        row = passing.get(profile)
+        if row is None:
+            problems.append(
+                f"verifier: required profile {profile!r} has no PASS evidence")
+            continue
+        if (row.profile_version != version
+                or row.config_digest != config_digest):
+            problems.append(
+                f"verifier: profile {profile!r} configuration drifted")
+            continue
+        if (row.project_id != evidence.project_id
+                or row.task_id != evidence.task_id
+                or row.attempt_id != evidence.attempt_id
+                or row.attempt_no != evidence.attempt_no
+                or row.dispatch_task_version != evidence.dispatch_task_version
+                or row.brief_digest != evidence.brief_digest
+                or row.worker_report_id != evidence.worker_report_id
+                or row.worker_report_digest != evidence.worker_report_digest
+                or row.allocation_id != evidence.allocation_id
+                or row.worktree_path != evidence.worktree_path
+                or row.branch != evidence.branch
+                or row.base_sha != evidence.base_sha):
+            problems.append(
+                f"verifier: profile {profile!r} evidence bindings drifted")
+            continue
+        entries.append({
+            "profile": profile, "profile_version": version,
+            "config_digest": config_digest,
+            "verification_id": row.id, "report_digest": row.report_digest,
+            "log_digest": row.log_digest, "exit_code": row.exit_code,
+            "status": "pass",
+        })
+    if _verifier_digest(entries) != evidence.verifier_digest:
+        problems.append(
+            "verifier: exact PASS evidence digest differs from the PR pin")
+    return problems
+
+
 def pr_evidence_is_current(conn: TeamCraftConnection,
                           evidence: PullRequestEvidence, *,
                           live_gh: bool = True,
                           run_gh: github_adapter.GitHubRunner | None = None,
-                          which: Any = None) -> DeliveryFreshness:
-    """Whether durable PR evidence still matches live Task/GitHub facts."""
+                          which: Any = None,
+                          after_merge: bool = False) -> DeliveryFreshness:
+    """Whether durable PR evidence still matches live Task/GitHub facts.
+
+    ``after_merge=True`` is the terminal view used once the PR has landed:
+    the Task legitimately sits DONE, one or two versions past the evidence
+    (readiness CAS then merge acceptance), and only the still-current durable
+    pins are required.  A non-DONE Task, or a version outside that exact
+    window, is drift.
+    """
     problems: list[str] = []
+    if evidence.legacy:
+        return DeliveryFreshness(
+            ok=False,
+            problems=(
+                f"schema: PR evidence {evidence.event_id} uses legacy direct-PR"
+                f" contract v{evidence.schema_version}; legacy rows are"
+                f" READ-ONLY and never current under v{PR_CONTRACT_VERSION}."
+                " Re-prepare the pull request.",))
     try:
         task = domain.get_task(conn, evidence.task_id)
     except (NotFoundError, ValidationError):
         return DeliveryFreshness(ok=False, problems=("task: missing",))
-    if task.status not in ("verifying", "ready_to_merge"):
+    if after_merge:
+        if task.status != "done":
+            problems.append(f"status: task is {task.status!r}, expected 'done'")
+        elif task.version not in (evidence.task_version + 1,
+                                  evidence.task_version + 2):
+            problems.append(
+                f"version: merged Task is v{task.version} but evidence formed"
+                f" at v{evidence.task_version}; expected the readiness CAS or"
+                " merge acceptance, not arbitrary drift")
+    elif task.status not in ("verifying", "ready_to_merge"):
         problems.append(f"status: task is {task.status!r}")
     elif task.status == "ready_to_merge" and task.version != evidence.task_version + 1:
         problems.append(
@@ -4727,7 +4935,9 @@ def pr_evidence_is_current(conn: TeamCraftConnection,
         brief_digest=evidence.brief_digest,
         report_id=evidence.worker_report_id,
         report_digest=evidence.worker_report_digest,
-        expect_statuses=("verifying", "ready_to_merge"), check_version=False))
+        expect_statuses=(("done",) if after_merge
+                         else ("verifying", "ready_to_merge")),
+        check_version=False))
     try:
         _policy, policy_digest, config = _direct_pr_policy(task)
         if policy_digest != evidence.policy_digest:
@@ -4744,6 +4954,10 @@ def pr_evidence_is_current(conn: TeamCraftConnection,
             problems.append("commit: evidence chain drifted")
     except (NotFoundError, StorageError) as exc:
         problems.append(f"commit: {exc}")
+    try:
+        problems.extend(_pr_verifier_problems(conn, evidence, task))
+    except (NotFoundError, StorageError, ValidationError) as exc:
+        problems.append(f"verifier: {exc}")
     latest = load_latest_pr_evidence(conn, evidence.task_id)
     if latest is not None and latest.event_id != evidence.event_id:
         problems.append("evidence: a newer PR observation supersedes this row")
@@ -4777,10 +4991,20 @@ def pr_merge_approval_is_current(
     drift shows up here as invalidation, exactly like M4-04 approvals.
     """
     problems: list[str] = []
+    if approval.legacy:
+        problems.append(
+            f"schema: merge approval {approval.event_id} uses legacy direct-PR"
+            f" contract v{approval.schema_version}; legacy rows are READ-ONLY"
+            f" and never current under v{PR_CONTRACT_VERSION}")
     try:
         pr = get_pr_evidence(conn, approval.pr_evidence_id)
     except (NotFoundError, StorageError) as exc:
         return DeliveryFreshness(ok=False, problems=(f"evidence: {exc}",))
+    if pr.legacy:
+        problems.append(
+            f"schema: PR evidence {pr.event_id} uses legacy direct-PR contract"
+            f" v{pr.schema_version}; legacy rows are READ-ONLY and never current"
+            f" under v{PR_CONTRACT_VERSION}")
     if approval.pr_evidence_digest != pr.evidence_digest:
         problems.append("evidence: approval no longer binds this evidence version")
     if (approval.head_sha != pr.head_sha or approval.base_ref != pr.base_ref
@@ -4810,17 +5034,42 @@ def pr_merge_approval_is_current(
                     gh, task_repo_root(conn, task), repo=pr.repo, evidence=pr)
                 problems.extend(live_problems)
     else:
+        if merge.legacy:
+            problems.append(
+                f"schema: merge evidence {merge.event_id} uses legacy direct-PR"
+                f" contract v{merge.schema_version}; legacy rows are READ-ONLY"
+                f" and never current under v{PR_CONTRACT_VERSION}")
+        if not merge.merged:
+            problems.append("merge: merge evidence is not merged")
         if (merge.approval_event_id != approval.id
                 or merge.pr_evidence_id != pr.event_id):
             problems.append("merge: merge evidence does not name this approval")
         if merge.intended_base != approval.intended_base:
             problems.append("merge: intended base drifted")
+        if (merge.head_sha != pr.head_sha or merge.base_ref != pr.base_ref
+                or merge.pr_number != pr.pr_number or merge.repo != pr.repo
+                or merge.policy_digest != pr.policy_digest):
+            problems.append("merge: merge evidence drifted from the PR evidence")
+        if merge.task_version != approval.task_version:
+            problems.append("merge: approval/merge Task versions drifted")
+        if approval.decision != "approve":
+            problems.append(
+                f"merge: approval decision is {approval.decision!r}, not 'approve'")
         if task.status != "done" or task.version != approval.task_version + 1:
             problems.append(
                 f"status: merged task is {task.status!r} v{task.version},"
                 f" expected done v{approval.task_version + 1}")
+        # The PR evidence may have been formed while VERIFYING (readiness CAS
+        # adds one) or refreshed while READY_TO_MERGE (no further bump before
+        # acceptance).  Anything else is Task drift the terminal check rejects.
+        if pr.task_version not in (approval.task_version - 1,
+                                   approval.task_version):
+            problems.append(
+                f"version: PR evidence bound v{pr.task_version}, approval"
+                f" bound v{approval.task_version}")
     if approval.decision == "approve":
-        freshness = pr_evidence_is_current(conn, pr, live_gh=False)
+        freshness = pr_evidence_is_current(
+            conn, pr, live_gh=False, after_merge=merge is not None)
         problems.extend(freshness.problems)
     return DeliveryFreshness(ok=not problems, problems=tuple(problems))
 
@@ -4976,7 +5225,7 @@ def check_integration_state(
     merge = worktrees.check_merge_conflicts(conn, attempt_id,
                                            base_sha=drift.live_base_sha,
                                            run_git=runner)
-    required = bool(drift.drifted or merge.conflicting)
+    required = bool(drift.drifted or drift.problems or not merge.clean)
     requirement = load_integration_requirement(conn, attempt_id)
     problems = tuple(drift.problems) + tuple(merge.problems)
     status = IntegrationStatus(
@@ -5029,8 +5278,10 @@ def ensure_integration_task(
     status = check_integration_state(conn, attempt_id, run_git=runner,
                                      clock=clock)
     existing = load_integration_requirement(conn, attempt_id)
-    if status.integration_task_id is None and existing is not None:
-        # A requirement predates this pass (e.g. drift since healed).
+    if existing is not None:
+        # A requirement predates this pass, even if drift has since healed.
+        # The explicit integration Task is human-owned: detection never
+        # auto-cancels or duplicates it.
         return status, domain.get_task(conn, existing[0]), False
     if not status.integration_required:
         return status, None, False
@@ -5041,7 +5292,11 @@ def ensure_integration_task(
         raced = load_integration_requirement(conn, attempt_id)
         if raced is not None:
             return status, domain.get_task(conn, raced[0]), False
-        trigger = ("merge_conflict" if status.conflict_files else "base_drift")
+        trigger = (
+            "merge_conflict"
+            if status.merge_status == worktrees.MERGE_STATUS_CONFLICT
+            else "base_drift" if status.base_drift
+            else "integration_unknown")
         acceptance = [
             (f"resolve {status.merge_status} between {status.branch} and live"
              f" base {status.live_base_sha}" if status.conflict_files else
@@ -5240,7 +5495,9 @@ def evaluate_cleanup_eligibility(
         conn, task, attempt_id, run_git=runner, live_git=live_git)
     reasons.extend(delivery_problems)
     if not reasons:
-        # Identity + cleanliness + no undelivered commits, live.
+        # Identity + cleanliness + no undelivered commits, live.  Cleanup is
+        # an inspection gate here: it must NEVER repair a missing marker (that
+        # would destroy the evidence that the workspace is ambiguous).
         try:
             worktrees.validate_worktree_identity(
                 conn, attempt_id, run_git=runner)

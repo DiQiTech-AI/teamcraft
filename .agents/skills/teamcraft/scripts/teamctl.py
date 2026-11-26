@@ -203,6 +203,24 @@ class _TeamctlHerdrAdapter(HerdrAdapter):
     def list_agents(self) -> list[dict[str, Any]]:
         return self._translate(super().list_agents)
 
+    def rename_pane(self, pane_id: str, label: str) -> dict[str, Any]:
+        """Rename a pane with the CLI's normalized error type.
+
+        Declared on this CLI adapter in addition to the base class so an older
+        bundled Core (which may predate ``HerdrAdapter.rename_pane``) still
+        exposes the capability instead of raising ``AttributeError``; when the
+        base method is available it is preferred and translated uniformly.
+        """
+        try:
+            base = super().rename_pane
+        except AttributeError:  # stale bundled Core: no base implementation
+            base = None
+        if base is None:
+            return self._translate(
+                self.request, ["pane", "rename", pane_id, label]
+            )
+        return self._translate(base, pane_id, label)
+
 
 def _herdr_adapter() -> HerdrAdapter:
     def runner(argv: Sequence[str], timeout: float, accepted: tuple[int, ...]):
@@ -2000,7 +2018,9 @@ def verify_recorded_occupant(
         return {}, None
     try:
         pane = _herdr_adapter().current_pane(pane_id)
-    except HerdrCommandError:
+    except (HerdrCommandError, TeamctlError) as exc:
+        if _herdr_error_code(exc) not in {None, "pane_not_found"}:
+            raise
         # A moved pane gets a new public ID. Resolve by the still-unique live name,
         # then require persisted terminal/session identity before adopting it.
         try:
@@ -2613,7 +2633,24 @@ def _native_session(member: dict[str, Any]) -> str | None:
 
 
 def _stop_evidence(member: dict[str, Any], *, require_live_agent: bool) -> dict[str, Any]:
-    """Inspect the recorded occupant, failing closed on any identity ambiguity."""
+    """Inspect the recorded occupant, failing closed on any identity ambiguity.
+
+    ``identity_verified`` keeps its recovery contract meaning: the recorded
+    terminal/native-session identity was positively accounted for.  The
+    ``identity_mode`` field makes *how* that was proven explicit so the
+    status is never mistaken for a live-identity check:
+
+    * ``live_pane`` — the recorded pane is still present and its live Agent
+      was re-inspected; ``process_alive`` reflects that Agent.
+    * ``recorded_identity_absent`` — the recorded pane is gone and the whole
+      Herdr inventory (agents + every workspace's panes) was searched without
+      finding the recorded name/pane/terminal/native identity.  This proves
+      *absence*, so ``process_alive`` is ``False``; ``recorded_identity_absent``
+      is an explicit, non-misleading marker for that mode.
+
+    ``recovery.resolve_unknown`` still requires ``identity_verified is True``
+    and a matching ``process_alive``; the extra fields do not widen that gate.
+    """
     pane, agent = verify_recorded_occupant(member)
     native, terminal = _native_session(member), member.get("terminal_id")
     if not isinstance(terminal, str) or not terminal or not native:
@@ -2623,10 +2660,66 @@ def _stop_evidence(member: dict[str, Any], *, require_live_agent: bool) -> dict[
     if not require_live_agent and agent is not None:
         raise TeamctlError("Agent still appears live after stop; cancellation remains UNKNOWN")
     if not pane:
-        raise TeamctlError("recorded pane is unavailable; cancellation remains UNKNOWN")
+        if require_live_agent:
+            raise TeamctlError("recorded pane is unavailable; cancellation remains UNKNOWN")
+        _require_recorded_identity_absent(member, native=native, terminal=terminal)
+        return {"identity_verified": True, "process_alive": False,
+                "identity_mode": "recorded_identity_absent",
+                "recorded_identity_absent": True,
+                "pane_id": member.get("pane_id"), "terminal_id": terminal,
+                "native_session_id": native}
     return {"identity_verified": True, "process_alive": bool(agent),
+            "identity_mode": "live_pane", "recorded_identity_absent": False,
             "pane_id": pane.get("pane_id"), "terminal_id": terminal,
             "native_session_id": native}
+
+
+def _require_recorded_identity_absent(
+    member: dict[str, Any], *, native: str, terminal: str,
+) -> None:
+    """Prove a legacy recorded occupant is absent from the whole Herdr session."""
+    name, pane_id = member.get("name"), member.get("pane_id")
+    if not isinstance(name, str) or not name or not isinstance(pane_id, str) or not pane_id:
+        raise TeamctlError("recorded name/pane identity is incomplete")
+    adapter = _herdr_adapter()
+    agents = adapter.list_agents()
+    for agent in agents:
+        if (agent.get("name") == name or agent.get("pane_id") == pane_id
+                or agent.get("terminal_id") == terminal
+                or _native_session(agent) == native):
+            raise TeamctlError(
+                "recorded Agent identity still appears in live inventory; cancellation remains UNKNOWN"
+            )
+
+    workspaces_payload = adapter.request(["workspace", "list"])
+    try:
+        workspaces = workspaces_payload["result"]["workspaces"]
+    except (KeyError, TypeError) as exc:
+        raise TeamctlError("Herdr workspace inventory is malformed") from exc
+    if not isinstance(workspaces, list):
+        raise TeamctlError("Herdr workspace inventory is malformed")
+    panes: list[dict[str, Any]] = []
+    for workspace in workspaces:
+        workspace_id = workspace.get("workspace_id") if isinstance(workspace, dict) else None
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise TeamctlError("Herdr workspace inventory contains an invalid identity")
+        pane_payload = adapter.request(["pane", "list", "--workspace", workspace_id])
+        try:
+            workspace_panes = pane_payload["result"]["panes"]
+        except (KeyError, TypeError) as exc:
+            raise TeamctlError("Herdr pane inventory is malformed") from exc
+        if not isinstance(workspace_panes, list) or any(
+            not isinstance(item, dict) for item in workspace_panes
+        ):
+            raise TeamctlError("Herdr pane inventory is malformed")
+        panes.extend(workspace_panes)
+    if any(
+        pane.get("pane_id") == pane_id or pane.get("terminal_id") == terminal
+        for pane in panes
+    ):
+        raise TeamctlError(
+            "recorded pane/terminal identity still appears in live inventory; cancellation remains UNKNOWN"
+        )
 
 
 def _live_reconcile_evidence(member: dict[str, Any]) -> dict[str, Any]:
@@ -2636,6 +2729,7 @@ def _live_reconcile_evidence(member: dict[str, Any]) -> dict[str, Any]:
     if not pane or not agent or not native or not isinstance(terminal, str) or not terminal:
         raise TeamctlError("live recovery requires a verified pane, terminal, and native Agent session")
     return {"identity_verified": True, "process_alive": True,
+            "identity_mode": "live_pane", "recorded_identity_absent": False,
             "pane_id": pane.get("pane_id"), "terminal_id": terminal,
             "native_session_id": native}
 
@@ -4174,7 +4268,7 @@ def integration_ensure(args: argparse.Namespace) -> int:
 
 
 def integration_status(args: argparse.Namespace) -> int:
-    """Latest recorded integration facts + requirement for one member."""
+    """Read-only integration facts + requirement (never appends an Event)."""
 
     store = StateStore(resolve_project_root(args.cwd))
     conn = store._connect()
@@ -4191,7 +4285,7 @@ def integration_status(args: argparse.Namespace) -> int:
 
 
 def worktree_cleanup_status(args: argparse.Namespace) -> int:
-    """Cleanup eligibility verdict for one member's worktree (read-only)."""
+    """Read-only cleanup eligibility for one member (never repairs markers)."""
 
     store = StateStore(resolve_project_root(args.cwd))
     conn = store._connect()
@@ -5123,12 +5217,16 @@ def build_parser() -> argparse.ArgumentParser:
     integration_ensure_parser.add_argument("--member", required=True)
     integration_ensure_parser.set_defaults(handler=integration_ensure)
 
-    integration_status_parser = commands.add_parser("integration-status")
+    integration_status_parser = commands.add_parser(
+        "integration-status",
+        help="read-only integration facts (never appends an audit Event)")
     add_cwd(integration_status_parser)
     integration_status_parser.add_argument("--member", required=True)
     integration_status_parser.set_defaults(handler=integration_status)
 
-    cleanup_status_parser = commands.add_parser("worktree-cleanup-status")
+    cleanup_status_parser = commands.add_parser(
+        "worktree-cleanup-status",
+        help="read-only cleanup eligibility (never repairs Git markers)")
     add_cwd(cleanup_status_parser)
     cleanup_status_parser.add_argument("--member", required=True)
     cleanup_status_parser.set_defaults(handler=worktree_cleanup_status)

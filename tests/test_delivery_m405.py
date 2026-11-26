@@ -32,6 +32,7 @@ from teamcraft import (
     commands,
     delivery,
     domain,
+    events,
     github_adapter,
     leader,
     storage,
@@ -81,6 +82,11 @@ def sha1(text: str) -> str:
 def canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                      ensure_ascii=False)
+
+
+def payload_digest(payload: dict) -> str:
+    stripped = {k: v for k, v in payload.items() if k != "evidence_digest"}
+    return hashlib.sha256(canonical(stripped).encode("utf-8")).hexdigest()
 
 
 def init_repo_and_origin(base: Path) -> tuple[Path, Path]:
@@ -415,6 +421,46 @@ class DirectPrDeliveryTests(unittest.TestCase):
             (kind,)).fetchall()
         return str(rows[index][0])
 
+    def _legacy_pr_payload_json(self, evidence) -> str:
+        """Rewrite one v2 PR row as the exact v1 shape (no verifier_digest)."""
+
+        row = self.conn.execute(
+            "SELECT payload_json FROM events WHERE kind = ? AND event_id = ?",
+            (delivery.PR_EVIDENCE_KIND, evidence.id)).fetchone()
+        payload = json.loads(str(row[0]))
+        payload.pop("verifier_digest", None)
+        payload["schema_version"] = 1
+        payload.pop("evidence_digest", None)
+        payload["evidence_digest"] = payload_digest(payload)
+        return canonical(payload)
+
+    def _append_legacy_pr(self, task, attempt, evidence,
+                          event_id: str = "evt-dpe-legacy-v1"):
+        return events.append_event(
+            self.conn, delivery.PR_EVIDENCE_KIND,
+            project_id=task.project_id, task_id=task.id,
+            attempt_id=attempt.id,
+            payload_json=self._legacy_pr_payload_json(evidence),
+            event_id=event_id)
+
+    def _legacy_pr_command_payload(self, task, attempt, allocation, commit):
+        # Exact pre-v2 shape: no verifier_digest pin was written at all.
+        return {
+            "project_id": self.project.id, "task_id": task.id,
+            "task_version": task.version, "attempt_id": attempt.id,
+            "attempt_no": attempt.attempt_no,
+            "dispatch_task_version": task.version - 1,
+            "brief_digest": self._brief_digest(attempt.id),
+            "brief_version": 1, "worker_report_id": self._report_id(attempt.id),
+            "worker_report_digest": self._report_digest(attempt.id),
+            "allocation_id": allocation.allocation_id,
+            "worktree_path": allocation.worktree_path, "branch": allocation.branch,
+            "base_sha": allocation.base_sha, "commit_sha": commit.commit_sha,
+            "commit_evidence_id": "x", "policy_digest": self._policy_digest(),
+            "repo": POLICY["direct_pr"]["repo"], "base": "main",
+            "merge_method": "merge",
+        }
+
     # -- BLOCKED with zero writes ---------------------------------------------
 
     def test_missing_gh_blocks_with_zero_writes(self):
@@ -583,6 +629,99 @@ class DirectPrDeliveryTests(unittest.TestCase):
         result = self.prepared(attempt, key="pr-fresh")
         self.assertEqual(result.outcome, "ready")
         self.assertEqual(len(self.gh.prs), 1)
+
+    # -- contract versioning: v2 current vs v1 read-only ----------------------
+
+    def test_pr_evidence_contract_v2_is_current(self):
+        task, attempt, _alloc, _commit = self.ready_attempt()
+        evidence = self.prepared(attempt).pr_evidence
+        self.assertEqual(evidence.schema_version, 2)
+        self.assertFalse(evidence.legacy)
+        self.assertEqual(
+            delivery.get_pr_evidence(self.conn, evidence.id).schema_version, 2)
+        fresh = delivery.pr_evidence_is_current(self.conn, evidence,
+                                               live_gh=False)
+        self.assertTrue(fresh.ok, fresh.problems)
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "ready_to_merge")
+
+    def test_legacy_v1_pr_evidence_is_read_only_and_never_current(self):
+        task, attempt, _alloc, _commit = self.ready_attempt()
+        evidence = self.prepared(attempt).pr_evidence
+        legacy_row = self._append_legacy_pr(task, attempt, evidence)
+        legacy = delivery.load_latest_pr_evidence(self.conn, task.id)
+        self.assertIsNotNone(legacy)
+        self.assertEqual(legacy.event_id, legacy_row.event_id)
+        self.assertTrue(legacy.legacy)
+        self.assertEqual(legacy.schema_version, 1)
+        self.assertEqual(legacy.verifier_digest, "")
+        # The legacy reader is stable and does not shape-crash.
+        reread = delivery.get_pr_evidence(self.conn, legacy.event_id)
+        self.assertEqual(reread.evidence_digest, legacy.evidence_digest)
+        fresh = delivery.pr_evidence_is_current(self.conn, legacy,
+                                               live_gh=False)
+        self.assertFalse(fresh.ok)
+        self.assertIn("legacy", " ".join(fresh.problems))
+        # A legacy row can never authorize approval or merge.
+        with self.assertRaises(delivery.DeliveryRefusal) as caught:
+            self.approved(legacy)
+        self.assertEqual(caught.exception.kind, "legacy-schema")
+        with self.assertRaises(delivery.DeliveryRefusal) as caught:
+            self.delivered(legacy)
+        self.assertEqual(caught.exception.kind, "legacy-schema")
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "ready_to_merge")
+        self.assertEqual(self.events_of("delivery.pr_merged", task.id), [])
+
+    def test_legacy_pr_command_adoption_is_refused(self):
+        task, attempt, allocation, commit = self.ready_attempt()
+        payload = self._legacy_pr_command_payload(task, attempt, allocation,
+                                                  commit)
+        submitted = commands.submit_command(
+            self.conn, idempotency_key="legacy-crash-1",
+            kind=delivery.PR_PREPARE_COMMAND_KIND,
+            payload_json=canonical(payload), evidence_json="{}")
+        commands.claim_command(self.conn, submitted.command.id)
+        commands.mark_command_unknown(self.conn, submitted.command.id,
+                                     note="process died before v2 contract")
+        git("push", "-q", "origin", allocation.branch, cwd=self.repo)
+        self.gh.seed(head=allocation.branch, base="main")
+        with self.assertRaises(ConflictError) as caught:
+            delivery.reconcile_pr_receipt(
+                self.conn, submitted.command.id, lease=self.lease(),
+                actor="ops", reason="legacy crash window", run_git=self.rec,
+                run_gh=self.gh)
+        message = str(caught.exception)
+        self.assertIn("predates", message)
+        self.assertIn("verifier_digest", message)
+        self.assertIn("re-prepare", message)
+        self.assertEqual(self.events_of(delivery.PR_EVIDENCE_KIND, task.id), [])
+        self.assertEqual(self.command_state(delivery.PR_PREPARE_COMMAND_KIND),
+                         "unknown")
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "verifying")
+
+    def test_legacy_pr_command_without_pr_effect_expires_cleanly(self):
+        task, attempt, allocation, commit = self.ready_attempt()
+        payload = self._legacy_pr_command_payload(task, attempt, allocation,
+                                                  commit)
+        submitted = commands.submit_command(
+            self.conn, idempotency_key="legacy-crash-2",
+            kind=delivery.PR_PREPARE_COMMAND_KIND,
+            payload_json=canonical(payload), evidence_json="{}")
+        commands.claim_command(self.conn, submitted.command.id)
+        commands.mark_command_unknown(self.conn, submitted.command.id,
+                                     note="process died before v2 contract")
+        outcome = delivery.reconcile_pr_receipt(
+            self.conn, submitted.command.id, lease=self.lease(), actor="ops",
+            reason="legacy crash window", run_git=self.rec, run_gh=self.gh)
+        self.assertEqual(outcome["resolution"], "expired")
+        self.assertIsNone(outcome["pr_evidence"])
+        self.assertEqual(self.command_state(delivery.PR_PREPARE_COMMAND_KIND),
+                         "expired")
+        self.assertEqual(self.events_of(delivery.PR_EVIDENCE_KIND, task.id), [])
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "verifying")
 
     def _brief_digest(self, attempt_id: str) -> str:
         row = self.conn.execute(

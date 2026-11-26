@@ -294,7 +294,14 @@ LEGACY_MISSING_REPORT_EVENT_KIND = "recovery.legacy_missing_report_disposition"
 #: GitHub PR evidence lives outside the local-only ``DELIVERY_CONTRACT_VERSION``
 #: payloads but shares the same integrity rule; versioned independently so a
 #: later hardening (partial unique indexes) can bump it without touching local.
-PR_DELIVERY_CONTRACT_VERSION = 1
+#:
+#: v2 adds the ``verifier_digest`` pin to PR evidence (the exact M4-03 PASS
+#: snapshot bound into the PR observation).  v1 rows are still READABLE for
+#: audit, but they are read-only and can NEVER satisfy readiness or completion:
+#: both gates query only the current version explicitly.
+PR_DELIVERY_CONTRACT_VERSION = 2
+#: Legacy direct-PR payload versions kept purely for read-only audit readers.
+PR_DELIVERY_LEGACY_CONTRACT_VERSIONS = frozenset({1})
 #: Status-check conclusions that count as merge-ready (mirrors the adapter).
 _PR_PASSING_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
@@ -312,6 +319,7 @@ _TASK_TRANSITIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("ready", "attempts_exhausted"): ("needs_human",),
     ("verifying", "verification_passed"): ("needs_human",),
     ("verifying", "verification_failed"): ("needs_human",),
+    ("verifying", "retry_approved"): ("ready",),
     ("verifying", LEGACY_ATTEMPT_INCOMPLETE_EVENT): ("needs_human",),
     ("verifying", LOCAL_DELIVERY_ACCEPT_EVENT): ("done",),
     ("verifying", DIRECT_PR_READY_EVENT): ("ready_to_merge",),
@@ -1190,6 +1198,28 @@ def _require_direct_pr_ready(
          task.version, DIRECT_PR_MERGE_ACTION),
     ).fetchone()
     if row is None:
+        legacy = conn.execute(
+            "SELECT event_id, json_extract(payload_json, '$.schema_version')"
+            " FROM events WHERE kind = ? AND task_id = ?"
+            " AND json_extract(payload_json, '$.schema_version') IN ("
+            + ",".join(str(v) for v in sorted(
+                PR_DELIVERY_LEGACY_CONTRACT_VERSIONS))
+            + ")"
+            " AND json_extract(payload_json, '$.delivery_mode') = 'direct_pr'"
+            " AND json_extract(payload_json, '$.proposed_action') = ?"
+            " AND json_extract(payload_json, '$.task_version') = ?"
+            " ORDER BY seq DESC LIMIT 1",
+            (PR_EVIDENCE_EVENT_KIND, task.id, DIRECT_PR_MERGE_ACTION,
+             task.version),
+        ).fetchone()
+        if legacy is not None:
+            raise refuse(
+                "PR_EVIDENCE_LEGACY_SCHEMA",
+                f"durable PR evidence {str(legacy[0])!r} uses legacy direct-PR"
+                f" contract schema_version {legacy[1]!r} and is READ-ONLY; legacy"
+                " rows are never current and can never authorize readiness."
+                f" Re-prepare the pull request under contract v"
+                f"{PR_DELIVERY_CONTRACT_VERSION}.")
         raise refuse("PR_READY_FACTS_MISSING",
                     "no durable direct-PR evidence bound to this Task's current"
                     " version exists; create the pull request first")
@@ -1278,6 +1308,27 @@ def _require_direct_pr_delivery_acceptance(
          task.version),
     ).fetchone()
     if merge_row is None:
+        legacy = conn.execute(
+            "SELECT kind, event_id, json_extract(payload_json, '$.schema_version')"
+            " FROM events WHERE task_id = ? AND kind IN (?, ?)"
+            " AND json_extract(payload_json, '$.schema_version') IN ("
+            + ",".join(str(v) for v in sorted(
+                PR_DELIVERY_LEGACY_CONTRACT_VERSIONS))
+            + ")"
+            " AND json_extract(payload_json, '$.task_version') = ?"
+            " ORDER BY seq DESC LIMIT 1",
+            (task.id, PR_MERGE_EVIDENCE_EVENT_KIND, PR_EVIDENCE_EVENT_KIND,
+             task.version),
+        ).fetchone()
+        if legacy is not None:
+            raise refuse(
+                "MERGE_FACTS_LEGACY_SCHEMA",
+                f"durable {legacy[0]} row {str(legacy[1])!r} uses legacy"
+                f" direct-PR contract schema_version {legacy[2]!r} and is"
+                " READ-ONLY; legacy rows are never current and can never"
+                " complete delivery."
+                f" Re-prepare and re-merge under contract v"
+                f"{PR_DELIVERY_CONTRACT_VERSION}.")
         raise refuse("MERGE_FACTS_MISSING",
                     "no durable merge evidence confirms this Task's PR was merged"
                     " at its current version; a verified merge is required for DONE")
@@ -1322,6 +1373,13 @@ def _require_direct_pr_delivery_acceptance(
     pr = json.loads(str(pr_row[0]))
     if not isinstance(pr, dict) or _delivery_payload_digest(pr) != pr.get("evidence_digest"):
         raise refuse("MERGE_FACTS_STALE", "PR evidence digest does not recompute")
+    if pr.get("schema_version") != PR_DELIVERY_CONTRACT_VERSION:
+        raise refuse(
+            "MERGE_FACTS_LEGACY_SCHEMA",
+            f"the PR evidence this merge names uses schema_version"
+            f" {pr.get('schema_version')!r}, not the current contract"
+            f" v{PR_DELIVERY_CONTRACT_VERSION}; legacy evidence can never"
+            " complete delivery")
     if (str(pr.get("task_id")) != task.id
             or str(pr.get("attempt_id")) != str(merge.get("attempt_id"))
             or pr.get("delivery_mode") != "direct_pr"):
@@ -1343,6 +1401,13 @@ def _require_direct_pr_delivery_acceptance(
     approval = json.loads(str(approval_row[0]))
     if not isinstance(approval, dict):
         raise refuse("APPROVAL_REQUIRED", "merge Approval row is malformed")
+    if approval.get("schema_version") != PR_DELIVERY_CONTRACT_VERSION:
+        raise refuse(
+            "APPROVAL_LEGACY_SCHEMA",
+            f"the merge Approval uses schema_version"
+            f" {approval.get('schema_version')!r}, not the current contract"
+            f" v{PR_DELIVERY_CONTRACT_VERSION}; legacy approvals cannot"
+            " authorize completion")
     if (approval.get("decision") != "approve"
             or approval.get("proposed_action") != DIRECT_PR_MERGE_ACTION
             or int(approval.get("task_version") or -1) != task.version):
@@ -2553,6 +2618,7 @@ __all__ = [
     "OCCUPYING_ATTEMPT_STATUSES",
     "PAUSABLE_TASK_STATUSES",
     "PR_DELIVERY_CONTRACT_VERSION",
+    "PR_DELIVERY_LEGACY_CONTRACT_VERSIONS",
     "PR_EVIDENCE_EVENT_KIND",
     "PR_MERGE_APPROVAL_EVENT_KIND",
     "PR_MERGE_EVIDENCE_EVENT_KIND",

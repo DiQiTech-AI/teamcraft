@@ -787,5 +787,108 @@ class TeamctlParserTests(unittest.TestCase):
                 self.assertIn("install.sh", message)
 
 
+class PaneLabelTransportTests(unittest.TestCase):
+    """The CLI adapter exposes rename_pane and routes it through Herdr."""
+
+    def test_rename_pane_issues_pane_rename_with_one_label_argument(self):
+        calls: list[list[str]] = []
+
+        def runner(argv, timeout, accepted):
+            calls.append(list(argv))
+            return (
+                '{"result":{"pane":{"pane_id":"p9","label":"developer · Fix"}}}',
+                "",
+                0,
+            )
+
+        adapter = TEAMCTL._TeamctlHerdrAdapter(runner)
+        payload = adapter.rename_pane("p9", "developer · Fix")
+        self.assertEqual(
+            calls, [["herdr", "pane", "rename", "p9", "developer · Fix"]]
+        )
+        self.assertEqual(payload["result"]["pane"]["pane_id"], "p9")
+
+    def test_rename_pane_translates_herdr_error_to_teamctl_error(self):
+        def runner(argv, timeout, accepted):
+            raise TEAMCTL.HerdrError("command_failed", "pane not found")
+
+        adapter = TEAMCTL._TeamctlHerdrAdapter(runner)
+        with self.assertRaises(TEAMCTL.TeamctlError):
+            adapter.rename_pane("p9", "label")
+
+    def test_set_member_pane_label_writes_derived_label(self):
+        adapter = mock.Mock()
+        member = {
+            "name": "api_dev", "role": "developer",
+            "task": "Fix the login bug", "pane_id": "pane-1",
+        }
+        with mock.patch.object(TEAMCTL, "_herdr_adapter", return_value=adapter):
+            label = TEAMCTL.set_member_pane_label(member)
+        self.assertEqual(label, "developer · Fix the login bug")
+        adapter.rename_pane.assert_called_once_with(
+            "pane-1", "developer · Fix the login bug"
+        )
+
+
+class _AbsentLegacyOccupantAdapter:
+    """Pane and Agent are both gone; the whole Herdr inventory is empty."""
+
+    def current_pane(self, pane_id):
+        raise TEAMCTL.TeamctlError(
+            json.dumps({"error": {"code": "pane_not_found", "message": "gone"}})
+        )
+
+    def get_agent(self, name):
+        raise TEAMCTL.TeamctlError(
+            json.dumps({"error": {"code": "agent_not_found", "message": "gone"}})
+        )
+
+    def list_agents(self):
+        return []
+
+    def request(self, argv):
+        if argv == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w3"}]}}
+        if argv == ["pane", "list", "--workspace", "w3"]:
+            return {"result": {"panes": []}}
+        raise AssertionError(f"unexpected Herdr request: {argv}")
+
+
+class StopEvidenceNoPaneTests(unittest.TestCase):
+    """D8: absent recorded identity must not masquerade as a live check."""
+
+    def _member(self):
+        return {
+            "name": "legacy_dev",
+            "pane_id": "w3:p9",
+            "terminal_id": "term-9",
+            "agent_session": {"kind": "id", "value": "native-9"},
+        }
+
+    def test_absent_identity_is_labelled_as_recorded_absence(self):
+        with mock.patch.object(
+            TEAMCTL, "_herdr_adapter", return_value=_AbsentLegacyOccupantAdapter()
+        ):
+            evidence = TEAMCTL._stop_evidence(
+                self._member(), require_live_agent=False
+            )
+        # The recovery gate contract is unchanged ...
+        self.assertIs(evidence["identity_verified"], True)
+        self.assertIs(evidence["process_alive"], False)
+        self.assertEqual(evidence["terminal_id"], "term-9")
+        self.assertEqual(evidence["native_session_id"], "native-9")
+        # ... but the semantics are now explicit and non-misleading.
+        self.assertEqual(evidence["identity_mode"], "recorded_identity_absent")
+        self.assertIs(evidence["recorded_identity_absent"], True)
+
+    def test_live_identity_collision_still_fails_closed(self):
+        adapter = _AbsentLegacyOccupantAdapter()
+        adapter.list_agents = lambda: [{"name": "legacy_dev"}]
+        with mock.patch.object(
+            TEAMCTL, "_herdr_adapter", return_value=adapter
+        ), self.assertRaisesRegex(TEAMCTL.TeamctlError, "still appears"):
+            TEAMCTL._stop_evidence(self._member(), require_live_agent=False)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

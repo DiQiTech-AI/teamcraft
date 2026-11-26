@@ -667,10 +667,13 @@ def allocate_attempt_worktree(
     """Deliver the isolated worktree + branch for one writable Attempt.
 
     Returns ``(allocation, created)``.  Re-allocation of the same Attempt
-    re-adopts the exact recorded identity (``created=False``).  The durable
-    allocation event is committed BEFORE the Git effect, so a failure after
-    allocation preserves the durable record — and any workspace already on
-    disk — for restart discovery; this function never deletes anything.
+    normally re-adopts the exact recorded identity (``created=False``).  If
+    the prior Git effect provably created no path, branch, or registration,
+    re-allocation may materialise that exact durable identity
+    (``created=True``).  The durable allocation event is committed BEFORE the
+    Git effect, so a failure after allocation preserves the durable record —
+    and any workspace already on disk — for restart discovery; this function
+    never deletes anything.
 
     Refusals (nothing written, nothing deleted):
     * attempt/task binding or terminal attempt -> ValidationError/Illegal;
@@ -724,10 +727,70 @@ def allocate_attempt_worktree(
 
     existing = load_allocation(conn, attempt_id)
     if existing is not None:
-        # Restart/retry: adopt only the exact recorded identity.
-        _verify_identity(conn, existing, runner, repair=True)
+        # Restart/retry normally adopts only the exact materialised identity.
+        # There is one narrower recovery shape: the durable allocation won,
+        # but ``git worktree add`` produced no branch, path, or registration.
+        # Re-run that exact effect only after proving every resource is absent
+        # and the recorded base/repository/claims still match current facts.
+        if os.path.exists(existing.worktree_path):
+            _verify_identity(conn, existing, runner, repair=True)
+            _sync_attempt_resources(conn, attempt, existing)
+            return existing, False
+
+        expected_claims = tuple(claims)
+        expected_path = worktree_path_for(root, attempt_id)
+        expected_branch = worktree_branch(task_id, attempt_id)
+        if (existing.project_id != task.project_id
+                or existing.task_id != task_id
+                or existing.attempt_id != attempt_id
+                or os.path.realpath(existing.repo_root) != root
+                or existing.worktree_path != expected_path
+                or existing.branch != expected_branch
+                or existing.claims != expected_claims):
+            raise WorktreeIdentityError(
+                "drift",
+                "recorded allocation identity differs from current exact "
+                "Task/repository/claims; refusing to materialise it",
+            )
+        workspace = collect_workspace_state(root, run_git=runner)
+        if workspace.base_sha != existing.base_sha:
+            raise ConflictError(
+                f"recorded allocation base {existing.base_sha!r} no longer "
+                f"matches live HEAD {workspace.base_sha!r}; refusing recovery"
+            )
+        registered = _registered_worktrees(runner, root)
+        if os.path.realpath(existing.worktree_path) in registered:
+            raise WorktreeIdentityError(
+                "unregistered",
+                f"recorded worktree path {existing.worktree_path!r} is absent "
+                "but remains registered; refusing partial-state recovery",
+            )
+        branch_tip = _try_git(
+            runner, ["rev-parse", "--verify", f"refs/heads/{existing.branch}"],
+            root,
+        )
+        if branch_tip is not None:
+            raise ConflictError(
+                f"recorded branch {existing.branch!r} already exists at "
+                f"{branch_tip!r}; refusing partial-state recovery"
+            )
+        try:
+            _git(
+                runner,
+                ["worktree", "add", existing.worktree_path, "-b",
+                 existing.branch, existing.base_sha],
+                root,
+            )
+            _write_markers(runner, existing.worktree_path, existing)
+            _verify_identity(conn, existing, runner, repair=False)
+        except (GitStateError, WorktreeIdentityError) as exc:
+            raise StorageError(
+                f"worktree allocation recovery for attempt {attempt_id} "
+                f"failed ({exc}); the durable allocation and any partial "
+                "workspace are preserved for inspection"
+            ) from exc
         _sync_attempt_resources(conn, attempt, existing)
-        return existing, False
+        return existing, True
 
     workspace = collect_workspace_state(root, run_git=runner)
     base_sha = workspace.base_sha
@@ -1259,9 +1322,9 @@ def finalize_cleaned_worktree(
     * CLEANED replays validate their binding against the live allocation and
       converge onto the stored record;
     * the allocation must still be CLEANABLE and its Attempt terminal;
-    * exact identity (path/registration/repo/branch; markers repaired only if
-      everything else matches): foreign, moved, dirty, or unmerged workspaces
-      are refused and PRESERVED;
+    * exact identity (path/registration/repo/branch AND the recorded marker
+      set): missing, partial, foreign, moved, dirty, or unmerged workspaces are
+      refused and PRESERVED — cleanup never repairs identity markers;
     * ``git worktree remove`` without ``--force`` lets Git itself refuse any
       residue it sees;
     * post-effect proof: the path is gone and deregistered, while the branch

@@ -44,11 +44,15 @@ def payload_digest(payload: dict) -> str:
     return sha(canonical(stripped))
 
 
-def with_digest(payload: dict) -> str:
+def with_digest_at(payload: dict, schema_version: int) -> str:
     payload = dict(payload)
-    payload["schema_version"] = domain.PR_DELIVERY_CONTRACT_VERSION
+    payload["schema_version"] = schema_version
     payload["evidence_digest"] = payload_digest(payload)
     return canonical(payload)
+
+
+def with_digest(payload: dict) -> str:
+    return with_digest_at(payload, domain.PR_DELIVERY_CONTRACT_VERSION)
 
 
 class DirectPrGateTests(unittest.TestCase):
@@ -129,6 +133,8 @@ class DirectPrGateTests(unittest.TestCase):
             "mergeable": over.pop("mergeable", "MERGEABLE"),
             "checks_json": canonical(checks),
             "checks_digest": sha(canonical(checks)),
+            "verifier_digest": over.pop("verifier_digest",
+                                        sha("verifier-pin")),
         }
         payload.update(over)
         return payload
@@ -263,6 +269,42 @@ class DirectPrGateTests(unittest.TestCase):
         self.assertEqual(updated.status, "ready_to_merge")
         self.assertEqual(updated.version, task.version + 1)
 
+    def test_ready_refuses_legacy_v1_evidence_without_verifier_digest(self):
+        """v1 rows are readable for audit but can never authorize readiness."""
+
+        task, attempt, brief, report_id, dispatch_ver, report_digest = \
+            self.ship(policy=POLICY)
+        payload = self.pr_evidence_payload(task, attempt, brief, report_id,
+                                          dispatch_ver, report_digest)
+        payload.pop("verifier_digest")  # exactly what a v1 durable row carries
+        self.append(domain.PR_EVIDENCE_EVENT_KIND, task, attempt,
+                    with_digest_at(payload, 1))
+        with self.assertRaises(IllegalTransitionError) as caught:
+            domain.apply_task_event(
+                self.conn, task.id, domain.DIRECT_PR_READY_EVENT,
+                expected_version=task.version)
+        self.assertEqual(caught.exception.reason_code,
+                         "PR_EVIDENCE_LEGACY_SCHEMA")
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "verifying")
+
+    def test_ready_ignores_legacy_when_current_v2_evidence_exists(self):
+        task, attempt, brief, report_id, dispatch_ver, report_digest = \
+            self.ship(policy=POLICY)
+        legacy = self.pr_evidence_payload(task, attempt, brief, report_id,
+                                         dispatch_ver, report_digest)
+        legacy.pop("verifier_digest")
+        self.append(domain.PR_EVIDENCE_EVENT_KIND, task, attempt,
+                    with_digest_at(legacy, 1))
+        current = self.pr_evidence_payload(task, attempt, brief, report_id,
+                                          dispatch_ver, report_digest)
+        self.append(domain.PR_EVIDENCE_EVENT_KIND, task, attempt,
+                    with_digest(current))
+        updated = domain.apply_task_event(
+            self.conn, task.id, domain.DIRECT_PR_READY_EVENT,
+            expected_version=task.version)
+        self.assertEqual(updated.status, "ready_to_merge")
+
     def test_ready_refuses_tampered_digest(self):
         task, attempt, brief, report_id, dispatch_ver, report_digest = \
             self.ship(policy=POLICY)
@@ -383,6 +425,39 @@ class DirectPrGateTests(unittest.TestCase):
             domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
                                   expected_version=task.version)
         self.assertEqual(caught.exception.reason_code, "MERGE_FACTS_MISSING")
+
+    def test_done_refuses_legacy_v1_merge_evidence(self):
+        task, attempt = self._prepare_ready()
+        approval = self.approval_row(task, attempt, self.pr_event_id,
+                                    self.evidence_digest, head_sha=self.head_sha)
+        payload = {
+            "project_id": self.project.id, "task_id": task.id,
+            "attempt_id": attempt.id, "attempt_no": attempt.attempt_no,
+            "task_version": task.version,
+            "dispatch_task_version": self.dispatch_ver,
+            "brief_digest": self.brief_digest, "brief_version": self.brief_version,
+            "worker_report_id": self.report_id,
+            "worker_report_digest": self.report_digest,
+            "policy_digest": self.policy_digest_of(task),
+            "delivery_mode": "direct_pr",
+            "action": domain.DIRECT_PR_MERGE_ACTION,
+            "pr_evidence_id": self.pr_event_id,
+            "approval_event_id": approval.event_id,
+            "repo": POLICY["direct_pr"]["repo"], "pr_number": 11, "pr_url": "",
+            "head_sha": self.head_sha, "base_ref": "main", "intended_base": "main",
+            "merge_commit_sha": "d" * 40, "merged": True,
+            "merged_at": "2026-11-14T00:00:00Z", "method": "merge",
+            "source": "executed",
+        }
+        self.append(domain.PR_MERGE_EVIDENCE_EVENT_KIND, task, attempt,
+                    with_digest_at(payload, 1))
+        with self.assertRaises(IllegalTransitionError) as caught:
+            domain.apply_task_event(self.conn, task.id, "approved_and_delivered",
+                                  expected_version=task.version)
+        self.assertEqual(caught.exception.reason_code,
+                         "MERGE_FACTS_LEGACY_SCHEMA")
+        self.assertEqual(domain.get_task(self.conn, task.id).status,
+                         "ready_to_merge")
 
     def test_done_refuses_wrong_base(self):
         task, attempt = self._prepare_ready()

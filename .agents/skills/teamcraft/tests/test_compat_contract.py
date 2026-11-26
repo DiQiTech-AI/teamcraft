@@ -292,8 +292,10 @@ class CompatContractTests(unittest.TestCase):
             ["agent", "get", "dev"],
         ]
         self.assertEqual(double.calls[:7], expected_prefix)
-        self.assertEqual(double.calls[7][:3], ["agent", "prompt", "dev"])
-        self.assertEqual(double.calls[8], ["agent", "get", "dev"])
+        # f189ba7 inserts a pane-label rename between agent get and prompt.
+        self.assertEqual(double.calls[7][:3], ["pane", "rename", CHILD_PANE_ID])
+        self.assertEqual(double.calls[8][:3], ["agent", "prompt", "dev"])
+        self.assertEqual(double.calls[9], ["agent", "get", "dev"])
         # Codex launches must not carry OpenCode env injection.
         self.assertNotIn("--env", double.calls[4])
 

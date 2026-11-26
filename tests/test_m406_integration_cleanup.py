@@ -25,6 +25,7 @@ Acceptance matrix covered here:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -33,11 +34,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from teamcraft import (
     briefs,
     delivery,
     domain,
+    fresh_start,
     leader,
     runtime_adapter,
     storage,
@@ -106,13 +109,21 @@ class RecordingRunner:
 class M406Fixture(unittest.TestCase):
     """Temp repo + runtime DB + the full local-only delivery pipeline."""
 
+    #: ``True`` provisions the canonical ``<root>/.teamcraft`` runtime so the
+    #: same fixture can drive ``teamctl`` read commands end-to-end.
+    runtime_root_mode = False
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="tc-m406-")
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name).resolve()
         self.repo = init_repo(self.base)
-        self.db = self.base / "teamcraft.db"
-        storage.migrate_to_head(self.db, allow_unverified_location=True)
+        if self.runtime_root_mode:
+            fresh_start.initialize_project_root(str(self.base))
+            self.db = self.base / ".teamcraft" / "teamcraft.db"
+        else:
+            self.db = self.base / "teamcraft.db"
+            storage.migrate_to_head(self.db, allow_unverified_location=True)
         self.conn = storage.connect(self.db, allow_unverified_location=True)
         self.addCleanup(self.conn.close)
         self.project = domain.create_project(self.conn, "demo", str(self.repo))
@@ -127,7 +138,7 @@ class M406Fixture(unittest.TestCase):
         )
 
     def make_ship(self, *, claims: list[str] | None = None,
-                 feature: bool = True):
+                 feature: bool = True, policy: dict | None = None):
         task = domain.create_task(
             self.conn, self.project.id, "deliver", kind="ship",
             ownership_json=json.dumps(claims or ["src/**"]))
@@ -136,8 +147,8 @@ class M406Fixture(unittest.TestCase):
             expected_version=task.version)
         task = domain.set_execution_policy(
             self.conn, task.id, expected_version=task.version,
-            policy={"delivery": "local_only"}, actor="ceo",
-            reason="m406 test policy")
+            policy=policy if policy is not None else {"delivery": "local_only"},
+            actor="ceo", reason="m406 test policy")
         attempt = domain.create_attempt(self.conn, task.id,
                                        expected_version=task.version)
         domain.register_session(self.conn, attempt.id, "opencode",
@@ -235,7 +246,8 @@ class M406Fixture(unittest.TestCase):
                 "created_at,updated_at) VALUES "
                 "(?,'developer','m406','opencode','m406',?,0,?,'[]',30000,"
                 "'agent_started',0,?,?,0,0)",
-                (name, task.ownership_json, str(self.repo), task.id, attempt.id),
+                (name, task.ownership_json, str(self.repo), task.id,
+                 attempt.id),
             )
 
     def marker_value(self, path: str, key: str) -> str | None:
@@ -267,8 +279,42 @@ class IntegrationDetectionTests(M406Fixture):
 
         self.assertIsNotNone(status["integration"])
         self.assertEqual(
+            set(status["integration"]),
+            set(runtime_adapter._INTEGRATION_DTO_KEYS))
+        self.assertEqual(
             self.event_rows(delivery.INTEGRATION_CHECK_EVENT_KIND,
                             attempt_id=attempt.id), [])
+
+    def test_status_dto_schema_is_stable_before_and_after_audit(self):
+        task, attempt, _allocation = self.make_ship()
+        self.bind_member(task, attempt, name="m406-status-schema")
+        first = runtime_adapter.member_integration_status(
+            self.conn, "m406-status-schema", run_git=self.rec)
+        self.assertIsNotNone(first["integration"])
+        self.assertEqual(
+            self.event_rows(delivery.INTEGRATION_CHECK_EVENT_KIND,
+                            attempt_id=attempt.id), [])
+
+        # An explicit check records the observation; the READ path must now
+        # return the recorded snapshot with EXACTLY the same DTO keys/values.
+        audited = delivery.check_integration_state(self.conn, attempt.id,
+                                                   run_git=self.rec)
+        second = runtime_adapter.member_integration_status(
+            self.conn, "m406-status-schema", run_git=self.rec)
+        self.assertEqual(set(first["integration"]),
+                         set(second["integration"]))
+        self.assertEqual(first["integration"], second["integration"])
+        self.assertEqual(
+            first["integration"]["task_id"], audited.task_id)
+        # The read path itself never appended anything.
+        self.assertEqual(
+            len(self.event_rows(delivery.INTEGRATION_CHECK_EVENT_KIND,
+                                attempt_id=attempt.id)), 1)
+        runtime_adapter.member_integration_status(
+            self.conn, "m406-status-schema", run_git=self.rec)
+        self.assertEqual(
+            len(self.event_rows(delivery.INTEGRATION_CHECK_EVENT_KIND,
+                                attempt_id=attempt.id)), 1)
 
     def test_no_drift_requires_no_integration_task(self):
         _task, attempt, allocation = self.make_ship()
@@ -448,6 +494,79 @@ class CleanupGateTests(M406Fixture):
         for key in marker_keys:
             self.assertIsNone(self.marker_value(path, key))
 
+    def test_cleanup_refuses_missing_markers_without_repair(self):
+        _task, attempt, allocation, _commit, _ship = self.made_cleanable()
+        path = allocation.worktree_path
+        marker_keys = (
+            "teamcraft.allocationId", "teamcraft.attemptId",
+            "teamcraft.taskId",
+        )
+        for key in marker_keys:
+            git("config", "--worktree", "--unset-all", key, cwd=Path(path))
+
+        verdict = delivery.evaluate_cleanup_eligibility(self.conn, attempt.id,
+                                                       run_git=self.rec)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("marker", " | ".join(verdict.reasons))
+        with self.assertRaises(delivery.DeliveryRefusal):
+            delivery.cleanup_attempt_worktree(self.conn, attempt.id,
+                                             lease=self.lease(),
+                                             run_git=self.rec)
+        # Fail closed and preserve the scene: no marker was silently re-pinned,
+        # the workspace stayed registered, and the refusal was audited.
+        for key in marker_keys:
+            self.assertIsNone(self.marker_value(path, key))
+        self.assertTrue(self.worktree_registered(path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        refused = self.event_rows(delivery.CLEANUP_REFUSED_EVENT_KIND,
+                                  attempt_id=attempt.id)
+        self.assertEqual(len(refused), 1)
+        self.assertIn("marker",
+                      " | ".join(json.loads(str(refused[0][2]))["reasons"]))
+
+    def test_durable_only_eligibility_does_not_repair_missing_markers(self):
+        # ``live_git=False`` is the reconcile/durable view: delivery freshness
+        # skips workspace-bound re-proofs, so the identity gate MUST still
+        # inspect markers without repairing them (the old claim_worktree path
+        # silently re-pinned an all-missing set here).
+        _task, attempt, allocation, _commit, _ship = self.made_cleanable()
+        path = allocation.worktree_path
+        marker_keys = (
+            "teamcraft.allocationId", "teamcraft.attemptId",
+            "teamcraft.taskId",
+        )
+        for key in marker_keys:
+            git("config", "--worktree", "--unset-all", key, cwd=Path(path))
+
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt.id, run_git=self.rec, live_git=False)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("marker", " | ".join(verdict.reasons))
+        for key in marker_keys:
+            self.assertIsNone(self.marker_value(path, key))
+
+    def test_reconcile_does_not_repair_missing_markers(self):
+        _task, attempt, allocation, _commit, _ship = self.made_cleanable()
+        path = allocation.worktree_path
+        marker_keys = (
+            "teamcraft.allocationId", "teamcraft.attemptId",
+            "teamcraft.taskId",
+        )
+        for key in marker_keys:
+            git("config", "--worktree", "--unset-all", key, cwd=Path(path))
+
+        with self.assertRaises(delivery.DeliveryRefusal):
+            delivery.reconcile_cleanup_worktree(
+                self.conn, attempt.id, lease=self.lease(), run_git=self.rec)
+        # No silent repair: the ambiguous scene is preserved for a human.
+        for key in marker_keys:
+            self.assertIsNone(self.marker_value(path, key))
+        self.assertTrue(Path(path).exists())
+        self.assertTrue(self.worktree_registered(path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        self.assertEqual(len(self.event_rows(
+            delivery.CLEANUP_REFUSED_EVENT_KIND, attempt_id=attempt.id)), 1)
+
     def test_fresh_allocation_is_not_eligible_and_refusal_is_audited(self):
         _task, attempt, allocation = self.make_ship()
         verdict = delivery.evaluate_cleanup_eligibility(self.conn, attempt.id,
@@ -510,6 +629,33 @@ class CleanupGateTests(M406Fixture):
         self.assertEqual(dirty.read_text(), "worker residue\n")
         self.assertTrue(self.worktree_registered(allocation.worktree_path))
         self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        refused = self.event_rows(delivery.CLEANUP_REFUSED_EVENT_KIND,
+                                  attempt_id=attempt.id)
+        self.assertEqual(len(refused), 1)
+        reasons = " | ".join(json.loads(str(refused[0][2]))["reasons"])
+        self.assertIn("dirty", reasons)
+        self.assertIn("src/residue.py", reasons)
+
+    def test_delivered_but_not_cleanable_is_refused_and_preserved(self):
+        _task, attempt, allocation, _commit, _ship = self.delivered()
+        # Delivery is DONE with complete evidence, but the workspace was never
+        # marked CLEANABLE: that precise lifecycle fact is still required.
+        verdict = delivery.evaluate_cleanup_eligibility(self.conn, attempt.id,
+                                                       run_git=self.rec)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("worktree-not-cleanable", verdict.reasons)
+        with self.assertRaises(delivery.DeliveryRefusal):
+            delivery.cleanup_attempt_worktree(self.conn, attempt.id,
+                                             lease=self.lease(),
+                                             run_git=self.rec)
+        self.assertTrue(Path(allocation.worktree_path).exists())
+        self.assertTrue(self.worktree_registered(allocation.worktree_path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        refused = self.event_rows(delivery.CLEANUP_REFUSED_EVENT_KIND,
+                                  attempt_id=attempt.id)
+        self.assertEqual(len(refused), 1)
+        self.assertIn("worktree-not-cleanable",
+                      " | ".join(json.loads(str(refused[0][2]))["reasons"]))
 
     def test_undelivered_commits_fail_closed(self):
         _task, attempt, allocation, _commit, _ship = self.made_cleanable()
@@ -695,6 +841,25 @@ class CleanupRecoveryTests(M406Fixture):
         self.assertEqual(len(self.event_rows(worktrees.CLEANED_EVENT_KIND,
                                             attempt_id=attempt.id)), 1)
 
+    def test_reconcile_refuses_dirty_scene_without_deleting(self):
+        _task, attempt, allocation, _commit, _ship = self.made_cleanable()
+        dirty = Path(allocation.worktree_path) / "src" / "residue.py"
+        dirty.parent.mkdir(parents=True, exist_ok=True)
+        dirty.write_text("keep me\n", encoding="utf-8")
+
+        with self.assertRaises(delivery.DeliveryRefusal):
+            delivery.reconcile_cleanup_worktree(
+                self.conn, attempt.id, lease=self.lease(), run_git=self.rec)
+        # Recovery never guesses: the dirty scene and its registration stay.
+        self.assertEqual(dirty.read_text(), "keep me\n")
+        self.assertTrue(self.worktree_registered(allocation.worktree_path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        refused = self.event_rows(delivery.CLEANUP_REFUSED_EVENT_KIND,
+                                  attempt_id=attempt.id)
+        self.assertEqual(len(refused), 1)
+        reasons = " | ".join(json.loads(str(refused[0][2]))["reasons"])
+        self.assertIn("residue.py", reasons)
+
     def test_finalize_requires_cleanable_and_terminal(self):
         _task, attempt, allocation, commit, _ship = self.delivered()
         # Delivered + DONE but the workspace was NEVER marked cleanable.
@@ -760,6 +925,62 @@ class LowerLevelSafetyTests(M406Fixture):
                 delivery_mode="local_only", run_git=self.rec)
         self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
 
+    def test_unreadable_live_base_requires_integration_not_clean(self):
+        _task, attempt, _allocation = self.make_ship()
+        root = os.path.realpath(str(self.repo))
+
+        def runner(args, cwd):
+            if (list(args) == ["rev-parse", "--verify", "HEAD"]
+                    and os.path.realpath(str(cwd)) == root):
+                raise workspaces.GitStateError(
+                    "git rev-parse failed (exit 128): boom")
+            return self.rec(args, cwd)
+
+        status = delivery.check_integration_state(self.conn, attempt.id,
+                                                 run_git=runner)
+        self.assertFalse(status.base_drift)
+        self.assertIsNone(status.live_base_sha)
+        self.assertEqual(status.merge_status, worktrees.MERGE_STATUS_UNKNOWN)
+        # Undecidable detection must never look like "no integration needed".
+        self.assertTrue(status.integration_required)
+        self.assertTrue(status.problems)
+
+        _s, integration_task, created = delivery.ensure_integration_task(
+            self.conn, attempt.id, run_git=runner)
+        self.assertTrue(created)
+        assert integration_task is not None
+        rows = self.event_rows(delivery.INTEGRATION_REQUIRED_EVENT_KIND,
+                               attempt_id=attempt.id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(str(rows[0][2]))["trigger"],
+                         "integration_unknown")
+
+    def test_recorded_integration_task_stands_after_drift_heals(self):
+        _task, attempt, allocation = self.make_ship()
+        (self.repo / "one.py").write_text("one\n", encoding="utf-8")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-q", "-m", "advance one", cwd=self.repo)
+        _s, task1, created1 = delivery.ensure_integration_task(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertTrue(created1)
+        assert task1 is not None
+
+        # The base is moved BACK to the recorded allocation base (e.g. the
+        # drift was an operator mistake).  Detection must no longer require
+        # integration, but the explicit Task is human-owned: it stands until
+        # closed, and re-ensuring returns that SAME Task without duplicating.
+        git("reset", "--hard", allocation.base_sha, cwd=self.repo)
+        status, task2, created2 = delivery.ensure_integration_task(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertFalse(status.integration_required)
+        self.assertFalse(created2)
+        assert task2 is not None
+        self.assertEqual(task2.id, task1.id)
+        self.assertEqual(task2.status, "pending")
+        self.assertEqual(len(self.event_rows(
+            delivery.INTEGRATION_REQUIRED_EVENT_KIND,
+            attempt_id=attempt.id)), 1)
+
     def test_idempotent_requirement_payload_survives_moving_facts(self):
         # Requirement payload is stable, so a LATER drifted re-check still
         # replays the same requirement instead of failing or duplicating.
@@ -783,6 +1004,211 @@ class LowerLevelSafetyTests(M406Fixture):
         self.assertEqual(len(self.event_rows(
             delivery.INTEGRATION_REQUIRED_EVENT_KIND,
             attempt_id=attempt.id)), 1)
+
+
+_M405_HELPERS = None
+
+
+def m405_helpers():
+    """Load the real M4-05 direct-PR fixture (fake gh + local bare origin)."""
+
+    global _M405_HELPERS
+    if _M405_HELPERS is None:
+        path = Path(__file__).with_name("test_delivery_m405.py")
+        spec = importlib.util.spec_from_file_location(
+            "tc_m405_helpers_for_m406", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        _M405_HELPERS = module
+    return _M405_HELPERS
+
+
+class DirectPrCleanupTests(M406Fixture):
+    """P1: a MERGED direct-PR Task at DONE must still be cleanup-eligible.
+
+    M4-05 evidence is real (local bare origin + fake ``gh``): the Task only
+    reaches DONE through prepare -> explicit human approve -> merge.  Cleanup
+    freshness must validate that TERMINAL evidence (not reject every DONE Task
+    for no longer sitting VERIFYING/READY_TO_MERGE), while still refusing any
+    missing/drifted/non-DONE state.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.helpers = m405_helpers()
+        origin = self.base / "origin.git"
+        origin.mkdir()
+        self.helpers.git("init", "-q", "--bare", "-b", "main",
+                         cwd=self.base, git_dir=origin)
+        self.helpers.git("remote", "add", "origin", str(origin), cwd=self.repo)
+        self.helpers.git("push", "-q", "origin", "main", cwd=self.repo)
+        self.gh = self.helpers.FakeGitHub(origin)
+        self.which = lambda name: "/usr/bin/gh"
+
+    def delivered_direct_pr(self):
+        task, attempt, allocation = self.make_ship(
+            policy=self.helpers.POLICY, feature=True)
+        self.configure_and_verify(attempt)
+        commit = delivery.create_local_commit(
+            self.conn, attempt.id, idempotency_key="commit-dp-1",
+            lease=self.lease(), run_git=self.rec)
+        prepared = delivery.prepare_direct_pr(
+            self.conn, attempt.id, idempotency_key="pr-dp-1",
+            lease=self.lease(), run_git=self.rec, run_gh=self.gh,
+            which=self.which)
+        self.assertFalse(prepared.blocked, prepared.detail)
+        self.assertEqual(prepared.outcome, "ready")
+        evidence = prepared.pr_evidence
+        assert evidence is not None
+        approval = delivery.approve_direct_pr_merge(
+            self.conn, evidence.id, decision="approve",
+            pr_number=evidence.pr_number, head_sha=evidence.head_sha,
+            base=evidence.base_ref, actor="human", reason="reviewed",
+            idempotency_key="ap-dp-1", lease=self.lease(), run_gh=self.gh,
+            which=self.which)
+        merge = delivery.merge_direct_pr(
+            self.conn, evidence.id, idempotency_key="merge-dp-1",
+            lease=self.lease(), run_gh=self.gh, which=self.which)
+        self.assertTrue(merge.merged)
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "done")
+        worktrees.mark_worktree_cleanable(self.conn, attempt.id,
+                                         run_git=self.rec)
+        return (domain.get_task(self.conn, task.id),
+                domain.get_attempt(self.conn, attempt.id), allocation,
+                commit, evidence, approval, merge)
+
+    def test_direct_pr_done_cleanable_is_verified_and_cleaned(self):
+        _task, attempt, allocation, _commit, evidence, approval, merge = \
+            self.delivered_direct_pr()
+
+        # The freshness gate must understand the TERMINAL state: same
+        # approval, merge and delivery evidence, now DONE rather than READY.
+        fresh = delivery.pr_merge_approval_is_current(
+            self.conn, approval, live_gh=False)
+        self.assertTrue(fresh.ok, fresh.problems)
+        self.assertTrue(delivery.pr_evidence_is_current(
+            self.conn, evidence, live_gh=False, after_merge=True).ok)
+
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertTrue(verdict.eligible, verdict.reasons)
+        self.assertEqual(verdict.state, "eligible")
+
+        result = delivery.cleanup_attempt_worktree(
+            self.conn, attempt.id, lease=self.lease(), run_git=self.rec)
+        self.assertEqual(result["disposition"], "removed")
+        self.assertEqual(result["cleaned"]["delivery_mode"], "direct_pr")
+        self.assertEqual(result["cleaned"]["commit_sha"], merge.head_sha)
+        self.assertFalse(Path(allocation.worktree_path).exists())
+        self.assertFalse(self.worktree_registered(allocation.worktree_path))
+        # The branch/commit are never deleted, even for a merged PR delivery.
+        self.assertEqual(
+            git("rev-parse", "--verify", f"refs/heads/{allocation.branch}",
+                cwd=self.repo),
+            merge.head_sha)
+
+    def test_direct_pr_done_missing_evidence_fails_closed(self):
+        _task, attempt, allocation, _commit, _evidence, _approval, _merge = \
+            self.delivered_direct_pr()
+        with mock.patch.object(delivery, "load_pr_merge_evidence",
+                               return_value=None):
+            verdict = delivery.evaluate_cleanup_eligibility(
+                self.conn, attempt.id, run_git=self.rec)
+            self.assertFalse(verdict.eligible)
+            self.assertIn("merge-evidence-missing", verdict.reasons)
+            with self.assertRaises(delivery.DeliveryRefusal):
+                delivery.cleanup_attempt_worktree(
+                    self.conn, attempt.id, lease=self.lease(),
+                    run_git=self.rec)
+        with mock.patch.object(delivery, "load_pr_merge_approval",
+                               return_value=None):
+            verdict = delivery.evaluate_cleanup_eligibility(
+                self.conn, attempt.id, run_git=self.rec)
+            self.assertFalse(verdict.eligible)
+            self.assertIn("merge-approval-missing", verdict.reasons)
+        # Missing evidence never removes the workspace or fabricates CLEANED.
+        self.assertTrue(Path(allocation.worktree_path).exists())
+        self.assertTrue(self.worktree_registered(allocation.worktree_path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+
+    def test_direct_pr_done_drift_refuses_cleanup_and_preserves_scene(self):
+        task, attempt, allocation, _commit, _evidence, approval, _merge = \
+            self.delivered_direct_pr()
+        # Any Task mutation after DONE reopens it: the terminal evidence is no
+        # longer intact, so cleanup must fail closed and preserve the scene.
+        domain.update_task(self.conn, task.id, expected_version=task.version,
+                          title="deliver (post-merge edit)")
+        reopened = domain.get_task(self.conn, task.id)
+        self.assertEqual(reopened.status, "needs_human")
+        fresh = delivery.pr_merge_approval_is_current(
+            self.conn, approval, live_gh=False)
+        self.assertFalse(fresh.ok)
+
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("delivery-task-needs_human", verdict.reasons)
+        with self.assertRaises(delivery.DeliveryRefusal):
+            delivery.cleanup_attempt_worktree(
+                self.conn, attempt.id, lease=self.lease(), run_git=self.rec)
+        self.assertTrue(Path(allocation.worktree_path).exists())
+        self.assertTrue(self.worktree_registered(allocation.worktree_path))
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        self.assertEqual(len(self.event_rows(
+            delivery.CLEANUP_REFUSED_EVENT_KIND, attempt_id=attempt.id)), 1)
+
+    def test_direct_pr_done_verifier_profile_version_drift_refuses_cleanup(self):
+        task, attempt, allocation, _commit, evidence, approval, _merge = \
+            self.delivered_direct_pr()
+
+        # A later human-approved profile version invalidates the exact PASS
+        # snapshot that the PR evidence pinned, even though the merge and Task
+        # remain terminal.
+        verification.configure_verifier_profile(
+            self.conn, self.project.id, profile="test",
+            argv=[sys.executable, "-c", "print('new rules')"],
+            timeout_seconds=10, actor="human", idempotency_key="cfg-test-v2",
+            lease=self.lease())
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "done")
+
+        fresh = delivery.pr_merge_approval_is_current(
+            self.conn, approval, live_gh=False)
+        self.assertFalse(fresh.ok)
+        self.assertIn("verifier", " | ".join(fresh.problems))
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("verifier", " | ".join(verdict.reasons))
+        self.assertTrue(Path(allocation.worktree_path).exists())
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
+        self.assertEqual(evidence.verifier_digest,
+                         delivery.get_pr_evidence(
+                             self.conn, evidence.id).verifier_digest)
+
+    def test_direct_pr_done_disabled_verifier_profile_refuses_cleanup(self):
+        task, attempt, allocation, _commit, _evidence, approval, _merge = \
+            self.delivered_direct_pr()
+
+        verification.configure_verifier_profile(
+            self.conn, self.project.id, profile="test",
+            argv=[sys.executable, "-c", "print('disabled')"],
+            timeout_seconds=10, actor="human",
+            idempotency_key="cfg-test-disabled", lease=self.lease(),
+            enabled=False)
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "done")
+
+        fresh = delivery.pr_merge_approval_is_current(
+            self.conn, approval, live_gh=False)
+        self.assertFalse(fresh.ok)
+        self.assertIn("no approved-and-enabled verifier profiles",
+                      " | ".join(fresh.problems))
+        verdict = delivery.evaluate_cleanup_eligibility(
+            self.conn, attempt.id, run_git=self.rec)
+        self.assertFalse(verdict.eligible)
+        self.assertIn("verifier", " | ".join(verdict.reasons))
+        self.assertTrue(Path(allocation.worktree_path).exists())
+        self.assertIsNone(worktrees.load_cleaned_record(self.conn, attempt.id))
 
 
 if __name__ == "__main__":

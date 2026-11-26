@@ -6,8 +6,11 @@ primitives injected (bridge src/status, proof runner, herdr client).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -47,10 +50,46 @@ def make_world(tmp: Path):
     return root, worktree, root / "project"
 
 
-def fake_bridge(tmp: Path):
-    src = tmp / "installed" / prep._sessreg.BRIDGE_PLUGIN_NAME
+TUI_SOURCE = """// installed by herdr
+// managed by herdr; reinstalling or updating the integration overwrites this file.
+// HERDR_INTEGRATION_ID=opencode-tui
+// HERDR_INTEGRATION_VERSION=13
+const SOURCE = "herdr:opencode";
+function requestOnce(sessionID, state) {
+  return request(state === undefined ? "pane.report_agent_session" : "pane.report_agent", {
+    agent_session_id: sessionID,
+    ...(state === undefined ? { session_start_source: "select" } : { state }),
+  });
+}
+function routeID() { const route = api.route.current; return route?.params?.sessionID; }
+"""
+
+
+def fake_bridge(tmp: Path, *, tui: bool = True, register: bool = True,
+                tui_source: str | None = None):
+    """Create a disposable installed layout (server + optional TUI bridge).
+
+    Mirrors the verified installed integration: the server plugin lives under
+    ``opencode/plugins`` and the TUI bridge is registered through ``cli.json``
+    as a local directory plugin ``./herdr-opencode`` whose ``tui.js`` re-exports
+    ``../herdr-tui-session.js``.  No user config is copied.
+    """
+    root = tmp / "installed"
+    shutil.rmtree(root, ignore_errors=True)   # each fixture call is a fresh layout
+    src = root / "plugins" / prep._sessreg.BRIDGE_PLUGIN_NAME
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text("// verified v13 bridge\n", encoding="utf-8")
+    if tui:
+        bridge = root / prep.TUI_BRIDGE_PLUGIN_NAME
+        bridge.write_text(tui_source if tui_source is not None else TUI_SOURCE,
+                          encoding="utf-8")
+    if register:
+        wrapper = root / prep.TUI_REGISTRATION_DIR / prep.TUI_REGISTRATION_ENTRY
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text('export { default } from "../herdr-tui-session.js";\n',
+                           encoding="utf-8")
+        (root / "cli.json").write_text(
+            json.dumps({"plugins": [f"./{prep.TUI_REGISTRATION_DIR}"]}), encoding="utf-8")
     return str(src), f"opencode: current (v13) ({src})\n"
 
 
@@ -86,6 +125,32 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(prep.PrepError):
                 prep.prepare_pane(**self._base(session_id=bad))
 
+    def test_bridge_src_must_equal_reported_server_path(self):
+        other = self.tmp / "elsewhere" / prep._sessreg.BRIDGE_PLUGIN_NAME
+        other.parent.mkdir(parents=True)
+        other.write_text(Path(self.src).read_text("utf-8"), encoding="utf-8")
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base(bridge_src=str(other)))
+        self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
+    def test_bridge_src_symlink_refused(self):
+        link = self.tmp / "linked-server.js"
+        os.symlink(self.src, link)
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base(bridge_src=str(link)))
+        self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
+    def test_reported_server_bridge_symlink_refused(self):
+        real = self.tmp / "real-server.js"
+        real.write_text(Path(self.src).read_text("utf-8"), encoding="utf-8")
+        link = self.tmp / "status-server.js"
+        os.symlink(str(real), str(link))
+        self.src = str(link)
+        self.status = f"opencode: current (v13) ({link})\n"
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base(bridge_src=None))
+        self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
     def test_live_repo_root_refused_by_reused_guard(self):
         with self.assertRaises(runner.GuardError):
             prep.prepare_pane(**self._base(root=str(REPO_ROOT)))
@@ -118,6 +183,122 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(prep.PrepError):
             prep.prepare_pane(**self._base(role="worker"))
 
+    def test_missing_tui_bridge_refused_before_write(self):
+        self.src, self.status = fake_bridge(self.tmp, tui=False)
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+        self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
+    def test_unregistered_tui_bridge_refused_before_write(self):
+        self.src, self.status = fake_bridge(self.tmp, register=False)
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+        self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
+    def test_unverified_tui_bridge_refused(self):
+        for src in (
+            "// HERDR_INTEGRATION_ID=opencode\n// HERDR_INTEGRATION_VERSION=13\n"
+            "pane.report_agent_session agent_session_id session_start_source route.current\n",
+            "// HERDR_INTEGRATION_ID=opencode-tui\n// HERDR_INTEGRATION_VERSION=12\n"
+            "pane.report_agent_session agent_session_id session_start_source route.current\n",
+        ):
+            with self.subTest(src=src):
+                self.src, self.status = fake_bridge(self.tmp, tui_source=src)
+                with self.assertRaises(prep.PrepError):
+                    prep.prepare_pane(**self._base())
+                self.assertFalse((self.root / "pane-prep" / "worker").exists())
+
+    def test_bare_file_tui_registration_refused(self):
+        self.src, self.status = fake_bridge(self.tmp, register=False)
+        (self.tmp / "installed" / "cli.json").write_text(
+            json.dumps({"plugins": ["./herdr-tui-session.js"]}), encoding="utf-8")
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+
+    def test_tui_registration_escape_refused(self):
+        self.src, self.status = fake_bridge(self.tmp, register=False)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "tui.js").write_text('export { default } from "../herdr-tui-session.js";\n',
+                                        encoding="utf-8")
+        (self.tmp / "installed" / "cli.json").write_text(
+            json.dumps({"plugins": ["../outside"]}), encoding="utf-8")
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["tui.js"])
+
+    def test_symlinked_tui_registration_refused(self):
+        self.src, self.status = fake_bridge(self.tmp, register=False)
+        root = self.tmp / "installed"
+        real = root / "real-plugin"
+        real.mkdir()
+        (real / prep.TUI_REGISTRATION_ENTRY).write_text(
+            'export { default } from "../herdr-tui-session.js";\n', encoding="utf-8")
+        os.symlink(str(real), str(root / prep.TUI_REGISTRATION_DIR))
+        (root / "cli.json").write_text(
+            json.dumps({"plugins": [f"./{prep.TUI_REGISTRATION_DIR}"]}), encoding="utf-8")
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+
+    def test_symlinked_installed_tui_bridge_refused(self):
+        self.src, self.status = fake_bridge(self.tmp, register=True)
+        bridge = self.tmp / "installed" / prep.TUI_BRIDGE_PLUGIN_NAME
+        real = self.tmp / "real-tui.js"
+        real.write_text(TUI_SOURCE, encoding="utf-8")
+        bridge.unlink()
+        os.symlink(str(real), str(bridge))
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+
+    def test_isolated_general_config_refused_before_any_write(self):
+        sbx = self.root / "pane-prep" / "worker"
+        general = sbx / "xdg-config" / "opencode" / "opencode.json"
+        general.parent.mkdir(parents=True)
+        general.write_text('{"model":"cloud/x"}\n', encoding="utf-8")
+        before = sorted(p.relative_to(sbx).as_posix()
+                        for p in sbx.rglob("*"))
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+        self.assertEqual(general.read_text("utf-8"), '{"model":"cloud/x"}\n')
+        after = sorted(p.relative_to(sbx).as_posix()
+                       for p in sbx.rglob("*"))
+        self.assertEqual(after, before)   # no dirs, copies, or prep.json created
+        self.assertFalse((self.worktree / "opencode.json").exists())
+        self.assertFalse((sbx / "xdg-config" / "opencode" / "plugins").exists())
+        self.assertFalse((sbx / "xdg-config" / "opencode" / "cli.json").exists())
+        self.assertFalse((sbx / "prep.json").exists())
+
+    def test_general_config_cli_failure_is_clean_and_partial_free(self):
+        sbx = self.root / "pane-prep" / "worker"
+        general = sbx / "xdg-config" / "opencode" / "opencode.json"
+        general.parent.mkdir(parents=True)
+        general.write_text('{"model":"cloud/x"}\n', encoding="utf-8")
+        before = sorted(p.relative_to(sbx).as_posix()
+                        for p in sbx.rglob("*"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = prep.main(["prep", "--role", "worker", "--root", str(self.root),
+                            "--herdr-pane", DESIGNATED_PANE, "--sandbox", str(sbx)])
+        self.assertEqual(rc, 2)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("general config", payload["error"])
+        after = sorted(p.relative_to(sbx).as_posix()
+                       for p in sbx.rglob("*"))
+        self.assertEqual(after, before)
+        self.assertFalse((self.worktree / "opencode.json").exists())
+
+    def test_isolated_cli_symlink_escape_refused(self):
+        sbx = self.root / "pane-prep" / "worker"
+        xdg = sbx / "xdg-config" / "opencode"
+        xdg.mkdir(parents=True)
+        outside = self.other / "cli.json"
+        outside.write_text("{}\n", encoding="utf-8")
+        os.symlink(str(outside), str(xdg / "cli.json"))
+        with self.assertRaises(prep.PrepError):
+            prep.prepare_pane(**self._base())
+        self.assertEqual(outside.read_text("utf-8"), "{}\n")
+
 
 class PrepareHappyPath(unittest.TestCase):
     def setUp(self):
@@ -135,17 +316,47 @@ class PrepareHappyPath(unittest.TestCase):
         kw.setdefault("bridge_status_text", self.status)
         return prep.prepare_pane(**kw)
 
-    def test_worker_targets_alloc_worktree_and_only_bridge(self):
+    def test_worker_targets_alloc_worktree_and_exact_identity_bridges(self):
         rep = self._prep()
         self.assertEqual(Path(rep["cwd"]).resolve(), self.worktree.resolve())
+        self.assertTrue(rep["server_bridge_ready"])
+        self.assertTrue(rep["tui_bridge_ready"])
+        self.assertTrue(rep["identity_bridge_ready"])
         self.assertTrue(rep["bridge_ready"])
-        files = sorted(p.name for p in (Path(rep["sandbox"]) / "xdg-config" / "opencode").rglob("*") if p.is_file())
-        self.assertEqual(files, [prep._sessreg.BRIDGE_PLUGIN_NAME])
+        xdg = Path(rep["sandbox"]) / "xdg-config" / "opencode"
+        files = sorted(p.name for p in xdg.rglob("*") if p.is_file())
+        self.assertEqual(files, ["cli.json", prep._sessreg.BRIDGE_PLUGIN_NAME,
+                                 prep.TUI_BRIDGE_PLUGIN_NAME, prep.TUI_REGISTRATION_ENTRY])
+        self.assertFalse((xdg / "opencode.json").exists())
+        self.assertFalse((xdg / "tui.json").exists())
+        cfg = json.loads((xdg / "cli.json").read_text("utf-8"))
+        self.assertEqual(cfg["plugins"], [f"./{prep.TUI_REGISTRATION_DIR}"])
+        wrapper = xdg / prep.TUI_REGISTRATION_DIR / prep.TUI_REGISTRATION_ENTRY
+        self.assertIn("../herdr-tui-session.js", wrapper.read_text("utf-8"))
+        self.assertEqual((xdg / prep.TUI_BRIDGE_PLUGIN_NAME).read_text("utf-8"), TUI_SOURCE)
+        self.assertEqual(rep["tui_bridge"]["integration_id"], prep.TUI_INTEGRATION_ID)
+        self.assertEqual(rep["tui_bridge"]["version"], 13)
+        self.assertEqual(rep["tui_bridge"]["isolated_plugin"],
+                         f"./{prep.TUI_REGISTRATION_DIR}")
         self.assertEqual(rep["pinned_config"]["status"], "written")
 
     def test_ceo_targets_project_root(self):
         rep = self._prep(role="ceo")
         self.assertEqual(Path(rep["cwd"]).resolve(), self.project.resolve())
+
+    def test_dispatch_example_quotes_root_with_spaces(self):
+        spaced = Path(tempfile.mkdtemp(prefix="m606 space "))
+        try:
+            root, _worktree, _project = make_world(spaced)
+            src, status = fake_bridge(spaced)
+            rep = prep.prepare_pane(role="worker", root=str(root), pane=DESIGNATED_PANE,
+                                    base_env=dict(BASE_ENV), template=TEMPLATE,
+                                    bridge_src=src, bridge_status_text=status)
+            quoted = shlex.quote(str(root.resolve()))
+            self.assertIn(f"--root {quoted}", rep["dispatch_example"])
+            self.assertIn(f"--root {quoted}", rep["runner_validate"])
+        finally:
+            shutil.rmtree(spaced, ignore_errors=True)
 
     def test_custom_sandbox_inside_root_accepted(self):
         sbx = self.root / "mysbx"

@@ -327,25 +327,57 @@ def _project_id_for_member(conn: TeamCraftConnection, member: str,
 
 def _project_id_for_command(conn: TeamCraftConnection, command_id: str) -> str:
     row = conn.execute(
-        "SELECT evidence_json, payload_json FROM commands WHERE id=?", (command_id,)
+        "SELECT kind, evidence_json, payload_json FROM commands WHERE id=?",
+        (command_id,),
     ).fetchone()
     if row is None:
         raise RuntimeAdapterError(f"command not found: {command_id}")
     try:
-        evidence, payload = json.loads(str(row[0])), json.loads(str(row[1]))
+        evidence, payload = json.loads(str(row[1])), json.loads(str(row[2]))
     except (TypeError, json.JSONDecodeError) as exc:
         raise RuntimeAdapterError(
             f"command {command_id} has invalid project evidence; refusing lease scope"
         ) from exc
-    task_id = evidence.get("task_id") if isinstance(evidence, dict) else None
-    member = payload.get("member") if isinstance(payload, dict) else None
-    if not isinstance(member, str) or not member:
+    if not isinstance(evidence, dict) or not isinstance(payload, dict):
+        raise RuntimeAdapterError(
+            f"command {command_id} has invalid project evidence; refusing lease scope"
+        )
+    task_id = evidence.get("task_id")
+    if "member" in payload:
+        member = payload.get("member")
+        if not isinstance(member, str) or not member:
+            raise RuntimeAdapterError(
+                f"command {command_id} has an invalid member project binding"
+            )
+        return _project_id_for_member(
+            conn, member, str(task_id) if task_id is not None else None,
+        )
+
+    # Recovery Commands are Task scoped and deliberately carry no member in
+    # their payload.  Bind them through the evidence Task, while still
+    # requiring that Task to belong to this runtime's project.  This is a
+    # scope derivation only; the caller's lease is independently rechecked by
+    # the guarded command operation.
+    if (
+        not str(row[0]).startswith("recovery.")
+        or not isinstance(task_id, str)
+        or not task_id
+    ):
         raise RuntimeAdapterError(
             f"command {command_id} has no member or Task project binding"
         )
-    return _project_id_for_member(
-        conn, member, str(task_id) if task_id is not None else None,
+    task = domain.get_task(conn, task_id)
+    root = conn.execute(
+        "SELECT project_root FROM runtime_meta WHERE id=1"
+    ).fetchone()
+    runtime_project = (
+        project_id_for_root(conn, str(root[0])) if root is not None else None
     )
+    if runtime_project is None or task.project_id != runtime_project:
+        raise RuntimeAdapterError(
+            f"Task {task_id!r} belongs to another project; refusing lease scope mismatch"
+        )
+    return runtime_project
 
 
 # ---------------------------------------------------------------------------
@@ -580,10 +612,35 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
             raise RuntimeAdapterError(
                 f"member {member.get('name')!r} Task belongs to another project"
             )
-        desired = json.dumps(list(member["ownership"]), ensure_ascii=False)
-        if task.ownership_json != desired and member["phase"] == "reserved":
-            domain.update_task(conn, task_id, ownership_json=desired,
-                              expected_version=task.version, clock=clock)
+        try:
+            recorded_ownership = json.loads(task.ownership_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeAdapterError(
+                f"Task {task.id} has invalid ownership_json"
+            ) from exc
+        desired_ownership = member.get("ownership")
+        for label, claims in (
+            ("Task", recorded_ownership), ("member", desired_ownership),
+        ):
+            if (
+                not isinstance(claims, list)
+                or any(not isinstance(claim, str) or not claim for claim in claims)
+                or len(set(claims)) != len(claims)
+            ):
+                raise RuntimeAdapterError(
+                    f"{label} {task.id} has invalid ownership claims"
+                )
+        if (
+            member["phase"] == "reserved"
+            and set(recorded_ownership) != set(desired_ownership)
+        ):
+            # Existing Task ownership is immutable through the domain API.
+            # A reserved member may reorder the exact same claims, but it may
+            # never silently widen or narrow the Task's authority.
+            raise RuntimeAdapterError(
+                f"member {member.get('name')!r} ownership differs from "
+                f"existing Task {task.id}; refusing unauthorized mutation"
+            )
 
     attempt_id = member.get("attempt_id")
     phase = str(member["phase"])
@@ -667,7 +724,27 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
                 # A member phase is not external proof. UNKNOWN may only be
                 # settled by the fenced recovery API after reconciliation.
                 pass
-            if phase == "completed":
+            # ``sync_state`` writes the complete member snapshot on every
+            # operation.  A historical completed member therefore appears
+            # again when a later Attempt for the same Task is reserved.  Only
+            # the transition into ``completed`` may advance the Task, and it
+            # must still refer to the Task's latest Attempt.  Otherwise an old
+            # member could report the newly-created retry done before it has
+            # even started.
+            entered_completed = (
+                phase == "completed"
+                and (before is None or before.get("phase") != "completed")
+            )
+            latest_attempt = conn.execute(
+                "SELECT id FROM attempts WHERE task_id = ? "
+                "ORDER BY attempt_no DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                entered_completed
+                and latest_attempt is not None
+                and str(latest_attempt[0]) == attempt_id
+            ):
                 task = domain.get_task(conn, task_id)
                 if task.status == "running":
                     domain.apply_task_event(conn, task_id,
@@ -984,6 +1061,13 @@ def member_workspace_status(
 # ---------------------------------------------------------------------------
 
 
+_INTEGRATION_DTO_KEYS = frozenset({
+    "attempt_id", "task_id", "project_id", "branch", "recorded_base_sha",
+    "live_base_sha", "base_drift", "merge_status", "conflict_files",
+    "integration_required", "integration_task_id", "problems",
+})
+
+
 def _integration_status_dto(status: delivery.IntegrationStatus) -> dict[str, Any]:
     return {
         "attempt_id": status.attempt_id,
@@ -999,6 +1083,63 @@ def _integration_status_dto(status: delivery.IntegrationStatus) -> dict[str, Any
         "integration_task_id": status.integration_task_id,
         "problems": list(status.problems),
     }
+
+
+def _integration_status_dto_from_record(payload: Any) -> dict[str, Any]:
+    """Map a persisted ``integration_check`` payload onto the SAME DTO shape.
+
+    The first read (no recorded row yet) and later reads (latest recorded row)
+    must hand callers one identical schema; storage-only markers such as
+    ``schema_version`` and ``source_task_id`` stay internal.
+    """
+
+    required = {
+        "attempt_id", "branch", "conflict_files", "integration_required",
+        "integration_task_id", "live_base_sha", "merge_status", "problems",
+        "project_id", "recorded_base_sha", "source_task_id",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise RuntimeAdapterError("recorded integration_check payload is malformed")
+    recorded = payload["recorded_base_sha"]
+    live = payload["live_base_sha"]
+    conflicts = payload["conflict_files"]
+    problems = payload["problems"]
+    task_id = payload["source_task_id"]
+    integration_task_id = payload["integration_task_id"]
+    if (
+        not isinstance(recorded, str) or not recorded
+        or not isinstance(task_id, str) or not task_id
+        or not isinstance(payload["attempt_id"], str) or not payload["attempt_id"]
+        or not isinstance(payload["project_id"], str) or not payload["project_id"]
+        or not isinstance(payload["branch"], str) or not payload["branch"]
+        or (live is not None and not isinstance(live, str))
+        or not isinstance(payload["merge_status"], str)
+        or not isinstance(payload["integration_required"], bool)
+        or (integration_task_id is not None
+            and not isinstance(integration_task_id, str))
+        or not isinstance(conflicts, list)
+        or any(not isinstance(item, str) for item in conflicts)
+        or not isinstance(problems, list)
+        or any(not isinstance(item, str) for item in problems)
+    ):
+        raise RuntimeAdapterError("recorded integration_check payload is malformed")
+    dto = {
+        "attempt_id": payload["attempt_id"],
+        "task_id": task_id,
+        "project_id": payload["project_id"],
+        "branch": payload["branch"],
+        "recorded_base_sha": recorded,
+        "live_base_sha": live,
+        "base_drift": live is not None and live != recorded,
+        "merge_status": payload["merge_status"],
+        "conflict_files": list(conflicts),
+        "integration_required": payload["integration_required"],
+        "integration_task_id": integration_task_id,
+        "problems": list(problems),
+    }
+    if set(dto) != _INTEGRATION_DTO_KEYS:  # pragma: no cover - invariant guard
+        raise RuntimeAdapterError("integration DTO schema drifted")
+    return dto
 
 
 def _cleanup_eligibility_dto(
@@ -1077,7 +1218,13 @@ def member_integration_status(
     *,
     run_git: Any = None,
 ) -> dict[str, Any]:
-    """Latest recorded integration facts for the member (no new facts)."""
+    """Read-only integration facts for one member (never appends an Event).
+
+    Returns the latest recorded ``integration_check`` row when one exists;
+    otherwise it computes a live DETECTION snapshot with ``audit=False``.
+    Both paths return the identical DTO schema, and neither mutates storage:
+    durable observations belong to explicit ``integration-check``/``ensure``.
+    """
 
     role, read_only, _task_id, attempt_id = _workspace_member_row(conn, member)
     if read_only or attempt_id is None:
@@ -1087,26 +1234,21 @@ def member_integration_status(
         "SELECT seq, event_id, payload_json, occurred_at FROM events"
         " WHERE kind = ? AND attempt_id = ? ORDER BY seq DESC LIMIT 1",
         (delivery.INTEGRATION_CHECK_EVENT_KIND, attempt_id)).fetchone()
-    latest: Any = None
-    if row is not None:
-        try:
-            latest = json.loads(str(row[2]))
-        except (TypeError, json.JSONDecodeError):
-            latest = None
-    requirement = delivery.load_integration_requirement(conn, attempt_id)
-    if latest is None:
-        # Nothing observed yet: compute a live view without creating an audit
-        # fact.  Status endpoints are inspection-only; explicit check/ensure
-        # commands own durable observations.
+    if row is None:
+        # Nothing recorded yet: report a live snapshot WITHOUT an audit fact.
         status = delivery.check_integration_state(conn, attempt_id,
                                                   run_git=run_git,
                                                   audit=False)
-        return {"member": member, "role": role,
-                "integration": _integration_status_dto(status),
-                "requirement": None if requirement is None else {
-                    "integration_task_id": requirement[0],
-                    "event_id": requirement[1]}}
-    return {"member": member, "role": role, "integration": latest,
+        integration = _integration_status_dto(status)
+    else:
+        try:
+            payload = json.loads(str(row[2]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeAdapterError(
+                "recorded integration_check payload is not valid JSON") from exc
+        integration = _integration_status_dto_from_record(payload)
+    requirement = delivery.load_integration_requirement(conn, attempt_id)
+    return {"member": member, "role": role, "integration": integration,
             "requirement": None if requirement is None else {
                 "integration_task_id": requirement[0],
                 "event_id": requirement[1]}}

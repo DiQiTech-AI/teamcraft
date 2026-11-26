@@ -23,7 +23,14 @@ import time
 import unittest
 from pathlib import Path
 
-from teamcraft import domain, runtime_adapter as ra, worktrees
+from teamcraft import (
+    commands,
+    domain,
+    leader,
+    runtime_adapter as ra,
+    storage,
+    worktrees,
+)
 from teamcraft.errors import IllegalTransitionError
 from teamcraft.runtime_adapter import RuntimeAdapterError
 
@@ -204,6 +211,175 @@ class AdapterRoutingTests(unittest.TestCase):
         status = ra.member_workspace_status(self.conn, "dev1")
         self.assertEqual(status["routed"], "unallocated")
         self.assertIsNone(status["worktree"])
+
+    def _set_task_ownership(self, task_id: str, claims: list[str], *,
+                            compact: bool = False) -> None:
+        separators = (",", ":") if compact else None
+        with storage.transaction(self.conn) as writable:
+            writable.execute(
+                "UPDATE tasks SET ownership_json=? WHERE id=?",
+                (json.dumps(claims, separators=separators), task_id),
+            )
+
+    def test_reserved_member_accepts_semantically_equal_task_ownership(self):
+        dev = self.state["members"]["dev1"]
+        task_id = dev["task_id"]
+        dev.update({"phase": "reserved", "ownership": [
+            "src/dev1/**", "docs/**",
+        ]})
+
+        # Compact JSON formatting must not be treated as an ownership change.
+        self._set_task_ownership(
+            task_id, ["src/dev1/**", "docs/**"], compact=True,
+        )
+        ra.sync_state(self.conn, self.state)
+
+        # Claim order is also non-authoritative: the same set stays accepted.
+        self._set_task_ownership(task_id, ["docs/**", "src/dev1/**"])
+        ra.sync_state(self.conn, self.state)
+        self.assertEqual(
+            set(json.loads(domain.get_task(self.conn, task_id).ownership_json)),
+            {"src/dev1/**", "docs/**"},
+        )
+
+    def test_reserved_member_cannot_change_existing_task_ownership(self):
+        dev = self.state["members"]["dev1"]
+        task_id = dev["task_id"]
+        original = json.loads(domain.get_task(self.conn, task_id).ownership_json)
+        dev.update({"phase": "reserved", "ownership": ["docs/**"]})
+
+        with self.assertRaisesRegex(
+            RuntimeAdapterError, "ownership differs.*unauthorized mutation",
+        ):
+            ra.sync_state(self.conn, self.state)
+
+        self.assertEqual(
+            json.loads(domain.get_task(self.conn, task_id).ownership_json),
+            original,
+        )
+
+    def test_completed_historical_member_cannot_complete_fresh_retry(self):
+        """Snapshot replay must not apply old completion to a new Attempt."""
+
+        dev = self.state["members"]["dev1"]
+        dev.update({"phase": "agent_started", "live_state": "working"})
+        ra.sync_state(self.conn, self.state)
+        old_attempt_id = dev["attempt_id"]
+
+        dev.update({"phase": "completed", "live_state": "done"})
+        ra.sync_state(self.conn, self.state)
+        self.assertEqual(domain.get_attempt(self.conn, old_attempt_id).status,
+                         "finished")
+
+        # Model the evidence-bound recovery service returning the Task to
+        # READY.  Its detailed evidence gates are covered by recovery tests;
+        # this test isolates the runtime snapshot/lineage boundary.
+        with storage.transaction(self.conn) as writable:
+            writable.execute(
+                "UPDATE tasks SET status='ready', version=version+1 "
+                "WHERE id=? AND status='verifying'",
+                (dev["task_id"],),
+            )
+        task = domain.get_task(self.conn, dev["task_id"])
+        retry = domain.create_attempt(
+            self.conn, task.id, expected_version=task.version,
+        )
+
+        retry_member = _member(
+            "dev1_retry",
+            phase="reserved",
+            ownership=list(dev["ownership"]),
+            cwd=str(self.repo),
+            pane_id=None,
+            task_id=task.id,
+            attempt_id=retry.id,
+        )
+        self.state["members"]["dev1_retry"] = retry_member
+
+        # sync_state visits dev1 (the old completed member) before the retry
+        # member.  Before the fix, that stale phase attempted to complete the
+        # created retry and raised EXECUTION_NOT_FINISHED.
+        ra.sync_state(self.conn, self.state)
+        ra.sync_state(self.conn, self.state)  # snapshot replay is idempotent
+
+        self.assertEqual(domain.get_attempt(self.conn, old_attempt_id).status,
+                         "finished")
+        self.assertEqual(domain.get_attempt(self.conn, retry.id).status,
+                         "created")
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "running")
+
+    def test_task_scoped_recovery_command_uses_evidence_project(self):
+        task = domain.get_task(
+            self.conn, self.state["members"]["dev1"]["task_id"]
+        )
+        command = commands.submit_command(
+            self.conn,
+            idempotency_key="task-only-recovery",
+            kind="recovery.cancel",
+            payload_json=json.dumps({"task_id": task.id}),
+            evidence_json=json.dumps({
+                "task_id": task.id, "task_version": task.version,
+            }),
+        ).command
+        lease = leader.acquire_or_renew(
+            self.conn, leader.project_scope(task.project_id), "recovery-test",
+            ttl_seconds=30,
+        )
+
+        claimed = ra.claim_recovery_action(
+            self.conn, command.id, lease=lease,
+        )
+        self.assertEqual(claimed.state, "running")
+
+    def test_task_scoped_command_rejects_malformed_binding_and_wrong_scope(self):
+        task = domain.get_task(
+            self.conn, self.state["members"]["dev1"]["task_id"]
+        )
+        malformed = commands.submit_command(
+            self.conn,
+            idempotency_key="malformed-task-only-recovery",
+            kind="recovery.cancel",
+            payload_json="[]",
+            evidence_json="{}",
+        ).command
+        lease = leader.acquire_or_renew(
+            self.conn, leader.project_scope(task.project_id), "recovery-test",
+            ttl_seconds=30,
+        )
+        with self.assertRaisesRegex(RuntimeAdapterError,
+                                    "invalid project evidence"):
+            ra.claim_recovery_action(self.conn, malformed.id, lease=lease)
+
+        unrelated = commands.submit_command(
+            self.conn,
+            idempotency_key="non-recovery-task-only-command",
+            kind="task.inspect",
+            payload_json="{}",
+            evidence_json=json.dumps({
+                "task_id": task.id, "task_version": task.version,
+            }),
+        ).command
+        with self.assertRaisesRegex(RuntimeAdapterError,
+                                    "no member or Task project binding"):
+            ra.claim_recovery_action(self.conn, unrelated.id, lease=lease)
+
+        scoped = commands.submit_command(
+            self.conn,
+            idempotency_key="wrong-scope-task-only-recovery",
+            kind="recovery.cancel",
+            payload_json="{}",
+            evidence_json=json.dumps({
+                "task_id": task.id, "task_version": task.version,
+            }),
+        ).command
+        wrong_lease = leader.Lease(
+            leader.project_scope("foreign-project"), "foreign", 1,
+            lease.acquired_at, lease.expires_at,
+        )
+        with self.assertRaises(leader.StaleLeaderError):
+            ra.claim_recovery_action(
+                self.conn, scoped.id, lease=wrong_lease,
+            )
 
 
 if __name__ == "__main__":

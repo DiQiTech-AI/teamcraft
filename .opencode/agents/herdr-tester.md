@@ -17,6 +17,7 @@ permission:
     "git *": allow
     "pwd": allow
     "cd /Users/blade/GitHub/teamcraft": allow
+    "cd /Users/blade/GitHub/teamcraft/.teamcraft/worktrees/*": allow
     "ls": allow
     "ls -la": allow
     "ls -1": allow

@@ -17,6 +17,12 @@ Hard guarantees (validated **before any write**):
   (only provider ``omlx``, loopback baseURL, pinned model, no credential) — never
   silently trusted, **never overwritten**; otherwise the run aborts;
 * session ids must match ``^ses_[A-Za-z0-9]+$`` or are rejected;
+* both identity bridges must be the verified **installed** integrations: the
+  server plugin path from ``herdr integration status`` and the ``opencode-tui``
+  v13+ bridge registered as a local directory plugin.  Missing, unregistered,
+  symlinked, or version-mismatched TUI bridges abort **before any write**;
+* the isolated XDG receives only the two bridge files, the local TUI wrapper, and
+  a minimal ``cli.json`` registration — never the user's general config;
 * the emitted launch command uses ``env -i`` (no inherited config), explicit
   necessary vars only, shell-quoted values, and **binds ``HERDR_PANE_ID`` to the
   designated pane** (socket/env preserved from the invoking pane via ``${VAR:?}``).
@@ -35,6 +41,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +70,18 @@ ROLES = ("worker", "ceo")
 DEFAULT_MODEL = runner.DEFAULT_MODEL
 OMLX_URL = runner.LOOPBACK_OMLX_URL
 TEMPLATE = REPO_ROOT / "opencode.example.json"
+
+# --- isolated TUI identity bridge (verified installed integration only) --------
+TUI_BRIDGE_PLUGIN_NAME = "herdr-tui-session.js"
+TUI_REGISTRATION_DIR = "herdr-opencode"
+TUI_REGISTRATION_ENTRY = "tui.js"
+TUI_INTEGRATION_ID = "opencode-tui"
+TUI_MIN_VERSION = 13
+TUI_CONFIG_NAMES = ("cli.json", "tui.json", "tui.jsonc")
+MAX_BRIDGE_BYTES = 1 << 20
+
+_INTEGRATION_ID_RE = re.compile(r"^//\s*HERDR_INTEGRATION_ID=([A-Za-z0-9_.-]+)\s*$", re.M)
+_INTEGRATION_VERSION_RE = re.compile(r"^//\s*HERDR_INTEGRATION_VERSION=(\d+)\s*$", re.M)
 
 
 class PrepError(RuntimeError):
@@ -130,6 +149,241 @@ def _default_bridge_status(timeout: float = 20.0) -> str:
     r = subprocess.run(["herdr", "integration", "status"],
                        capture_output=True, text=True, timeout=timeout, check=False)
     return (r.stdout or "") + (r.stderr or "")
+
+
+def _bounded_text(path: Path, limit: int = MAX_BRIDGE_BYTES) -> str:
+    """Read a verified module/config as UTF-8 without following a symlink."""
+    p = Path(path)
+    if p.is_symlink() or not p.is_file():
+        raise PrepError(f"not a regular file: {p}")
+    if p.stat().st_size > limit:
+        raise PrepError(f"file too large to verify ({p.stat().st_size} > {limit}): {p}")
+    try:
+        return p.read_text("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PrepError(f"not UTF-8 text: {p}") from exc
+
+
+def verify_tui_bridge(path: Path) -> dict:
+    """Accept only the installed ``opencode-tui`` v13+ selection bridge.
+
+    Provenance is the managed header plus the operations the bridge must emit;
+    no user config or credential value is read, printed, or copied.
+    """
+    p = Path(path)
+    text = _bounded_text(p)
+    ids = _INTEGRATION_ID_RE.findall(text)
+    versions = _INTEGRATION_VERSION_RE.findall(text)
+    if ids != [TUI_INTEGRATION_ID]:
+        raise PrepError(f"{p}: not the verified {TUI_INTEGRATION_ID} bridge")
+    if not versions:
+        raise PrepError(f"{p}: missing HERDR_INTEGRATION_VERSION marker")
+    version = max(int(v) for v in versions)
+    if version < TUI_MIN_VERSION:
+        raise PrepError(f"{p}: {TUI_INTEGRATION_ID} v{version} < v{TUI_MIN_VERSION}")
+    required = ("pane.report_agent_session", "agent_session_id",
+                "session_start_source", "route.current")
+    missing = [token for token in required if token not in text]
+    if missing:
+        raise PrepError(f"{p}: bridge is missing required operations {missing}")
+    return {"path": str(p.resolve()), "integration_id": TUI_INTEGRATION_ID,
+            "version": version}
+
+
+def _strip_jsonc(text: str) -> str:
+    """Remove // and /* */ comments plus trailing commas outside strings."""
+    out: list[str] = []
+    i = 0
+    in_string = False
+    escaped = False
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            end = text.find("\n", i)
+            if end == -1:
+                break
+            i = end
+            continue
+        if ch == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        out.append(ch)
+        i += 1
+    cleaned = "".join(out)
+    return re.sub(r",(\s*[}\]])", r"\1", cleaned)
+
+
+def _local_plugin_specs(name: str, text: str) -> list[str]:
+    """Extract local plugin specifiers from a CLI/TUI config without echoing it."""
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            obj = json.loads(_strip_jsonc(text))
+        except json.JSONDecodeError as exc:
+            raise PrepError(f"{name}: is not valid JSON/JSONC") from exc
+    if not isinstance(obj, dict):
+        raise PrepError(f"{name}: plugin config must be an object")
+    raw = obj.get("plugins", obj.get("plugin", []))
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise PrepError(f"{name}: 'plugins'/'plugin' must be a list")
+    specs: list[str] = []
+    for item in raw:
+        spec = item if isinstance(item, str) else (
+            item[0] if isinstance(item, list) and item and isinstance(item[0], str) else None)
+        if spec and (spec.startswith("./") or spec.startswith("../")):
+            specs.append(spec)
+    return specs
+
+
+def _registered_tui_module(spec: str, config_root: Path) -> Path | None:
+    """Resolve a local plugin spec to its TUI entrypoint, refusing escapes.
+
+    Only a directory entrypoint is accepted: ``opencode plugin list`` ignores a
+    bare ``./herdr-tui-session.js`` file even though Node can import it.
+    """
+    root = Path(config_root).resolve()
+    current = root
+    for part in Path(spec).parts:
+        if part == ".":
+            continue
+        current = (current.parent if part == ".." else current / part)
+        if current.is_symlink():
+            raise PrepError(f"plugin registration must not traverse a symlink: {spec}")
+    target = current.resolve()
+    if target != root and not str(target).startswith(str(root) + os.sep):
+        raise PrepError(f"plugin registration escapes the OpenCode config dir: {spec}")
+    if not target.is_dir():
+        return None
+    for entry in (TUI_REGISTRATION_ENTRY, "index.js", "index.mjs"):
+        candidate = target / entry
+        if candidate.exists():
+            if candidate.is_symlink() or not candidate.is_file():
+                raise PrepError(f"plugin entry must be a regular file: {spec}/{entry}")
+            return candidate
+    return None
+
+
+def _module_references_bridge(module: Path, bridge: Path) -> bool:
+    if module.resolve() == bridge.resolve():
+        return False  # a bare file is not a supported TUI registration
+    text = _bounded_text(module)
+    name = Path(bridge).name
+    return name in text and ("export" in text or "require" in text)
+
+
+def find_installed_tui_bridge(status_text: str | None = None, *,
+                              config_root: Path | str | None = None,
+                              config_texts: dict[str, str] | None = None) -> dict:
+    """Locate and verify the installed TUI bridge *and* its registration.
+
+    The server bridge's ``herdr integration status`` path anchors discovery.  The
+    TUI bridge is a sibling of the OpenCode config root; registration must be a
+    local directory plugin whose entrypoint re-exports that exact bridge.  User
+    config is parsed in memory only and never returned or copied.
+    """
+    text = status_text if status_text is not None else _default_bridge_status()
+    server = _sessreg.installed_bridge_path(text)
+    if not server:
+        raise PrepError("verified installed OpenCode server bridge not found")
+    server_path = Path(server)
+    root = Path(config_root).resolve() if config_root else (
+        server_path.parent.parent if server_path.parent.name == "plugins"
+        else server_path.parent).resolve()
+    candidates = [root / TUI_BRIDGE_PLUGIN_NAME,
+                  server_path.parent / TUI_BRIDGE_PLUGIN_NAME]
+    bridge = next((p for p in candidates if p.exists()), None)
+    if bridge is None:
+        raise PrepError(f"verified installed TUI bridge not found under {root}")
+    verified = verify_tui_bridge(bridge)
+
+    if config_texts is None:
+        config_texts = {}
+        for name in TUI_CONFIG_NAMES:
+            candidate = root / name
+            if candidate.exists():
+                config_texts[name] = _bounded_text(candidate)
+    if not config_texts:
+        raise PrepError("installed TUI bridge has no local plugin registration")
+
+    for name, cfg_text in config_texts.items():
+        for spec in _local_plugin_specs(name, cfg_text):
+            module = _registered_tui_module(spec, root)
+            if module and _module_references_bridge(module, bridge):
+                return {**verified, "config_root": str(root),
+                        "source_config": name, "source_spec": spec,
+                        "source_module": str(module)}
+    raise PrepError("installed TUI bridge is not registered as a supported local TUI plugin")
+
+
+def provision_tui_bridge_xdg(isolated_config_home: Path, bridge_src: Path) -> dict:
+    """Copy only the verified TUI bridge and write its isolated registration."""
+    verify_tui_bridge(bridge_src)
+    xdg = Path(isolated_config_home) / "opencode"
+    general_config = xdg / "opencode.json"
+    if general_config.exists() or general_config.is_symlink():
+        raise PrepError(f"general user config must not be imported: {general_config}")
+    dest_bridge = xdg / TUI_BRIDGE_PLUGIN_NAME
+    wrapper = xdg / TUI_REGISTRATION_DIR / TUI_REGISTRATION_ENTRY
+    cli_config = xdg / "cli.json"
+    for target in (dest_bridge, wrapper, cli_config):
+        if target.is_symlink():
+            raise PrepError(f"isolated bridge path must not be a symlink: {target}")
+    dest_bridge.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(bridge_src), str(dest_bridge))
+    verify_tui_bridge(dest_bridge)   # byte-copy integrity, not just existence
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(
+        f'export {{ default }} from "../{TUI_BRIDGE_PLUGIN_NAME}";\n',
+        encoding="utf-8")
+    cli_config.write_text(json.dumps({
+        "$schema": "https://opencode.ai/v2/cli.json",
+        "plugins": [f"./{TUI_REGISTRATION_DIR}"],
+    }, indent=2) + "\n", encoding="utf-8")
+    return {"bridge": str(dest_bridge), "registration": str(wrapper),
+            "config": str(cli_config), "plugin": f"./{TUI_REGISTRATION_DIR}"}
+
+
+def tui_bridge_available(isolated_config_home: Path) -> bool:
+    """True only when the isolated XDG has the bridge, wrapper, and registration."""
+    xdg = Path(isolated_config_home) / "opencode"
+    bridge = xdg / TUI_BRIDGE_PLUGIN_NAME
+    wrapper = xdg / TUI_REGISTRATION_DIR / TUI_REGISTRATION_ENTRY
+    cli_config = xdg / "cli.json"
+    if not (bridge.is_file() and wrapper.is_file() and cli_config.is_file()):
+        return False
+    if (xdg / "opencode.json").exists():
+        return False
+    try:
+        verify_tui_bridge(bridge)
+        cfg = json.loads(cli_config.read_text("utf-8"))
+        wrapper_text = wrapper.read_text("utf-8")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, PrepError):
+        return False
+    plugins = cfg.get("plugins") if isinstance(cfg, dict) else None
+    return (isinstance(plugins, list)
+            and f"./{TUI_REGISTRATION_DIR}" in plugins
+            and TUI_BRIDGE_PLUGIN_NAME in wrapper_text)
 
 
 def launch_command(role: str, pane: str, cwd: Path, sandbox: Path, base_env,
@@ -213,12 +467,44 @@ def prepare_pane(*, role: str, root: str, pane: str, cwd: str | None = None,
     else:
         sandbox_path = _within_root(root_path / "pane-prep" / role, root_real, "sandbox")
 
-    bridge_target = (sandbox_path / "xdg-config" / "opencode" / "plugins"
+    # Refuse an existing general config before even creating sandbox dirs.
+    general_config = sandbox_path / "xdg-config" / "opencode" / "opencode.json"
+    if general_config.exists() or general_config.is_symlink():
+        raise PrepError(
+            f"isolated XDG already contains general config; refusing before write: {general_config}")
+
+    # Resolve and verify BOTH identity bridges before any filesystem write.
+    status = bridge_status_text if bridge_status_text is not None else _default_bridge_status()
+    installed = _sessreg.installed_bridge_path(status)
+    if not installed:
+        raise PrepError("verified installed OpenCode bridge not found; refusing an unbridged pane")
+    installed_path = Path(installed)
+    if installed_path.is_symlink() or not installed_path.is_file():
+        raise PrepError(
+            f"reported server bridge is not a regular non-symlink file: {installed_path}")
+    if bridge_src is not None:
+        requested = Path(bridge_src)
+        if requested.is_symlink():
+            raise PrepError(f"--bridge-src must not be a symlink: {requested}")
+        if requested.resolve() != installed_path.resolve():
+            raise PrepError(
+                f"--bridge-src {requested} is not the current installed bridge "
+                f"reported by herdr: {installed_path}")
+        src = requested
+    else:
+        src = installed_path
+    tui = find_installed_tui_bridge(status)
+
+    server_target = (sandbox_path / "xdg-config" / "opencode" / "plugins"
                      / _sessreg.BRIDGE_PLUGIN_NAME)
+    tui_target = sandbox_path / "xdg-config" / "opencode" / TUI_BRIDGE_PLUGIN_NAME
+    tui_wrapper = (sandbox_path / "xdg-config" / "opencode" / TUI_REGISTRATION_DIR
+                   / TUI_REGISTRATION_ENTRY)
+    tui_cli = sandbox_path / "xdg-config" / "opencode" / "cli.json"
     mutable_paths = [
         *(sandbox_path / name for name in
           ("home", "xdg-config", "xdg-data", "xdg-cache", "xdg-state")),
-        bridge_target, role_cwd / "opencode.json",
+        server_target, tui_target, tui_wrapper, tui_cli, role_cwd / "opencode.json",
     ]
     for target in mutable_paths:
         if _within_root(target, root_real, "preparation path") != target:
@@ -228,20 +514,31 @@ def prepare_pane(*, role: str, root: str, pane: str, cwd: str | None = None,
     for d in ("home", "xdg-config", "xdg-data", "xdg-cache", "xdg-state"):
         (sandbox_path / d).mkdir(parents=True, exist_ok=True)
 
-    status = bridge_status_text if bridge_status_text is not None else _default_bridge_status()
-    installed = _sessreg.installed_bridge_path(status)
-    src = Path(bridge_src) if bridge_src else (Path(installed) if installed else None)
-    if not (src and src.exists()):
-        raise PrepError("verified installed OpenCode bridge not found; refusing an unbridged pane")
-    _sessreg.provision_bridge_xdg(sandbox_path / "xdg-config", src)
-    bridge_ready = _sessreg.bridge_available(sandbox_path / "xdg-config")
+    try:
+        _sessreg.provision_bridge_xdg(sandbox_path / "xdg-config", src)
+    except AssertionError as exc:   # preflighted above; convert a race/defense error
+        raise PrepError(str(exc)) from exc
+    server_ready = _sessreg.bridge_available(sandbox_path / "xdg-config")
+    tui_provisioned = provision_tui_bridge_xdg(sandbox_path / "xdg-config", Path(tui["path"]))
+    tui_ready = tui_bridge_available(sandbox_path / "xdg-config")
+    identity_ready = server_ready and tui_ready
+    if not identity_ready:
+        raise PrepError("isolated identity bridges were provisioned but did not validate")
 
     pinned = install_pinned_config(role_cwd, template, model=model, omlx_url=omlx_url)
     cmd, info = launch_command(role, pane, role_cwd, sandbox_path, base_env, session_id)
 
     report = {
         "role": role, "pane_id": pane, "cwd": str(role_cwd), "sandbox": str(sandbox_path),
-        "bridge_ready": bridge_ready, "bridge_only_in_xdg": bridge_ready,
+        "server_bridge_ready": server_ready, "tui_bridge_ready": tui_ready,
+        "identity_bridge_ready": identity_ready,
+        "bridge_ready": identity_ready, "bridge_only_in_xdg": identity_ready,
+        "tui_bridge": {
+            "integration_id": tui["integration_id"], "version": tui["version"],
+            "source_config": tui["source_config"], "source_spec": tui["source_spec"],
+            "isolated_config": Path(tui_provisioned["config"]).name,
+            "isolated_plugin": tui_provisioned["plugin"],
+        },
         "retained_herder_vars": info["retained_herder_vars"],
         "model": f"omlx/{model}", "omlx_url": omlx_url, "pinned_config": pinned,
         "launch_command": cmd, "observe_command": f"herdr agent get {pane}",
@@ -253,7 +550,8 @@ def prepare_pane(*, role: str, root: str, pane: str, cwd: str | None = None,
                            + (f"  # expect {session_id}" if session_id else "")
                            + "  # PREVIEW: refuses to dispatch (dispatch-consent flag omitted)"),
         "dispatch_example": ("[ACTUAL DISPATCH — operator action; prep never runs this] "
-                            f"scripts/m606_opencode_e2e.py --confirm-live-run --root {root_path} "
+                            f"scripts/m606_opencode_e2e.py --confirm-live-run "
+                            f"--root {shlex.quote(str(root_path))} "
                             f"--resume-handoff --consent-dispatch --herdr-pane {pane} "
                             f"--pane-model-evidence <attestation.json> --expect-session-id <OBSERVED_ID>"),
     }
@@ -302,7 +600,8 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--model", default=DEFAULT_MODEL)
     pp.add_argument("--omlx-url", default=OMLX_URL)
     pp.add_argument("--session-id", default=None, help=f"deterministic session id matching {SESSION_RE.pattern}")
-    pp.add_argument("--bridge-src", default=None, help="path to the verified installed bridge plugin")
+    pp.add_argument("--bridge-src", default=None,
+                    help="path to the verified installed server bridge (TUI bridge is auto-verified from its registration)")
     pp.add_argument("--allow-non-temp-root", action="store_true")
     pp.add_argument("--with-proof", action="store_true", help="run disposable prompt-free registration proof")
     ob = sub.add_parser("observe", help="read a live pane's native session id (read-only)")

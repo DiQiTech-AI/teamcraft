@@ -112,6 +112,135 @@ class RecoveryM205Tests(unittest.TestCase):
         self.assertEqual(domain.get_task(self.conn, task2.id).status, "cancelled")
         self.assertEqual(commands.get_command(self.conn, cmd.id).state, "confirmed")
 
+    def test_cancel_unknown_accepts_exact_legacy_member_session_identity(self):
+        task, attempt, session = self.active()
+        domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)
+        with storage.transaction(self.conn):
+            self.conn.execute(
+                "UPDATE sessions SET native_session_id=NULL WHERE id=?", (session.id,)
+            )
+            self.conn.execute(
+                "UPDATE members SET agent_session_json=? WHERE attempt_id=?",
+                (json.dumps({"kind": "id", "value": "native"}), attempt.id),
+            )
+        cmd = self.request(task, attempt, "cancel-legacy-session", action="cancel")
+        commands.claim_command(self.conn, cmd.id, clock=self.clock)
+        commands.mark_command_unknown(self.conn, cmd.id, note="legacy lost response", clock=self.clock)
+
+        recovery.resolve_unknown(
+            self.conn, attempt.id, command_id=cmd.id, lease=self.lease(),
+            resolution="cancelled", evidence=self.evidence(False),
+            actor="human", reason="inspect", clock=self.clock,
+        )
+
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id).status, "cancelled")
+        self.assertEqual(domain.get_task(self.conn, task.id).status, "cancelled")
+
+    def test_legacy_member_session_cannot_override_present_session_identity(self):
+        task, attempt, session = self.active()
+        domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)
+        with storage.transaction(self.conn):
+            self.conn.execute(
+                "UPDATE sessions SET native_session_id='different' WHERE id=?", (session.id,)
+            )
+            self.conn.execute(
+                "UPDATE members SET agent_session_json=? WHERE attempt_id=?",
+                (json.dumps({"kind": "id", "value": "native"}), attempt.id),
+            )
+        cmd = self.request(task, attempt, "cancel-authoritative-session", action="cancel")
+        commands.claim_command(self.conn, cmd.id, clock=self.clock)
+        commands.mark_command_unknown(self.conn, cmd.id, note="lost response", clock=self.clock)
+
+        with self.assertRaisesRegex(ValidationError, "persisted native session"):
+            recovery.resolve_unknown(
+                self.conn, attempt.id, command_id=cmd.id, lease=self.lease(),
+                resolution="cancelled", evidence=self.evidence(False),
+                actor="human", reason="inspect", clock=self.clock,
+            )
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id).status, "unknown")
+
+    def test_malformed_legacy_member_session_identity_fails_closed(self):
+        task, attempt, session = self.active()
+        domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)
+        with storage.transaction(self.conn):
+            self.conn.execute(
+                "UPDATE sessions SET native_session_id=NULL WHERE id=?", (session.id,)
+            )
+            self.conn.execute(
+                "UPDATE members SET agent_session_json='not-json' WHERE attempt_id=?",
+                (attempt.id,),
+            )
+        cmd = self.request(task, attempt, "cancel-malformed-session", action="cancel")
+        commands.claim_command(self.conn, cmd.id, clock=self.clock)
+        commands.mark_command_unknown(self.conn, cmd.id, note="lost response", clock=self.clock)
+
+        with self.assertRaisesRegex(ValidationError, "persisted native session"):
+            recovery.resolve_unknown(
+                self.conn, attempt.id, command_id=cmd.id, lease=self.lease(),
+                resolution="cancelled", evidence=self.evidence(False),
+                actor="human", reason="inspect", clock=self.clock,
+            )
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id).status, "unknown")
+
+    def test_legacy_member_session_fallback_requires_id_kind(self):
+        """A present-shaped compatibility record is not a Session identity."""
+        task, attempt, session = self.active()
+        domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)
+        with storage.transaction(self.conn):
+            self.conn.execute(
+                "UPDATE sessions SET native_session_id=NULL WHERE id=?", (session.id,)
+            )
+            self.conn.execute(
+                "UPDATE members SET agent_session_json=? WHERE attempt_id=?",
+                (json.dumps({"kind": "terminal", "value": "native"}), attempt.id),
+            )
+        cmd = self.request(task, attempt, "cancel-legacy-wrong-kind", action="cancel")
+        commands.claim_command(self.conn, cmd.id, clock=self.clock)
+        commands.mark_command_unknown(self.conn, cmd.id, note="lost response", clock=self.clock)
+
+        with self.assertRaisesRegex(ValidationError, "persisted native session"):
+            recovery.resolve_unknown(
+                self.conn, attempt.id, command_id=cmd.id, lease=self.lease(),
+                resolution="cancelled", evidence=self.evidence(False),
+                actor="human", reason="inspect", clock=self.clock,
+            )
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id).status, "unknown")
+
+    def test_present_native_identity_vetoes_other_legacy_member_row(self):
+        """Present native identity on ANY Attempt row outranks legacy fields."""
+        task, attempt, session = self.active()
+        domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)
+        other = domain.register_session(
+            self.conn, attempt.id, "herdr", native_session_id="different",
+            pane_id="pane-other", clock=self.clock,
+        )
+        with storage.transaction(self.conn):
+            self.conn.execute(
+                "UPDATE sessions SET native_session_id=NULL WHERE id=?", (session.id,)
+            )
+            self.conn.execute(
+                "UPDATE members SET agent_session_json=? WHERE attempt_id=?",
+                (json.dumps({"kind": "id", "value": "native"}), attempt.id),
+            )
+            self.conn.execute(
+                "INSERT INTO members (name,role,responsibility,kind,task,ownership_json,"
+                "read_only,cwd,pane_id,terminal_id,phase,task_id,attempt_id,session_id,"
+                "created_at,updated_at) VALUES (?,'worker','x','herdr','x','[]',0,"
+                "'/repo','pane-other','term','active',?,?,?,0,0)",
+                (f"w-other-{task.id}", task.id, attempt.id, other.id),
+            )
+        cmd = self.request(task, attempt, "cancel-present-native-veto", action="cancel")
+        commands.claim_command(self.conn, cmd.id, clock=self.clock)
+        commands.mark_command_unknown(self.conn, cmd.id, note="lost response", clock=self.clock)
+
+        with self.assertRaisesRegex(ValidationError, "persisted native session"):
+            recovery.resolve_unknown(
+                self.conn, attempt.id, command_id=cmd.id, lease=self.lease(),
+                resolution="cancelled", evidence=self.evidence(False),
+                actor="human", reason="inspect", clock=self.clock,
+            )
+        self.assertEqual(domain.get_attempt(self.conn, attempt.id).status, "unknown")
+
     def test_active_restore_requires_current_brief_task_version(self):
         task, attempt, _ = self.active()
         domain.transition_attempt(self.conn, attempt.id, "runtime_lost", clock=self.clock)

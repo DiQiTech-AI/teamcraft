@@ -34,6 +34,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from teamcraft import domain, storage, workspaces, worktrees
 from teamcraft.errors import (
@@ -260,7 +261,7 @@ class AllocationTests(_Fixture):
         self.assertEqual(ctx.exception.kind, "occupied")
         self.assertEqual((path / "keepme.txt").read_text(), "precious\n")
 
-    def test_failure_after_durable_allocation_preserves_state(self):
+    def record_unmaterialized_allocation(self):
         task, attempt = self.make_attempt(["src/**"])
 
         def failing_add(args, cwd):
@@ -276,9 +277,71 @@ class AllocationTests(_Fixture):
                          "allocated")
         found = worktrees.discover_allocations(self.conn, self.project.id)
         self.assertEqual([a.attempt_id for a, _ in found], [attempt.id])
+        return task, attempt, found[0][0]
+
+    def test_empty_failed_allocation_retries_exact_recorded_effect(self):
+        task, attempt, recorded = self.record_unmaterialized_allocation()
+
+        recovered, created = self.allocate(task, attempt)
+
+        self.assertTrue(created)
+        self.assertEqual(recovered, recorded)
+        self.assertEqual(
+            git("symbolic-ref", "--short", "HEAD",
+                cwd=Path(recovered.worktree_path)),
+            recorded.branch,
+        )
+        self.assertEqual(
+            git("rev-parse", "HEAD", cwd=Path(recovered.worktree_path)),
+            recorded.base_sha,
+        )
+        row = domain.get_attempt(self.conn, attempt.id)
+        self.assertEqual((row.worktree_path, row.branch),
+                         (recorded.worktree_path, recorded.branch))
+
+    def test_failed_allocation_retry_refuses_existing_branch(self):
+        task, attempt, recorded = self.record_unmaterialized_allocation()
+        git("branch", recorded.branch, recorded.base_sha, cwd=self.repo)
+
+        with self.assertRaises(ConflictError):
+            self.allocate(task, attempt)
+        self.assertFalse(Path(recorded.worktree_path).exists())
+
+    def test_failed_allocation_retry_refuses_moved_base(self):
+        task, attempt, recorded = self.record_unmaterialized_allocation()
+        (self.repo / "advanced.py").write_text("advanced\n", encoding="utf-8")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-q", "-m", "advanced", cwd=self.repo)
+
+        with self.assertRaises(ConflictError):
+            self.allocate(task, attempt)
+        self.assertFalse(Path(recorded.worktree_path).exists())
+        self.assertEqual(git("branch", "--list", recorded.branch,
+                             cwd=self.repo), "")
+
+    def test_failed_allocation_retry_refuses_existing_path(self):
+        task, attempt, recorded = self.record_unmaterialized_allocation()
+        path = Path(recorded.worktree_path)
+        path.mkdir(parents=True)
+        (path / "keep.txt").write_text("partial\n", encoding="utf-8")
+
         with self.assertRaises(WorktreeIdentityError) as ctx:
             self.allocate(task, attempt)
-        self.assertEqual(ctx.exception.kind, "missing")
+        self.assertIn(ctx.exception.kind, {"occupied", "unregistered"})
+        self.assertEqual((path / "keep.txt").read_text(encoding="utf-8"),
+                         "partial\n")
+
+    def test_failed_allocation_retry_refuses_absent_but_registered_path(self):
+        task, attempt, recorded = self.record_unmaterialized_allocation()
+        self.assertFalse(Path(recorded.worktree_path).exists())
+
+        with mock.patch(
+            "teamcraft.worktrees._registered_worktrees",
+            return_value={str(Path(recorded.worktree_path).resolve())},
+        ), self.assertRaises(WorktreeIdentityError) as ctx:
+            self.allocate(task, attempt)
+        self.assertEqual(ctx.exception.kind, "unregistered")
+        self.assertFalse(Path(recorded.worktree_path).exists())
 
 
 # ---------------------------------------------------------------------------

@@ -1352,5 +1352,92 @@ class TeamctlTests(unittest.TestCase):
         self.assertIn("Do not edit any file outside", prompt)
 
 
+class PaneLabelAdapterTests(unittest.TestCase):
+    """The CLI adapter must expose rename_pane for launch --label."""
+
+    def test_cli_adapter_rename_pane_uses_the_pane_rename_transport(self):
+        calls: list[list[str]] = []
+
+        def runner(argv, timeout, accepted):
+            calls.append(list(argv))
+            return ('{"result":{"pane":{"pane_id":"w1:p9"}}}', "", 0)
+
+        adapter = teamctl._TeamctlHerdrAdapter(runner)
+        payload = adapter.rename_pane("w1:p9", "tester · 验收")
+        self.assertEqual(
+            calls, [["herdr", "pane", "rename", "w1:p9", "tester · 验收"]]
+        )
+        self.assertEqual(payload["result"]["pane"]["pane_id"], "w1:p9")
+
+    def test_set_member_pane_label_derives_and_writes_the_label(self):
+        adapter = mock.Mock()
+        member = make_member(
+            "dev", ["src/**"], role="developer",
+            task="Fix login", pane_id="w1:p2",
+        )
+        with mock.patch.object(teamctl, "_herdr_adapter", return_value=adapter):
+            label = teamctl.set_member_pane_label(member)
+        self.assertEqual(label, "developer · Fix login")
+        adapter.rename_pane.assert_called_once_with(
+            "w1:p2", "developer · Fix login"
+        )
+
+
+class _AbsentOccupantAdapter:
+    def current_pane(self, pane_id):
+        raise teamctl.TeamctlError(
+            json.dumps({"error": {"code": "pane_not_found", "message": "gone"}})
+        )
+
+    def get_agent(self, name):
+        raise teamctl.TeamctlError(
+            json.dumps({"error": {"code": "agent_not_found", "message": "gone"}})
+        )
+
+    def list_agents(self):
+        return []
+
+    def request(self, argv):
+        if argv == ["workspace", "list"]:
+            return {"result": {"workspaces": [{"workspace_id": "w1"}]}}
+        if argv == ["pane", "list", "--workspace", "w1"]:
+            return {"result": {"panes": []}}
+        raise AssertionError(f"unexpected Herdr request: {argv}")
+
+
+class AbsentIdentityEvidenceTests(unittest.TestCase):
+    """D8: the no-pane path reports recorded absence, not a live check."""
+
+    def test_no_pane_evidence_carries_explicit_identity_mode(self):
+        member = {
+            "name": "legacy_dev", "pane_id": "w1:p9",
+            "terminal_id": "term-9",
+            "agent_session": {"kind": "id", "value": "native-9"},
+        }
+        with mock.patch.object(
+            teamctl, "_herdr_adapter", return_value=_AbsentOccupantAdapter()
+        ):
+            evidence = teamctl._stop_evidence(
+                member, require_live_agent=False
+            )
+        self.assertIs(evidence["identity_verified"], True)
+        self.assertIs(evidence["process_alive"], False)
+        self.assertEqual(evidence["identity_mode"], "recorded_identity_absent")
+        self.assertIs(evidence["recorded_identity_absent"], True)
+
+    def test_live_collision_still_fails_closed(self):
+        adapter = _AbsentOccupantAdapter()
+        adapter.list_agents = lambda: [{"pane_id": "w1:p9"}]
+        member = {
+            "name": "legacy_dev", "pane_id": "w1:p9",
+            "terminal_id": "term-9",
+            "agent_session": {"kind": "id", "value": "native-9"},
+        }
+        with mock.patch.object(
+            teamctl, "_herdr_adapter", return_value=adapter
+        ), self.assertRaisesRegex(teamctl.TeamctlError, "still appears"):
+            teamctl._stop_evidence(member, require_live_agent=False)
+
+
 if __name__ == "__main__":
     unittest.main()
