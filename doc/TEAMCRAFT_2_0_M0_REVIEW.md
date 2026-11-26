@@ -1182,3 +1182,26 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - 之后按 OpenCode 相同流程跑 Codex 的 dispatch → Wake → verify → local-only deliver，并记录版本/能力矩阵。
 
 **证据**：本轮 disposable root 已 `--cleanup-only` 清理（run `ca7dbe72380ac563`）；无项目文件/真实 DB 写入；未伪造 Codex 派工或交付证据。
+
+### 12.39 Codex leg 第二轮：runner 适配与剩余阻塞（2026-11-27）
+
+**本轮已实现（runner）**：
+
+- `SETTLED_STATUSES = {"idle", "done"}`：CEO/worker gate 与 Wake 等待接受 Codex 的 `idle`/`done`（M2-01 把两者都视为 settled）。
+- CEO harness postcondition 改为允许 `{codex, opencode}`，与 `teamcraft/ceo_initialization.py` 的 allowlist 一致。
+- 串行等待参数：`--submit-wait --submit-until idle --submit-until done`。
+
+**复跑结果**：
+
+- Codex worker 本地 oMLX + Herdr session 上报成功（`01a21a07-4fd8-…`）。
+- **两个 Codex pane 并发**时 oMLX `/v1/responses` 返回 `502 Bad Gateway`（单实例/并发限制）。
+- **same-pane（worker+CEO）**时 CEO bootstrap 的 `--wait` 默认 5s 超时 → `transport=unknown`；runner 按 one-shot 语义 halt，不重发。
+- runner 的 `expected_agent` 是**全局**的，Codex worker + OpenCode CEO 的跨 harness 组合被 `identity` 拒绝。
+
+**剩余（关闭 Codex leg 所需）**：
+
+1. 提高 `--submit-timeout-ms`（例如 240000）并验证 Codex 回合完成。
+2. 为 CEO 增加独立 `expected_agent`（允许 OpenCode CEO + Codex worker），或改为完全串行化两个 Codex 实例。
+3. 重新跑 dispatch → Wake → verify → local-only deliver，并记录版本/能力矩阵。
+
+**边界**：本轮未发送 Codex 任务 prompt、无交付证据；未伪造。disposable root 已 `--cleanup-only` 清理。

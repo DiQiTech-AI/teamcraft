@@ -738,7 +738,7 @@ class PaneGateTests(unittest.TestCase):
         herdr.agent_status = "working"
         with self.assertRaises(m606.GuardError) as ctx:
             self._resume(root, herdr)
-        self.assertIn("not idle", str(ctx.exception))
+        self.assertIn("not settled", str(ctx.exception))
         self.assertEqual(herdr.submits, [])
 
     def test_unstable_session_prevents_submit(self) -> None:
@@ -1816,7 +1816,7 @@ class CeoBootstrapTests(unittest.TestCase):
         run = self._ceo_run(root, herdr)
         with self.assertRaises(m606.GuardError) as ctx:
             run.resume()
-        self.assertIn("not idle", str(ctx.exception))
+        self.assertIn("not settled", str(ctx.exception))
         self.assertIsNone(ceo_row(run.conn),
                         "no nonce may be issued for a busy pane")
         self.assertEqual(herdr.submits, [])

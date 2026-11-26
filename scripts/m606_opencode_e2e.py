@@ -119,6 +119,10 @@ DEFAULT_MODEL = "Qwen3.8-Flash-Next-oQ4e-mtp"
 RUN_PREFIX = "m606-live-"
 MARKER = "M606-LIVE"
 
+#: M2-01 treats both ``idle`` (OpenCode) and ``done`` (Codex) as settled.  The
+#: runner gates on quiescence, not on one harness's spelling of it.
+SETTLED_STATUSES = frozenset({"idle", "done"})
+
 #: CLI stop points: ``ceo`` is deliberately absent — the CEO leg is part of the
 #: phase-2 dispatch phase and has no meaning as a stop point for phase 1.
 STOP_POINTS = ("provision", "allocate", "dispatch", "deliver", "cleanup", "close")
@@ -2160,10 +2164,11 @@ class M606LiveRun:
                 f"CEO pane session {first['session_id']!r} != the designated "
                 f"{expect!r}; refusing to initialize a CEO the operator did not "
                 f"name")
-        if first.get("agent_status") != "idle":
+        if first.get("agent_status") not in SETTLED_STATUSES:
             raise GuardError(
-                f"CEO pane {pane} is {first.get('agent_status')!r}, not idle; a "
-                f"bootstrap prompt would interleave with the CEO's current work")
+                f"CEO pane {pane} is {first.get('agent_status')!r}, not settled "
+                f"(idle/done); a bootstrap prompt would interleave with the "
+                f"CEO's current work")
         same_pane = pane == self.args.herdr_pane
         allowed = [real(str(self.project))]
         if same_pane and self.allocation is not None:
@@ -2263,7 +2268,9 @@ class M606LiveRun:
                 expected=1, observed=len(ceos))
         ceo = ceos[0]
         ev.post("ceo", "CEO harness kind supports the protocol discovery contract",
-                expected="opencode", observed=str(ceo[2]))
+                expected=True,
+                observed=str(ceo[2]) in {"codex", "opencode"},
+                detail=f"observed harness kind {ceo[2]!r}")
         ev.post("ceo", "CEO binds a TeamCraft Session, terminal and Attempt",
                 expected=True,
                 observed=all(v is not None for v in (ceo[4], ceo[5], ceo[6])))
@@ -2744,7 +2751,7 @@ class M606LiveRun:
         deadline = time.monotonic() + 120.0
         while True:
             status = self.herdr.identity(self.args.ceo_pane).get("agent_status")
-            if status == "idle":
+            if status in SETTLED_STATUSES:
                 break
             if time.monotonic() >= deadline:
                 report = {
@@ -2921,10 +2928,11 @@ class M606LiveRun:
                 f"pane session {first['session_id']!r} != --expect-session-id "
                 f"{self.args.expect_session_id!r}; the operator designated a "
                 f"different pane")
-        if first.get("agent_status") != "idle":
+        if first.get("agent_status") not in SETTLED_STATUSES:
             raise GuardError(
-                f"pane {pane} is {first.get('agent_status')!r}, not idle; a "
-                f"prompt would interleave with whatever is already running")
+                f"pane {pane} is {first.get('agent_status')!r}, not settled "
+                f"(idle/done); a prompt would interleave with whatever is "
+                f"already running")
         want = real(self.allocation.worktree_path)
         pane_cwd = real(first.get("cwd") or "")
         fg_cwd = real(first.get("foreground_cwd") or "") if first.get(
