@@ -1162,3 +1162,23 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 延期到后续里程碑（M6-07）。M6-06 的 Claude 行保持 `pending:PG-1`，不宣称三 Harness 全通过。
 
 **M6-06 当前状态**：OpenCode 全链路真实 PASS；**Codex 真实 leg 仍未完成**（目前只有发现冒烟），因此 M6-06 **尚未完全关闭**；剩余项为 Codex 全链路真实 E2E + 矩阵/独立复核。
+
+### 12.38 M6-06 Codex leg 尝试与当前阻塞（2026-11-27）
+
+**已真实验证**：
+
+- Codex CLI **0.172.0** 可通过自定义 provider `omlx`（`base_url=http://127.0.0.1:8000/v1`、`wire_api="responses"`、`env_key=OMLX_API_KEY`）使用**本地 oMLX**；`codex exec` 真实返回 `OK`。
+- Codex TUI 的 Herdr 集成 v8（`~/.codex/hooks.json` 的 `SessionStart` → `herdr-agent-state.sh session`）会在首个 prompt 后上报 `agent_session`；实测 worker `01a219f7-c8bf-…`、CEO `01a219f7-df98-…`（`source=herdr:codex`）。
+
+**阻塞（本轮未发送 Codex 任务 prompt、无交付证据）**：
+
+1. **并发 502**：两个 Codex TUI 同时向 oMLX `/v1/responses` 发请求时，CEO pane 收到 `502 Bad Gateway` 并重连；oMLX 的 Responses 端点在并发/流式下不稳定（单请求已验证通过）。
+2. **runner idle 门禁不匹配**：runner 的 worker/CEO gate 要求 `agent_status == "idle"`；Codex 在回合中报告 `working`、回合后报告 `done`，与 OpenCode 的 `idle` 不同。按 M2-01，`idle` 与 `done` 都应是 settled；需 harness-aware quiescence 谓词。
+
+**下一步**（关闭 M6-06 所需）：
+
+- runner 增加 harness-aware quiescence（Codex 接受 `idle|done`，必要时等待 `done`；OpenCode 保持 `idle`）。
+- 串行化 worker 与 CEO 的 oMLX 调用（或 CEO 使用另一 harness/provider），避免并发 502。
+- 之后按 OpenCode 相同流程跑 Codex 的 dispatch → Wake → verify → local-only deliver，并记录版本/能力矩阵。
+
+**证据**：本轮 disposable root 已 `--cleanup-only` 清理（run `ca7dbe72380ac563`）；无项目文件/真实 DB 写入；未伪造 Codex 派工或交付证据。
