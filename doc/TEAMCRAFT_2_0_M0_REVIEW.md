@@ -1111,4 +1111,23 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 
 **残余风险**：D1 的 `delivery.approval_invalidated` 仍为审计事件，旧证据不可复用主要由 Task 版本推进与新 Attempt 绑定保证；D3 旧 v1 行只读且被显式阻断进入 READY_TO_MERGE/DONE；`.codex/` 仅阻止误提交，本地宽泛 allow 未收敛；PG-1（Claude）、PG-7/G1（真实派工）、真实 Herdr pane 身份与跨 Harness E2E 仍 pending。M6-06 未关闭。
 
-**未决**：D1–D8 已完成实现并经 CEO 全量回归；独立 tester 二次复核可作为最终验收的可选下一步。任何 commit/push/merge/真实派工仍需用户明确授权。
+**未决**：D1–D8 已完成实现并经 CEO 全量回归；用户已授权本地 commit 与 remote push。真实派工仍受 HG-F 原生 session 身份绑定阻塞（见 §12.35）。
+
+### 12.35 M6-06 HG-F 真实 pane 派工尝试与当前阻塞（2026-11-26）
+
+**登记口径**：本节记录一次**未发送 prompt**的 HG-F 真实 pane 准备与身份绑定尝试。它不构成 PG-7 通过；真实派工仍未完成。
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| `--plan` / `--preflight` | PASS | oMLX loopback healthy；`Qwen3.8-Flash-Next-oQ4e-mtp` 在目录；Herdr 0.9.3 / protocol 22 兼容；协议 `1.0.0` / `c5c358bf…a742`；`repo_dirty_entries=0` |
+| Phase-1 allocation | PASS（无 prompt） | run `2afc64490b6af50e`；`allocated_cwd=…/worktrees/55ee6e24-78c3-49fb-9dd8-8bae207fc448`；`submit_allowed_in_this_invocation=false` |
+| 隔离 pane prep + 真实启动 | 模型已绑定 | 修复后 `tui.jsonc` = `{"plugin":["./herdr-tui-session.js"]}`；pane 页脚 `Build · Qwen3.8-Flash-Next-oQ4e-mtp Local oMLX`；cwd 为 allocated worktree |
+| 原生 session 身份 | **BLOCKED** | `herdr agent get w3:p3K` → `agent_session=None`；`observe` 拒绝绑定；TUI session picker 显示 "No sessions available" |
+| 派工 | **未执行** | 未发送任何 prompt；未写 attestation |
+
+**根因（一项已修复，一项仍 pending）**：
+
+1. 已修复（commit `16e955b`）：`m606_prepare_opencode_pane.py` 曾把 TUI bridge 注册到 `cli.json` 的 `plugins`；OpenCode v2.4.1 只从 `tui.jsonc` 的 `plugin` 加载。修复后隔离 XDG 正确生成 `tui.jsonc`，全量 `1597` 测试与 `95` Skill 测试通过。
+2. 仍 pending：`opencode --standalone --session <id>` 在**未发送消息前**不会创建一个可被 TUI 选择的 session（picker 显示 "No sessions available"），因此 TUI selection bridge 没有 `route.params.sessionID` 可上报；`--mini` 在 v2.4.1 不存在。下一步需要一条**不触发模型调用**的会话创建/选择路径（例如 `opencode session create` 后由 TUI 选择，或未来的 route 注入），再以 `--consent-dispatch` 执行单次派工。
+
+**清理**：disposable root 已通过 `--cleanup-only` 删除（run `b385c7263a3414e7`）；无 prompt、无 attestation、无 project repo/DB 写入。本次没有把阻塞写成通过；PG-7 / 真实 Herdr pane 身份仍为 **pending**，M6-06 未关闭。
