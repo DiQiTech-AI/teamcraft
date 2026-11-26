@@ -53,21 +53,20 @@ config**:
 2. Locate the sibling `herdr-tui-session.js`; require a regular (non-symlink)
    file with exactly `// HERDR_INTEGRATION_ID=opencode-tui` and
    `// HERDR_INTEGRATION_VERSION=13` (or newer), plus the required report tokens.
-3. Parse only the TUI config (`tui.jsonc` / `tui.json`) in memory, keep local
-   `./`/`../` `plugin` specifiers, and accept either a bare-file spec equal to
-   `./herdr-tui-session.js` or a directory plugin (`tui.js`/`index.js`/`index.mjs`)
-   whose entrypoint references the verified bridge by exact filename plus an
-   `export`/`require` token marker. Reject escapes, absolute paths and symlinks.
-   The directory case is a textual trust-on-first-use check, not a byte-identity
-   or cryptographic verification: any module containing the bridge filename and
-   either token passes. Residual risk: a malicious or corrupted user-local
-   entrypoint could satisfy the directory check; the tool parses registration
-   config in memory only, does not copy general user config, and never executes
-   it. This is the user's own config tree (outside this slice's threat model).
-4. `cli.json` belongs to the server bridge and is **never** read as a TUI
-   registration. OpenCode v2.4.1 loads TUI plugins from `tui.jsonc`/`tui.json`
-   under the singular `plugin` key; the supported isolated form is a bare-file
-   spec (`./herdr-tui-session.js`).
+3. Parse `cli.json` / `tui.json` / `tui.jsonc` in memory only, keep local
+   `./`/`../` plugin specifiers, resolve directory entrypoints
+   (`tui.js`/`index.js`/`index.mjs`), reject escapes and symlinks, and require the
+   entrypoint to **reference the verified bridge by exact filename plus an
+   `export`/`require` token marker**. This is a textual trust-on-first-use check,
+   not a byte-identity or cryptographic verification that the module really
+   re-exports that binding: any module containing the bridge filename and either
+   token passes. Residual risk: a malicious or corrupted user-local entrypoint
+   could satisfy the check; the tool parses registration config in memory only,
+   does not copy general user config, and never executes it. This is the user's
+   own config tree (outside this slice's threat model).
+4. Accept no bare-file registration. `opencode plugin list --standalone` ignores
+   `./herdr-tui-session.js` even though Node can import it; the supported form is
+   a directory plugin (`./herdr-opencode` → `tui.js`).
 5. Anchor `--bridge-src` to the exact server plugin path reported current by
    `herdr integration status`. A different path, a symlinked override, or a
    symlinked reported path is rejected before any write.
@@ -81,24 +80,26 @@ The prepared XDG contains only:
 
 ```text
 <run>/pane-prep/<role>/xdg-config/opencode/
+├── cli.json
 ├── herdr-tui-session.js
-├── tui.jsonc
+├── herdr-opencode/
+│   └── tui.js
 └── plugins/
     └── herdr-agent-state.js
 ```
 
-`tui.jsonc` is the minimal isolated TUI registration:
+`cli.json` is the minimal isolated registration:
 
 ```json
 {
-  "plugin": ["./herdr-tui-session.js"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["./herdr-opencode"]
 }
 ```
 
-`cli.json` is intentionally absent from the isolated tree; it belongs to the
-server bridge and is never treated as a TUI registration. No `opencode.json`,
-`tui.json`, general user config, credential, or key value is copied into the
-isolated tree. Existing symlinked targets and
+`herdr-opencode/tui.js` is a one-line re-export of `../herdr-tui-session.js`.
+No `opencode.json`, `tui.json`, `tui.jsonc`, general user config, credential, or
+key value is copied into the isolated tree. Existing symlinked targets and
 symlink escapes are rejected before the copy/write.
 
 A pre-existing isolated `opencode.json` is preflighted **before creating any
@@ -114,9 +115,9 @@ Method (`tests/test_m606_pane_launch_contract.py::LiveBridgeWireTests`):
 1. prepare a disposable world with the **real installed** server/TUI bridge and
    real registration discovery;
 2. run `opencode plugin list --standalone` with only the isolated `HOME`/XDG
-   environment; it lists the isolated `herdr-tui-session.js` registration
-   (proving OpenCode recognizes it);
-3. import the **copied** `herdr-tui-session.js` with Node, inject a fake TUI API
+   environment; it lists `local …/herdr-opencode` (proving OpenCode recognizes the
+   isolated registration);
+3. import the **copied** `herdr-opencode/tui.js` with Node, inject a fake TUI API
    with a synthetic `ses_` id, and capture every JSON line written to a disposable
    Unix socket.
 
@@ -167,9 +168,7 @@ zero frames. The TUI selection bridge is what carries the prepared bare-TUI id.
 * an existing isolated `opencode.json` fails closed before any directory, copy, or
   `prep.json` write; the CLI returns a clean JSON error (exit `2`);
 * the isolated tree has exactly the four expected files and no general config;
-* OpenCode v2.4.1 recognizes the isolated `./herdr-tui-session.js` (`tui.jsonc`)
-  registration; the earlier v2.4.0 `./herdr-opencode` directory form is
-  superseded (2026-11-26 correction).
+* OpenCode v2.4.0 recognizes the isolated `./herdr-opencode` registration;
 * the **copied** bridge emits the preregistered synthetic id verbatim to a
   disposable socket, with no model/provider data.
 
