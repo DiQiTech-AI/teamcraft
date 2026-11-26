@@ -72,6 +72,8 @@ python3 .agents/skills/teamcraft/scripts/teamctl.py launch \
 
 The helper resolves the caller or `--from-pane` through Herdr before matching layout geometry, uses an explicit canonical pane ID, preserves native arguments, and keeps focus with `--no-focus`. It validates the installed Herdr kind list and harness executable before splitting.
 
+After a successful `launch`, the member pane label is set automatically to `角色 · 任务名` (the role display name, ` · `, then the first non-empty task line); override the full label with `--label`.
+
 For OpenCode, project profiles live in `.opencode/agents/herdr-*.md`. The helper selects the role through a pane-local `OPENCODE_CONFIG_CONTENT` default-agent override and retains the full OpenCode TUI for Herdr detection. This does not modify an existing default profile. OpenCode launches default to `--auto`, so permissions the profile does not explicitly deny are auto-approved; the profile's explicit denies (package installs, network fetches, destructive or elevated commands) still apply. A live run has verified the CEO, developer, and tester profiles with `omlx/Qwen3.8-Flash-Next-oQ4e-mtp`; confirm the displayed role and model when first using an unverified profile or another project.
 
 ## Inspect and recover

@@ -105,6 +105,10 @@ class HerdrAdapter:
         selector = ["--pane", target] if target else ["--current"]
         return self.pane(self.request(["pane", "current", *selector]))
     def get_pane(self, pane_id: str) -> dict[str, Any]: return self.pane(self.request(["pane", "get", pane_id]))
+    def rename_pane(self, pane_id: str, label: str) -> dict[str, Any]:
+        # ``label`` is passed as a single argv element so a multi-word label
+        # (e.g. "developer · M4-06 文档同步") reaches Herdr as one argument.
+        return self.request(["pane", "rename", pane_id, label])
     def layout(self, pane_id: str) -> dict[str, Any]: return self.request(["pane", "layout", "--pane", pane_id])
     def process_info(self, pane_id: str) -> dict[str, Any]: return self.request(["pane", "process-info", "--pane", pane_id])
 

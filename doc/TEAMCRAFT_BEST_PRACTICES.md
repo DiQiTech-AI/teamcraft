@@ -100,6 +100,10 @@ CEO 收到任务后负责拆解和派工。每个成员的任务由 CEO 在运�
 
 不要要求用户为每个成员手工拼装环境变量或逐条执行 `launch` 命令。
 
+### 成员 pane label 约定
+
+每个成员的 pane label 固定为 `<角色> · <任务名>`，例如 `developer · M4-06 文档同步`、`tester · M4-06 验收测试`。`teamctl.py launch` 会在成员启动成功后**自动设置**该 label：角色显示名映射 `ceo→CEO`、`cto→CTO`，其余角色（developer/designer/tester/custom）用角色名原样；任务名取 `--task` 或 `--task-file` 内容的首个非空行，去首尾空白后截断到 40 字符。因此 CEO **无需**手动执行 `herdr pane rename`。需要自定义完整 label 时，用 `--label` 显式覆盖（例如 `--label 'developer · M4-06 文档同步（补丁分支）'`）。
+
 ## 4. 验收后结束任务
 
 CEO 核对改动范围、实际 diff 和测试结果。Herdr 的 `idle` 和 `done` 都表示成员可以接收下一条输入，交付是否通过以验收结果为准。用户只需在同一个 CEO 对话中确认是否接受交付；不要把 worker 的完成状态或自述当作验收通过。验收通过后，由 CEO 用 `teamctl.py complete <成员名>` 完成任务并释放 ownership。成员窗格会保留。

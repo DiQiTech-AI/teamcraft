@@ -113,6 +113,12 @@ ROLE_RESPONSIBILITIES = {
     "tester": "Own acceptance coverage, reproduction, verification, and evidence for the assigned scope.",
 }
 
+# Pane label convention: ``<role> · <task>`` (e.g. ``developer · M4-06 文档同步``).
+# CEO/CTO use their canonical display names; other roles keep their raw name.
+ROLE_DISPLAY_NAMES = {"ceo": "CEO", "cto": "CTO"}
+PANE_LABEL_SEPARATOR = " · "
+PANE_LABEL_SUMMARY_LIMIT = 40
+
 
 class TeamctlError(RuntimeError):
     """An expected, actionable teamctl failure."""
@@ -1068,6 +1074,63 @@ def role_responsibility(role: str, supplied: str | None) -> str:
     return ROLE_RESPONSIBILITIES[role]
 
 
+def role_display_name(role: str) -> str:
+    """Map a role to its pane-label display name (ceo→CEO, cto→CTO, else raw)."""
+    return ROLE_DISPLAY_NAMES.get(role, role)
+
+
+def first_nonempty_line(text: str) -> str:
+    """Return the first non-blank line, trimmed; '' when there is none."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def derive_pane_label(role: str, task: str, *, explicit: str | None = None) -> str:
+    """Derive the member pane label ``<role display> · <first task line>``.
+
+    An explicit ``--label`` always wins.  Otherwise the first non-empty line of
+    the task is trimmed and truncated to ``PANE_LABEL_SUMMARY_LIMIT`` code
+    points (Python slices by code point, so multi-byte text is never split
+    mid-character).  When the task has no non-empty line the label degrades to
+    the role display name alone.
+    """
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    summary = first_nonempty_line(task)
+    if len(summary) > PANE_LABEL_SUMMARY_LIMIT:
+        summary = summary[:PANE_LABEL_SUMMARY_LIMIT]
+    display = role_display_name(role)
+    return f"{display}{PANE_LABEL_SEPARATOR}{summary}" if summary else display
+
+
+def set_member_pane_label(member: dict[str, Any], explicit: str | None = None) -> str | None:
+    """Best-effort pane rename after a successful member start.
+
+    Never raises: a rename failure only prints a warning and leaves the launch,
+    the already-started member, and the persisted state untouched.  Returns the
+    applied label, or ``None`` when there is no recorded pane or the rename
+    failed.
+    """
+    pane_id = member.get("pane_id")
+    if not pane_id:
+        return None
+    label = derive_pane_label(
+        member.get("role", ""), member.get("task", ""), explicit=explicit
+    )
+    try:
+        _herdr_adapter().rename_pane(str(pane_id), label)
+    except Exception as exc:  # best-effort: any rename failure must not fail launch
+        print(
+            f"warning: pane label for {member.get('name')!r} was not set: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return label
+
+
 def normalize_ownership(raw_claims: Sequence[str], read_only: bool) -> list[str]:
     if read_only and raw_claims:
         raise TeamctlError("--read-only assignments cannot reserve --ownership")
@@ -1820,6 +1883,7 @@ def _launch_operation(args: argparse.Namespace) -> int:
         reserve_member(store, session, member, lease=lease)
         member = split_for_member(member, store, session, lease=lease)
         member = start_member(member, store, session, lease=lease)
+        set_member_pane_label(member, getattr(args, "label", None))
         member = prompt_member(
             member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
             lease=lease,
@@ -4700,6 +4764,10 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--start-timeout-ms", type=int, default=30_000)
     launch_parser.add_argument("--wait", action="store_true")
     launch_parser.add_argument("--timeout-ms", type=int, default=120_000)
+    launch_parser.add_argument(
+        "--label",
+        help="explicit full pane label (defaults to auto-derived '<role> · <task>')",
+    )
     launch_parser.set_defaults(handler=launch)
 
     resume_parser = commands.add_parser("resume")
