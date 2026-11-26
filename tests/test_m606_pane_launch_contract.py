@@ -29,7 +29,7 @@ WHAT THIS PINS
 WHAT THE PREPARATION TOOL NOW DOES
     ``scripts/m606_prepare_opencode_pane.py`` verifies the installed
     ``opencode-tui`` v13 bridge and its local registration, copies only that
-    bridge into the isolated XDG, and writes a minimal isolated ``cli.json``
+    bridge into the isolated XDG, and writes a minimal isolated ``tui.jsonc``
     registration (directory wrapper) that OpenCode v2.4.0 recognizes.  The live
     probe confirms the copied/registered artifact emits the preregistered id to
     a disposable socket; this is still a prepared-pane result, not a claim that
@@ -89,21 +89,17 @@ def tui_selection_bridge_ready(xdg_config_home: Path) -> bool:
     """True only when the isolated XDG has the copied bridge + supported registration."""
     xdg = Path(xdg_config_home) / "opencode"
     bridge = xdg / TUI_BRIDGE
-    wrapper = xdg / prep.TUI_REGISTRATION_DIR / prep.TUI_REGISTRATION_ENTRY
-    cli_config = xdg / "cli.json"
-    if not (bridge.is_file() and wrapper.is_file() and cli_config.is_file()):
+    tui_config = xdg / "tui.jsonc"
+    if not (bridge.is_file() and tui_config.is_file()):
         return False
     if (xdg / "opencode.json").exists():
         return False
     try:
-        cfg = json.loads(cli_config.read_text("utf-8"))
-        wrapper_text = wrapper.read_text("utf-8")
+        cfg = json.loads(tui_config.read_text("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
-    plugins = cfg.get("plugins") if isinstance(cfg, dict) else None
-    return (isinstance(plugins, list)
-            and f"./{prep.TUI_REGISTRATION_DIR}" in plugins
-            and TUI_BRIDGE in wrapper_text)
+    plugins = cfg.get("plugin") if isinstance(cfg, dict) else None
+    return isinstance(plugins, list) and f"./{TUI_BRIDGE}" in plugins
 
 
 def server_bridge_owns_local_lifecycle(argv: list[str]) -> bool:
@@ -189,12 +185,11 @@ class PaneLaunchContractTests(unittest.TestCase):
         rep = self._prep(session_id=PREREGISTERED)
         xdg = Path(rep["sandbox"]) / "xdg-config" / "opencode"
         files = sorted(p.name for p in xdg.rglob("*") if p.is_file())
-        self.assertEqual(files, ["cli.json", SERVER_BRIDGE, TUI_BRIDGE,
-                                 prep.TUI_REGISTRATION_ENTRY])
-        for general in ("opencode.json", "tui.json", "tui.jsonc"):
+        self.assertEqual(files, sorted([SERVER_BRIDGE, TUI_BRIDGE, "tui.jsonc"]))
+        for general in ("opencode.json", "tui.json", "cli.json"):
             self.assertFalse((xdg / general).exists(), general)
-        cfg = json.loads((xdg / "cli.json").read_text("utf-8"))
-        self.assertEqual(cfg["plugins"], [f"./{prep.TUI_REGISTRATION_DIR}"])
+        cfg = json.loads((xdg / "tui.jsonc").read_text("utf-8"))
+        self.assertEqual(cfg["plugin"], [f"./{TUI_BRIDGE}"])
         self.assertTrue(rep["server_bridge_ready"])
         self.assertTrue(rep["tui_bridge_ready"])
         self.assertTrue(rep["identity_bridge_ready"])
@@ -387,8 +382,7 @@ class LiveBridgeWireTests(unittest.TestCase):
                                 session_id=PREREGISTERED)
         xdg = Path(rep["sandbox"]) / "xdg-config" / "opencode"
         files = sorted(p.name for p in xdg.rglob("*") if p.is_file())
-        self.assertEqual(files, ["cli.json", SERVER_BRIDGE, TUI_BRIDGE,
-                                 prep.TUI_REGISTRATION_ENTRY])
+        self.assertEqual(files, sorted([SERVER_BRIDGE, TUI_BRIDGE, "tui.jsonc"]))
         self.assertTrue(rep["identity_bridge_ready"])
         self.assertTrue(tui_selection_bridge_ready(Path(rep["sandbox"]) / "xdg-config"))
 
@@ -405,13 +399,13 @@ class LiveBridgeWireTests(unittest.TestCase):
                                 cwd=str(work), env=env, capture_output=True, text=True,
                                 timeout=40, stdin=subprocess.DEVNULL, check=False)
         self.assertEqual(listed.returncode, 0, listed.stderr[-2000:])
-        self.assertIn(prep.TUI_REGISTRATION_DIR, listed.stdout)
+        self.assertIn(TUI_BRIDGE, listed.stdout)
         self.assertNotIn("No plugins found", listed.stdout)
 
         # The copied, registered wrapper must emit the preregistered id verbatim
         # to a disposable socket (no pane, no model, no prompt).
         out = self._probe(mode="tui", server=xdg / "plugins" / SERVER_BRIDGE,
-                          tui=xdg / prep.TUI_REGISTRATION_DIR / prep.TUI_REGISTRATION_ENTRY)
+                          tui=xdg / TUI_BRIDGE)
         self._assert_exact_id_only(out["frames"])
         self.assertTrue(any(f.get("method") == "pane.report_agent_session"
                             for f in out["frames"]))
