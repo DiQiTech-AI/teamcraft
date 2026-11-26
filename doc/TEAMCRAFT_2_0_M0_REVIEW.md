@@ -1131,3 +1131,5 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 2. 仍 pending：`opencode --standalone --session <id>` 在**未发送消息前**不会创建一个可被 TUI 选择的 session（picker 显示 "No sessions available"），因此 TUI selection bridge 没有 `route.params.sessionID` 可上报；`--mini` 在 v2.4.1 不存在。下一步需要一条**不触发模型调用**的会话创建/选择路径（例如 `opencode session create` 后由 TUI 选择，或未来的 route 注入），再以 `--consent-dispatch` 执行单次派工。
 
 **清理**：disposable root 已通过 `--cleanup-only` 删除（run `b385c7263a3414e7`）；无 prompt、无 attestation、无 project repo/DB 写入。本次没有把阻塞写成通过；PG-7 / 真实 Herdr pane 身份仍为 **pending**，M6-06 未关闭。
+
+**追加尝试（2026-11-26，仍未通过）**：使用 `opencode api --standalone ... session.create` 在 allocated worktree 创建了 session `ses_de7b4712fffeNDrGbeRdXcd5rC`（无模型调用）；TUI session picker 可列出并选中该 session；但 `herdr agent get <pane>` 仍返回 `agent_session=None`，且隔离 XDG 下 `opencode plugin list --standalone` 返回 `No plugins found`。因此 TUI selection bridge 在该隔离 v2.4.1 pane 中未被加载/未上报 session id；本轮仍未发送 prompt，root 已清理（run `59a8813aa932c455`）。下一步需确认 v2.4.1 TUI 插件的实际加载路径/键名（可能需要项目级 `tui.jsonc` 或不同 CLI 版本），再执行 `--consent-dispatch`。
