@@ -1005,3 +1005,110 @@ CLI 和 HTTP/Web 入口尚未接入。预览与导出一致性、密钥及路径
 **明确未声称/延期**：M4-06 不声称真实 Herdr 或 GitHub Actions 结果；无 Schema 变更；无 HTTP API 面（延期至 M6-02）；无 merge/覆盖/部署副作用；M6-02 丰富 Diff/时间线 UI 仍待实现。
 
 **README 同步**：README.md / README.zh-CN.md 新增"Worktree 集成冲突与安全清理（M4-06）"章节（六个 `teamctl` 命令、安全语义、审计事件 kind 列表、无 HTTP API 面说明），更新 Current limits / 当前边界 bullet 移除已完成的 M4-06 项，并在 Verification / 验证 章节登记上述三组测试数字；真实 Herdr / GitHub Actions 均标注未验证。
+
+
+### 12.33 M6-06 跨 Harness 收尾切片自检记录（2026-11-26）
+
+**登记口径**：本节只登记 M6-06 当前未提交切片的**实现范围与离线自检证据**，用于审计现状，**不构成 M6-06 验收通过**。本节不声称任何真实 Herdr pane、真实 Claude、真实模型驱动 Skill-load 或 GitHub Actions 证据；Mock/Fake 与离线夹具的结果均不被表述为真实跨 Harness E2E。记录快照时间：2026-11-26 21:17 CST，`HEAD` 为 `f189ba7`；工作树同时存在其他里程碑的未提交改动与并发进行中的改动，本记录只读分类，不修改、不提交它们。
+
+#### 1. 切片清单（快照）
+
+下表按文件名或文档主题归类为 M6-06；数字来自本轮实际执行的 `git status --short` 与 `git diff --numstat`。`+/-` 为对已跟踪文件的改动行数；未跟踪文件给出当前行数。
+
+**已跟踪修改（M6-06 相关）**
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/m606_prepare_opencode_pane.py` | `+311 / -12`（631 行） |
+| `tests/test_m606_prepare_opencode_pane.py` | `+216 / -5`（511 行） |
+| `doc/M6_06_HARNESS_READINESS.md` | `+68 / -0` |
+| `doc/M6_06_HOST_GATE_RESULTS.md` | `+163 / -0` |
+
+以上 4 个文件合计 `+758 / -17`。
+
+**未跟踪新增（M6-06 相关）**
+
+| 文件 | 当前行数 |
+|---|---|
+| `doc/M6_06_NATIVE_SESSION_VALIDATION.md` | 211 |
+| `scripts/m606_verify_opencode_skill.py` | 555 |
+| `tests/test_m606_pane_launch_contract.py` | 421 |
+| `tests/test_m606_verify_opencode_skill.py` | 355 |
+
+**归属未确认、未计入 M6-06 的改动**（本记录不修改、不声称归属）：`.agents/skills/teamcraft-ceo/SKILL.md`（`+2`，pane 标签说明）、`.opencode/agents/herdr-tester.md`（`+1`，本机权限路径）以及未跟踪的 `.codex/`。
+
+**同工作树中可判定属于其他里程碑的改动**（不计入 M6-06）：`teamcraft/recovery.py`、`teamcraft/domain.py`、`tests/test_recovery_m205.py`、`tests/test_legacy_unknown_reconcile.py`、`tests/test_retry_failed_verifier.py`、`tests/test_retry_stale_verifier_profile.py` 对应 M2 有界重试/旧版恢复；`teamcraft/worktrees.py`、`teamcraft/delivery.py`、`teamcraft/runtime_adapter.py`、`.agents/skills/teamcraft/scripts/teamctl.py`、`tests/test_m406_integration_cleanup.py`、`tests/test_runtime_adapter_m402.py`、`tests/test_worktrees_m402.py`、`tests/test_teamctl_m406.py` 对应 M4-06/M4-02 集成、清理与恢复命令作用域。上述判定来自 diff 内容（例如新增事件 kind、清理资格函数与 recovery 命令绑定），不是仅凭文件名猜测。`git diff --stat` 在快照时为 **16 files changed, 2321 insertions(+), 99 deletions(-)**，该总数包含这些非 M6-06 改动，不能直接当作 M6-06 的规模。
+
+说明：`doc/M6_06_HARNESS_READINESS.md`、`doc/M6_06_HOST_GATE_RESULTS.md`、`scripts/m606_verify_opencode_skill.py`、`tests/test_m606_verify_opencode_skill.py` 是在本轮全量测试启动**之后**由并发工作出现的；因此下面的全量数字不包含最后两个文件的测试（后者已单独复跑，见 §2）。
+
+#### 2. 证据数字（本轮实际执行）
+
+| 命令 | 观察到的结果 | 退出码 |
+|---|---|---|
+| `python3 -B -m unittest discover -s tests` | `Ran 1541 tests in 431.786s`；`OK (skipped=4)`；0 failures / 0 errors | 0 |
+| `python3 -B -m unittest discover -s tests -p 'test_m606_prepare_opencode_pane.py' -v` | `Ran 39 tests in 0.585s`；`OK`；0 skip | 0 |
+| `python3 -B -m unittest discover -s tests -p 'test_m606_pane_launch_contract.py' -v` | `Ran 10 tests in 0.133s`；`OK (skipped=3)`；3 个 live 用例因未设置 `M606_LIVE_BRIDGE=1` 而 skip | 0 |
+| `M606_LIVE_BRIDGE=1 python3 -B -m unittest discover -s tests -p 'test_m606_pane_launch_contract.py'` | `Ran 10 tests in 4.069s`；`OK`；0 skip | 0 |
+| `python3 -B -m unittest discover -s tests -p 'test_m606_verify_opencode_skill.py'` | `Ran 24 tests in 0.006s`；`OK`；0 skip | 0 |
+
+环境：Python 3.13.14，macOS（darwin arm64）。全量运行时的 `ResourceWarning`（未关闭文件/数据库句柄）只出现在测试输出中，未改变 `OK` 与退出码 0；未观察到测试失败。`M606_LIVE_BRIDGE=1` 的 10 项只证明**已安装 bridge 在一次性隔离目录与一次性 socket 上**能识别注册并逐字上报预注册的合成 `ses_` id，不涉及真实 pane、真实 Prompt 或模型推理。
+
+#### 3. 未关闭项与状态更新（PG-9 已 host-local 复验；其余仍 pending，不得表述为通过）
+
+| ID | 当前状态 | 本轮事实 |
+|---|---|---|
+| PG-1（Claude 行） | **pending:PG-1** | 本机 `command -v claude` 无输出（2026-11-26 复检），无 Claude 二进制、无版本/PATH/hash 证据。所有 Claude 矩阵单元保持 `pending:PG-1`，本切片未安装、未探测、未调用 Claude。 |
+| PG-7 / G1（真实派工与真实 Herdr 运行） | **pending** | 真实派工需要操作者按 HG-F 检查点显式同意；本轮未执行任何真实 Prompt、未启动或读取真实 pane、未做真实 Wake/ack/event-stream。`doc/M6_06_HOST_GATE_RESULTS.md` 当前快照同样标注 G1 **NOT released**。 |
+| PG-9（OpenCode 模型驱动 `teamcraft-ceo` Skill 加载） | **host-local pass（一次性 CLI，非真实 Herdr 交互 pane）** | 2026-11-26 CEO 独立复跑 `.venv/bin/python -B scripts/m606_verify_opencode_skill.py --live --model deepseek/deepseek-flash --timeout 180 --json`：`status=pass`，opencode exit 0，observed `1.0.0` / `c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742`，elapsed 4.703s；模型真实调用了 `skill` 工具加载 `teamcraft-ceo`。**边界**：这是 host-local 一次性 CLI 探测，**不是**真实 Herdr 交互 pane 的身份证据；真实 pane 身份与跨 Harness E2E 仍 **pending**。此前 §12.11 在 OpenCode v2.0.29 上的 `provider.no-route` 失败保留为历史记录，不被本次结果抹除。 |
+
+#### 4. README 同步建议（仅建议，本轮未修改 README）
+
+若后续获得授权，建议对齐以下小节，并继续把未关闭项写成 pending：
+
+- `README.md` → `## Verification`：追加 M6-06 离线证据段落，登记全量 `1541 tests / 4 skips / exit 0` 与定向 `39`、`10（3 skipped）`、`10（live bridge opt-in）`、`24` 的结果，并明确这些是离线/隔离夹具证据。
+- `README.md` → `## Current limits`：新增 M6-06 未关闭项 bullet，逐条写明 `pending:PG-1`、PG-7/G1 需操作者显式同意、PG-9 已 host-local 一次性 CLI 复验但真实 pane/跨 Harness E2E 仍 pending；不得写成跨 Harness E2E 已通过。
+- `README.md` → `## Use another harness`：补充 native Session 身份边界——预注册的 `ses_` id 由 bridge 逐字上报；没有真实 native `ses_` id 的 pane 必须继续被 runner 拒绝；真实交互 pane 属操作者所有，本切片未触碰。
+- `README.md` → `## Repository layout`（可选）：登记 `scripts/m606_prepare_opencode_pane.py`、`scripts/m606_verify_opencode_skill.py` 及 `doc/M6_06_*` 验证记录的位置。
+- `README.zh-CN.md` 镜像以上四处：`## 验证`、`## 当前边界`、`## 使用其他 Harness`、`## 项目结构`，内容与英文版一致，并保留同样的 pending 措辞。
+
+#### 5. 边界声明
+
+- 本记录只登记**实现与离线证据**，**不**构成 M6-06 验收通过；M6-06 仍为未关闭里程碑。
+- 本记录**不**声称真实 Herdr、真实 Claude、真实模型调用或 GitHub Actions 已运行或通过；Fake Herdr、合成 `ses_` id、一次性 socket 与离线契约测试均不能替代真实 E2E。
+- 本轮未 commit、未 push、未 merge、未 deploy、未 reset/checkout；未修改 `teamcraft/**`、`tests/**`、`scripts/**`、`README*` 或其他 doc 文件。本轮对工作树的唯一写入是本节所在的 `doc/TEAMCRAFT_2_0_M0_REVIEW.md`；其余改动均为进入本轮前已存在或并发产生，原样保留。
+- 更正（2026-11-26）：§3 的 PG-9 行登记了一次 **host-local 一次性 CLI** 的真实模型 Skill-load 复验；它不是 Herdr pane、不是 Claude，也不是跨 Harness E2E，因此不改变上一条对真实 E2E 的边界。
+
+### 12.34 D1–D8 修复登记（已修复并经 CEO 全量复核，2026-11-26）
+
+**登记口径**：本节登记独立 tester 缺陷 D1–D8 与 `rename_pane` 标签缺陷的修复结果及 CEO 全量复核证据。各条已实现修复，CEO 已独立运行全量 `tests/` 与 Skill 测试并通过（见下）。本节仍**不构成** M6-06 验收通过，也不代表任何真实 Herdr pane、真实 Claude、真实 pane 身份或跨 Harness E2E 已通过。
+
+| ID | 缺陷简述 | Owner | 状态 |
+|---|---|---|---|
+| D1（HIGH） | `VERIFYING` + ship evidence + verifier-profile drift 死锁：`approve_retry` 与 `delivery_approval` 同时被拒，无 sanctioned 出路；需允许创建新 Attempt，并把旧 ship/PASS/Approval 明确标记为 non-current | `m606_fix_recovery` | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D2（MEDIUM） | exact local-only policy rebind 合法产生 PASS@N、Commit@N+1，却被 VERIFYING 分支的 `task_version` 相等检查拒绝；需 rebind-aware 且不得放宽到任意版本差 | `m606_fix_recovery` | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D3（MEDIUM） | direct-PR durable evidence 新增 `verifier_digest` 但 `PR_DELIVERY_CONTRACT_VERSION` 未升；旧 v1 行与旧 pending PR Command 会因 schema/shape 崩溃，需显式 legacy reader 或 breaking reset，且旧行不得进入 READY_TO_MERGE/DONE | `m606_fix_pr` | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D4（MEDIUM） | `doc/M6_06_NATIVE_SESSION_VALIDATION.md` provenance 过期：记录时 `753b096` / `opencode` v2.4.0，当前核验 `f189ba7` / v2.4.1 | 本 docs | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D5（MEDIUM） | 同文档 §3 将 entrypoint 检查表述为 “re-export the exact verified bridge file”；实际检查只是精确文件名 + `export`/`require` token 标记的 trust-on-first-use，非密码学校验 | 本 docs | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D6（MEDIUM） | 未跟踪 `.codex/rules/default.rules` 对 `git`、`herdr`（含 pane close/prompt）宽泛 allow，存在误提交与本地权限风险 | 本 docs | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D7（LOW） | recovery legacy identity fallback docstring 夸大 authority：同一 Attempt 存在 present native id 时仍可能授权 legacy 匹配；需在 `kind == "id"` 且无冲突 present native id 时方可 fallback | `m606_fix_recovery` | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+| D8（LOW） | `teamctl _stop_evidence` 在无 pane 时返回 `identity_verified: True`，语义误导；需保留 `resolve_unknown` 契约的同时增加不误导字段 | `m606_fix_cli` | fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending |
+
+补充：`teamctl launch --label` 的 `rename_pane` 缺失缺陷（不在 D1–D8 编号内）同由 `m606_fix_cli` 修复，状态同为 `fixed / CEO full-suite verified (1583 OK)；independent tester re-check pending`。
+
+**文档侧已完成的动作（自述，不是验收）**
+
+- **D4**：在 `doc/M6_06_NATIVE_SESSION_VALIDATION.md` 头部保留原始快照行并新增带日期的 provenance correction（`753b096` → 当前 `f189ba7`，6 个提交；`opencode` v2.4.0 → v2.4.1），同时更正 §8 的 `HEAD remains 753b096` 表述；原始证据与 “未声称真实 pane/Claude/E2E” 的声明未删除。
+- **D5**：把 §3 item 3 改写为实际检查（精确文件名 + `export`/`require` token 标记），明确这是 trust-on-first-use、非字节/密码学校验，并保留恶意/损坏本地 entrypoint 的残余风险说明；未修改 `scripts/m606_prepare_opencode_pane.py`。
+- **D6**：在 `.gitignore` 增加 `.codex/`，只阻止误提交；未修改 `.codex/` 内容。**残余风险**：本地 `.codex/rules/default.rules` 对 `git`、`herdr`（含 pane close/prompt）的宽泛 allow 仍然生效，属用户本地配置，本记录不声称已收敛该权限面。
+- **PG-9**：§12.33 已按 CEO 独立复跑结果更新为 `host-local pass（一次性 CLI，非真实 Herdr 交互 pane）`；真实 pane 身份与跨 Harness E2E 仍 pending。
+
+**CEO 复核证据（2026-11-26，macOS arm64，Python 3.13.14）**
+
+- `python3 -B -m unittest discover -s tests` → **1583 tests OK（skipped=4），exit 0**（416.038s）。
+- `python3 -B -m unittest discover -s .agents/skills/teamcraft/tests -p 'test_*.py'` → **95 tests OK，exit 0**。
+- 定向：`test_retry_stale_verifier_profile.py` 7 OK、`test_retry_failed_verifier.py` 3 OK、`test_recovery_m205.py` 12 OK、`test_delivery_m405.py` 27 OK、`test_domain_m405.py` 22 OK、`test_legacy_unknown_reconcile.py` 3 OK。
+- 期间发现并对齐两处测试期望：D8 新增字段（`tests/test_legacy_unknown_reconcile.py`）与 `f189ba7` 新增的 pane rename argv（`.agents/skills/teamcraft/tests/test_compat_contract.py`）。
+
+**残余风险**：D1 的 `delivery.approval_invalidated` 仍为审计事件，旧证据不可复用主要由 Task 版本推进与新 Attempt 绑定保证；D3 旧 v1 行只读且被显式阻断进入 READY_TO_MERGE/DONE；`.codex/` 仅阻止误提交，本地宽泛 allow 未收敛；PG-1（Claude）、PG-7/G1（真实派工）、真实 Herdr pane 身份与跨 Harness E2E 仍 pending。M6-06 未关闭。
+
+**未决**：D1–D8 已完成实现并经 CEO 全量回归；独立 tester 二次复核可作为最终验收的可选下一步。任何 commit/push/merge/真实派工仍需用户明确授权。

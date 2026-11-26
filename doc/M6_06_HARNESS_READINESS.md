@@ -206,3 +206,71 @@ the gap gates that keep every future claim tied to recorded evidence.
 §12.11/§12.23/§12.25/§12.27, FR-025 row (L158); host `command -v` results
 2026-11-22. Recorded at `main` 77a7385; all gaps PG-*/decisions D* unclosed at
 draft time.*
+
+---
+
+## Claude 行（PG-1）pending 与降级规范
+
+> **状态声明：** 本机 `claude` 可执行文件**缺失**（PG-1，`command -v claude` 无输出）。
+> 因此本文件中一切 Claude 相关矩阵行**必须保持 `pending:PG-1`**，不得升级为
+> REAL/✓，不得计入 M6-06 通过。本轮只写规范，不安装、不派工、不调用任何真实
+> Claude / Herdr / GitHub Actions。
+
+### 1. 权威状态 token
+
+| 项 | 当前必须的表述 | 禁止的表述 |
+|---|---|---|
+| Claude 矩阵单元 | `pending:PG-1`（等价展开可写 `UNAVAILABLE (PG-1)` / `NOT-BUILT (P1–P4, gated by PG-1)`） | `REAL ✓`、`PARTIAL ✓`、`passed`、`done` |
+| `probe_harness("claude")` | 静态 `health=unsupported`、`reason_code=adapter_pending`；二进制缺失时 `executable_missing` | 伪造 `healthy` / 版本号 / hash |
+| 跨 harness E2E (R4) | 只能写“2/3 harnesses recordable，Claude pending:PG-1” | “cross-harness E2E complete” |
+| 复制漂移 (R6) | 仅对**已存在**的副本给出 MATCH/DRIFT | 对不存在的 `.claude` 副本声称 MATCH |
+
+`pending:PG-1` 是**规范 token**；任何报告、看板、矩阵、PR 描述若描述 Claude，
+都必须带上它，直到第 4 节的退出条件全部满足。
+
+### 2. 不可用时的降级行为（硬规则）
+
+1. **不派工：** 不向任何 `claude` pane 发送 Prompt；不创建 Claude worktree/branch；
+   不执行 `claude` CLI；不安装/升级 Claude Code（TeamCraft 从不自行安装软件）。
+2. **不声称通过：** 不把任何 Claude 行标为 REAL/✓/passed；不得以“计划已就绪”替代
+   真实执行；不得让 Claude 行的缺失阻塞被表述为“已通过”。
+3. **不伪造证据：** 不编造版本字符串、二进制路径/hash、发现结果、`prompt_ack`/
+   `event_stream` 观测；`assumed_default` 必须按原样记录，绝不写成 host-trusted receipt。
+4. **允许的动作：** 文档/计划、离线契约测试（STUB 列）、只读 `command -v` 探测、
+   对**已存在**副本做 sha256 清点。
+5. **对其它 leg 的影响：** Codex/OpenCode leg 可各自推进，但不得据此声称与 Claude
+   对等；它们的 init/dispatch/Wake 仍受 PG-7 约束，模型调用仍受 PG-8 预算约束。
+6. **失败即降级，不静默重试：** Claude 探测失败/超时/版本不符 ⇒ 保持 `pending`，
+   记录原因码，不自动重试、不切换到其它 harness 冒充。
+
+### 3. 与现有 protocol 的一致性要求
+
+Claude 一旦可用，其初始化/派工必须与现有 harness **消费同一份** canonical 协议：
+`protocol_version = 1.0.0`，`sha256 = c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742`，
+且 `verify_protocol(..., expected_version="1.0.0", expected_sha256=c5c358bf…742)`
+在安装副本上返回 PASS；`.claude` 副本是**首个 relocated copy**，必须在 install 时
+与 init 时各校验一次，漂移即 **fail-closed**（不静默修复）。
+
+### 4. 未来可用时的退出条件（全部满足才可离开 `pending:PG-1`）
+
+| ID | 退出条件 | 需要的证据（真实、可复现） |
+|---|---|---|
+| **E1** | 固定 Claude 版本 | `claude --version` 精确字符串 + 二进制路径 + 二进制 sha256 + 安装渠道；运行期间版本冻结 |
+| **E2** | 真实发现 | 在钉死版本上验证 `.claude/skills/<name>/SKILL.md` 的项目级发现与 `~/.claude/skills` 优先级（关闭 PG-2），记录原始输出 |
+| **E3** | 真实初始化 | CEO 初始化状态机真实走通 `discovered→initialized`，绑定 native session；`assumed_default` 路径须有 bootstrap 传输 + post-submit 绑定 + 二次身份校验 |
+| **E4** | 真实派工 + Wake | 一次真实 prompt 提交 + 一次 `ceo.wake`，记录 `pending→sending→(submitted 或 unknown)`；无 ack 通道时必须如实标 `unknown` |
+| **E5** | 真实验证 | verifier 命令输出 + commit/diff 证据，且 Diff Gate 结论与其它 harness 一致 |
+| **E6** | 协议 version/hash 一致 | 第 3 节 PASS，且全量副本 0 DRIFT |
+| **E7** | Mock 与真实分栏 | 同一行的 `real` 与 `mock` 结果**分列**，各自带 harness/version/hash/timestamp/origin；永不合并 |
+| **E8** | 预算授权 | 任何调用付费模型的 leg 需 PG-8 预算批准 + NULL-safe 用量（M5-04） |
+
+**状态迁移（单向）：**
+`pending:PG-1` →（E1–E8 全绿 + 操作者按 HG-F 显式同意 G1）→ `REAL-PENDING`
+（工具在、已记录待跑）→ 真实运行证据落盘后 → `REAL ✓`。
+任一条不满足即停在上一状态；**不得跳级**，也不得由文档或计划自行推进。
+
+### 5. 边界声明
+
+本节**未执行**任何需要操作者同意的真实派工，**未安装** Claude，**未声称** Claude
+发现/初始化/派工/验证已通过，也**未声称**真实 Herdr / Claude / GitHub Actions 已运行。
+PG-1 仍未关闭；Claude 行在矩阵中保持 `pending:PG-1`。

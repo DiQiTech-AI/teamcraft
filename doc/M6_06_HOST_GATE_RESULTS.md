@@ -417,3 +417,166 @@ $TMP/m606-e2e-*`. Route-declaration checks (§1.3) counted pattern occurrences
 only — no config file contents, tokens or keys were read or printed. No live DB
 connection was opened; no agent was spawned; no model was invoked; no commit or
 push was made.*
+
+---
+
+## 9. HG-F 可执行同意清单（本轮只整理，不执行）
+
+> **状态声明（必读）：** 本节把 §7 的 HG-A…HG-H 整理成一条**可执行、可审计**的顺序
+> 清单。本轮**未执行**任何标注「⛔ 需要操作者显式同意（G1）」的步骤；未向任何真实
+> Agent pane 发送 Prompt；未 spawn、未调用模型、未读凭据、未 commit/push。因此本节
+> **不代表 PG-7 已关闭**，也**不代表 G1 已释放**。HG-F 的同意必须在真实运行开始时
+> 由操作者针对**具体 pane、具体 leg、具体范围**逐次给出，不能由本文档、本 Agent、
+> 计划默认值或任何“上一轮已同意”推断代劳。
+
+### 9.1 同意分类总表（顺序即执行顺序）
+
+| # | 步骤 | 具体动作（摘要） | 分类 | 真实效应 |
+|---|---|---|---|---|
+| 1 | **HG-A** | 盘点/回收 `$TMPDIR/m606-e2e-*` 泄漏根；`mktemp -d` 建 `$RUNROOT`；repo 越界 guard；只读 `git rev-parse`/`status` | **安全、无需同意** | 仅本机 `$TMPDIR` 一次性目录；不触碰 repo、不碰 Agent |
+| 2 | **HG-B** | `providers.probe_omlx()` 回环健康 + 断言声明模型在目录中 | **安全、无需同意** | 仅一次 `GET /v1/models`；无推理、无 key |
+| 3 | **HG-C** | `herdr status` / `session list` / `api snapshot` 只读；绑定目标 pane 四元组 | **安全、无需同意** | 只读拓扑；不改 tab/pane/agent |
+| 4 | **HG-D** | 一次性 bare origin + clone + `install.sh --dry-run` 后真装 + 迁移 run 内 DB + 全量 hash 校验 | **安全、无需同意** | 全部写入 `$RUNROOT`；repo 只读 |
+| 5 | **HG-E** | 离线 pytest 基线（providers/router/protocol/init/wake/local_e2e） | **安全、无需同意** | 纯本地测试，不触网 |
+| 6 | **HG-F** | **真实派工**：向已绑定 pane 提交 1 条 prompt、post-submit 绑定身份、1 次 `ceo.wake` | **⛔ 需要操作者显式同意（G1）** | **产生真实 Agent 行为**；提交不可撤销，只能 UNKNOWN 隔离 |
+| 7 | **HG-G** | 在真实 leg 的 `$RUNROOT` worktree 上跑验证 / Diff Gate / 本地交付 / cleanup | **⛔ 需要操作者显式同意（G1）** | 承接 HG-F 的真实产物；commit 只进 `$RUNROOT` 的一次性 origin |
+| 8 | **HG-H** | 收尾：fixture 复跑、证据摘要、`rm -rf "${RUNROOT:?}"`、repo 状态核对 | **安全、无需同意**（仅限本次 `$RUNROOT`） | 仅删除本次运行自建目录 |
+
+**一句话结论：** `HG-A → HG-E` 与 `HG-H` 属「安全、无需同意」；
+**`HG-F → HG-G` 属「⛔ 需要操作者显式同意（G1）」，本轮一律停在 HG-F 之前。**
+
+### 9.2 无需同意的步骤（HG-A → HG-E）：命令、中止、回滚
+
+> 下列命令取自 §7，本轮**未执行**。所有真实写入只允许落在 `$RUNROOT`；repo 始终只读。
+
+**HG-A — hygiene + 隔离前置（先建隔离，再谈其余）。**
+```sh
+REPO=$(git rev-parse --show-toplevel)
+REPO=$(cd "$REPO" && pwd -P)          # 对称解析，避免 /var 与 /private/var 绕过 guard
+TMP=${TMPDIR:-/tmp}
+
+# A1 只读盘点（不删除）
+find "$TMP" -maxdepth 1 -type d -name 'm606-e2e-*' | wc -l
+du -shc "$TMP"/m606-e2e-* 2>/dev/null | tail -1
+
+# A2 可选回收：先看清单，逐项核对后再删单个目录（禁止裸通配 rm）
+find "$TMP" -maxdepth 1 -type d -name 'm606-e2e-*' -print
+# 仅对已确认属旧 fixture 的目录逐个执行： rm -rf -- "<单个目录>"
+
+# A3 建隔离根 + 越界 guard
+RUNROOT=$(mktemp -d "$TMP/m606-run-XXXXXXXX"); RUNROOT=$(cd "$RUNROOT" && pwd -P)
+echo "$RUNROOT"
+case "$RUNROOT" in "$REPO"|"$REPO"/*) echo "GUARD: RUNROOT inside repo"; exit 1;; esac
+git -C "$REPO" rev-parse HEAD
+git -C "$REPO" status --porcelain | wc -l   # 记录基线；dirty 时禁止以 repo 作 install target
+```
+*证据：* `runroot.txt`（解析后路径 + `outside_protected=true`）。
+*中止：* guard 命中、`RUNROOT` 为空、或 `mktemp` 失败。
+*回滚：* `rm -rf "${RUNROOT:?}"`；除此之外无状态变更。
+
+**HG-B — G2 启动检查（仅回环，无模型调用、无 key）。**
+```sh
+cd "$REPO" && .venv/bin/python - "$RUNROOT" <<'PY'
+import json, sys, pathlib
+from teamcraft import providers
+s = providers.probe_omlx("http://127.0.0.1:8000/v1")
+want = "Qwen3.8-Flash-Next-oQ4e-mtp"
+out = {"health": s.health, "reason_code": s.reason_code, "source": s.source,
+       "models": list(s.models), "declared_model_present": want in s.models}
+pathlib.Path(sys.argv[1], "g2-omlx.json").write_text(json.dumps(out, indent=2) + "\n")
+print(out)
+assert s.health == "healthy" and out["declared_model_present"], "G2 not met"
+PY
+```
+*证据：* `g2-omlx.json`。
+*中止：* `health != healthy` 或声明模型不在目录 ⇒ 记录 `G2-fail`，**不得**回退到云端。
+*回滚：* 删除 `g2-omlx.json` / `$RUNROOT`。
+
+**HG-C — G3 启动检查（只读 herdr，禁止变更拓扑）。**
+```sh
+herdr status                > "$RUNROOT/g3-status.txt"
+herdr session list          > "$RUNROOT/g3-sessions.json"
+herdr api snapshot          > "$RUNROOT/g3-snapshot-before.json"
+```
+断言 `private_protocol_compatible: yes`、`restart_needed: no`，并记录目标 pane 的
+`(workspace_id, tab_id, pane_id, terminal_id, agent, agent_session.value)` 到
+`g3-target-pane.json`。
+*允许动词：* `status`、`session list`、`tab list`、`api snapshot|schema`。
+*本步禁止：* `tab create|close|focus`、`pane`、`agent`、`session attach|stop|delete`。
+*中止：* 版本 skew、`endpoint_compatible: no`、或无 `agent_session.value`。
+*回滚：* 删除本次写入的 `$RUNROOT/g3-*`；拓扑本就不该变化。
+
+**HG-D — S0/S1 一次性脚手架。**
+```sh
+git init -q --bare "$RUNROOT/origin.git"
+git clone -q "$RUNROOT/origin.git" "$RUNROOT/project"
+PATH="$REPO/.venv/bin:$PATH" bash "$REPO/scripts/install.sh" --target "$RUNROOT/project" --dry-run | tee "$RUNROOT/install-dry.txt"
+PATH="$REPO/.venv/bin:$PATH" bash "$REPO/scripts/install.sh" --target "$RUNROOT/project"           | tee "$RUNROOT/install.txt"
+```
+随后在 run 内 DB：`storage.migrate_to_head(db, allow_unverified_location=True)`，
+建 project + CEO Attempt 并钉死 `protocol_version=1.0.0` /
+`protocol_hash=c5c358bf…742`，再对 `$RUNROOT` 下每个副本重算 hash。
+*通过：* dry-run 0 文件；真装 ≥52 变更；每个副本 MATCH；目标内 `verify_protocol`
+返回钉死对；DB `fresh=True, 0→17`。
+*中止：* 托管冲突或任一 hash 漂移 ⇒ `protocol-drift`，停止。
+*回滚：* `rm -rf "${RUNROOT:?}"`。
+
+**HG-E — PRE-5 离线基线（运行起点复跑）。**
+```sh
+cd "$REPO" && .venv/bin/python -m pytest tests/test_providers_m501.py tests/test_router_m502.py \
+  tests/test_ceo_protocol_m108.py tests/test_ceo_initialization_m208.py tests/test_wake_m209.py \
+  tests/test_local_e2e_m606.py -q
+```
+*中止：* 任一失败。
+*回滚：* 无持久状态；pytest cache 可忽略。
+
+### 9.3 ⛔ 需要同意的步骤（HG-F → HG-G）
+
+**HG-F — ⛔ CONSENT CHECKPOINT (G1)，本轮到此为止。**
+前置：HG-A…HG-E 全绿，且操作者已书面/口头明确指定**一个 pane**、**一条 leg**、
+**一次 prompt 的范围**（如“只读摘要、禁止编辑”）。未获该同意时 S2/S3 保持
+`pending:G1`，不得以任何形式代批。获同意后按序执行：
+1. 向 HG-C 绑定的 pane 提交**一条** prompt（read-mostly，例如“总结 README 结构，不要编辑”）；
+2. 提交**之后**再从 `herdr api snapshot` 绑定身份（四元组 + `agent_session.value`）并写入 attempt 行；
+3. 入队**恰好一次** `ceo.wake`，预期**恰好一次** `wake-dispatch`，记录
+   `pending→sending→submitted|unknown`；
+4. 两条 leg 消费**同一个** protocol hash（R4）。
+*中止 / UNKNOWN：* 提交丢失、重复发送、或 `sending` 超时 ⇒ 判 **UNKNOWN**、隔离、
+   停该 leg、**绝不自动重试**；保留 worktree 供检查（UNKNOWN 拒绝路径已由 fixture 证明为绿）。
+*回滚：* 提交本身不可撤回；可清理的只有 `$RUNROOT` 与 worktree 的 cleanable 状态。
+
+**HG-G — ⛔ 承接 HG-F 的真实 leg 验证/交付。**
+仅在 HG-F 已获同意且产生真实产物后执行：验证 profile 从 run worktree 的 repo facts
+计算结论；对分支 diff 跑 Diff Gate；对本地 bare origin 做 local-only 交付；
+`mark_worktree_cleanable` → `evaluate_cleanup_eligibility` → `cleanup_attempt_worktree`
+（**永不 force**）。
+*中止：* Diff-Gate 的未声明改动按“负向探针通过”记录；origin 除种子 `refs/heads/main`
+外**不得**新增任何 ref。
+*回滚：* 只删除 `$RUNROOT` 内 worktree/branch；repo 与真实 origin 不受影响。
+
+### 9.4 回滚 / 清理纪律（复用 HG-A 与 HG-H）
+
+- **隔离优先：** 先建 `$RUNROOT` 并过 guard，再做任何写入；repo 始终只读。
+- **rmtree 纪律：** 只用 `rm -rf "${RUNROOT:?}"`（带 `:?`，变量为空即失败），
+  绝不用裸 `$RUNROOT` / 未加引号通配。
+- **回收纪律：** 只处理 `$TMPDIR` 下 `-maxdepth 1` 的 `m606-e2e-*` / `m606-run-*`，
+  删除前 `-print` 逐项核对；不触碰 `.teamcraft/`、git worktree、真实 DB。
+- **失败即停：** 任一 `*Abort` 命中后先保全证据、再删 `$RUNROOT`，不继续后续步骤。
+- **收尾核对：** HG-H 复跑 `test_local_e2e_m606` 仍绿；`du -shc "$TMP"/m606-run-*`；
+  证据拷出并 digest 校验后再删 `$RUNROOT`；`git -C "$REPO" status --porcelain`
+  只应出现预期的 doc/test 变更。
+
+### 9.5 本轮边界与本轮发现的脚本风险（需后续 owner 决定）
+
+**明确声明：** 本节**未执行**任何「⛔ 需要操作者显式同意（G1）」的步骤，
+**不代表 PG-7 已关闭**，**不代表 G1 已释放**，也未声称真实 Herdr / Claude /
+GitHub Actions 已运行。
+
+本轮仅阅读 §7 文本，发现三处需后续 owner 处理的事项（**未修改**，因不在本文件
+ownership 内，仅记录给后续执行者）：
+1. §7 HG-A 的 guard 只对 `RUNROOT` 做 `pwd -P`，未对 `$REPO` 对称解析；建议如 9.2
+   所示先 `REPO=$(cd "$REPO" && pwd -P)`，避免符号链接/`/var`↔`/private/var` 绕过。
+2. §7 第 277 行的 `test -z "$(git status --porcelain)" || echo NOTE` 只**警告**不中止；
+   真实运行应把“repo dirty”作为**禁止以 repo 为 install target**的硬条件。
+3. H-1（fixture 不 `rmtree`，每轮 +23 根）根因在 `tests/test_local_e2e_m606.py`，
+   **不在本文件**；修复需该测试 owner 处理，本文档只记录。

@@ -12,4 +12,6 @@ This is a loader, not a second copy of the CEO rules. Before making project deci
 3. If either file is missing, unreadable, mismatched, or incompatible with a version/hash already pinned to the active Attempt, stop dispatch and report `NEEDS_HUMAN`. Do not substitute remembered instructions or silently adopt a newer protocol.
 4. Continue to use the `teamcraft` runtime Skill for Herdr operations and its durable command/recovery rules. This CEO Skill does not replace or duplicate that runtime.
 
+For each launched or adopted member, resolve its canonical `pane_id` from the `launch`, `resume`, or `status` output and label the pane with `herdr pane rename <pane_id> "<member name> | <short current task summary>"`. Keep the summary concise and update the label whenever the member's task changes.
+
 The shared `.agents/skills/teamcraft-ceo/` path is used by Codex and OpenCode. Do not copy the protocol into `AGENTS.md`, `CLAUDE.md`, or Harness-specific agent prompts. Claude Code installation is not part of this release.

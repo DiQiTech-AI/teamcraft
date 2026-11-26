@@ -8,3 +8,5 @@ __pycache__/
 *.py[cod]
 /.agents/skills/teamcraft/scripts/core/
 .vscode/
+# Local Codex CLI rules/permissions are machine-local; never commit them.
+.codex/
