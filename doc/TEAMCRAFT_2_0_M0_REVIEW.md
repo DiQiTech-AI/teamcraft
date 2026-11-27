@@ -1233,3 +1233,22 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 结论：当前 oMLX 服务对 Codex TUI 的请求形状/负载不可用（可能服务状态退化、模型实例泄漏或 TUI 工具/系统提示过大）。这不是 runner 逻辑问题；runner 的 harness-aware 适配（settled、CEO kind、`--ceo-agent`、可配置超时）已就绪并推送。
 
 **下一步**：重启/升级 oMLX，或换用稳定的本地 Responses provider（或加一个 `/v1/responses` 代理），然后重跑 Codex dispatch → Wake → verify → deliver。M6-06 仍未完全关闭；本轮未发送 Codex 任务 prompt、无交付证据、未伪造。
+
+### 12.42 oMLX 重启后 Codex TUI 仍 502（2026-11-27）
+
+用户重启 oMLX 后复测：
+
+- `/v1/models` 与 `/v1/responses` **流式 curl** 正常（`response.created`）。
+- `codex exec` 短请求正常（返回 `OK`）。
+- **单个 Codex TUI 会话**的 `/v1/responses` 仍持续 `502 Bad Gateway`（`Reconnecting 4/5`）。
+
+结论：问题**特定于 Codex TUI 的 Responses 请求形状**（工具/系统提示/流式输入），不是 oMLX 服务状态或 runner 逻辑；`codex exec` 路径可用，但 Herdr 的持久 agent 派工需要 TUI。
+
+**可选下一步**：
+
+1. 使用一个对 Codex TUI 稳定的本地 Responses provider（更新版 oMLX / 其他实现）；
+2. 写一个 `/v1/responses` → `/v1/chat/completions` 代理（需处理工具调用，工作量较大）；
+3. 用 `codex exec` 做 worker 并调整证据口径（不是 Herdr TUI 派工，证据强度较弱）；
+4. 接受 Codex 为 pending，按显式范围决策关闭（与路径 B 的“2/3 真实 leg”不一致）。
+
+**边界**：本轮未发送 Codex 任务 prompt、无交付证据、未伪造；M6-06 仍未完全关闭。
