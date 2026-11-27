@@ -16,6 +16,17 @@ class ProtocolError(ValueError):
 VERSION_RE = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)$")
 HEADER_RE = re.compile(rb"\A---\r?\nprotocol_version: ([0-9]+\.[0-9]+\.[0-9]+)\r?\n---\r?\n")
 
+#: The only harnesses whose installed CEO Skill may pin the protocol.
+#: Codex/OpenCode load the canonical ``.agents`` tree; Claude Code loads the
+#: installer-managed byte-identical copy under ``.claude``.  Mapping a harness
+#: to a root never changes the artifact contract: both trees are verified by
+#: the same frontmatter/manifest/SHA-256 rules below.
+SKILL_ROOTS: dict[str, tuple[str, ...]] = {
+    "codex": (".agents", "skills", "teamcraft-ceo"),
+    "opencode": (".agents", "skills", "teamcraft-ceo"),
+    "claude": (".claude", "skills", "teamcraft-ceo"),
+}
+
 
 @dataclass(frozen=True)
 class ProtocolSnapshot:
@@ -62,21 +73,34 @@ def verify_protocol(directory: str | Path, *, expected_version: str | None = Non
 def discover_protocol(project_root: str | Path, harness: str, *,
                       expected_version: str | None = None,
                       expected_sha256: str | None = None) -> ProtocolSnapshot:
-    """Mockable Codex/OpenCode discovery through their shared skill location."""
-    if harness not in {"codex", "opencode"}:
-        raise ProtocolError(f"unsupported M1-08 harness: {harness}")
-    skill_root = Path(project_root) / ".agents" / "skills" / "teamcraft-ceo"
-    path_chain = [Path(project_root) / ".agents",
-                  Path(project_root) / ".agents" / "skills", skill_root,
-                  skill_root / "SKILL.md"]
+    """Discover the installed CEO Skill for one supported harness.
+
+    Codex and OpenCode resolve through the shared ``.agents/skills`` tree;
+    Claude Code resolves through its installer-managed ``.claude/skills``
+    copy.  Unknown harnesses stay rejected, and every supported harness must
+    still satisfy the identical Skill frontmatter and pinned protocol
+    version/SHA-256 contract (no relaxed pin).
+    """
+    try:
+        parts = SKILL_ROOTS[harness]
+    except (KeyError, TypeError):
+        raise ProtocolError(f"unsupported M1-08 harness: {harness}") from None
+    root = Path(project_root)
+    skill_root = root
+    path_chain = []
+    for relative_part in parts:
+        skill_root = skill_root / relative_part
+        path_chain.append(skill_root)
     if any(path.is_symlink() for path in path_chain):
+        raise ProtocolError(f"CEO Skill discovery path contains a symbolic link: {harness}")
+    if (skill_root / "SKILL.md").is_symlink():
         raise ProtocolError(f"CEO Skill discovery path contains a symbolic link: {harness}")
     try:
         frontmatter = (skill_root / "SKILL.md").read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ProtocolError(f"CEO Skill is missing or unreadable for {harness}: {exc}") from exc
-    parts = frontmatter.split("---\n", 2)
-    if len(parts) < 3 or parts[0] != "" or "name: teamcraft-ceo\n" not in parts[1]:
+    sections = frontmatter.split("---\n", 2)
+    if len(sections) < 3 or sections[0] != "" or "name: teamcraft-ceo\n" not in sections[1]:
         raise ProtocolError(f"CEO Skill discovery contract invalid for {harness}")
     return verify_protocol(skill_root / "references", expected_version=expected_version,
                            expected_sha256=expected_sha256)

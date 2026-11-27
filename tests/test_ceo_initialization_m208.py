@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from teamcraft import ceo_initialization as init, domain, events, leader, runtime_adapter, scheduler, storage, wake
+from teamcraft import ceo_initialization as init, domain, events, leader, providers, runtime_adapter, scheduler, storage, wake
 
 
 class Clock:
@@ -25,10 +25,14 @@ class CEOInitializationM208Tests(unittest.TestCase):
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
         source = Path(__file__).resolve().parents[1] / ".agents" / "skills"
-        shutil.copytree(source / "teamcraft-ceo", self.root / ".agents/skills/teamcraft-ceo")
-        skill = self.root / ".agents/skills/teamcraft"
-        skill.mkdir(parents=True)
-        shutil.copy2(source / "teamcraft/SKILL.md", skill / "SKILL.md")
+        # The installer writes byte-identical copies of both canonical Skill
+        # trees into ``.claude`` (M6-07).  Materialise that layout so each
+        # Harness can resolve its own installed tree.
+        for tree in (".agents", ".claude"):
+            shutil.copytree(source / "teamcraft-ceo", self.root / tree / "skills/teamcraft-ceo")
+            skill = self.root / tree / "skills/teamcraft"
+            skill.mkdir(parents=True)
+            shutil.copy2(source / "teamcraft/SKILL.md", skill / "SKILL.md")
         self.conn, _ = runtime_adapter.open_runtime(self.root)
         self.addCleanup(self.conn.close)
         self.clock = Clock()
@@ -1050,6 +1054,202 @@ class CEOInitializationM208Tests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT count(*) FROM commands WHERE kind='ceo.identity.native_session'"
         ).fetchone()[0], 0)
+
+    # ------------------------------------------------------------------
+    # M6-07: the CEO Harness allowlist admits `claude` on the same protocol
+    # version/hash and identity contract as Codex/OpenCode, resolving the
+    # installer-managed ``.claude/skills/teamcraft-ceo`` copy instead of the
+    # ``.agents`` tree.  This is only protocol/identity resolution: the real
+    # Claude leg stays pending (PG-1) and no test here executes or claims a
+    # live Claude run.
+    # ------------------------------------------------------------------
+
+    def set_ceo_harness(self, kind):
+        """Model a CEO member reported as another allowlisted Harness.
+
+        The runtime adapter still pins new CEO Attempts from the member kind,
+        so the existing Codex-pinned Attempt is kept and only the durable
+        member row is relabelled; ``ceo_initialization`` re-reads that row on
+        every binding check.
+        """
+        with storage.transaction(self.conn):
+            self.conn.execute("UPDATE members SET kind=? WHERE name='ceo'", (kind,))
+
+    def test_claude_member_passes_allowlist_with_shared_protocol_and_identity_pin(self):
+        attempt = domain.get_attempt(self.conn, self.state["members"]["ceo"]["attempt_id"])
+        self.set_ceo_harness("claude")
+        record, nonce = self.issue()
+
+        self.assertEqual(record.state, "discovered")
+        # No second protocol source and no weaker pin: the same immutable
+        # version/hash as the Attempt and the other Harnesses.
+        self.assertEqual((record.protocol_version, record.protocol_hash),
+                         (attempt.protocol_version, attempt.protocol_hash))
+        self.assertEqual(
+            (record.terminal_id, record.native_session_id, record.teamcraft_session_id),
+            ("terminal-m208", "native-m208", self.state["members"]["ceo"]["session_id"]),
+        )
+        self.assertEqual(
+            init.bootstrap_prompt_fields(record, nonce)["protocol_hash"],
+            attempt.protocol_hash,
+        )
+
+        pending = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(pending.state, "unknown")
+        initialized = init.record_bootstrap_submitted_assumed(
+            self.conn, self.project_id, nonce, native_session_id="native-m208",
+            session_state="idle", lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(
+            (initialized.state, initialized.receipt_source, initialized.identity_mode),
+            ("initialized", "assumed_default", "native"),
+        )
+        self.assertEqual(
+            init.require_initialized(self.conn, self.project_id).protocol_hash,
+            attempt.protocol_hash,
+        )
+
+    def test_claude_initialization_resolves_only_the_managed_claude_ceo_skill(self):
+        attempt = domain.get_attempt(self.conn, self.state["members"]["ceo"]["attempt_id"])
+        # Remove the canonical CEO protocol tree: only the installer-managed
+        # ``.claude`` copy remains for Claude to resolve.
+        shutil.rmtree(self.root / ".agents/skills/teamcraft-ceo")
+        self.set_ceo_harness("claude")
+        record, nonce = self.issue()
+
+        self.assertEqual(record.state, "discovered")
+        self.assertFalse((self.root / ".agents/skills/teamcraft-ceo").exists())
+        self.assertEqual((record.protocol_version, record.protocol_hash),
+                         (attempt.protocol_version, attempt.protocol_hash))
+        claude_snapshot = init._discover_protocol(
+            self.root, "claude",
+            expected_version=attempt.protocol_version,
+            expected_sha256=attempt.protocol_hash,
+        )
+        self.assertEqual((claude_snapshot.version, claude_snapshot.sha256),
+                         (attempt.protocol_version, attempt.protocol_hash))
+        # The runtime Skill check is unchanged: it still reads the canonical
+        # ``.agents`` tree; only the CEO protocol artifact comes from .claude.
+        self.assertEqual(
+            record.runtime_skill_hash,
+            hashlib.sha256(
+                (self.root / ".agents/skills/teamcraft/SKILL.md").read_bytes()
+            ).hexdigest(),
+        )
+        # The effect-admission boundary re-reads the same .claude tree.
+        pending = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(pending.state, "unknown")
+
+    def test_claude_protocol_discovery_needs_no_agents_tree_at_all(self):
+        attempt = domain.get_attempt(self.conn, self.state["members"]["ceo"]["attempt_id"])
+        shutil.rmtree(self.root / ".agents")
+        self.assertFalse((self.root / ".agents").exists())
+        snapshot = init._discover_protocol(
+            self.root, "claude",
+            expected_version=attempt.protocol_version,
+            expected_sha256=attempt.protocol_hash,
+        )
+        self.assertEqual((snapshot.version, snapshot.sha256),
+                         (attempt.protocol_version, attempt.protocol_hash))
+        # No silent cross-tree fallback: .agents Harnesses stay fail-closed.
+        with self.assertRaisesRegex(ValueError, "missing or unreadable for codex"):
+            init._discover_protocol(self.root, "codex")
+
+    def test_claude_without_managed_tree_is_refused_instead_of_falling_back(self):
+        shutil.rmtree(self.root / ".claude")
+        self.set_ceo_harness("claude")
+        with self.assertRaisesRegex(
+            init.CEOInitializationGateClosed, "missing or unreadable for claude",
+        ):
+            self.issue()
+        self.assertIsNone(init.get_initialization(self.conn, self.project_id))
+        # The canonical .agents artifact exists but is never substituted.
+        self.assertTrue((self.root / (
+            ".agents/skills/teamcraft-ceo/references/CEO_PROTOCOL.md"
+        )).is_file())
+
+    def test_claude_protocol_hash_drift_still_fails_closed(self):
+        self.set_ceo_harness("claude")
+        _, nonce = self.issue()
+        protocol_file = self.root / ".claude/skills/teamcraft-ceo/references/CEO_PROTOCOL.md"
+        protocol_file.write_bytes(protocol_file.read_bytes() + b"\nclaude drift\n")
+        drifted = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(drifted.state, "failed")
+        self.assertIn("drifted", drifted.detail)
+        self.assertIsNotNone(drifted.nonce_consumed_at)
+        with self.assertRaises(init.CEOInitializationGateClosed):
+            init.require_initialized(self.conn, self.project_id)
+
+    def test_claude_pinned_version_drift_refuses_issue(self):
+        self.set_ceo_harness("claude")
+        refs = self.root / ".claude/skills/teamcraft-ceo/references"
+        changed = (refs / "CEO_PROTOCOL.md").read_bytes().replace(
+            b"protocol_version: 1.0.0", b"protocol_version: 1.1.0", 1,
+        )
+        (refs / "CEO_PROTOCOL.md").write_bytes(changed)
+        (refs / "protocol.manifest.json").write_text(json.dumps({
+            "protocol_version": "1.1.0",
+            "sha256": hashlib.sha256(changed).hexdigest(),
+        }))
+        with self.assertRaisesRegex(init.CEOInitializationGateClosed,
+                                    "pinned protocol version"):
+            self.issue()
+        self.assertIsNone(init.get_initialization(self.conn, self.project_id))
+
+    def test_unknown_harness_is_still_rejected_by_the_allowlist(self):
+        self.set_ceo_harness("gemini")
+        with self.assertRaisesRegex(
+            init.CEOInitializationError, "no supported protocol discovery contract",
+        ):
+            self.issue()
+        self.assertIsNone(init.get_initialization(self.conn, self.project_id))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind LIKE 'ceo.initialization.%'"
+        ).fetchone()[0], 0)
+
+    def test_codex_and_opencode_still_initialize_from_agents_without_claude_tree(self):
+        attempt = domain.get_attempt(self.conn, self.state["members"]["ceo"]["attempt_id"])
+        shutil.rmtree(self.root / ".claude")
+        self.assertFalse((self.root / ".claude").exists())
+        pins = set()
+        for harness in ("codex", "opencode"):
+            with self.subTest(harness=harness):
+                self.set_ceo_harness(harness)
+                record, nonce = self.issue()
+                self.assertEqual(record.state, "discovered")
+                self.assertTrue(nonce)
+                self.assertEqual((record.protocol_version, record.protocol_hash),
+                                 (attempt.protocol_version, attempt.protocol_hash))
+                pins.add((record.protocol_version, record.protocol_hash))
+        self.assertEqual(len(pins), 1)
+        # Without its own .claude tree a Claude CEO cannot fall back to .agents.
+        self.set_ceo_harness("claude")
+        with self.assertRaisesRegex(
+            init.CEOInitializationGateClosed, "missing or unreadable for claude",
+        ):
+            self.issue()
+
+    def test_claude_allowlist_admission_does_not_claim_live_capability(self):
+        # The static policy is unchanged: no runner is injected, so no process
+        # is spawned and Claude's capability/health stays pending.
+        snapshot = providers.probe_harness("claude", self.root, clock=self.clock)
+        self.assertEqual((snapshot.health, snapshot.reason_code),
+                         ("unsupported", "adapter_pending"))
+        self.assertIsNone(snapshot.version)
+
+        self.set_ceo_harness("claude")
+        record, _ = self.issue()
+        self.assertEqual(record.state, "discovered")
+        self.assertEqual(record.receipt_source, "unverified")
+        self.assertEqual(providers.probe_harness(
+            "claude", self.root, clock=self.clock,
+        ).health, "unsupported")
 
 
 if __name__ == "__main__": unittest.main()

@@ -72,7 +72,7 @@ class CEOProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ProtocolError, "discovery contract invalid"):
                 discover_protocol(temp, "opencode")
         with self.assertRaisesRegex(ProtocolError, "unsupported"):
-            discover_protocol(".", "claude")
+            discover_protocol(".", "gemini")
 
     def test_attempt_persists_and_cannot_change_protocol_pin(self):
         with tempfile.TemporaryDirectory() as temp:

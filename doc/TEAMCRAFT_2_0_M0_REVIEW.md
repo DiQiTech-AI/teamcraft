@@ -404,7 +404,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M6-03 脱敏诊断包（本地 Python 接口；见 12.31）**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
 | **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
-| **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07，保持 pending:PG-1）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
+| **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07，保持 pending:PG-1；**M6-07 已登记**，见 §12.46）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
 **M6 退出门禁**：P2 项逐项独立发布；跨 Harness E2E 按实际版本和真实运行证据验收，未安装 Claude 时明确未验证；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源或第二份 CEO 协议。
 
@@ -413,7 +413,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | 场景 | 负责任务 | 最低证据 |
 |---|---|---|
 | Codex/OpenCode 发现同一 CEO Skill/协议 | M1-08、M2-08 | Mock 契约 + 各自已安装版本真实冒烟，version/hash 一致 |
-| Claude 项目入口与发现 | M6-06 | 目标版本真实测试；本机不可用期间标记 pending |
+| Claude 项目入口与发现 | M6-06→M6-07（已登记，§12.46） | 目标版本真实测试；本机不可用期间标记 `pending:PG-1` |
 | Skill/协议缺失、读取失败、版本不兼容 | M1-08、M2-08 | 离线失败路径；初始化不通过且零派工 |
 | Worker Prompt 成功/失败、投递后崩溃 | M2-03、M2-07 | Fake Adapter 故障注入；可用 Herdr 实机契约另列 |
 | CEO working 多事件、idle 合并 Wake | M2-09、M2-07 | 持久 DB 状态、单次发送、事件未丢失 |
@@ -1300,4 +1300,35 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - **Mock/真实分栏**：本节只登记真实 harness 证据；Mock/Fake 不计为真实。
 - `prompt_ack=unknown`、`host_trusted_receipt=false` 保持不变；DONE 仍需 human accept（M4-04）。
 
-**后续**：M6-07（Claude 适配 + 真实 leg）；`scripts/m606_responses_proxy.py` 是本地测试桥，不进入生产运行时。
+**后续**：M6-07（Claude 适配 + 真实 leg）已于 2026-11-27 登记（§12.46），当前 `in progress`、Claude 行保持 `pending:PG-1`，不代表验收；`scripts/m606_responses_proxy.py` 是本地测试桥，不进入生产运行时。
+
+### 12.46 M6-07 Claude 适配登记（2026-11-27）
+
+**登记口径**：本节只登记 M6-07 的范围、owner 与状态，**不构成 M6-07 验收**，也不声称真实 Claude 已发现、已初始化、已派工、已 Wake、已验证或已交付。Claude 行保持 `pending:PG-1`。
+
+**背景**：M6-06 按路径 B 关闭，Claude 适配延期到 M6-07（§12.37、§12.45）。本机 `claude` 仍不可得（2026-11-27 `command -v claude` 无输出，PG-1），项目 `.claude/` 未安装；`~/.claude/skills` 仅为不可信环境残留，不作为证据。
+
+**范围（目标布局，不是已完成事实）**：
+
+- `.claude/skills/teamcraft/` 与 `.claude/skills/teamcraft-ceo/`：受管副本（默认）或**经验证的 symlink**，与 `.agents/skills/` 字节一致；symlink 仅在目标位于项目内、真实发现通过、漂移校验解析内容后才可采用。
+- 精简 `CLAUDE.md`：带 TeamCraft 受管标记，仅缺失时创建或受管文件显式 `--force` 升级；已存在的用户文件即使 `--force` 也不覆盖（fail-before-write）。
+- 同一协议：`1.0.0 / c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742`；安装时与初始化时各校验一次，任何副本漂移 fail-closed，不静默修复。
+- 固定 Claude Code 版本上的真实发现 → 初始化 → 派工 → Wake → 验证 → 交付；Mock 与真实结果分栏，永不合并。
+
+**Owner 与状态**：
+
+| Owner | 范围 | 状态 |
+|---|---|---|
+| m607_installer | `scripts/install.sh`、`tests/test_install*.py`：`.claude` 受管安装、`CLAUDE.md`、幂等/dry-run/冲突、副本 hash 一致 | `in progress` |
+| m607_ceo_allowlist | `teamcraft/ceo_initialization.py`、`tests/test_ceo_initialization_m208.py`：Claude 进入同一协议/身份契约，不放宽 pin/nonce/门禁 | `in progress` |
+| m607_docs（本节） | `doc/M6_07_CLAUDE_ADAPTER.md`、本报告登记 | `in progress` |
+
+**退出条件**：固定 Claude 版本；真实发现/初始化/派工/Wake/验证/交付；Mock 与真实分栏；协议 0 漂移。全部满足并经独立验收后才可离开 `pending:PG-1`；证据要求与状态迁移见 `doc/M6_07_CLAUDE_ADAPTER.md` 第 5 节。
+
+**降级**：Claude 不可用时不派工、不声称、不伪造；探测超时、版本不符、发现失败或协议漂移均保持 `pending` 或 fail-closed，不自动重试、不切换其它 harness 冒充。
+
+**明确不代表验收**：状态 `in progress` 仅表示文档已登记、适配工作在进行；M6-07 未关闭，真实 Claude leg 为 `pending:PG-1`，不得表述为三 Harness 全通过。
+
+**离线切片复核（2026-11-27，独立 tester PASS）**：全量 `tests/` **1621 OK（4 skipped）**；定向 install 36、ceo 52、ceo_protocol 9、runtime_adapter 56、m607 8 全绿；临时安装 `.agents`/`.claude` 42/42 字节一致、协议 `1.0.0 / c5c358bf…a742`、幂等、用户 `CLAUDE.md` 不被覆盖。真实 Claude leg 仍 `pending:PG-1`。
+
+**非阻塞缺口（后续）**：`teamcraft/ceo_initialization.py` 的 runtime skill hash 路径仍读 `.agents/skills/teamcraft`（约 :324/458/571/745/976/1193）；Claude-only 安装需按 harness 解析 `.claude`。当前安装器同时提供两棵字节一致树，故 pin 一致、不影响本次离线切片。

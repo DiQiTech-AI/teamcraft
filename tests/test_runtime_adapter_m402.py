@@ -16,14 +16,18 @@ Acceptance covered here:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from teamcraft import (
+    ceo_protocol,
     commands,
     domain,
     leader,
@@ -380,6 +384,109 @@ class AdapterRoutingTests(unittest.TestCase):
             ra.claim_recovery_action(
                 self.conn, scoped.id, lease=wrong_lease,
             )
+
+
+CANONICAL_CEO_PROTOCOL_VERSION = "1.0.0"
+CANONICAL_CEO_PROTOCOL_SHA256 = (
+    "c5c358bf5e1654bc902579972acda4b29984ffde171a547559d289b20ef0a742"
+)
+CANONICAL_CEO_SKILL = (
+    Path(__file__).resolve().parents[1] / ".agents/skills/teamcraft-ceo"
+)
+
+
+class ClaudeCeoProtocolPinTests(unittest.TestCase):
+    """M6-07: a Claude CEO Attempt pins the installer-managed ``.claude`` copy.
+
+    Adapter/mock level only: no Claude process is installed, started, or
+    probed.  The pin/verify contract is the same immutable version/SHA-256
+    used for Codex/OpenCode, and drift or an unknown harness stays
+    ``NEEDS_HUMAN``.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="tc-m607-ra-")
+        self.addCleanup(self._tmp.cleanup)
+        self.project = Path(self._tmp.name).resolve() / "project"
+        self.project.mkdir()
+        shutil.copytree(
+            CANONICAL_CEO_SKILL,
+            self.project / ".claude/skills/teamcraft-ceo",
+        )
+        self.conn, _report = ra.open_runtime(self.project)
+        self.addCleanup(self.conn.close)
+        self.member = _member(
+            "ceo", role="ceo", read_only=True, kind="claude",
+            ownership=[], cwd=str(self.project), pane_id=None,
+            agent_args=[], phase="reserved",
+        )
+        self.state = {
+            "version": ra.STATE_VERSION, "team_id": "team-m607-claude",
+            "project_root": str(self.project),
+            "herdr_session": {"server_id": "srv", "socket_path": "/s"},
+            "created_at": int(time.time()),
+            "members": {"ceo": self.member},
+        }
+
+    def _sync(self, phase: str) -> None:
+        self.member["phase"] = phase
+        ra.sync_state(self.conn, self.state)
+
+    def test_claude_ceo_attempt_pins_and_verifies_managed_copy(self):
+        self._sync("reserved")
+        self.assertIsNone(self.member["attempt_id"])
+        self._sync("split_requested")
+
+        attempt = domain.get_attempt(self.conn, self.member["attempt_id"])
+        snapshot = ceo_protocol.discover_protocol(self.project, "claude")
+        self.assertEqual(
+            (attempt.protocol_version, attempt.protocol_hash),
+            (CANONICAL_CEO_PROTOCOL_VERSION, CANONICAL_CEO_PROTOCOL_SHA256),
+        )
+        self.assertEqual(
+            (attempt.protocol_version, attempt.protocol_hash),
+            (snapshot.version, snapshot.sha256),
+        )
+        # The recorded pin re-verifies against the .claude tree.
+        ra._verify_member_protocol(self.state, self.member, attempt)
+
+    def test_claude_protocol_drift_becomes_needs_human(self):
+        self._sync("reserved")
+        self._sync("split_requested")
+        attempt = domain.get_attempt(self.conn, self.member["attempt_id"])
+
+        refs = self.project / ".claude/skills/teamcraft-ceo/references"
+        changed = (refs / "CEO_PROTOCOL.md").read_bytes().replace(
+            b"protocol_version: 1.0.0", b"protocol_version: 1.1.0", 1,
+        )
+        (refs / "CEO_PROTOCOL.md").write_bytes(changed)
+        (refs / "protocol.manifest.json").write_text(json.dumps({
+            "protocol_version": "1.1.0",
+            "sha256": hashlib.sha256(changed).hexdigest(),
+        }))
+        with self.assertRaisesRegex(
+            RuntimeAdapterError, "NEEDS_HUMAN.*pinned CEO protocol",
+        ):
+            ra._verify_member_protocol(self.state, self.member, attempt)
+        with self.assertRaisesRegex(
+            RuntimeAdapterError, "NEEDS_HUMAN.*pinned CEO protocol",
+        ):
+            ra.sync_state(self.conn, self.state)
+
+    def test_unknown_ceo_harness_cannot_be_pinned(self):
+        self.member["kind"] = "gemini"
+        self._sync("reserved")
+        with self.assertRaisesRegex(
+            RuntimeAdapterError, "NEEDS_HUMAN.*cannot be pinned",
+        ):
+            self._sync("split_requested")
+
+    def test_missing_protocol_pin_is_needs_human(self):
+        attempt = SimpleNamespace(protocol_version=None, protocol_hash=None)
+        with self.assertRaisesRegex(
+            RuntimeAdapterError, "no protocol pin",
+        ):
+            ra._verify_member_protocol(self.state, self.member, attempt)
 
 
 if __name__ == "__main__":

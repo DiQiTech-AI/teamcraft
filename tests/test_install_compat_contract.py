@@ -13,6 +13,8 @@ source root; nothing global is touched and no network access occurs.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
@@ -62,7 +64,17 @@ class InstallerCompatContractTests(unittest.TestCase):
         shutil.copyfile(INSTALLER, root / "scripts" / "install.sh")
         (skill / "SKILL.md").write_text("# fake skill\n", encoding="utf-8")
         (ceo_skill / "SKILL.md").write_text("# fake CEO skill\n", encoding="utf-8")
-        (ceo_skill / "references" / "CEO_PROTOCOL.md").write_text("# protocol\n", encoding="utf-8")
+        # The installer fail-closes on protocol drift, so the fixture must
+        # carry a self-consistent pinned manifest, not just a protocol file.
+        protocol_bytes = b"# fake protocol\n"
+        (ceo_skill / "references" / "CEO_PROTOCOL.md").write_bytes(protocol_bytes)
+        (ceo_skill / "references" / "protocol.manifest.json").write_text(
+            json.dumps({
+                "protocol_version": "1.0.0",
+                "sha256": hashlib.sha256(protocol_bytes).hexdigest(),
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
         (skill / "scripts" / "teamctl.py").write_text("print('fake')\n", encoding="utf-8")
         (skill / "tests" / "test_fake.py").write_text("pass\n", encoding="utf-8")
         (root / ".opencode" / "agents" / "herdr-ceo.md").write_text(
@@ -110,6 +122,11 @@ class InstallerCompatContractTests(unittest.TestCase):
         would_create = [line for line in result.stdout.splitlines()
                        if line.startswith("would create")]
         self.assertGreaterEqual(len(would_create), 3)  # skill + profile + config
+        self.assertIn(str(target / ".claude" / "skills" / "teamcraft" / "SKILL.md"),
+                      result.stdout)
+        self.assertIn(str(target / ".claude" / "skills" / "teamcraft-ceo" / "SKILL.md"),
+                      result.stdout)
+        self.assertIn(str(target / "CLAUDE.md"), result.stdout)
         self.assertTrue(SUMMARY_RE.search(result.stdout), result.stdout)
         self.assertIn("Dry run", result.stdout)
         self.assertFalse(target.exists())
@@ -192,6 +209,18 @@ class InstallerCompatContractTests(unittest.TestCase):
         self.assertFalse([p for p in installed if "__pycache__" in p
                          or p.endswith((".pyc", ".pyo", ".DS_Store"))])
 
+    def test_protocol_drift_fails_before_writes(self):
+        root = self.build_fake_source_root()
+        protocol = (root / ".agents" / "skills" / "teamcraft-ceo"
+                    / "references" / "CEO_PROTOCOL.md")
+        protocol.write_bytes(b"tampered protocol\n")
+        target = self.base / "project"
+        result = self.run_installer(
+            target, installer=root / "scripts" / "install.sh", expected_code=1
+        )
+        self.assertIn("Claude protocol hash drift", result.stderr)
+        self.assertFalse(target.exists())
+
     def test_source_tree_symlink_rejected(self):
         root = self.build_fake_source_root()
         link = root / ".agents" / "skills" / "teamcraft" / "evil.txt"
@@ -201,6 +230,69 @@ class InstallerCompatContractTests(unittest.TestCase):
                                    expected_code=1)
         self.assertIn("must not contain symlinks", result.stderr)
         self.assertFalse(target.joinpath(".agents").exists())
+
+    def test_claude_managed_tree_matches_agents_byte_for_byte(self):
+        root = self.build_fake_source_root()
+        target = self.base / "project"
+        self.run_installer(target, installer=root / "scripts" / "install.sh")
+
+        def tree(path: Path) -> dict[str, bytes]:
+            return {
+                entry.relative_to(path).as_posix(): entry.read_bytes()
+                for entry in sorted(path.rglob("*"))
+                if entry.is_file() and "__pycache__" not in entry.parts
+            }
+
+        agents = tree(target / ".agents" / "skills")
+        claude = tree(target / ".claude" / "skills")
+        self.assertEqual(sorted(agents), sorted(claude))
+        for relative, content in agents.items():
+            self.assertEqual(content, claude[relative], relative)
+        self.assertTrue(
+            (target / ".claude" / "skills" / "teamcraft" / "scripts" / "core"
+             / "teamcraft" / "__init__.py").is_file()
+        )
+        claude_md = (target / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertTrue(claude_md.startswith(
+            "<!-- teamcraft-managed: claude-instructions v1 -->"
+        ))
+
+    def test_user_claude_md_conflict_is_all_or_nothing_preflight(self):
+        root = self.build_fake_source_root()
+        target = self.base / "project"
+        target.mkdir()
+        claude_md = target / "CLAUDE.md"
+        claude_md.write_text("user-owned claude rules\n", encoding="utf-8")
+        result = self.run_installer(target, "--force",
+                                    installer=root / "scripts" / "install.sh",
+                                    expected_code=1)
+        self.assertIn("user-owned CLAUDE.md conflicts", result.stderr)
+        self.assertEqual(claude_md.read_text(encoding="utf-8"),
+                         "user-owned claude rules\n")
+        self.assertFalse((target / ".agents").exists())
+        self.assertFalse((target / ".claude").exists())
+        self.assertFalse((target / "opencode.json").exists())
+        self.assertFalse((target / ".gitignore").exists())
+
+    def test_claude_install_never_invokes_claude_cli(self):
+        root = self.build_fake_source_root()
+        target = self.base / "project"
+        fake_bin = self.base / "bin"
+        fake_bin.mkdir()
+        sentinel = self.base / "claude-called"
+        fake = fake_bin / "claude"
+        fake.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(root / "scripts" / "install.sh"),
+             "--target", str(target)],
+            text=True, capture_output=True, check=False,
+            env={"PATH": f"{fake_bin}:/usr/bin:/bin",
+                 "HOME": str(self.base / "home")},
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        self.assertFalse(sentinel.exists(), "installer invoked claude CLI")
 
     def test_file_as_destination_parent_rejected_before_writes(self):
         target = self.base / "project"

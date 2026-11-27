@@ -9,6 +9,8 @@ exec python3 - "$@" <<'PY'
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +21,21 @@ import tempfile
 
 IGNORE_RULES = ("/.teamcraft/", "/opencode.json",
                 "/.agents/skills/teamcraft/scripts/core/")
+
+CLAUDE_PROTOCOL_VERSION = "1.0.0"
+CLAUDE_MARKER = b"<!-- teamcraft-managed: claude-instructions v1 -->"
+CLAUDE_INSTRUCTIONS = (
+    CLAUDE_MARKER + b"\n"
+    b"# TeamCraft\n\n"
+    b"This file is managed by TeamCraft. It points Claude Code at the\n"
+    b"installed TeamCraft skills. TeamCraft does not install or probe the\n"
+    b"Claude Code binary.\n\n"
+    b"- `.claude/skills/teamcraft/SKILL.md`\n"
+    b"- `.claude/skills/teamcraft-ceo/SKILL.md`\n\n"
+    b"Those skill trees are managed copies of `.agents/skills/` and must not\n"
+    b"be edited by hand. Rerun `scripts/install.sh --force` to upgrade\n"
+    b"TeamCraft-managed files.\n"
+)
 
 
 class InstallError(RuntimeError):
@@ -43,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="replace differing TeamCraft-managed files; never replaces opencode.json",
+        help="replace differing TeamCraft-managed files; never replaces "
+             "opencode.json or a user-owned CLAUDE.md",
     )
     return parser.parse_args()
 
@@ -89,6 +107,16 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
              / "teamcraft" / path.name)
         )
 
+    # M6-07: Claude Code reads skills from .claude/skills. Install managed
+    # byte-identical copies of the canonical .agents skill trees so both
+    # harnesses load the same protocol (1.0.0). Copies are used instead of
+    # symlinks so the installed project stays portable and cannot escape the
+    # target through a link. No Claude binary is installed or probed.
+    agents_skill_sources = list(sources)
+    for path, relative in agents_skill_sources:
+        claude_relative = Path(".claude") / "skills" / Path(*relative.parts[2:])
+        sources.append((path, claude_relative))
+
     profiles_dir = source_root / ".opencode" / "agents"
     profiles = sorted(profiles_dir.glob("herdr-*.md"))
     ceo_entry = profiles_dir / "teamcraft-ceo.md"
@@ -107,6 +135,48 @@ def source_manifest(source_root: Path) -> list[tuple[Path, Path]]:
     sources.append((template, template.relative_to(source_root)))
 
     return sources
+
+
+def verify_claude_protocol(source_root: Path) -> None:
+    """Fail closed before any write if the canonical Claude protocol drifts.
+
+    The .claude skill trees are byte-identical copies of .agents/skills, so a
+    drifted canonical protocol would otherwise be copied verbatim. This check
+    is install-time only: it reads local files and never invokes or probes the
+    Claude Code binary.
+    """
+
+    references = (
+        source_root / ".agents" / "skills" / "teamcraft-ceo" / "references"
+    )
+    manifest_path = references / "protocol.manifest.json"
+    protocol_path = references / "CEO_PROTOCOL.md"
+    for path in (manifest_path, protocol_path):
+        if path.is_symlink() or not path.is_file():
+            raise InstallError(f"missing or unsafe Claude protocol file: {path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstallError(
+            f"invalid Claude protocol manifest: {manifest_path}"
+        ) from error
+    if manifest.get("protocol_version") != CLAUDE_PROTOCOL_VERSION:
+        raise InstallError(
+            f"Claude protocol version mismatch in {manifest_path}: "
+            f"expected {CLAUDE_PROTOCOL_VERSION}, "
+            f"found {manifest.get('protocol_version')!r}"
+        )
+    expected_sha256 = manifest.get("sha256")
+    if not isinstance(expected_sha256, str):
+        raise InstallError(
+            f"Claude protocol manifest lacks a sha256 string: {manifest_path}"
+        )
+    actual = hashlib.sha256(protocol_path.read_bytes()).hexdigest()
+    if actual != expected_sha256:
+        raise InstallError(
+            f"Claude protocol hash drift in {protocol_path}: "
+            f"expected {expected_sha256}, found {actual}"
+        )
 
 
 def validate_target_root(target: Path) -> None:
@@ -206,6 +276,7 @@ def install(args: argparse.Namespace) -> int:
     target = Path(os.path.normpath(target))
 
     validate_target_root(target)
+    verify_claude_protocol(source_root)
     manifest = source_manifest(source_root)
     operations: list[tuple[str, Path, Path | bytes | None, int | None]] = []
     unchanged = 0
@@ -242,6 +313,35 @@ def install(args: argparse.Namespace) -> int:
             operations.append(("update", destination, source, None))
         else:
             operations.append(("create", destination, source, None))
+
+    # M6-07: a minimal managed CLAUDE.md. Existing byte-identical content is
+    # accepted; an unmarked user file is never replaced (even with --force);
+    # a marked managed file may only be upgraded explicitly with --force.
+    claude_file = validate_destination_path(target, Path("CLAUDE.md"))
+    if claude_file.exists():
+        if not claude_file.is_file():
+            raise InstallError(f"CLAUDE.md is not a regular file: {claude_file}")
+        existing_claude = claude_file.read_bytes()
+        if existing_claude == CLAUDE_INSTRUCTIONS:
+            unchanged += 1
+        else:
+            is_managed = CLAUDE_MARKER in existing_claude.splitlines()[:3]
+            if not is_managed:
+                raise InstallError(
+                    f"user-owned CLAUDE.md conflicts with TeamCraft: {claude_file}; "
+                    "move it yourself or install into a different project"
+                )
+            if not args.force:
+                raise InstallError(
+                    f"managed file differs: {claude_file}\n"
+                    "rerun with --force to replace TeamCraft-managed files"
+                )
+            operations.append((
+                "update", claude_file, CLAUDE_INSTRUCTIONS,
+                stat.S_IMODE(claude_file.stat().st_mode),
+            ))
+    else:
+        operations.append(("create", claude_file, CLAUDE_INSTRUCTIONS, 0o644))
 
     template = source_root / "opencode.example.json"
     local_config = validate_destination_path(target, Path("opencode.json"))

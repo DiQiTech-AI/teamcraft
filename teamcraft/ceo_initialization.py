@@ -27,6 +27,14 @@ CEO_STATES = frozenset({
 })
 MAX_AGENT_CLAIM_BYTES = 16 * 1024
 DEFAULT_NONCE_TTL_SECONDS = 300
+#: Harnesses whose CEO protocol/Skill discovery contract is understood.
+#: Codex/OpenCode read the canonical ``.agents/skills/teamcraft-ceo`` tree and
+#: Claude reads the installer-managed byte-identical
+#: ``.claude/skills/teamcraft-ceo`` copy, all under the same immutable
+#: version/hash pin.  Admission here means only that the protocol and identity
+#: contract can be resolved; Claude's real adapter leg is still pending (PG-1)
+#: and an initialization record never implies that a live Claude run occurred.
+SUPPORTED_CEO_HARNESSES = frozenset({"codex", "opencode", "claude"})
 
 
 class CEOInitializationError(TeamCraftError):
@@ -89,6 +97,28 @@ def _json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _discover_protocol(
+    project_root: str | Path, harness: str, *,
+    expected_version: str | None = None,
+    expected_sha256: str | None = None,
+) -> ceo_protocol.ProtocolSnapshot:
+    """Read the installed CEO protocol artifact for an allowlisted Harness.
+
+    The Harness name is passed straight through to
+    ``ceo_protocol.discover_protocol``: Codex/OpenCode resolve the canonical
+    ``.agents/skills/teamcraft-ceo`` tree and Claude resolves the
+    installer-managed byte-identical ``.claude/skills/teamcraft-ceo`` copy.
+    Every allowlisted Harness must still satisfy the same immutable
+    version/hash pin, unknown Harnesses stay rejected, and no Harness falls
+    back to another Harness's tree.  This is protocol/identity resolution
+    only; it is not evidence that a live Claude run occurred.
+    """
+    return ceo_protocol.discover_protocol(
+        project_root, harness,
+        expected_version=expected_version, expected_sha256=expected_sha256,
+    )
 
 
 def _record(row: Any) -> CEOInitialization:
@@ -187,7 +217,7 @@ def _ceo_bindings(
             f"project must have exactly one canonical CEO member; found {sorted(names)!r}"
         )
     row = rows[0]
-    if str(row[1]) not in {"codex", "opencode"}:
+    if str(row[1]) not in SUPPORTED_CEO_HARNESSES:
         raise CEOInitializationError("CEO Harness has no supported protocol discovery contract")
     if (row[4] is None or row[5] is None or not str(row[5]).strip()
             or row[3] is None or row[8] is None or str(row[3]) != str(row[8])):
@@ -286,7 +316,7 @@ def discover_and_issue(
                 )
             refresh_existing = True
         try:
-            protocol = ceo_protocol.discover_protocol(
+            protocol = _discover_protocol(
                 bindings["project_root"], bindings["harness"],
                 expected_version=bindings["protocol_version"],
                 expected_sha256=bindings["protocol_hash"],
@@ -420,7 +450,7 @@ def mark_bootstrap_unknown(
             # Re-read both protocol artifacts at the effect admission boundary.
             # The immutable Attempt pin alone cannot detect files changed after
             # discover_and_issue() returned its challenge.
-            protocol = ceo_protocol.discover_protocol(
+            protocol = _discover_protocol(
                 bindings["project_root"], bindings["harness"],
                 expected_version=record.protocol_version,
                 expected_sha256=record.protocol_hash,
@@ -534,7 +564,7 @@ def record_bootstrap_submitted_assumed(
                 or bindings["protocol_hash"] != record.protocol_hash
                 or project_task_snapshot_digest(conn, project_id) != record.snapshot_digest):
             raise CEOInitializationGateClosed("CEO bootstrap bindings drifted before assumed acceptance")
-        protocol = ceo_protocol.discover_protocol(
+        protocol = _discover_protocol(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version, expected_sha256=record.protocol_hash,
         )
@@ -706,7 +736,7 @@ def reconcile_bootstrap_submitted_native_session(
                 "bootstrap Prompt was not submitted within its challenge lifetime"
             )
 
-        protocol = ceo_protocol.discover_protocol(
+        protocol = _discover_protocol(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version,
             expected_sha256=record.protocol_hash,
@@ -938,7 +968,7 @@ def record_bootstrap_submitted_live_process(
                 "live Harness process did not start strictly before the submitted bootstrap; "
                 "refusing retroactive adoption"
             )
-        protocol = ceo_protocol.discover_protocol(
+        protocol = _discover_protocol(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version,
             expected_sha256=record.protocol_hash,
@@ -1156,7 +1186,7 @@ def require_initialized(
             or bindings["protocol_hash"] != record.protocol_hash):
         raise CEOInitializationGateClosed("CEO initialization identity drifted; dispatch is blocked")
     try:
-        protocol = ceo_protocol.discover_protocol(
+        protocol = _discover_protocol(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version, expected_sha256=record.protocol_hash,
         )

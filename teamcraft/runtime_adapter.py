@@ -754,7 +754,13 @@ def _maintain_lineage(conn: TeamCraftConnection, state: dict[str, Any],
 
 
 def _discover_member_protocol(state: dict[str, Any], member: dict[str, Any]):
-    """Return the current immutable CEO protocol snapshot for new Attempts."""
+    """Return the current immutable CEO protocol snapshot for new Attempts.
+
+    The member ``kind`` selects the installed Skill tree
+    (``codex``/``opencode`` -> ``.agents``, ``claude`` -> ``.claude``); the
+    protocol version/hash contract is identical for every harness, and an
+    unknown kind remains a fail-closed ``NEEDS_HUMAN`` condition.
+    """
     if member.get("role") != "ceo":
         return None
     try:
@@ -766,7 +772,12 @@ def _discover_member_protocol(state: dict[str, Any], member: dict[str, Any]):
 
 
 def _verify_member_protocol(state: dict[str, Any], member: dict[str, Any], attempt: Any) -> None:
-    """Fail closed before further lifecycle progress if a CEO pin is absent or changed."""
+    """Fail closed before further lifecycle progress if a CEO pin is absent or changed.
+
+    Verification re-discovers through the member's harness root, so a Claude
+    CEO Attempt is checked against the managed ``.claude`` copy with the same
+    no-relaxation pin semantics as Codex/OpenCode.
+    """
     if member.get("role") != "ceo":
         return
     if not attempt.protocol_version or not attempt.protocol_hash:
