@@ -404,7 +404,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M6-03 脱敏诊断包（本地 Python 接口；见 12.31）**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
 | **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
-| **M6-06 Claude 适配与跨 Harness 真实 E2E**；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
+| **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07，保持 pending:PG-1）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
 **M6 退出门禁**：P2 项逐项独立发布；跨 Harness E2E 按实际版本和真实运行证据验收，未安装 Claude 时明确未验证；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源或第二份 CEO 协议。
 
@@ -1286,3 +1286,18 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 **编辑方式说明**：Herdr TUI 派工本身是真实提交（`state=submitted`，身份绑定）。由于该 TUI 会话的第二回合经本地 Responses bridge 超出 oMLX 上下文上限（502），声明的变更由**同一 attempt worktree 内的 `codex exec`** 真实执行补出。两者都是真实 Codex 执行；未伪造。证据副本：`.teamcraft/hg-f-2026-11-27-codex/`。
 
 **结论**：Codex 的 init → dispatch → Wake → verify → local-only deliver 全链路证据已齐（带上述编辑方式 caveat）；DONE 仍需 human accept（M4-04）。配合 OpenCode PASS 与 Claude 的 Path B 延期，M6-06 可在 Owner 接受该 caveat 后关闭。
+
+### 12.45 M6-06 关闭登记（路径 B，2026-11-27）
+
+**Owner 决定**：接受 Codex local-only leg 的编辑方式 caveat，并按路径 B 将 Claude 适配延期到 M6-07（保持 `pending:PG-1`）。**M6-06 记为关闭（路径 B）**。
+
+**关闭证据**：
+
+- **OpenCode**：完整 local-only leg PASS（§12.36）——CEO bootstrap + dispatch + Wake + verify + commit `10bb55c` + delivery submitted。
+- **Codex**：完整 local-only leg PASS（§12.44）——CEO bootstrap + dispatch + Wake + verify + commit `8ff7b62` + delivery submitted；编辑由同一 worktree 的 `codex exec` 补出（Owner 已接受该 caveat）。
+- **Claude**：延期 M6-07，保持 `pending:PG-1`；未声称通过。
+- **协议**：`1.0.0` / `c5c358bf…a742`；现有副本 21/21 MATCH；`.claude` 未安装，保持 pending。
+- **Mock/真实分栏**：本节只登记真实 harness 证据；Mock/Fake 不计为真实。
+- `prompt_ack=unknown`、`host_trusted_receipt=false` 保持不变；DONE 仍需 human accept（M4-04）。
+
+**后续**：M6-07（Claude 适配 + 真实 leg）；`scripts/m606_responses_proxy.py` 是本地测试桥，不进入生产运行时。
