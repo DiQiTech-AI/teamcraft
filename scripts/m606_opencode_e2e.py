@@ -991,7 +991,11 @@ class Herdr:
             for state in until:
                 argv += ["--until", state]
             argv += ["--timeout", str(timeout_ms)]
-        code, out = self.run(*argv)
+        # ``--wait --timeout`` may legitimately run for minutes; the subprocess
+        # transport timeout must exceed the Herdr wait, or Python kills it and
+        # the submit is misclassified as unknown.
+        code, out = self.run(
+            *argv, timeout=(timeout_ms / 1000.0) + 60.0 if wait else 30.0)
         after = self.identity(target, expected_agent=expected_agent)
 
         # Classify herdr's documented refusal/stall outcomes by observation.
@@ -2365,7 +2369,10 @@ class M606LiveRun:
         transport = ("submitted" if submit["returncode"] == 0
                      and observation == "accepted" else "unknown")
         submit["state"] = transport
-        after = self.herdr.identity(gate["pane_id"])
+        after = self.herdr.identity(
+            gate["pane_id"],
+            expected_agent=getattr(self.args, "ceo_agent", None)
+            or self.args.herdr_agent)
         same_occupant = after.get("session_id") == gate["session_id"]
         ev.write("ceo-submit.json", {
             **submit, "pane_gate": gate, "post_submit_identity": after,
@@ -2757,7 +2764,11 @@ class M606LiveRun:
         # honest deferral and leave the durable Wake pending.
         deadline = time.monotonic() + 120.0
         while True:
-            status = self.herdr.identity(self.args.ceo_pane).get("agent_status")
+            status = self.herdr.identity(
+                self.args.ceo_pane,
+                expected_agent=getattr(self.args, "ceo_agent", None)
+                or self.args.herdr_agent,
+            ).get("agent_status")
             if status in SETTLED_STATUSES:
                 break
             if time.monotonic() >= deadline:

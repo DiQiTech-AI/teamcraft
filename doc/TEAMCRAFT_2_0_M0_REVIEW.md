@@ -1252,3 +1252,20 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 4. 接受 Codex 为 pending，按显式范围决策关闭（与路径 B 的“2/3 真实 leg”不一致）。
 
 **边界**：本轮未发送 Codex 任务 prompt、无交付证据、未伪造；M6-06 仍未完全关闭。
+
+### 12.43 Codex 跨 harness 真实派工 PASS（delivery 待补，2026-11-27）
+
+**突破**：通过本地 `/v1/responses` → oMLX `/v1/chat/completions` 桥接代理（`scripts/m606_responses_proxy.py`），Codex 0.172.0 TUI 可稳定使用 oMLX。本轮真实运行 **Codex worker + OpenCode CEO**：
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| PG-7 CEO bootstrap（OpenCode） | PASS | `ceo-bootstrap`：`state=initialized`、`receipt_source=assumed_default`、`identity_mode=native`、`gate_open_for_wake=true` |
+| Codex worker 派工 | PASS | `dispatch`：`state=submitted`、`agent=codex`、`session=01a21cf3-…`、`prompt_ack=unknown`、`returncode=0`、`session_stable=true`、`topology_unchanged=true` |
+| Wake 投递 | PASS | `wake`：`transport=delivered`、`outcome=submitted`、`ceo_acknowledged=false` |
+| 验证/交付 | **未完成** | worker 未写入 `src/feature.py`；后续编辑 prompt 经代理返回 `502`（上下文/上游限制），无法生成 diff |
+
+**本轮 runner 修复**：
+- `--ceo-agent` 应用到 CEO 提交后的 `identity()` 与 Wake 等待；
+- `Herdr.submit` 的子进程超时改为大于 `--wait --timeout`，避免 `TimeoutExpired` 被误判为 unknown。
+
+**证据副本**：`.teamcraft/hg-f-2026-11-27-codex/`。**边界**：本轮未伪造 worker 变更或交付证据；`prompt_ack=unknown`/`host_trusted_receipt=false` 保持。Codex 的 init/dispatch/Wake 已真实通过；verify/deliver 仍需 worker 产出变更（建议新会话/减小上下文或换更可靠的编辑模型）后 `--post-dispatch` 完成。M6-06 仍未完全关闭。
