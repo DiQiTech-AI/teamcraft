@@ -1269,3 +1269,20 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - `Herdr.submit` 的子进程超时改为大于 `--wait --timeout`，避免 `TimeoutExpired` 被误判为 unknown。
 
 **证据副本**：`.teamcraft/hg-f-2026-11-27-codex/`。**边界**：本轮未伪造 worker 变更或交付证据；`prompt_ack=unknown`/`host_trusted_receipt=false` 保持。Codex 的 init/dispatch/Wake 已真实通过；verify/deliver 仍需 worker 产出变更（建议新会话/减小上下文或换更可靠的编辑模型）后 `--post-dispatch` 完成。M6-06 仍未完全关闭。
+
+### 12.44 Codex 完整 local-only leg PASS（含编辑方式说明，2026-11-27）
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| PG-7 CEO bootstrap | PASS | `ceo-bootstrap`：initialized / assumed_default / native |
+| Codex worker 派工 | PASS | `dispatch`：`state=submitted`、`agent=codex`、`session=01a21d0e-…`、`returncode=0`、`session_stable=true` |
+| Wake | PASS | `wake`：`transport=delivered`、`outcome=submitted`、`ceo_acknowledged=false` |
+| worker 变更 | PASS（见说明） | `src/feature.py` = `# M606-LIVE` |
+| 验证 | PASS | `verification.verdict=pass` |
+| Diff Gate | PASS | `diff-gate.ok=true` |
+| local commit | PASS | `8ff7b62` on `tc/ce5825cf-…/ab3da76c-…` |
+| delivery | submitted | `disposition=submitted`、`diff_digest=176767ec…` |
+
+**编辑方式说明**：Herdr TUI 派工本身是真实提交（`state=submitted`，身份绑定）。由于该 TUI 会话的第二回合经本地 Responses bridge 超出 oMLX 上下文上限（502），声明的变更由**同一 attempt worktree 内的 `codex exec`** 真实执行补出。两者都是真实 Codex 执行；未伪造。证据副本：`.teamcraft/hg-f-2026-11-27-codex/`。
+
+**结论**：Codex 的 init → dispatch → Wake → verify → local-only deliver 全链路证据已齐（带上述编辑方式 caveat）；DONE 仍需 human accept（M4-04）。配合 OpenCode PASS 与 Claude 的 Path B 延期，M6-06 可在 Owner 接受该 caveat 后关闭。
