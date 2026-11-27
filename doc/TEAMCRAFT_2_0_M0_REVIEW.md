@@ -1221,3 +1221,15 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - 未发送 Codex 任务 prompt、无交付证据；未伪造。
 
 **结论**：Codex leg 的剩余阻塞是 **oMLX `/v1/responses` 的稳定性/并发能力**，不是 runner 逻辑。runner 的 harness-aware 适配已就绪；需要在更稳定的本地 Responses provider（或 oMLX 修复/限流）上重跑 Codex dispatch → Wake → verify → deliver。M6-06 仍未完全关闭。
+
+### 12.41 Codex TUI 单会话 502（2026-11-27）
+
+在同一 oMLX 服务上继续验证：
+
+- `curl` 的 `/v1/responses` 流式请求可正常返回 `response.created`。
+- `codex exec` 的短请求可正常返回 `OK`。
+- 但 **单个 Codex TUI 会话**（无第二个模型会话）的 `/v1/responses` 请求持续 `502 Bad Gateway`（多次 `Reconnecting 5/5`）。
+
+结论：当前 oMLX 服务对 Codex TUI 的请求形状/负载不可用（可能服务状态退化、模型实例泄漏或 TUI 工具/系统提示过大）。这不是 runner 逻辑问题；runner 的 harness-aware 适配（settled、CEO kind、`--ceo-agent`、可配置超时）已就绪并推送。
+
+**下一步**：重启/升级 oMLX，或换用稳定的本地 Responses provider（或加一个 `/v1/responses` 代理），然后重跑 Codex dispatch → Wake → verify → deliver。M6-06 仍未完全关闭；本轮未发送 Codex 任务 prompt、无交付证据、未伪造。
