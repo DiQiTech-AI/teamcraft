@@ -84,6 +84,16 @@ try:  # M4-04 module; a pre-M4-04 bundled core may not carry it.
 except ImportError:  # pragma: no cover - only with a stale bundled core
     _delivery = None
 
+try:  # M5-01 module; kept optional for a stale bundled core.
+    from teamcraft import providers as _providers  # noqa: E402
+except ImportError:  # pragma: no cover - only with a stale bundled core
+    _providers = None
+
+try:  # M5-02 dispatch wiring; a stale bundled core has no route path.
+    from teamcraft import dispatch_routing as _dispatch_routing  # noqa: E402
+except ImportError:  # pragma: no cover - only with a stale bundled core
+    _dispatch_routing = None
+
 
 STATE_VERSION = 1
 RUNTIME_DIRECTORY_NAME = ".teamcraft"
@@ -2080,11 +2090,292 @@ def prepare_launch_brief_options(
     return template_id, values
 
 
+ROUTE_RISK_LEVELS = ("normal", "high", "critical")
+
+
+def _require_routing_core() -> None:
+    if _providers is None or _dispatch_routing is None:
+        raise TeamctlError(
+            "routing requires a current TeamCraft core with M5-01/M5-02"
+            " providers/dispatch_routing; refresh the bundled core"
+        )
+
+
+def _route_requested(args: argparse.Namespace) -> bool:
+    """True only when the caller explicitly opted into routing.
+
+    ``--route-risk`` and ``--route-tag`` imply ``--route`` exactly as the
+    documented contract says.  No other launch flag enables routing.
+    """
+
+    return bool(
+        getattr(args, "route", False)
+        or getattr(args, "route_risk", None) is not None
+        or getattr(args, "route_tag", None)
+    )
+
+
+def _route_modifier_requested(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, name, None) is not None
+        for name in ("route_catalog", "route_actor", "route_override_reason")
+    )
+
+
+def _validate_route_launch_args(args: argparse.Namespace) -> None:
+    """Refuse route/override shapes before any project or Herdr side effect."""
+
+    if args.kind != "opencode":
+        raise TeamctlError("--route requires --kind opencode")
+    explicit = getattr(args, "opencode_model", None)
+    reason = getattr(args, "route_override_reason", None)
+    actor = getattr(args, "route_actor", None)
+    if explicit is not None:
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", explicit):
+            raise TeamctlError("--opencode-model must use provider/model format")
+        if reason is None or not reason.strip():
+            raise TeamctlError(
+                "routing with an explicit --opencode-model is a manual"
+                " override and requires --route-override-reason"
+            )
+    else:
+        if reason is not None:
+            raise TeamctlError(
+                "--route-override-reason requires an explicit --opencode-model"
+            )
+        if actor is not None:
+            raise TeamctlError(
+                "--route-actor requires an explicit --opencode-model override"
+            )
+
+
+def _route_catalog_path(args: argparse.Namespace, root: Path) -> Path:
+    supplied = getattr(args, "route_catalog", None)
+    if supplied is None:
+        return root / RUNTIME_DIRECTORY_NAME / _dispatch_routing.CATALOG_FILENAME
+    path = Path(supplied).expanduser()
+    return path if path.is_absolute() else (root / path)
+
+
+def _decide_launch_route(
+    args: argparse.Namespace, root: Path,
+) -> Any:
+    """Resolve catalog + probes and decide BEFORE reserve/split.
+
+    Raises :class:`TeamctlError` on every failure; there is no fallback to the
+    explicit or default model.
+    """
+
+    _require_routing_core()
+    catalog_path = _route_catalog_path(args, root)
+    try:
+        catalog = _dispatch_routing.load_catalog(catalog_path)
+    except _CoreError as exc:
+        raise TeamctlError(f"route catalog {catalog_path}: {exc}") from exc
+    except Exception as exc:
+        raise TeamctlError(f"route catalog {catalog_path}: {exc}") from exc
+
+    explicit = getattr(args, "opencode_model", None)
+    override = None
+    if explicit is not None:
+        provider, _, model = explicit.partition("/")
+        actor = (
+            getattr(args, "route_actor", None)
+            or os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or "teamctl"
+        )
+        reason = getattr(args, "route_override_reason", None)
+        try:
+            override = _dispatch_routing.router.ManualOverride(
+                selection=_dispatch_routing.router.RouteSelection(
+                    args.kind, provider, model,
+                ),
+                actor=actor,
+                reason=reason or "",
+            )
+        except _CoreError as exc:
+            raise TeamctlError(f"route override is invalid: {exc}") from exc
+
+    store = StateStore(root)
+    conn = store._connect()
+    try:
+        project_id = _adapter.project_id_for_root(conn, str(root))
+        if project_id is None:
+            raise TeamctlError(
+                "routing requires an initialized TeamCraft project with"
+                " capability probes; run teamctl providers-probe first"
+            )
+        try:
+            outcome = _dispatch_routing.decide(
+                conn, project_id, catalog=catalog,
+                risk=getattr(args, "route_risk", None) or "normal",
+                tags=tuple(getattr(args, "route_tag", None) or ()),
+                override=override,
+            )
+        except _dispatch_routing.RouteUnavailable as exc:
+            raise TeamctlError(str(exc)) from exc
+        except _CoreError as exc:
+            raise TeamctlError(f"route decision failed: {exc}") from exc
+        except Exception as exc:
+            raise TeamctlError(f"route decision failed: {exc}") from exc
+    finally:
+        conn.close()
+
+    selection = outcome.decision.selection
+    if selection is None or selection.harness != args.kind:
+        raise TeamctlError(
+            "routed harness does not match the launch kind"
+            f" ({None if selection is None else selection.harness!r} != {args.kind!r})"
+        )
+    if explicit is not None:
+        audit = outcome.decision.override_audit
+        if (
+            outcome.decision.reason_code != "selected_manual_override"
+            or audit is None or not audit.applied
+        ):
+            raise TeamctlError(
+                "route override was not applied after the routing gates;"
+                " refusing to launch"
+            )
+        if outcome.opencode_model != explicit:
+            raise TeamctlError(
+                "route override selection does not match --opencode-model"
+            )
+    return outcome
+
+
+def _commit_launch_route(
+    root: Path, member: dict[str, Any], outcome: Any,
+) -> None:
+    """Bind the started Attempt's capabilities before the prompt is sent."""
+
+    _require_routing_core()
+    attempt_id = member.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise TeamctlError(
+            "routing requires a dispatched Attempt before the prompt;"
+            " refusing to continue without a committed route"
+        )
+    store = StateStore(root)
+    conn = store._connect()
+    try:
+        try:
+            _dispatch_routing.commit(conn, attempt_id, outcome)
+        except TeamctlError:
+            raise
+        except _CoreError as exc:
+            raise TeamctlError(
+                f"route decision could not be committed for Attempt"
+                f" {attempt_id}: {exc}; resume {member.get('name')} before"
+                " retrying (no prompt was sent)"
+            ) from exc
+        except Exception as exc:
+            raise TeamctlError(
+                f"route decision could not be committed for Attempt"
+                f" {attempt_id}: {exc}; resume {member.get('name')} before"
+                " retrying (no prompt was sent)"
+            ) from exc
+    finally:
+        conn.close()
+
+
+def providers_probe(args: argparse.Namespace) -> int:
+    """Probe local harnesses + oMLX and durably record capability snapshots."""
+
+    if _providers is None:
+        raise TeamctlError(
+            "providers-probe requires a current TeamCraft core with M5-01"
+            " providers; refresh the bundled core"
+        )
+    root = resolve_project_root(getattr(args, "cwd", None))
+    store = StateStore(root)
+    project_id = store.ensure_project()
+    conn = store._connect()
+    snapshots: list[dict[str, Any]] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    try:
+        for name in getattr(args, "harness", None) or ["opencode"]:
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                snapshot = _providers.probe_harness(name, root)
+                _providers.record_capability_probe(conn, project_id, snapshot)
+            except _CoreError as exc:
+                raise TeamctlError(f"cannot probe harness {name}: {exc}") from exc
+            item = {
+                "kind": snapshot.entity_type,
+                "name": snapshot.name,
+                "health": snapshot.health,
+                "reason": snapshot.reason_code,
+                "version": snapshot.version,
+                "models": list(snapshot.models),
+                "snapshot_digest": snapshot.snapshot_digest,
+                "probed": name != "claude",
+            }
+            if name == "claude":
+                # No runner is injected here by design: record the historical
+                # static unsupported/adapter_pending snapshot, never spawn.
+                item["probe"] = "static_policy"
+                item["probe_note"] = (
+                    "not probed: static unsupported/adapter_pending snapshot"
+                )
+                notes.append(
+                    "claude was not probed; a static unsupported/adapter_pending"
+                    " snapshot was recorded"
+                )
+            snapshots.append(item)
+
+        try:
+            omlx = _providers.probe_omlx(
+                getattr(args, "omlx_url", "http://127.0.0.1:8000/v1")
+            )
+            _providers.record_capability_probe(conn, project_id, omlx)
+        except _CoreError as exc:
+            raise TeamctlError(f"cannot probe oMLX: {exc}") from exc
+        snapshots.append({
+            "kind": omlx.entity_type,
+            "name": omlx.name,
+            "health": omlx.health,
+            "reason": omlx.reason_code,
+            "version": omlx.version,
+            "models": list(omlx.models),
+            "snapshot_digest": omlx.snapshot_digest,
+            "probed": True,
+        })
+    finally:
+        conn.close()
+    output: dict[str, Any] = {
+        "project_id": project_id,
+        "snapshots": snapshots,
+    }
+    if notes:
+        output["notes"] = notes
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _launch_operation(args: argparse.Namespace) -> int:
+    # Routing is opt-in.  A modifier without the switch is refused rather than
+    # silently ignored; the no-route* path below is the historical path.
+    routed = _route_requested(args)
+    if not routed and _route_modifier_requested(args):
+        raise TeamctlError(
+            "--route-catalog/--route-actor/--route-override-reason require --route"
+        )
+    if routed:
+        # Kind, explicit-model override and reason shape are checked before
+        # resolving the project or touching Herdr.
+        _validate_route_launch_args(args)
     # Resolve the project FIRST (read-only) so an explicit ``--cwd`` decides
     # which template store is authoritative; validating brief options before
     # this would silently bind the launch to the caller's current directory.
     root, task, responsibility, ownership = validate_common_launch(args)
+    # Catalog parsing, probe reads and the decision all happen before any
+    # reserve/split effect.  Any failure here dispatches nothing.
+    route_outcome = _decide_launch_route(args, root) if routed else None
     brief_template, brief_values = prepare_launch_brief_options(
         args, project_root=root)
     brief_store_dir = (
@@ -2093,6 +2384,8 @@ def _launch_operation(args: argparse.Namespace) -> int:
     )
     require_herdr()
     model = getattr(args, "opencode_model", None)
+    if route_outcome is not None:
+        model = route_outcome.opencode_model
     agent_args = launch_agent_args(args.role, args.kind, args.agent_arg)
     if model is not None:
         if args.kind != "opencode":
@@ -2135,6 +2428,11 @@ def _launch_operation(args: argparse.Namespace) -> int:
         reserve_member(store, session, member, lease=lease)
         member = split_for_member(member, store, session, lease=lease)
         member = start_member(member, store, session, lease=lease)
+        if route_outcome is not None:
+            # The Started Attempt exists now.  Bind its immutable capability
+            # selection and append route.decided BEFORE any prompt transport;
+            # a failure must stop here so resume can recover the member.
+            _commit_launch_route(root, member, route_outcome)
         set_member_pane_label(member, getattr(args, "label", None))
         member = prompt_member(
             member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
@@ -2144,6 +2442,12 @@ def _launch_operation(args: argparse.Namespace) -> int:
         with store.locked() as state:
             assert state is not None
             output = member_output(state, member)
+        if route_outcome is not None:
+            output["route"] = {
+                "model": route_outcome.opencode_model,
+                "reason_code": route_outcome.decision.reason_code,
+                "decision_digest": route_outcome.decision_digest,
+            }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return 0
     finally:
@@ -5090,6 +5394,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--opencode-model", metavar="PROVIDER/MODEL",
         help="set a pane-local OpenCode model using a private server",
     )
+    launch_parser.add_argument(
+        "--route", action="store_true",
+        help="opt in to catalog/probe based Harness/Provider/Model routing",
+    )
+    launch_parser.add_argument(
+        "--route-risk", choices=ROUTE_RISK_LEVELS, default=None,
+        help="routing risk (implies --route; default normal)",
+    )
+    launch_parser.add_argument(
+        "--route-tag", action="append", default=[], metavar="TAG",
+        help="routing task tag (repeatable; implies --route)",
+    )
+    launch_parser.add_argument(
+        "--route-catalog", metavar="PATH", default=None,
+        help="route catalog (default <cwd>/.teamcraft/routes.json)",
+    )
+    launch_parser.add_argument(
+        "--route-actor", default=None,
+        help="manual override actor (default $USER)",
+    )
+    launch_parser.add_argument(
+        "--route-override-reason", default=None, metavar="TEXT",
+        help="required reason when routing with an explicit --opencode-model",
+    )
     launch_parser.add_argument("--start-timeout-ms", type=int, default=30_000)
     launch_parser.add_argument("--wait", action="store_true")
     launch_parser.add_argument("--timeout-ms", type=int, default=120_000)
@@ -5108,6 +5436,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit full pane label (defaults to auto-derived '<role> · <task>')",
     )
     launch_parser.set_defaults(handler=launch)
+
+    providers_probe_parser = commands.add_parser(
+        "providers-probe",
+        help="probe harnesses and oMLX, then record capability snapshots",
+    )
+    providers_probe_parser.add_argument(
+        "--harness", action="append", default=[],
+        choices=("opencode", "codex", "claude"),
+        help="harness to probe (repeatable; default opencode)",
+    )
+    providers_probe_parser.add_argument(
+        "--omlx-url", default="http://127.0.0.1:8000/v1",
+        help="loopback oMLX base URL",
+    )
+    add_cwd(providers_probe_parser)
+    providers_probe_parser.set_defaults(handler=providers_probe)
 
     resume_parser = commands.add_parser("resume")
     resume_parser.add_argument("name")

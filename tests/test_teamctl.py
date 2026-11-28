@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
@@ -888,6 +889,250 @@ class StopEvidenceNoPaneTests(unittest.TestCase):
             TEAMCTL, "_herdr_adapter", return_value=adapter
         ), self.assertRaisesRegex(TEAMCTL.TeamctlError, "still appears"):
             TEAMCTL._stop_evidence(self._member(), require_live_agent=False)
+
+
+class _RoutingFakeStore:
+    """Only the StateStore surface _launch_operation touches in these tests."""
+
+    def __init__(self) -> None:
+        self.released = []
+
+    def acquire_lease(self, name, ttl_seconds):
+        return object()
+
+    def release_lease(self, lease) -> None:
+        self.released.append(lease)
+
+    def require_ceo_initialized(self) -> None:
+        return None
+
+    @contextlib.contextmanager
+    def locked(self):
+        yield {"team_id": "team-m502-routing"}
+
+
+class TeamctlRoutingM502Tests(unittest.TestCase):
+    """Opt-in routing must be fail-closed and inert on the default path."""
+
+    def setUp(self) -> None:
+        self.root = str(Path(tempfile.mkdtemp(prefix="tc-route-")).resolve())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        fresh_start.initialize_project_root(self.root)
+        self.db_path = Path(self.root) / ".teamcraft" / "teamcraft.db"
+
+    def _args(self, *, kind="opencode", extra=()):
+        return TEAMCTL.build_parser().parse_args([
+            "launch", "--role", "developer", "--kind", kind,
+            "--name", "dev1", "--task", "route wiring",
+            "--ownership", "src/**", "--cwd", self.root, *extra,
+        ])
+
+    def _route_event_count(self) -> int:
+        conn = storage.connect(str(self.db_path))
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'route.decided'"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    def _snapshot(self, entity_type, name, *, models=(), health="healthy",
+                  reason="ok"):
+        now = datetime.now(timezone.utc)
+        from teamcraft import providers
+        return providers.CapabilitySnapshot(
+            entity_type, name, "1.0",
+            "openai_compatible" if entity_type == "provider" else None,
+            tuple(models), {"skill_rules": "supported"},
+            {"inference_request": "supported"}, health, reason, "test",
+            (now - timedelta(seconds=1)).isoformat(),
+            (now + timedelta(seconds=300)).isoformat(),
+        )
+
+    def test_providers_probe_records_all_and_marks_claude_unprobed(self) -> None:
+        harness_snapshots = {
+            "opencode": self._snapshot("harness", "opencode"),
+            "claude": self._snapshot(
+                "harness", "claude", health="unsupported",
+                reason="adapter_pending",
+            ),
+        }
+        omlx = self._snapshot("provider", "omlx", models=("qwen3:8b",))
+        out = io.StringIO()
+        with mock.patch.object(
+            TEAMCTL._providers, "probe_harness",
+            side_effect=lambda name, root: harness_snapshots[name],
+        ) as probe_harness, mock.patch.object(
+            TEAMCTL._providers, "probe_omlx", return_value=omlx,
+        ):
+            with contextlib.redirect_stdout(out):
+                code = TEAMCTL.main([
+                    "providers-probe", "--harness", "opencode",
+                    "--harness", "claude", "--cwd", self.root,
+                ])
+        self.assertEqual(code, 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual(
+            [item["name"] for item in result["snapshots"]],
+            ["opencode", "claude", "omlx"],
+        )
+        claude = result["snapshots"][1]
+        self.assertFalse(claude["probed"])
+        self.assertEqual(claude["reason"], "adapter_pending")
+        self.assertIn("not probed", claude["probe_note"])
+        self.assertIn("claude was not probed", result["notes"][0])
+        for item in result["snapshots"]:
+            for key in ("kind", "name", "health", "reason", "version",
+                        "models", "snapshot_digest"):
+                self.assertIn(key, item)
+        self.assertEqual(probe_harness.call_args_list[0].args[0], "opencode")
+        self.assertEqual(probe_harness.call_args_list[1].args[0], "claude")
+
+    def _member(self):
+        return {
+            "name": "dev1", "role": "developer", "kind": "opencode",
+            "phase": "agent_started", "live_state": "idle", "read_only": False,
+            "ownership": ["src/**"], "pane_id": "w1:p2",
+            "terminal_id": "term-2", "attempt_id": "att-route",
+        }
+
+    def _patch_lifecycle(self, member):
+        patches = {
+            "StateStore": mock.patch.object(
+                TEAMCTL, "StateStore", return_value=_RoutingFakeStore()
+            ),
+            "current_session_identity": mock.patch.object(
+                TEAMCTL, "current_session_identity", return_value={}
+            ),
+            "require_herdr": mock.patch.object(TEAMCTL, "require_herdr"),
+            "preflight_kind": mock.patch.object(TEAMCTL, "preflight_kind"),
+            "ensure_live_name_available": mock.patch.object(
+                TEAMCTL, "ensure_live_name_available"
+            ),
+            "resolve_pane": mock.patch.object(
+                TEAMCTL, "resolve_pane", return_value={"pane_id": "w1:p1"}
+            ),
+            "reserve_member": mock.patch.object(
+                TEAMCTL, "reserve_member", return_value=member
+            ),
+            "split_for_member": mock.patch.object(
+                TEAMCTL, "split_for_member", return_value=member
+            ),
+            "start_member": mock.patch.object(
+                TEAMCTL, "start_member", return_value=member
+            ),
+            "set_member_pane_label": mock.patch.object(
+                TEAMCTL, "set_member_pane_label"
+            ),
+            "prompt_member": mock.patch.object(
+                TEAMCTL, "prompt_member", return_value=member
+            ),
+            "opencode_config_content": mock.patch.object(
+                TEAMCTL, "opencode_config_content", return_value="{}"
+            ),
+        }
+        return patches
+
+    def test_route_requires_opencode_kind_before_any_effect(self) -> None:
+        args = self._args(kind="codex", extra=["--route"])
+        with mock.patch.object(TEAMCTL, "reserve_member") as reserve, \
+                mock.patch.object(TEAMCTL, "split_for_member") as split:
+            with self.assertRaisesRegex(
+                TEAMCTL.TeamctlError, "--route requires --kind opencode"
+            ):
+                TEAMCTL._launch_operation(args)
+        reserve.assert_not_called()
+        split.assert_not_called()
+
+    def test_missing_catalog_fails_before_reserve_or_split(self) -> None:
+        args = self._args(extra=["--route"])
+        with mock.patch.object(TEAMCTL, "reserve_member") as reserve, \
+                mock.patch.object(TEAMCTL, "split_for_member") as split:
+            with self.assertRaisesRegex(TEAMCTL.TeamctlError, "route catalog"):
+                TEAMCTL._launch_operation(args)
+        reserve.assert_not_called()
+        split.assert_not_called()
+
+    def test_missing_probes_fails_before_reserve_or_split(self) -> None:
+        catalog = Path(self.root) / ".teamcraft" / "routes.json"
+        catalog.write_text(json.dumps([{
+            "harness": "opencode", "provider": "omlx", "model": "qwen3:8b",
+            "locality": "local", "assurance": 2, "cost_rank": 0,
+        }]), encoding="utf-8")
+        conn = storage.connect(str(self.db_path))
+        try:
+            runtime_adapter.ensure_project(conn, self.root)
+        finally:
+            conn.close()
+        args = self._args(extra=["--route"])
+        with mock.patch.object(TEAMCTL, "reserve_member") as reserve, \
+                mock.patch.object(TEAMCTL, "split_for_member") as split:
+            with self.assertRaisesRegex(TEAMCTL.TeamctlError, "no route selected"):
+                TEAMCTL._launch_operation(args)
+        reserve.assert_not_called()
+        split.assert_not_called()
+
+    def test_override_without_reason_is_refused_before_effects(self) -> None:
+        args = self._args(extra=[
+            "--route", "--opencode-model", "omlx/qwen3:8b",
+        ])
+        with mock.patch.object(TEAMCTL, "reserve_member") as reserve:
+            with self.assertRaisesRegex(
+                TEAMCTL.TeamctlError, "requires --route-override-reason"
+            ):
+                TEAMCTL._launch_operation(args)
+        reserve.assert_not_called()
+
+    def test_default_launch_never_decides_or_commits(self) -> None:
+        member = self._member()
+        patches = self._patch_lifecycle(member)
+        route_core = mock.Mock()
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch)
+                     for name, patch in patches.items()}
+            stack.enter_context(mock.patch.object(
+                TEAMCTL, "_dispatch_routing", route_core
+            ))
+            with contextlib.redirect_stdout(out):
+                code = TEAMCTL._launch_operation(self._args())
+        self.assertEqual(code, 0)
+        route_core.decide.assert_not_called()
+        route_core.commit.assert_not_called()
+        mocks["prompt_member"].assert_called_once()
+        self.assertEqual(self._route_event_count(), 0)
+        # The CLI's machine-readable result must be captured here instead of
+        # leaking into unittest's stdout; exactly one JSON record, no extras.
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(json.loads(lines[0])["name"], "dev1")
+
+    def test_commit_failure_suppresses_prompt(self) -> None:
+        member = self._member()
+        outcome = types.SimpleNamespace(
+            opencode_model="omlx/qwen3:8b",
+            decision=types.SimpleNamespace(reason_code="selected_local_first"),
+            decision_digest="d" * 64,
+        )
+        patches = self._patch_lifecycle(member)
+        with contextlib.ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch)
+                     for name, patch in patches.items()}
+            stack.enter_context(mock.patch.object(
+                TEAMCTL, "_decide_launch_route", return_value=outcome
+            ))
+            stack.enter_context(mock.patch.object(
+                TEAMCTL, "_commit_launch_route",
+                side_effect=TEAMCTL.TeamctlError("route commit refused"),
+            ))
+            with self.assertRaisesRegex(
+                TEAMCTL.TeamctlError, "route commit refused"
+            ):
+                TEAMCTL._launch_operation(self._args(extra=["--route"]))
+        mocks["reserve_member"].assert_called_once()
+        mocks["split_for_member"].assert_called_once()
+        mocks["start_member"].assert_called_once()
+        mocks["prompt_member"].assert_not_called()
 
 
 if __name__ == "__main__":  # pragma: no cover

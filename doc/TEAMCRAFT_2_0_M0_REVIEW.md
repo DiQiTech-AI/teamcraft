@@ -387,7 +387,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M5-01 Harness/Provider 能力注册与健康检查（实现及当前版本本机核验完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode 仅执行隔离的版本探测，oMLX 仅查询 loopback 模型目录，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。2026-11-20 当前版本本机结果：Codex/OpenCode/oMLX 有界探测 healthy，定向测试 9/9 通过，待独立 tester 验收（该独立验收已于 2026-11-28 复验通过，见 §12.51） | 探测结果不证明推理可用；版本/模型名不稳定；文档能力与实机不同 |
-| **M5-02 确定性 Router（实现完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
+| **M5-02 确定性 Router（实现完成，验收通过（2026-11-28；证据见 §12.51）；Router 已接入主 dispatch 并绑定 Attempt 能力快照（见 §12.57）；原证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
 | **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件（两项延期验证结果见 §12.52；升级链路已闭环、真实投递已复现，runner 级 submitted 见 §12.53/§12.54） |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
@@ -1441,6 +1441,8 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 
 **限制声明**：本节不声称真实 oMLX 服务端到端通过、不声称 GitHub Actions 已运行；§9.5 中 M5-01/M5-02 的“验收通过”仅指 D1–D7 修复后的缺陷复现与回归证据成立。历史 12.25/12.26 记录保留不删；上述接入与端到端项在后续里程碑补证。
 
+**后续更新（2026-11-28）**：Router 已接入主 dispatch、Attempt 能力快照已绑定，见 §12.57。
+
 
 ### 12.52 M5-03 延期验证结果（2026-11-28）
 
@@ -1603,3 +1605,43 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - Router 为库级消费（未接入主 dispatch 路径）；无云端臂；GitHub Actions 未运行；roadmap 的正式云端 vs 混合对照实验仍 PENDING。
 
 **限制声明**：登记时代码未提交，上述数字的可复跑基准是**含未提交改动的工作树**，持久性以 CEO 提交为准；§12.29 及其前历史记录保留不删，仅在 §12.29 末尾追加后续更新标记。
+
+### 12.57 Router 接入主 dispatch 与 Attempt 能力快照（2026-11-28）
+
+**登记口径**：本节登记 M5-02 Router 与 M5-01 能力快照从**库级契约**接入主 dispatch 路径的实现、独立验收与本机真实 E2E，闭环 §12.51 残余“Router 决策尚未接入主 dispatch 流程、Attempt 能力快照尚未接入模型选择主流程”的缺口；§12.25/§12.26/§12.51 历史记录保留不删改。代码改动共 4 件——新增 `teamcraft/dispatch_routing.py`、新增 `tests/test_dispatch_routing_m502.py`、修改 `.agents/skills/teamcraft/scripts/teamctl.py` 与 `tests/test_teamctl.py`——登记时**均未提交**（由 CEO 提交），无 Schema 变更；本次登记仅改动本文档，未 commit/push。文档由本地 oMLX `Qwen3.8-Flash-Next-oQ4e-mtp` 撰写。
+
+**背景**：§12.51 复验 PASS 时，`teamcraft/router.py`（纯决策层）与 `teamcraft/providers.py`（能力探测与快照登记）彼此隔离，残余风险明确记为“Router 决策尚未接入主 dispatch、Attempt 能力快照未接入模型选择主流程（仅有显式绑定入口与纯决策原语）”。本轮新增一个刻意窄小的桥接模块 `teamcraft/dispatch_routing.py` 并接通 `teamctl launch`，使路由成为**opt-in、fail-closed** 的主路径能力；默认（不带 `--route`）launch 行为不变。该桥接不探测 harness/provider、不读凭据、不 spawn 进程、不静默回退默认模型。
+
+**实现范围**：
+
+- **catalog（`routes.json`）**：项目自有路由目录（默认 `<root>/.teamcraft/routes.json`，可 `--route-catalog` 指定），严格 schema——字段白名单 `harness|provider|model|locality|assurance|cost_rank`，未知键拒绝而非忽略；`model|provider|harness` 须匹配锚定安全标识符正则，**拒绝含 `/`、空白或空串**（因 launch 路径以 `provider/model` 拼接，catalog 层前置拒绝可避免 decide 选出 launch 必拒的路由）。
+- **`decide()`**：读 `providers.latest_capability_probes` 取项目级最新 durable 快照构造候选，交 `router.route` 决策；缺 harness 或 provider 快照的 catalog 路由不参与、进入 `missing`/`skipped` 披露而非猜测；无选择、选择无法唯一绑定精确快照、或人工覆盖被要求但未生效（健康/能力/风险 gate 优先于覆盖）一律抛 `RouteUnavailable`，携带稳定 `reason_code` 及 considered/missing/skipped/catalog_digest。
+- **`commit()`**：单事务内先 `providers.bind_attempt_capabilities` 绑定 Attempt 能力快照，再追加**恰好一条** `route.decided` 审计事件（payload 过 `_reject_secrets`，含 selection、decision、decision_digest、catalog_digest）；同一 Attempt + 同 digest 重放**幂等**返回既有事件，不同决策抛 `ConflictError`（"route decision is immutable for this Attempt"，选择**不可变**）；bind 失败在审计写入前传播、事务回滚**不留痕**。
+- **`teamctl providers-probe`**：新子命令，`opencode` 执行真实版本探测、`claude` 静态记 `unsupported/adapter_pending`（明确未探测）、oMLX 仅查询 loopback 模型目录（沿 §12.51 的严格校验与拒重定向语义）。
+- **`teamctl launch` 接线**：新参数 `--route / --route-risk / --route-tag / --route-catalog / --route-actor / --route-override-reason`，**仅 `--kind opencode`**（`--route` 遇其它 kind 拒绝；`--route-risk`/`--route-tag` 隐含 `--route`）。**顺序**：参数形态校验与 `decide()` 在 reserve/split **之前**，`commit()` 在 prompt transport **之前**。override 语义：显式 `--opencode-model` + route = 人工覆盖，**必须**给 `--route-override-reason`（无显式 model 而给 reason/actor 亦拒绝）；gate 优先，覆盖未生效则整体拒绝而非部分生效。
+
+**失败语义**：全部 fail closed——决策或绑定失败即中止启动，且**零副作用**（pane 未 reserve/split、prompt 未发出、无半成品事件）；失败 payload 带稳定 reason code 与 missing/skipped 披露；已提交决策不可变（重放幂等、改判 Conflict）；bind 失败事务回滚。13 个 fail-closed 启动用例覆盖上述各拒绝分支（见下）。
+
+**独立验收（PASS，无阻断）**：13 个 fail-closed 启动用例均在 reserve/split/prompt **前**失败且零副作用；bind 失败回滚且不 prompt；同 digest 幂等、不同决策 `ConflictError`；默认（无 `--route`）路径零 decide/零 commit/零新事件；真实 `providers-probe` 记录 opencode/claude/omlx 且 claude 明确标注未探测。随后两项非阻断修复（catalog id 校验、测试 stdout 泄漏）经增量 tester **PASS**（17/34，stdout 无泄漏）。
+
+**真实 E2E（本机，2026-11-28）**：
+
+- 仓库 `.teamcraft/routes.json`（gitignored，`/.teamcraft/` 整目录忽略）示例：opencode+omlx 两条候选——`Qwen3.8-Flash-Next-4bit-mtp`（local，assurance 1/cost_rank 0）与 `Qwen3.8-Flash-Next-oQ4e-mtp`（local，assurance 2/cost_rank 1）。
+- `providers-probe --harness opencode --harness claude` 真实结果：opencode `v2.4.1` healthy（快照 digest `6a5c315f…`）；omlx healthy、2 模型（digest `591622c2…`）；claude 静态 `unsupported/adapter_pending`（digest `7c42c31e…`，未探测）。
+- `launch --route`（normal 风险）：选中 `omlx/Qwen3.8-Flash-Next-4bit-mtp`、reason `selected_local_first`、`decision_digest 84ff2e23…`；该 Attempt 上 `attempt.capability_snapshot` 与 `route.decided` 各恰 1 条，selection/digest 与探针一致；pane 环境变量 `OPENCODE_CONFIG_CONTENT` 的 `herdr-developer.model` 确为 4bit（模型生效以 pane 环境/agent 配置核验）。
+- **显示层说明**：pane 页脚显示的是全局默认 `oQ4e`，与路由选择不同；页脚为显示层，**不作为模型生效证据**，此为显示差异而非路由失效。
+- 该 E2E 成员随后 `complete` 并关闭 pane。
+
+**测试数字**：`tests/test_dispatch_routing_m502.py` **17 OK**、`tests/test_teamctl.py` **34 OK**（本轮新增 7）——本节撰写者在含上述未提交改动的工作树复跑确认，且两文件 stdout 无泄漏（修复后复核）；默认 launch 零 decide/commit/零事件由测试固定。全量 `tests/`：开发者运行 **Ran 1764 OK（4 skipped）**；本节撰写者同工作树独立复跑 **Ran 1764 tests，OK（skipped=4）**，与开发者数字一致（CEO 提交前复跑）。
+
+**残余与未声称**：
+
+- provider 名称须与能力快照名/OpenCode provider id **一致**（无别名解析层）；不一致时该路由不参与（fail closed）。
+- decide→commit 之间快照 TTL 竞态：决策基于 decider 时点的快照，commit 时快照若过期由绑定校验 fail closed；本接线不引入新鲜度重检窗口。
+- 路由接线**仅支持 `--kind opencode`**；其它 harness 待后续。
+- `inference_request` 仍为 `unknown`（§12.51 D3 口径）：**路由与探测不证明推理可用**，本节不声称推理端到端。
+- **无云端候选**：本机 E2E catalog 仅 loopback oMLX 两模型；GitHub Actions 未运行；云端候选与 CI 均 PENDING。
+- 页脚显示差异（页脚显示全局默认而非路由选择）为已知显示层行为。
+- 决策一经提交对 Attempt **不可变**，改选需新 Attempt。
+
+**限制声明**：登记时代码未提交，上述数字的可复跑基准是**含未提交改动的工作树**，持久性以 CEO 提交为准；E2E 事实以该次本机运行的 Attempt 事件与 pane 环境为准，页脚显示不计入证据；不声称云端候选、GitHub Actions 或真实推理可用性已验证。历史 §12.25/§12.26/§12.51 记录保留不删，仅在 §12.51 末尾追加后续更新标记。
