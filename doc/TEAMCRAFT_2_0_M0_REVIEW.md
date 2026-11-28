@@ -390,7 +390,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M5-02 确定性 Router（实现完成，待独立验收；证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
 | **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
-| **M5-05 用量/成本 UI**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
+| **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
 | **M5-06 对照实验（工具验收完成，真实实验延期；见 12.29）**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
 
 **M5 退出门禁**：本地 Worker 完成至少一个真实小任务；oMLX 不可用时有界阻塞或按审批升级；Router 决策可解释；成本数据区分真实、估算、缺失；对照实验可复现且不虚报收益。
@@ -400,9 +400,9 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
 | **M6-01 只读 DAG 可视化（功能验收通过；见 12.30）**；依赖 M3-05、M1-04 | React Flow 展示依赖、状态、角色和阻塞原因；大图筛选/定位；不开放拖拽编辑 | UI 与后端依赖一致；循环不可能由 UI 制造；阻塞路径可解释 | 大图性能；视觉状态与事件延迟 |
-| **M6-02 Diff/验证/时间线页面**；依赖 M4-04、M3-05 | 安全渲染 Diff、Verification、Attempt/Session/Event 时间线；截断和下载受控 | 内容转义；大日志/二进制有明确提示；Commit 与证据关联清楚 | XSS；超大工件；敏感内容 |
+| **M6-02 Diff/验证/时间线页面（实现完成，2026-11-28；证据见 §12.50）**；依赖 M4-04、M3-05 | 安全渲染 Diff、Verification、Attempt/Session/Event 时间线；截断和下载受控 | 内容转义；大日志/二进制有明确提示；Commit 与证据关联清楚 | XSS；超大工件；敏感内容 |
 | **M6-03 脱敏诊断包（本地 Python 接口；见 12.31）**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
-| **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
+| **M6-04 模板与个人偏好（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
 | **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07（已关闭，2026-11-28）；**M6-07 已登记**，见 §12.46）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
@@ -1371,3 +1371,33 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - `teamcraft/ceo_initialization.py` 新增 `_runtime_skill_path`：`codex`/`opencode` → `.agents/skills/teamcraft/SKILL.md`；`claude` → `.claude/skills/teamcraft/SKILL.md`；symlink 链拒绝与 fail-closed 读/hash 语义保留。
 - 替换 6 处硬编码 `skill_path`；`test_ceo_*.py` **58 OK**，全量回归见提交证据。
 - 无 Schema 变更；未声称真实 Claude。此缺口为 §12.47/§12.48 记录的非阻塞项，现已关闭。
+
+### 12.50 M5-05 / M6-02 / M6-04 实现登记（2026-11-28）
+
+**登记口径**：本节只登记 M5-05、M6-02、M6-04 三项的实现提交与本地可复核测试事实，**不构成验收 PASS**；独立复核见下文。
+
+**提交**：
+
+- M5-05 `46902dd`（"Complete M5-05 usage and cost UI"）
+- M6-02 `09a8936`（"Complete M6-02 evidence and execution timeline views"）
+- M6-04 `fca82c8`（"Complete M6-04 versioned templates and display preferences"）
+
+**定向测试**：
+
+- M5-05：**20 OK**（`tests/test_api_m505.py` 8 + `tests/test_web_m505.py` 12）
+- M6-02：**17 OK**（`tests/test_web_m602.py`）
+- M6-04：**50 OK**（`tests/test_templates_m604.py`）
+
+**全量回归**：`tests/` **1627 OK（4 skipped）**。
+
+**范围/边界**：
+
+- M5-05 用量/成本 UI：任一数字可追到 Attempt/Wake/来源（来源可追）；NULL-safe，缺失不当作 0 错误求和；失败尝试也计入；不默认宣称节省率。
+- M6-02 Diff/验证/时间线页面：内容转义（证据值仅经文本节点挂载、服务器 URL 保持文本不成 href、无危险 sink）；截断与下载受控（显示上限声明并应用、无原始下载路由、下载能力仅以 JSON 声明）；大日志/二进制有明确提示，不静默；Commit 与证据关联保留。
+- M6-04 模板与个人偏好：模板不能绕过 Ownership、命令白名单或审批；配置版本与导入校验，配置错误可回退；模板不构成隐蔽命令注入通道。
+
+**独立复核（2026-11-28，PASS）**：`m505_m602_m604_tester` 只读复核 PASS：定向 20/17/50 OK、全量 1627 OK（4 skipped）、exit 0；提交 `46902dd`/`09a8936`/`fca82c8` 均为 HEAD 祖先且未触碰 schema。M5-05 来源可追/NULL-safe/失败入账；M6-02 textContent/截断/无原始下载；M6-04 forbidden key tokens/版本 pinned/原子校验 fail-closed。
+
+**残余风险**：`teamcraft/templates.py` 尚无运行时消费者（隔离在数据层，未接入执行路径）；M6-02 为静态源码核验；真实 Herdr/GitHub Actions 未运行。**本登记仍不构成完整验收 PASS**，仅记录实现与独立复核事实。
+
+**限制声明**：本登记未声称真实 Herdr 或 GitHub Actions 已运行；无 Schema 变更。
