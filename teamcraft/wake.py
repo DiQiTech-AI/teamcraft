@@ -15,6 +15,16 @@ bound, so a budget cannot be bypassed by any delivery driver.  An urgent wake
 may interrupt a working CEO only when the budget has remaining allowance AND
 the caller explicitly opts in through ``EscalationPolicy.allow_urgent_interrupt``
 — the "dedicated policy and budget path" the M2-09 hold referred to.
+
+The same slice owns the needs-human escape for an urgent Wake the budget
+refused: :func:`record_urgent_wake_escalation` writes the durable
+``wake.urgent_escalated`` Event and, in that same transaction, moves the Wake
+from ``pending`` to ``blocked`` with an auditable
+``urgent_wake_budget_exhausted:<used>/<max>`` detail.  ``blocked`` therefore
+carries two compatible meanings — "explicit reconciliation proved this was
+NOT delivered, never auto-resend" and "budget-exhausted needs-human
+escalation" — both of which forbid automatic delivery until a human acts, and
+both of which remain visible through ``wake-status --state blocked``.
 """
 
 from __future__ import annotations
@@ -133,8 +143,10 @@ MAX_WAKE_BUDGET_WINDOW_SECONDS = 86400
 
 #: States that represent a wake which reached (or may have reached) the CEO
 #: transport and therefore conservatively consumes window allowance.  Pending
-#: wakes never count; ``blocked`` (explicitly reconciled NOT delivered) never
-#: consumed attention and stays excluded.
+#: wakes never count; ``blocked`` rows never consumed attention and stay
+#: excluded — that covers both the explicitly reconciled NOT-delivered row and
+#: the budget-exhausted needs-human escalation written by
+#: :func:`record_urgent_wake_escalation`.
 _CONSUMING_WAKE_STATES = ("sending", "submitted", "acknowledged", "processed",
                          "unknown")
 
@@ -349,6 +361,65 @@ URGENT_WAKE_ESCALATION_EVENT = "wake.urgent_escalated"
 _URGENT_ESCALATION_DETAIL_MAX_BYTES = 512
 
 
+def _urgent_escalation_reason(
+    conn: TeamCraftConnection,
+    project_id: str,
+    target_ceo_name: str,
+    persisted: WakeBudgetPolicy | None,
+    detail: str | None,
+    clock: Clock | None,
+) -> str:
+    """Auditable ``<code>:<used>/<max>`` reason for the blocked Wake.
+
+    The caller's refusal detail wins when it already carries the stable code
+    (it is the exact count the admission path observed).  Otherwise the count
+    is re-derived from the durable budget window, so the Wake ``detail`` is
+    always a reproducible audit fact rather than free text.
+    """
+    text: str | None = None
+    if detail is not None:
+        text = _config_audit_text(
+            detail, "detail", limit=_URGENT_ESCALATION_DETAIL_MAX_BYTES)
+        if text.startswith(f"{URGENT_WAKE_BUDGET_EXHAUSTED_REASON}:"):
+            return text
+    if persisted is not None:
+        floor_iso, _ = _budget_window(
+            _now(clock), persisted.budget.window_seconds)
+        used = _consumed_in_window(
+            conn, project_id, target_ceo_name, floor_iso)
+        return (f"{URGENT_WAKE_BUDGET_EXHAUSTED_REASON}:{used}/"
+                f"{persisted.budget.max_wakes_per_window}")
+    if text is not None:
+        return text
+    return URGENT_WAKE_BUDGET_EXHAUSTED_REASON
+
+
+def _find_urgent_wake_escalation_event(
+    conn: TeamCraftConnection, project_id: str, wake_id: str,
+) -> events.Event | None:
+    """Newest persisted escalation Event for one Wake, if any.
+
+    The content-addressed event id collapses identical replays; this lookup
+    makes the *Wake state* transition idempotent too, because once the Wake
+    left ``pending`` the durable ledger is the only authority on whether it
+    was already escalated.
+    """
+    rows = conn.execute(
+        "SELECT event_id FROM events WHERE kind=? AND project_id=?"
+        " ORDER BY seq DESC",
+        (URGENT_WAKE_ESCALATION_EVENT, project_id),
+    ).fetchall()
+    for (event_id,) in rows:
+        event = events.get_event(conn, str(event_id))
+        try:
+            payload = json.loads(event.payload_json)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("wake_id") == wake_id:
+            return event
+    return None
+
+
 def record_urgent_wake_escalation(
     conn: TeamCraftConnection,
     project_id: str,
@@ -358,19 +429,31 @@ def record_urgent_wake_escalation(
     detail: str | None = None,
     clock: Clock | None = None,
 ) -> tuple[events.Event, bool]:
-    """Durably record that a human must act on an over-budget urgent Wake.
+    """Escalate an over-budget urgent Wake to a human, durably and atomically.
 
     :func:`admit_pending_wake` deliberately only *defers* when the budget
     refused an urgent item — it never drops the Wake and never silently
-    resolves it — so the dispatch path that observed the refusal records the
-    human escalation here.  The Event is idempotent per Wake and budget
-    window: repeated dispatch attempts under the same window and allowance
-    collapse into the one existing record, while a genuinely new exhaustion
-    (a later window, or different durable limits) produces a new record.
+    resolves it.  The dispatch path that observed the refusal calls this
+    function, which is the ONLY transition that turns the refusal into durable
+    work for a human: one transaction writes the ``wake.urgent_escalated``
+    Event **and** moves the Wake from ``pending`` to ``blocked``, recording
+    ``urgent_wake_budget_exhausted:<used>/<max>`` (or the equivalent caller
+    reason) in the Wake ``detail``.  A blocked Wake is never admitted again,
+    so the refusal cannot be mistaken for a retryable backlog item.
 
-    It never changes Wake state, never emits a Command, and never touches
-    the transport: the Wake stays ``pending`` so a later window can still
-    deliver it, and reconciliation/ack rules are untouched.
+    ``blocked`` is shared with the explicit reconciliation vocabulary
+    ("inspected and proven NOT delivered; automatic resend prohibited", see
+    :func:`reconcile_wake_delivery`).  Both uses mean "automatic delivery is
+    forbidden until a human reconciles", and ``wake-status --state blocked``
+    is the notification consumer that lists them with their ``detail``.
+
+    Idempotent per Wake: if the Wake is already blocked by an earlier
+    escalation, the existing Event is returned with ``inserted=False`` and
+    neither the row nor the event stream changes.  Repeated dispatch attempts
+    therefore cannot duplicate the escalation, and a later budget window
+    cannot produce a second record for the same Wake because the Wake is
+    permanently blocked.  It never emits a Command and never touches the
+    transport.
     """
     domain.require_head(conn)
     if lease.scope != leader.project_scope(project_id):
@@ -387,37 +470,53 @@ def record_urgent_wake_escalation(
         if row is None:
             raise ValidationError(
                 "urgent Wake escalation target is not a Wake of this project")
-        if str(row[7]) != "pending":
+        state = str(row[7])
+        if state == "blocked":
+            existing = _find_urgent_wake_escalation_event(
+                conn, project_id, wake_id)
+            if existing is not None:
+                return existing, False
+            raise ValidationError(
+                "blocked Wake has no recorded urgent escalation; reconcile"
+                f" it explicitly instead; wake {wake_id} is blocked")
+        if state != "pending":
             raise ValidationError(
                 "only pending Wakes can escalate an urgent budget refusal;"
-                f" wake {wake_id} is {row[7]}")
-        payload: dict[str, Any] = {
-            "version": 1,
-            "escalation": "needs_human",
-            "reason_code": URGENT_WAKE_BUDGET_EXHAUSTED_REASON,
-            "wake_id": wake_id,
-            "target_ceo_name": str(row[2]),
-            "wake_state": str(row[7]),
-            "priority": int(row[6]),
-            "first_seq": int(row[8]),
-            "last_seq": int(row[9]),
-            "event_digest": str(row[11]),
-        }
+                f" wake {wake_id} is {state}")
+        persisted: WakeBudgetPolicy | None = None
+        budget_config_invalid = False
         try:
             persisted = get_wake_budget(conn, project_id)
         except ValidationError:
             # A corrupt budget config must not block the escalation itself:
             # admission already refused fail-closed, and losing the human
             # signal would be the worse failure.
+            budget_config_invalid = True
+        reason = _urgent_escalation_reason(
+            conn, project_id, str(row[2]), persisted, detail, clock)
+        payload: dict[str, Any] = {
+            "version": 1,
+            "escalation": "needs_human",
+            "reason_code": URGENT_WAKE_BUDGET_EXHAUSTED_REASON,
+            "wake_id": wake_id,
+            "target_ceo_name": str(row[2]),
+            "wake_state": "blocked",
+            "state_before": "pending",
+            "wake_detail": reason,
+            "priority": int(row[6]),
+            "first_seq": int(row[8]),
+            "last_seq": int(row[9]),
+            "event_digest": str(row[11]),
+        }
+        if budget_config_invalid:
             payload["budget_config_invalid"] = True
-        else:
-            if persisted is not None:
-                floor_iso, window_id = _budget_window(
-                    _now(clock), persisted.budget.window_seconds)
-                payload["max_wakes_per_window"] = (
-                    persisted.budget.max_wakes_per_window)
-                payload["window_seconds"] = persisted.budget.window_seconds
-                payload["window_id"] = window_id
+        elif persisted is not None:
+            floor_iso, window_id = _budget_window(
+                _now(clock), persisted.budget.window_seconds)
+            payload["max_wakes_per_window"] = (
+                persisted.budget.max_wakes_per_window)
+            payload["window_seconds"] = persisted.budget.window_seconds
+            payload["window_id"] = window_id
         if detail is not None:
             payload["detail"] = _config_audit_text(
                 detail, "detail", limit=_URGENT_ESCALATION_DETAIL_MAX_BYTES)
@@ -427,9 +526,23 @@ def record_urgent_wake_escalation(
         # record while letting a genuinely changed context be recorded again.
         event_id = ("wake_urgent_escalated_"
                    + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32])
-        return events.append_event_idempotent(
+        event, _inserted = events.append_event_idempotent(
             conn, URGENT_WAKE_ESCALATION_EVENT, project_id=project_id,
             payload_json=body, event_id=event_id, clock=clock)
+        # Same transaction as the Event: the Wake leaves the dispatchable
+        # state only together with its durable human-escalation record.  The
+        # CAS also converges a legacy pending row that already had a record.
+        now = _iso(_now(clock))
+        changed = conn.execute(
+            "UPDATE wakes SET state='blocked',detail=?,updated_at=? "
+            "WHERE id=? AND state='pending'",
+            (reason, now, wake_id),
+        ).rowcount
+        if changed != 1:
+            raise storage.StorageError(
+                "urgent Wake escalation lost its pending-state"
+                " compare-and-swap")
+        return event, _inserted
 
     if conn.in_transaction:
         return _record()
@@ -1030,6 +1143,11 @@ def reconcile_wake_delivery(
     A positive finding settles the Command and Wake as submitted. A finding
     that delivery did not occur expires the Command and blocks the Wake for
     manual follow-up. Neither result creates a replacement Command.
+
+    ``blocked`` is also written by :func:`record_urgent_wake_escalation` for
+    a budget-exhausted urgent Wake.  Both rows share one meaning — automatic
+    delivery is forbidden until a human acts — and the ``detail`` column says
+    which cause applies.
     """
     domain.require_head(conn)
     if not isinstance(delivered, bool):

@@ -553,6 +553,51 @@ class EscalationM503Tests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM commands").fetchone()[0], before)
 
+    def test_needs_human_decision_is_advisory_until_durably_escalated(self):
+        self.seed_wakes()
+        self.insert_session("ses_ceo", "idle")
+        with self.as_ceo("ses_ceo"):
+            decisions = {
+                item.dedupe_key: (item, decision)
+                for item, decision
+                in scheduler.pending_wake_budget_decisions(
+                    self.conn, self.project.id, max_wakes_per_window=0)}
+        urgent, decision = decisions["recovery.escalated:-:-"]
+        self.assertEqual(decision.action, "needs_human")
+        self.assertEqual(decision.reason_code,
+                         "urgent_wake_budget_exhausted")
+        self.assertFalse(decision.consumes_budget)
+        # Planning is advisory: it neither blocks nor records anything.
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='wake.urgent_escalated'"
+        ).fetchone()[0], 0)
+        self.assertEqual(wake.list_wakes(self.conn, self.project.id,
+                                        states=("blocked",)), ())
+        pending = wake.list_wakes(self.conn, self.project.id,
+                                  states=("pending",))
+        self.assertEqual(len(pending), 2)
+        self.assertEqual({item.state for item in pending}, {"pending"})
+        # Only the durable escalation transition moves the Wake to blocked.
+        event, inserted = wake.record_urgent_wake_escalation(
+            self.conn, self.project.id, urgent.id, self.lease,
+            detail=f"{decision.reason_code}:0/0", clock=self.clock)
+        self.assertTrue(inserted)
+        payload = json.loads(event.payload_json)
+        self.assertEqual(payload["escalation"], "needs_human")
+        self.assertEqual(payload["wake_state"], "blocked")
+        blocked = wake.list_wakes(self.conn, self.project.id,
+                                  states=("blocked",))
+        self.assertEqual([item.id for item in blocked], [urgent.id])
+        self.assertEqual(blocked[0].detail,
+                         "urgent_wake_budget_exhausted:0/0")
+        replay, inserted_again = wake.record_urgent_wake_escalation(
+            self.conn, self.project.id, urgent.id, self.lease,
+            detail=f"{decision.reason_code}:0/0", clock=self.clock)
+        self.assertFalse(inserted_again)
+        self.assertEqual(replay.event_id, event.event_id)
+        self.assertEqual(len(wake.list_wakes(self.conn, self.project.id,
+                                            states=("blocked",))), 1)
+
 
 class CloudBudgetReservationTests(unittest.TestCase):
     """Durable cloud budget + enforcement at the real reservation boundary."""

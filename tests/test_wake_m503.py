@@ -150,6 +150,19 @@ class WakeBudgetM503Tests(unittest.TestCase):
             "SELECT state FROM wakes WHERE id=?", (wake_id,)).fetchone()
         return str(row[0])
 
+    def wake_row(self, wake_id: str):
+        return self.conn.execute(
+            "SELECT state, detail, updated_at FROM wakes WHERE id=?",
+            (wake_id,)).fetchone()
+
+    def escalation_payloads(self, wake_id: str) -> list[dict]:
+        payloads = [json.loads(str(row[0])) for row in self.conn.execute(
+            "SELECT payload_json FROM events"
+            " WHERE kind='wake.urgent_escalated'")]
+        return [payload for payload in payloads
+                if isinstance(payload, dict)
+                and payload.get("wake_id") == wake_id]
+
     def full_lifecycle(self, admitted) -> None:
         item = (admitted.wake
                 if isinstance(admitted, wake.AdmissionResult) else admitted)
@@ -399,6 +412,179 @@ class WakeBudgetM503Tests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "only pending Wakes"):
             wake.admit_pending_wake(self.conn, self.project_id, urgent.id,
                                    self.lease, clock=self.clock)
+
+    # -- needs-human escalation of an over-budget urgent wake --------------
+
+    def test_urgent_escalation_blocks_wake_with_auditable_reason(self) -> None:
+        self.set_ceo("idle")
+        self.record_budget(1)
+        first = self.new_wake("task:b1")
+        self.full_lifecycle(
+            wake.admit_pending_wake(self.conn, self.project_id, first.id,
+                                   self.lease, clock=self.clock))
+        urgent = self.new_wake("task:b2", priority=100)
+        deferred = wake.admit_pending_wake(
+            self.conn, self.project_id, urgent.id, self.lease,
+            clock=self.clock)
+        self.assertEqual(deferred.deferred_reason,
+                         "urgent_wake_budget_exhausted:1/1")
+        self.assertEqual(self.wake_state(urgent.id), "pending")
+        # The refusal alone is not the escalation: the dispatch path records
+        # it, and that record is what turns the Wake into human work.
+        event, inserted = wake.record_urgent_wake_escalation(
+            self.conn, self.project_id, urgent.id, self.lease,
+            detail=deferred.deferred_reason, clock=self.clock)
+        self.assertTrue(inserted)
+        row = self.wake_row(urgent.id)
+        self.assertEqual(row[0], "blocked")
+        self.assertEqual(row[1], "urgent_wake_budget_exhausted:1/1")
+        payload = json.loads(event.payload_json)
+        self.assertEqual(payload["escalation"], "needs_human")
+        self.assertEqual(payload["wake_state"], "blocked")
+        self.assertEqual(payload["state_before"], "pending")
+        self.assertEqual(payload["wake_detail"],
+                         "urgent_wake_budget_exhausted:1/1")
+        # Notification consumer: the blocked Wake (and its reason) is listed.
+        blocked = wake.list_wakes(self.conn, self.project_id,
+                                  states=("blocked",))
+        self.assertEqual([item.id for item in blocked], [urgent.id])
+        self.assertEqual(blocked[0].detail,
+                         "urgent_wake_budget_exhausted:1/1")
+        # Replay is a strict no-op for the row and the event stream.
+        again, inserted_again = wake.record_urgent_wake_escalation(
+            self.conn, self.project_id, urgent.id, self.lease,
+            detail=deferred.deferred_reason, clock=self.clock)
+        self.assertFalse(inserted_again)
+        self.assertEqual(again.event_id, event.event_id)
+        self.assertEqual(self.wake_row(urgent.id), row)
+        self.assertEqual(len(self.escalation_payloads(urgent.id)), 1)
+        # ...including after the budget window has rolled: the Wake is
+        # permanently out of the dispatchable state, so no second record.
+        self.advance()
+        still, inserted_later = wake.record_urgent_wake_escalation(
+            self.conn, self.project_id, urgent.id, self.lease,
+            detail=deferred.deferred_reason, clock=self.clock)
+        self.assertFalse(inserted_later)
+        self.assertEqual(still.event_id, event.event_id)
+        self.assertEqual(self.wake_row(urgent.id), row)
+        self.assertEqual(len(self.escalation_payloads(urgent.id)), 1)
+        # Blocked is terminal for admission: a retry tick cannot deliver it.
+        with self.assertRaisesRegex(ValidationError, "only pending Wakes"):
+            wake.admit_pending_wake(self.conn, self.project_id, urgent.id,
+                                   self.lease, clock=self.clock)
+        self.assertEqual(self.command_count(), 1)
+
+    def test_escalation_derives_reason_when_caller_omits_detail(self) -> None:
+        self.set_ceo("idle")
+        self.record_budget(1)
+        first = self.new_wake("task:d1")
+        self.full_lifecycle(
+            wake.admit_pending_wake(self.conn, self.project_id, first.id,
+                                   self.lease, clock=self.clock))
+        urgent = self.new_wake("task:d2", priority=100)
+        deferred = wake.admit_pending_wake(
+            self.conn, self.project_id, urgent.id, self.lease,
+            clock=self.clock)
+        self.assertEqual(deferred.deferred_reason,
+                         "urgent_wake_budget_exhausted:1/1")
+        _event, inserted = wake.record_urgent_wake_escalation(
+            self.conn, self.project_id, urgent.id, self.lease,
+            clock=self.clock)
+        self.assertTrue(inserted)
+        self.assertEqual(self.wake_row(urgent.id)[:2],
+                         ("blocked", "urgent_wake_budget_exhausted:1/1"))
+
+    def test_zero_budget_urgent_escalation_also_blocks(self) -> None:
+        self.set_ceo("idle")
+        self.record_budget(0)
+        urgent = self.new_wake("task:z0", priority=100)
+        deferred = wake.admit_pending_wake(
+            self.conn, self.project_id, urgent.id, self.lease,
+            clock=self.clock)
+        self.assertEqual(deferred.deferred_reason,
+                         "urgent_wake_budget_exhausted:0/0")
+        _, inserted = wake.record_urgent_wake_escalation(
+            self.conn, self.project_id, urgent.id, self.lease,
+            detail=deferred.deferred_reason, clock=self.clock)
+        self.assertTrue(inserted)
+        self.assertEqual(self.wake_row(urgent.id)[:2],
+                         ("blocked", "urgent_wake_budget_exhausted:0/0"))
+        # Escalating a never-attempted Wake consumes no window allowance and
+        # creates no Command: the fail-closed budget stays intact.
+        self.assertEqual(wake.wake_budget_usage(
+            self.conn, self.project_id, window_seconds=3600,
+            clock=self.clock), 0)
+        self.assertEqual(self.command_count(), 0)
+
+    def test_non_urgent_exhaustion_stays_pending_and_unrecorded(self) -> None:
+        self.set_ceo("idle")
+        self.record_budget(1)
+        first = self.new_wake("task:n1")
+        self.full_lifecycle(
+            wake.admit_pending_wake(self.conn, self.project_id, first.id,
+                                   self.lease, clock=self.clock))
+        ordinary = self.new_wake("task:n2")
+        deferred = wake.admit_pending_wake(
+            self.conn, self.project_id, ordinary.id, self.lease,
+            clock=self.clock)
+        self.assertEqual(deferred.deferred_reason, "wake_budget_exhausted:1/1")
+        self.assertEqual(self.wake_state(ordinary.id), "pending")
+        self.assertEqual(self.escalation_payloads(ordinary.id), [])
+        self.assertEqual(wake.list_wakes(self.conn, self.project_id,
+                                         states=("blocked",)), ())
+
+    def test_escalation_is_lease_fenced_and_writes_nothing_when_stale(self) -> None:
+        self.set_ceo("idle")
+        self.record_budget(0)
+        urgent = self.new_wake("task:fence", priority=100)
+        deferred = wake.admit_pending_wake(
+            self.conn, self.project_id, urgent.id, self.lease,
+            clock=self.clock)
+        self.assertEqual(deferred.deferred_reason,
+                         "urgent_wake_budget_exhausted:0/0")
+        stale = self.lease
+        self.assertTrue(leader.release(
+            self.conn, leader.project_scope(self.project_id), "m503-test",
+            clock=self.clock))
+        leader.acquire_or_renew(
+            self.conn, leader.project_scope(self.project_id), "holder-a",
+            ttl_seconds=1, clock=self.clock)
+        self.clock.value += timedelta(seconds=2)
+        self.lease = leader.acquire_or_renew(
+            self.conn, leader.project_scope(self.project_id), "holder-b",
+            ttl_seconds=120, clock=self.clock)
+        with self.assertRaises(leader.StaleLeaderError):
+            wake.record_urgent_wake_escalation(
+                self.conn, self.project_id, urgent.id, stale,
+                detail=deferred.deferred_reason, clock=self.clock)
+        self.assertEqual(self.wake_state(urgent.id), "pending")
+        self.assertEqual(self.escalation_payloads(urgent.id), [])
+
+    def test_reconciliation_blocked_wake_is_not_reused_for_escalation(
+            self) -> None:
+        self.set_ceo("idle")
+        item = self.new_wake("task:rec-blocked")
+        wake.admit_pending_wake(self.conn, self.project_id, item.id,
+                               self.lease, clock=self.clock)
+        wake.record_submission_result(
+            self.conn, self.project_id, item.id, self.lease,
+            outcome="unknown", detail="Herdr response lost", clock=self.clock)
+        settled = wake.reconcile_wake_delivery(
+            self.conn, self.project_id, item.id, self.lease,
+            delivered=False, actor="operator",
+            note="Herdr history shows no prompt",
+            evidence_json='{"observed_prompts":[]}', clock=self.clock)
+        self.assertEqual(settled.state, "blocked")
+        self.assertEqual(settled.detail,
+                         "reconciled as not submitted; automatic resend prohibited")
+        with self.assertRaisesRegex(ValidationError, "blocked"):
+            wake.record_urgent_wake_escalation(
+                self.conn, self.project_id, item.id, self.lease,
+                detail="urgent_wake_budget_exhausted:0/0", clock=self.clock)
+        # The reconciliation reason is preserved verbatim; no escalation.
+        self.assertEqual(self.wake_row(item.id)[0:2],
+                         (settled.state, settled.detail))
+        self.assertEqual(self.escalation_payloads(item.id), [])
 
     # -- accounting semantics -----------------------------------------------
 
@@ -716,20 +902,56 @@ class WakeBudgetCliM503Tests(unittest.TestCase):
         self.assertEqual(deferred["urgent_escalation"], "recorded")
         # No prompt was attempted for the refused urgent Wake.
         self.assertEqual(len(self.herdr.prompts), 1)
-        self.assertEqual(self.wake_state("task:cli-urgent"), "pending")
+        # The escalation is a needs-human transition, not a retryable defer:
+        # the Wake is blocked with its auditable reason and can never be
+        # silently delivered by a later dispatch tick.
+        self.assertEqual(self.wake_state("task:cli-urgent"), "blocked")
+        detail = self.conn.execute(
+            "SELECT detail FROM wakes WHERE dedupe_key=?",
+            ("task:cli-urgent",)).fetchone()[0]
+        self.assertEqual(detail, "urgent_wake_budget_exhausted:1/1")
         self.assertEqual(self.escalation_rows(), 1)
-        # A repeated dispatch attempt does not duplicate the escalation.
+        # A repeated dispatch attempt finds nothing pending: no duplicate
+        # prompt, no duplicate escalation event, no state churn.
         again = self.invoke(["wake-dispatch", "--cwd", str(self.root)])
-        self.assertEqual(again["urgent_escalation"], "already_recorded")
+        self.assertEqual(again["status"], "idle")
+        self.assertNotIn("urgent_escalation", again)
         self.assertEqual(self.escalation_rows(), 1)
         self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(self.wake_state("task:cli-urgent"), "blocked")
         row = self.conn.execute(
             "SELECT payload_json FROM events WHERE kind='wake.urgent_escalated'"
             " ORDER BY seq DESC LIMIT 1").fetchone()
         payload = json.loads(str(row[0]))
         self.assertEqual(payload["escalation"], "needs_human")
+        self.assertEqual(payload["wake_state"], "blocked")
+        self.assertEqual(payload["wake_detail"],
+                         "urgent_wake_budget_exhausted:1/1")
         self.assertEqual(payload["priority"], 100)
         self.assertEqual(payload["max_wakes_per_window"], 1)
+
+    def test_wake_status_blocked_lists_escalated_wake(self) -> None:
+        self.invoke(["wake-budget-set", "--cwd", str(self.root),
+                    "--max-wakes-per-window", "0", "--allow-urgent-interrupt",
+                    "--actor", "owner", "--reason", "freeze wakes"])
+        self.queue_wake("task:cli-status", priority=100)
+        out = self.invoke(["wake-dispatch", "--cwd", str(self.root)])
+        self.assertEqual(out["status"], "deferred")
+        self.assertEqual(out["reason"], "urgent_wake_budget_exhausted:0/0")
+        self.assertEqual(out["urgent_escalation"], "recorded")
+        blocked = self.invoke(["wake-status", "--cwd", str(self.root),
+                               "--state", "blocked"])
+        self.assertEqual(len(blocked["wakes"]), 1)
+        item = blocked["wakes"][0]
+        self.assertEqual(item["state"], "blocked")
+        self.assertEqual(item["dedupe_key"], "task:cli-status")
+        self.assertEqual(item["detail"],
+                         "urgent_wake_budget_exhausted:0/0")
+        # The escalated Wake left the pending queue entirely.
+        pending = self.invoke(["wake-status", "--cwd", str(self.root),
+                               "--state", "pending"])
+        self.assertEqual(pending["wakes"], [])
+        self.assertEqual(self.herdr.prompts, [])
 
     def test_non_urgent_while_working_keeps_legacy_deferral(self) -> None:
         self.invoke(["wake-budget-set", "--cwd", str(self.root),
