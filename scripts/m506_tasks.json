@@ -1,0 +1,82 @@
+[
+  {
+    "id": "merge_intervals",
+    "title": "Merge overlapping intervals",
+    "prompt": "Write a Python function merge_intervals(intervals) that takes a list of (start, end) integer pairs and returns a new list (a real list, not a tuple and not a generator) of merged [start, end] two-element lists sorted by start. Every returned element must itself be a two-element list. Intervals that overlap or touch (share an endpoint) must be merged. Empty input returns []. Do not mutate the input. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import merge_intervals\n\n\ndef _check(got, expected, label):\n    assert isinstance(got, list), (\n        f'{label}: must return a list, got {type(got).__name__}'\n    )\n    assert not isinstance(got, tuple), f'{label}: must not return a tuple'\n    assert all(isinstance(item, list) for item in got), (\n        f'{label}: every interval must be a [start, end] list, got {got!r}'\n    )\n    assert all(len(item) == 2 for item in got), (\n        f'{label}: every interval must have exactly two items, got {got!r}'\n    )\n    assert got == expected, f'{label}: got {got!r}, expected {expected!r}'\n\n\ndef main():\n    cases = [\n        ([], []),\n        ([(1, 3)], [[1, 3]]),\n        ([(1, 3), (2, 6), (8, 10), (9, 12)], [[1, 6], [8, 12]]),\n        ([(5, 7), (1, 2)], [[1, 2], [5, 7]]),\n        ([(1, 2), (2, 3)], [[1, 3]]),\n        ([(1, 10), (2, 3), (4, 5)], [[1, 10]]),\n        ([(1, 2), (3, 4)], [[1, 2], [3, 4]]),\n        ([(1, 4), (2, 5), (7, 9)], [[1, 5], [7, 9]]),\n    ]\n    for intervals, expected in cases:\n        original = list(intervals)\n        got = merge_intervals(intervals)\n        _check(got, expected, f'merge_intervals({original!r})')\n        assert intervals == original, 'merge_intervals must not mutate its input'\n    # Boundary: a tuple or generator result must be rejected.\n    _check(merge_intervals([(1, 3), (2, 6)]), [[1, 6]], 'merge_intervals boundary')\n    print('ok: merge_intervals')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": [
+      "algorithms"
+    ]
+  },
+  {
+    "id": "parse_csv_line",
+    "title": "Parse one quoted CSV record",
+    "prompt": "Write a Python function parse_csv_line(line: str) -> list[str] that parses one RFC 4180 CSV record without embedded newlines. Double quotes group a field, and two consecutive double quotes inside a quoted field represent one literal double quote. Commas outside quotes separate fields. A quote is only special at the start of a field, and this applies to every field, not just the first (for example a,\"b,c\" must return ['a', 'b,c']). An empty input line returns []. Preserve empty fields. Raise ValueError for an unterminated quoted field in any position, or for extra characters between a closing quote and the next comma or the end of the line. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import parse_csv_line\n\n\ndef main():\n    q = chr(34)\n    cases = [\n        ('a,b,c', ['a', 'b', 'c']),\n        ('a,,c', ['a', '', 'c']),\n        ('a,', ['a', '']),\n        ('', []),\n        (q + 'a,b' + q + ',c', ['a,b', 'c']),\n        (q + 'he said ' + q + q + 'hi' + q + q + q + ',x', ['he said ' + q + 'hi' + q, 'x']),\n        (q + q, ['']),\n        (q + 'a' + q, ['a']),\n        # Boundary: quoting applies to every field, not only the first.\n        ('a,' + q + 'b,c' + q, ['a', 'b,c']),\n        ('a,' + q + 'b' + q + q + 'c' + q, ['a', 'b' + q + 'c']),\n        ('x,' + q + q + ',y', ['x', '', 'y']),\n        (q + q + ',' + q + 'a' + q, ['', 'a']),\n        ('a,b,' + q + 'c,d' + q + ',e', ['a', 'b', 'c,d', 'e']),\n    ]\n    for line, expected in cases:\n        got = parse_csv_line(line)\n        assert got == expected, f'parse_csv_line({line!r}) -> {got!r}, expected {expected!r}'\n    # Boundary: unterminated quotes and trailing junk are errors in any field.\n    for bad in (\n        q + 'a,b',\n        q + 'a' + q + 'b,c',\n        'a,' + q + 'b',\n        'a,' + q + 'b' + q + 'c',\n        'a,b,' + q + 'c',\n    ):\n        try:\n            parse_csv_line(bad)\n        except ValueError:\n            continue\n        raise AssertionError(f'parse_csv_line({bad!r}) should raise ValueError')\n    print('ok: parse_csv_line')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": [
+      "parsing"
+    ]
+  },
+  {
+    "id": "slugify",
+    "title": "Slugify ASCII text",
+    "prompt": "Write a Python function slugify(text: str) -> str. Use str.casefold() (not str.lower()) to normalize case, so that '\u00df' expands to 'ss' and 'Stra\u00dfe' becomes 'strasse'. Then replace every run of characters that are not ASCII letters or digits with a single hyphen, strip leading and trailing hyphens, and return an empty string if nothing remains. Do not use external libraries. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import slugify\n\n\ndef main():\n    cases = [\n        ('Hello, World!', 'hello-world'),\n        ('  A  B  ', 'a-b'),\n        ('already-slug', 'already-slug'),\n        ('A_B.C', 'a-b-c'),\n        ('---', ''),\n        ('', ''),\n        ('One2Two', 'one2two'),\n        ('na\u00efve', 'na-ve'),\n        # Boundary: casefold, not lower: sharp s expands to ss.\n        ('Stra\u00dfe', 'strasse'),\n        ('\u00df', 'ss'),\n        ('\u1e9e', 'ss'),\n    ]\n    for text, expected in cases:\n        got = slugify(text)\n        assert got == expected, f'slugify({text!r}) -> {got!r}, expected {expected!r}'\n    print('ok: slugify')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": [
+      "text"
+    ]
+  },
+  {
+    "id": "retry_delays",
+    "title": "Exponential retry delays",
+    "prompt": "Write a Python function retry_delays(attempts: int, base: float, factor: float, max_delay: float) -> list[float] returning the delay before each retry for attempt indexes 0 through attempts-1, where delay_i = min(base * factor ** i, max_delay). Return [] when attempts <= 0. Do not round or otherwise alter the floating-point values: each delay must equal the formula exactly at full float precision. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import retry_delays\n\n\ndef check(attempts, base, factor, cap, expected):\n    got = retry_delays(attempts, base, factor, cap)\n    assert isinstance(got, list), f'must return a list, got {type(got).__name__}'\n    assert len(got) == len(expected), f'length {len(got)} != {len(expected)}'\n    for index, (value, wanted) in enumerate(zip(got, expected)):\n        assert abs(value - wanted) <= 1e-12, (\n            f'index {index}: {value!r} != {wanted!r}; do not round the delay values'\n        )\n\n\ndef main():\n    check(0, 1.0, 2.0, 10.0, [])\n    check(-3, 1.0, 2.0, 10.0, [])\n    check(3, 1.0, 2.0, 10.0, [1.0, 2.0, 4.0])\n    check(5, 1.0, 2.0, 10.0, [1.0, 2.0, 4.0, 8.0, 10.0])\n    check(2, 0.5, 3.0, 2.0, [0.5, 1.5])\n    check(6, 1.0, 2.0, 5.0, [1.0, 2.0, 4.0, 5.0, 5.0, 5.0])\n    check(1, 0.0, 3.0, 10.0, [0.0])\n    # Boundary: full binary-float precision must survive; any round(..., n)\n    # implementation for a small n fails these.\n    check(4, 0.1, 1.234, 100.0, [min(0.1 * (1.234 ** i), 100.0) for i in range(4)])\n    check(5, 0.1, 1.5, 100.0, [min(0.1 * (1.5 ** i), 100.0) for i in range(5)])\n    print('ok: retry_delays')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": [
+      "reliability"
+    ]
+  },
+  {
+    "id": "aggregate_windows",
+    "title": "Aggregate events into aligned time windows",
+    "prompt": "Write a Python function aggregate_windows(events, window_seconds) where events is a list of (timestamp: int, value: float) pairs. For each event compute window_start = timestamp - (timestamp % window_seconds) (floor division semantics, including negative timestamps), sum values per window, and return a dict mapping window_start to the summed float. Raise ValueError when window_seconds <= 0, including negative values. Never mutate the input list, including on the ValueError path. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import aggregate_windows\n\nimport copy\n\n\ndef main():\n    # Success path: deliberately unsorted input. An implementation that calls\n    # events.sort() before aggregating changes the caller's list and is caught.\n    events = [(10, 3.0), (0, 1.0), (9, 2.0)]\n    snapshot = copy.deepcopy(events)\n    got = aggregate_windows(events, 10)\n    assert got == {0: 3.0, 10: 3.0}, f'got {got!r}'\n    assert len(events) == len(snapshot), (\n        'aggregate_windows changed the input length'\n    )\n    for index, (current, original) in enumerate(zip(events, snapshot)):\n        assert current == original, (\n            f'aggregate_windows reordered or changed input[{index}]: '\n            f'{current!r} != {original!r}'\n        )\n\n    got = aggregate_windows([(25, 1.0), (21, 2.0), (29, 3.0)], 10)\n    assert got == {20: 6.0}, f'got {got!r}'\n    got = aggregate_windows([(-1, 5.0)], 10)\n    assert got == {-10: 5.0}, f'negative timestamp got {got!r}'\n    got = aggregate_windows([(1, 0.1), (2, 0.2)], 5)\n    assert set(got) == {0}, f'got {got!r}'\n    assert abs(got[0] - 0.3) < 1e-9, f'got {got!r}'\n    assert aggregate_windows([], 10) == {}\n\n    # Boundary: every non-positive window raises ValueError and must not\n    # mutate the caller's list. This is a separate, unsorted probe (not mixed\n    # with the success path) so sorting before validation is caught as well.\n    for bad_window in (0, -1, -10):\n        probe = [(2, 2.0), (1, 1.0)]\n        probe_snapshot = copy.deepcopy(probe)\n        try:\n            aggregate_windows(probe, bad_window)\n        except ValueError:\n            pass\n        else:\n            raise AssertionError(\n                f'window_seconds={bad_window} must raise ValueError'\n            )\n        assert len(probe) == len(probe_snapshot), (\n            'aggregate_windows changed the input length on ValueError'\n        )\n        for index, (current, original) in enumerate(zip(probe, probe_snapshot)):\n            assert current == original, (\n                'aggregate_windows mutated its input on ValueError: '\n                f'input[{index}] {current!r} != {original!r}'\n            )\n    print('ok: aggregate_windows')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": [
+      "time"
+    ]
+  },
+  {
+    "id": "top_k_frequent",
+    "title": "Top-k frequent values with deterministic ties",
+    "prompt": "Write a Python function top_k_frequent(values: list, k: int) -> list returning the k most frequent values ordered by descending count. When several values have the same count, preserve the order in which those values first appeared in the input; do not re-sort the selected values by value. Return [] when k <= 0 or values is empty. Values are mutually comparable. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import top_k_frequent\n\n\ndef main():\n    cases = [\n        ([], 3, []),\n        ([1, 1, 2, 2, 3], 2, [1, 2]),\n        ([3, 3, 1, 1, 2], 2, [3, 1]),\n        (['b', 'a', 'b', 'c', 'a', 'a'], 2, ['a', 'b']),\n        ([1, 2, 3], 0, []),\n        ([1, 2, 3], -1, []),\n        ([2, 1, 2, 1, 3], 10, [2, 1, 3]),\n        # Boundary: equal counts keep first-appearance order; re-sorting the\n        # selected values afterwards is rejected.\n        ([2, 1, 2, 1], 2, [2, 1]),\n        ([1, 2, 3, 4], 2, [1, 2]),\n        ([9, 8, 7, 9, 8, 7], 3, [9, 8, 7]),\n    ]\n    for values, k, expected in cases:\n        got = top_k_frequent(values, k)\n        assert got == expected, (\n            f'top_k_frequent({values!r}, {k}) -> {got!r}, expected {expected!r}'\n        )\n    print('ok: top_k_frequent')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "normal",
+    "tags": []
+  },
+  {
+    "id": "validate_api_key_shape",
+    "title": "Validate API key shape (credential)",
+    "prompt": "Write a Python function validate_api_key_shape(value: str) -> bool that returns True only when value is a string of exactly 36 characters: the literal prefix tck_ followed by 32 ASCII lowercase letters or digits. Return False for any other value, including None, non-strings, wrong prefix, wrong length, uppercase, punctuation, and any non-ASCII character (for example fullwidth or accented letters and non-ASCII digits, even when the length and prefix look right). Do not use regular expressions. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import validate_api_key_shape\n\n\ndef main():\n    good = 'tck_' + ('a' * 32)\n    assert validate_api_key_shape(good) is True\n    assert validate_api_key_shape('tck_' + '0123456789abcdefghijklmnopqrstuv') is True\n    bad = [\n        '',\n        'tck_' + ('a' * 31),\n        'tck_' + ('a' * 33),\n        'TCK_' + ('a' * 32),\n        'tck_' + ('A' * 32),\n        'tck_' + ('a' * 31) + '-',\n        'tck_' + ('a' * 32) + ' ',\n        None,\n        123,\n        # Boundary: non-ASCII characters of the right length are not allowed,\n        # even when str.islower()/str.isdigit() would return True.\n        'tck_' + ('\u00e9' * 32),\n        'tck_' + ('\uff41' * 32),\n        'tck_' + ('\u00df' * 32),\n        'tck_' + ('\u0663' * 32),\n        'tck_' + ('a' * 31) + '\u00e9',\n    ]\n    for value in bad:\n        assert validate_api_key_shape(value) is False, f'accepted bad value {value!r}'\n    print('ok: validate_api_key_shape')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "high",
+    "tags": [
+      "credential",
+      "key"
+    ]
+  },
+  {
+    "id": "mask_secret",
+    "title": "Mask credential text (redaction)",
+    "prompt": "Write a Python function mask_secret(value: str, visible: int = 4) -> str for redacting a credential string. If visible <= 0 (including 0 and negative values), return one asterisk for every character. If len(value) <= visible, return one asterisk for every character. Otherwise return (len(value) - visible) asterisks followed by the last visible characters. The empty string returns an empty string. Output only the Python code in one ```python fenced block.",
+    "verifier_python": "from solution import mask_secret\n\n\ndef main():\n    cases = [\n        ('abcdefgh', 4, '****efgh'),\n        ('abcd', 4, '****'),\n        ('abc', 4, '***'),\n        ('', 4, ''),\n        ('abcdef', 0, '******'),\n        ('abcdef', -2, '******'),\n        ('abcdef', 2, '****ef'),\n        ('ab', 10, '**'),\n        # Boundary: empty string and visible <= 0.\n        ('', 0, ''),\n        ('', -1, ''),\n        ('', 10, ''),\n        ('a', 0, '*'),\n        ('abc', -5, '***'),\n        ('abcdef', -100, '******'),\n    ]\n    for value, visible, expected in cases:\n        got = mask_secret(value, visible)\n        assert got == expected, (\n            f'mask_secret({value!r}, {visible}) -> {got!r}, expected {expected!r}'\n        )\n    assert mask_secret('abcdef') == '**cdef'\n    assert mask_secret('') == ''\n    assert mask_secret('abcdef', 0) == '******'\n    print('ok: mask_secret')\n\n\nif __name__ == '__main__':\n    main()",
+    "risk": "high",
+    "tags": [
+      "credential",
+      "redaction"
+    ]
+  }
+]

@@ -391,7 +391,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件（两项延期验证结果见 §12.52；升级链路已闭环、真实投递已复现，runner 级 submitted 见 §12.53/§12.54） |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
-| **M5-06 对照实验（工具验收完成，真实实验延期；见 12.29）**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
+| **M5-06 对照实验（工具验收完成；本地试点已完成（两臂 6/8，无云端臂，见 §12.56）；正式云端对照仍 PENDING）**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
 
 **M5 退出门禁**：本地 Worker 完成至少一个真实小任务；oMLX 不可用时有界阻塞或按审批升级；Router 决策可解释；成本数据区分真实、估算、缺失；对照实验可复现且不虚报收益。
 
@@ -973,6 +973,8 @@ WorkerReport、Verifier 和调度预算已接入用量记录，CEO Wake 次数�
 ### 12.29 M5-06 对照实验工具验收
 
 提交 `470d5c3` 已推送主线。90 项测试和 8 个子测试通过。用户接受工具范围并关闭追踪项。当前条件不足，纯云端与混合模式的真实对照实验延期，未记录实际收益。
+
+**后续更新（2026-11-28）**：本地试点已完成并登记于 §12.56；云端对照仍 PENDING。
 
 
 ### 12.30 M6-01 只读 DAG 验收
@@ -1567,3 +1569,37 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - 云端正向派发、GitHub Actions、真实 oMLX 推理端到端仍未验证，维持 §12.52/§12.53/§9.5 所注 PENDING。
 
 **限制声明**：本节仅登记代码接线、独立验收与可复跑测试事实；因代码在登记时未提交，上述数字的可复跑基准是**含未提交改动的工作树**，提交落地前在干净 HEAD 上跑新 31 项面会因文件缺失而不同。在 CEO 提交该 3 文件之前，M6-04 运行时接线的持久性以提交为准；真实 Herdr 模板投递取得独立证据之前，相应边界不得宣称通过。历史 §12.50 及其前记录保留不删。
+
+### 12.56 M5-06 本地试点实验（2026-11-28）
+
+**登记口径**：本节登记操作者批准的 M5-06**本地试点**——loopback-only oMLX 端点、两个同族量化模型（`Qwen3.8-Flash-Next-4bit-mtp` 为 cheap 档、`Qwen3.8-Flash-Next-oQ4e-mtp` 为 strong 档）、每 (arm, task) N=1、temperature=0、max_tokens=8192，Router 为**库级消费**（`teamcraft.router`，未接入主 dispatch 路径）。该试点**不是** roadmap 要求的纯云端 vs 混合对照实验：无云端臂、无云传输调用、GitHub Actions 未运行，正式云端对照仍 PENDING。代码 3 件（`scripts/m506_pilot.py`、`scripts/m506_tasks.json`、`tests/test_m506_pilot.py`）登记时**未提交**（由 CEO 提交）；本次登记仅改动本文档，未 commit/push。本文档由本地 oMLX `Qwen3.8-Flash-Next-oQ4e-mtp` 撰写。
+
+**三轮开发与独立验收历史（失败不省略）**：
+
+1. **第一轮（max_tokens=2048）——作废**。独立 tester FAIL：verifier 存在 10 类边界假阳性；`os._exit(0)`/`sys.exit(0)` 可绕过哨兵（sentinel）；混杂情况未披露；无 provenance。原结果目录 `/tmp/m506_pilot_20261128T082428Z`（max_tokens=2048）仅留历史，不再作为验收证据。
+2. **第二轮（max_tokens=8192，修复后重跑）**：两臂各成功 6/8 = 0.750（即下方有效数字的实测来源）。独立 tester 仍 **FAIL**：`aggregate_windows` 的 verifier 使用已排序输入且把负窗口与变异混用，"仅加 `events.sort()`" 的变异解可通过；另有高残余风险（进程内伪造 nonce/excepthook 与 `ctypes` 可绕过隔离）。
+3. **第三轮（verifier 加固 + 重放）**：修复该 verifier（乱序输入不再计为变异解、负窗口分离为独立边界），新增 11 项加固测试；引入 `--replay` 以留存脱敏 `contents/` 重放 → **16/16 (arm, task) 内容哈希一致、0 判定变化**（以修复后 verifier 复判：single 6/8→6/8、mixed 6/8→6/8，`changed_count=0`）。聚焦 tester **PASS（无阻断）**。
+
+**有效实验结果（第二轮实测，第三轮重放确认判定未变）**：
+
+- 任务集 `scripts/m506_tasks.json`：8 任务，其中 2 个 high 风险（`validate_api_key_shape`、`mask_secret`，tags 含 credential/key），两臂跑同一任务集与同一验收。
+- **single**（每任务均用 strong oQ4e）：6/8（0.750）；wall_model_seconds 422.754s / generation_seconds 416.590s；tokens p/c/r = 1285/22124/21584；截断 2（`parse_csv_line`、`top_k_frequent`，`finish_reason=length`、返回空内容）。
+- **mixed**（Router 按声明风险/标签逐任务选择）：6/8（0.750）；wall_model_seconds 530.958s / generation_seconds 471.780s；tokens p/c/r = 1285/25079/24479；同两任务截断。
+- Router 决策分布（mixed 臂）：6 normal → 4bit（`selected_local_first`）、2 high → oQ4e（`selected_high_risk_assurance`）；0 拒绝（`router_refused` 为 0，无静默回退）。
+- 模型加载合计 112.430s（跨 warmups 与任务调用；mixed 臂发生模型切换，该臂内加载约 51.4s）；`wall_model_seconds` 含加载/切换、`generation_seconds` 不含。
+- **两臂同分（0.750），mixed 更慢（wall +108.2s）且 reasoning tokens 更多（24479 vs 21584）；该数据不支持"mixed 更优"，本节不作任何收益宣称**，与 §9.5 "结果标注样本和限制、'50%' 只作为目标而非承诺" 口径一致。
+
+**测试计数**（本节撰写者在含上述未提交工件的工作树复跑，结果与验收轮日志一致）：
+
+- `tests/test_m506_pilot.py`：**62 passed + 55 subtests passed**，exit 0（含 11 项 verifier 加固测试）
+- 全量 `tests/`：**1736 passed / 4 skipped**（585 subtests passed），exit 0
+- `--dry-run` 两次运行产生相同计划哈希（`a1504ce0…`）；`replay.json` 的 `harness_sha256`（`11837e62…`）与当前工作树 `scripts/m506_pilot.py` 的 SHA-256 一致；第二轮 `results.json`/`summary.md` 保留披露补丁前的 harness 哈希（`6a8de799…`）。
+
+**残余与未声称**：
+
+- verifier 是**正确性守卫，不是安全边界**：进程内 `ctypes` 或伪造 nonce/excepthook 可绕过隔离；上述结论只适用于**非对抗性模型输出**（该披露已写入 harness docstring 与 `replay.json`）。
+- N=1、单机、loopback、两模型为同族量化对比、无统计显著性；`merge_intervals` 的非变异检查为有限见证（tuple 乱序用例）。
+- 第二轮 `summary.md`/`results.json` 生成于披露补丁之前，**不含**"非安全边界"披露行；引用第二轮工件时必须连同本节披露一并引用。
+- Router 为库级消费（未接入主 dispatch 路径）；无云端臂；GitHub Actions 未运行；roadmap 的正式云端 vs 混合对照实验仍 PENDING。
+
+**限制声明**：登记时代码未提交，上述数字的可复跑基准是**含未提交改动的工作树**，持久性以 CEO 提交为准；§12.29 及其前历史记录保留不删，仅在 §12.29 末尾追加后续更新标记。
