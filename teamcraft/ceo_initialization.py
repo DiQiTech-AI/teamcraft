@@ -35,6 +35,15 @@ DEFAULT_NONCE_TTL_SECONDS = 300
 #: contract can be resolved; Claude's real adapter leg is still pending (PG-1)
 #: and an initialization record never implies that a live Claude run occurred.
 SUPPORTED_CEO_HARNESSES = frozenset({"codex", "opencode", "claude"})
+#: Installed runtime Skill directory per allowlisted Harness.  Codex/OpenCode
+#: read the canonical ``.agents`` tree and Claude reads the installer-managed
+#: byte-identical ``.claude`` copy.  Both resolve the same canonical
+#: ``SKILL.md`` bytes, so ``runtime_skill_hash`` validation is unchanged.
+_RUNTIME_SKILL_DIRS: dict[str, tuple[str, ...]] = {
+    "codex": (".agents", "skills", "teamcraft"),
+    "opencode": (".agents", "skills", "teamcraft"),
+    "claude": (".claude", "skills", "teamcraft"),
+}
 
 
 class CEOInitializationError(TeamCraftError):
@@ -119,6 +128,34 @@ def _discover_protocol(
         project_root, harness,
         expected_version=expected_version, expected_sha256=expected_sha256,
     )
+
+
+def _runtime_skill_path(project_root: str | Path, harness: str) -> Path:
+    """Resolve the installed runtime ``SKILL.md`` for one allowlisted Harness.
+
+    Codex/OpenCode resolve the canonical ``.agents`` tree and Claude resolves
+    the installer-managed byte-identical ``.claude`` copy.  Every path
+    component is rejected if it is a symbolic link; a missing or unreadable
+    file is left to the caller's existing fail-closed read/compare checks so
+    the validation semantics (same canonical bytes, same hash) do not change.
+    """
+    try:
+        parts = _RUNTIME_SKILL_DIRS[harness]
+    except (KeyError, TypeError):
+        raise CEOInitializationError(
+            f"runtime Skill has no supported path for Harness {harness!r}"
+        ) from None
+    skill_dir = Path(project_root)
+    path_chain = []
+    for part in parts:
+        skill_dir = skill_dir / part
+        path_chain.append(skill_dir)
+    skill_path = skill_dir / "SKILL.md"
+    if any(path.is_symlink() for path in (*path_chain, skill_path)):
+        raise CEOInitializationError(
+            "TeamCraft runtime Skill path must not contain symbolic links"
+        )
+    return skill_path
 
 
 def _record(row: Any) -> CEOInitialization:
@@ -321,9 +358,7 @@ def discover_and_issue(
                 expected_version=bindings["protocol_version"],
                 expected_sha256=bindings["protocol_hash"],
             )
-            skill_path = Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-            if skill_path.is_symlink():
-                raise CEOInitializationError("TeamCraft runtime Skill must not be a symbolic link")
+            skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
             skill_bytes = skill_path.read_bytes()
             skill_bytes.decode("utf-8")
         except (ceo_protocol.ProtocolError, OSError, UnicodeError) as exc:
@@ -455,15 +490,7 @@ def mark_bootstrap_unknown(
                 expected_version=record.protocol_version,
                 expected_sha256=record.protocol_hash,
             )
-            skill_path = Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-            skill_chain = (
-                Path(bindings["project_root"]) / ".agents",
-                Path(bindings["project_root"]) / ".agents" / "skills",
-                Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft",
-                skill_path,
-            )
-            if any(path.is_symlink() for path in skill_chain):
-                raise CEOInitializationError("TeamCraft runtime Skill path must not contain symbolic links")
+            skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
             skill_bytes = skill_path.read_bytes()
             skill_bytes.decode("utf-8")
             current_skill_hash = hashlib.sha256(skill_bytes).hexdigest()
@@ -568,8 +595,13 @@ def record_bootstrap_submitted_assumed(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version, expected_sha256=record.protocol_hash,
         )
-        skill_path = Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-        if (protocol.sha256 != record.protocol_hash or skill_path.is_symlink()
+        try:
+            skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
+        except CEOInitializationError as exc:
+            raise CEOInitializationGateClosed(
+                f"CEO Protocol or runtime Skill drifted before assumed acceptance: {exc}"
+            ) from exc
+        if (protocol.sha256 != record.protocol_hash
                 or hashlib.sha256(skill_path.read_bytes()).hexdigest() != record.runtime_skill_hash):
             raise CEOInitializationGateClosed("CEO Protocol or runtime Skill drifted before assumed acceptance")
         updated_member = conn.execute(
@@ -741,10 +773,13 @@ def reconcile_bootstrap_submitted_native_session(
             expected_version=record.protocol_version,
             expected_sha256=record.protocol_hash,
         )
-        skill_path = (
-            Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-        )
-        if (protocol.sha256 != record.protocol_hash or skill_path.is_symlink()
+        try:
+            skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
+        except CEOInitializationError as exc:
+            raise CEOInitializationGateClosed(
+                f"CEO Protocol or runtime Skill drifted: {exc}"
+            ) from exc
+        if (protocol.sha256 != record.protocol_hash
                 or hashlib.sha256(skill_path.read_bytes()).hexdigest()
                 != record.runtime_skill_hash):
             raise CEOInitializationGateClosed("CEO Protocol or runtime Skill drifted")
@@ -973,8 +1008,13 @@ def record_bootstrap_submitted_live_process(
             expected_version=record.protocol_version,
             expected_sha256=record.protocol_hash,
         )
-        skill_path = Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-        if (protocol.sha256 != record.protocol_hash or skill_path.is_symlink()
+        try:
+            skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
+        except CEOInitializationError as exc:
+            raise CEOInitializationGateClosed(
+                f"CEO Protocol or runtime Skill drifted: {exc}"
+            ) from exc
+        if (protocol.sha256 != record.protocol_hash
                 or hashlib.sha256(skill_path.read_bytes()).hexdigest() != record.runtime_skill_hash):
             raise CEOInitializationGateClosed("CEO Protocol or runtime Skill drifted")
         payload = _json({
@@ -1186,12 +1226,17 @@ def require_initialized(
             or bindings["protocol_hash"] != record.protocol_hash):
         raise CEOInitializationGateClosed("CEO initialization identity drifted; dispatch is blocked")
     try:
+        skill_path = _runtime_skill_path(bindings["project_root"], bindings["harness"])
+    except CEOInitializationError as exc:
+        raise CEOInitializationGateClosed(
+            f"initialized CEO runtime Skill is unavailable: {exc}"
+        ) from exc
+    try:
         protocol = _discover_protocol(
             bindings["project_root"], bindings["harness"],
             expected_version=record.protocol_version, expected_sha256=record.protocol_hash,
         )
-        skill_path = Path(bindings["project_root"]) / ".agents" / "skills" / "teamcraft" / "SKILL.md"
-        if skill_path.is_symlink() or hashlib.sha256(skill_path.read_bytes()).hexdigest() != record.runtime_skill_hash:
+        if hashlib.sha256(skill_path.read_bytes()).hexdigest() != record.runtime_skill_hash:
             raise CEOInitializationGateClosed("TeamCraft runtime Skill identity drifted; dispatch is blocked")
     except (ceo_protocol.ProtocolError, OSError) as exc:
         raise CEOInitializationGateClosed(f"initialized CEO protocol/runtime Skill is unavailable: {exc}") from exc

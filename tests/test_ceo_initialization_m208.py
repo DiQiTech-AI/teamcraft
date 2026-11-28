@@ -1130,12 +1130,13 @@ class CEOInitializationM208Tests(unittest.TestCase):
         )
         self.assertEqual((claude_snapshot.version, claude_snapshot.sha256),
                          (attempt.protocol_version, attempt.protocol_hash))
-        # The runtime Skill check is unchanged: it still reads the canonical
-        # ``.agents`` tree; only the CEO protocol artifact comes from .claude.
+        # The runtime Skill check follows the same per-Harness tree as the
+        # protocol artifact: Claude resolves the installer-managed ``.claude``
+        # copy, which carries the same canonical SKILL.md bytes.
         self.assertEqual(
             record.runtime_skill_hash,
             hashlib.sha256(
-                (self.root / ".agents/skills/teamcraft/SKILL.md").read_bytes()
+                (self.root / ".claude/skills/teamcraft/SKILL.md").read_bytes()
             ).hexdigest(),
         )
         # The effect-admission boundary re-reads the same .claude tree.
@@ -1226,6 +1227,14 @@ class CEOInitializationM208Tests(unittest.TestCase):
                 self.assertTrue(nonce)
                 self.assertEqual((record.protocol_version, record.protocol_hash),
                                  (attempt.protocol_version, attempt.protocol_hash))
+                # Codex/OpenCode keep reading the canonical ``.agents``
+                # runtime Skill; there is no fallback to another tree.
+                self.assertEqual(
+                    record.runtime_skill_hash,
+                    hashlib.sha256(
+                        (self.root / ".agents/skills/teamcraft/SKILL.md").read_bytes()
+                    ).hexdigest(),
+                )
                 pins.add((record.protocol_version, record.protocol_hash))
         self.assertEqual(len(pins), 1)
         # Without its own .claude tree a Claude CEO cannot fall back to .agents.
@@ -1234,6 +1243,103 @@ class CEOInitializationM208Tests(unittest.TestCase):
             init.CEOInitializationGateClosed, "missing or unreadable for claude",
         ):
             self.issue()
+
+    def test_runtime_skill_path_maps_each_harness_to_its_installed_tree(self):
+        self.assertEqual(
+            init._runtime_skill_path(self.root, "codex"),
+            self.root / ".agents/skills/teamcraft/SKILL.md",
+        )
+        self.assertEqual(
+            init._runtime_skill_path(self.root, "opencode"),
+            self.root / ".agents/skills/teamcraft/SKILL.md",
+        )
+        self.assertEqual(
+            init._runtime_skill_path(self.root, "claude"),
+            self.root / ".claude/skills/teamcraft/SKILL.md",
+        )
+        with self.assertRaises(init.CEOInitializationError):
+            init._runtime_skill_path(self.root, "gemini")
+
+    def test_claude_only_install_uses_claude_runtime_skill_end_to_end(self):
+        # Claude-only installation: the canonical ``.agents`` tree is absent,
+        # so both the CEO protocol and the runtime Skill must resolve from the
+        # installer-managed ``.claude`` copy.
+        shutil.rmtree(self.root / ".agents")
+        self.assertFalse((self.root / ".agents").exists())
+        self.set_ceo_harness("claude")
+        expected = hashlib.sha256(
+            (self.root / ".claude/skills/teamcraft/SKILL.md").read_bytes()
+        ).hexdigest()
+        record, nonce = self.issue()
+        self.assertEqual(record.state, "discovered")
+        self.assertEqual(record.runtime_skill_hash, expected)
+
+        pending = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(pending.state, "unknown")
+        initialized = init.record_bootstrap_submitted_assumed(
+            self.conn, self.project_id, nonce, native_session_id="native-m208",
+            session_state="idle", lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(initialized.state, "initialized")
+        self.assertEqual(initialized.runtime_skill_hash, expected)
+        self.assertEqual(
+            init.require_initialized(self.conn, self.project_id).runtime_skill_hash,
+            expected,
+        )
+
+    def test_claude_runtime_skill_missing_fails_closed(self):
+        self.set_ceo_harness("claude")
+        shutil.rmtree(self.root / ".claude/skills/teamcraft")
+        with self.assertRaisesRegex(
+            init.CEOInitializationGateClosed, "runtime Skill discovery failed",
+        ):
+            self.issue()
+        self.assertIsNone(init.get_initialization(self.conn, self.project_id))
+
+    def test_claude_runtime_skill_drift_fails_closed(self):
+        self.set_ceo_harness("claude")
+        _, nonce = self.issue()
+        skill = self.root / ".claude/skills/teamcraft/SKILL.md"
+        skill.write_bytes(skill.read_bytes() + b"\nclaude runtime drift\n")
+        drifted = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(drifted.state, "failed")
+        self.assertIn("drifted", drifted.detail)
+        self.assertIsNotNone(drifted.nonce_consumed_at)
+        with self.assertRaises(init.CEOInitializationGateClosed):
+            init.require_initialized(self.conn, self.project_id)
+
+    def test_claude_runtime_skill_symlink_fails_closed(self):
+        self.set_ceo_harness("claude")
+        _, nonce = self.issue()
+        skill = self.root / ".claude/skills/teamcraft/SKILL.md"
+        target = self.root / "claude-skill-target.md"
+        target.write_bytes(skill.read_bytes())
+        skill.unlink()
+        skill.symlink_to(target)
+        result = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(result.state, "failed")
+        self.assertIsNotNone(result.nonce_consumed_at)
+
+    def test_claude_symlinked_runtime_skill_tree_fails_closed(self):
+        self.set_ceo_harness("claude")
+        _, nonce = self.issue()
+        skill_dir = self.root / ".claude/skills/teamcraft"
+        target_dir = self.root / "claude-skill-dir"
+        target_dir.mkdir()
+        shutil.copy2(skill_dir / "SKILL.md", target_dir / "SKILL.md")
+        shutil.rmtree(skill_dir)
+        skill_dir.symlink_to(target_dir, target_is_directory=True)
+        result = init.mark_bootstrap_unknown(
+            self.conn, self.project_id, nonce, lease=self.lease, clock=self.clock,
+        )
+        self.assertEqual(result.state, "failed")
+        self.assertIsNotNone(result.nonce_consumed_at)
 
     def test_claude_allowlist_admission_does_not_claim_live_capability(self):
         # The static policy is unchanged: no runner is injected, so no process

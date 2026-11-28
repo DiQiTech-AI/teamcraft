@@ -404,7 +404,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M6-03 脱敏诊断包（本地 Python 接口；见 12.31）**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
 | **M6-04 模板与个人偏好**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
-| **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07，保持 pending:PG-1；**M6-07 已登记**，见 §12.46）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
+| **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07（已关闭，2026-11-28）；**M6-07 已登记**，见 §12.46）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
 **M6 退出门禁**：P2 项逐项独立发布；跨 Harness E2E 按实际版本和真实运行证据验收，未安装 Claude 时明确未验证；任何远程或多机能力先有单独 RFC；新增界面只展示真实 Core 数据，不引入第二状态真源或第二份 CEO 协议。
 
@@ -1353,3 +1353,21 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 **边界**：`prompt_ack=unknown`、`host_trusted_receipt=false`；DONE 需 human accept（M4-04）；真实 Claude 使用 oMLX 本地模型（非云端），`.claude` 协议副本与 `.agents` 字节一致（installer）。证据副本：`.teamcraft/hg-f-2026-11-28-claude/`。
 
 **M6-07 状态**：离线适配（installer/allowlist/discovery/init-path）与**真实 Claude leg 均 PASS**；非阻塞缺口：`ceo_initialization` 的 runtime skill hash 路径仍读 `.agents`（Claude-only 安装需后续按 harness 解析 `.claude`）。
+
+### 12.48 M6-07 关闭登记（2026-11-28）
+
+**Owner 决定**：**M6-07（Claude 适配）关闭**。离线适配（installer / allowlist / discovery / init-path）与**真实 Claude leg** 均 PASS；真实 leg 使用 Claude Code 2.1.332 + **本地 oMLX Claude API**（无云端调用）。
+
+**关闭证据**：
+
+- 离线：全量 `tests/` 1621 OK（4 skipped）；Skill 95 OK；installer 36、ceo 52、ceo_protocol 9、runtime_adapter 56、m607 8。
+- 真实 Claude leg（§12.47）：CEO bootstrap + dispatch + Wake + worker edit（`src/feature.py = # M606-LIVE`）+ verify + commit `996f315` + delivery submitted。
+- E1：Claude Code **2.1.332**、`/opt/homebrew/bin/claude`、sha256 `5b8214f8f082f3187420b27b4063b9b4f4d9412cd66ea436d6d1966ad582700f`；后端 `ANTHROPIC_BASE_URL=http://127.0.0.1:8000`。
+- 非阻塞缺口：`ceo_initialization` 的 runtime skill hash 路径仍读 `.agents`；随后修复（§12.49）。
+- `prompt_ack=unknown`、`host_trusted_receipt=false`；DONE 需 human accept（M4-04）。
+
+### 12.49 M6-07 runtime-skill 路径缺口修复（2026-11-28）
+
+- `teamcraft/ceo_initialization.py` 新增 `_runtime_skill_path`：`codex`/`opencode` → `.agents/skills/teamcraft/SKILL.md`；`claude` → `.claude/skills/teamcraft/SKILL.md`；symlink 链拒绝与 fail-closed 读/hash 语义保留。
+- 替换 6 处硬编码 `skill_path`；`test_ceo_*.py` **58 OK**，全量回归见提交证据。
+- 无 Schema 变更；未声称真实 Claude。此缺口为 §12.47/§12.48 记录的非阻塞项，现已关闭。
