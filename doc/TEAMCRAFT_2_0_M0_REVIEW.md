@@ -1332,3 +1332,24 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 **离线切片复核（2026-11-27，独立 tester PASS）**：全量 `tests/` **1621 OK（4 skipped）**；定向 install 36、ceo 52、ceo_protocol 9、runtime_adapter 56、m607 8 全绿；临时安装 `.agents`/`.claude` 42/42 字节一致、协议 `1.0.0 / c5c358bf…a742`、幂等、用户 `CLAUDE.md` 不被覆盖。真实 Claude leg 仍 `pending:PG-1`。
 
 **非阻塞缺口（后续）**：`teamcraft/ceo_initialization.py` 的 runtime skill hash 路径仍读 `.agents/skills/teamcraft`（约 :324/458/571/745/976/1193）；Claude-only 安装需按 harness 解析 `.claude`。当前安装器同时提供两棵字节一致树，故 pin 一致、不影响本次离线切片。
+
+### 12.47 M6-07 Claude 真实 local-only leg PASS（2026-11-28）
+
+**环境（E1）**：Claude Code **2.1.332**（Homebrew cask `claude-code`），binary `/opt/homebrew/bin/claude`；后端为**本地 oMLX Claude API**（`ANTHROPIC_BASE_URL=http://127.0.0.1:8000`），无云端调用。
+
+**真实运行**（run `b5780455e9d20455` dispatch / `950dacc5c1fdb4d6` deliver）：
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| CEO bootstrap（claude / `.claude`） | PASS | `ceo-bootstrap`：initialized / assumed_default / native；`cwd_kind=project_root` |
+| worker dispatch | PASS | `dispatch`：`state=submitted`、`agent=claude`、`session=6e496b10-…`、`session_stable=true`、`topology_unchanged=true` |
+| Wake | PASS | `wake`：`transport=delivered`、`outcome=submitted`、`ceo_acknowledged=false` |
+| worker 变更 | PASS | `src/feature.py` = `# M606-LIVE`（Claude Code 真实写入） |
+| 验证 | PASS | `verification.verdict=pass` |
+| Diff Gate | PASS | `diff-gate.ok=true` |
+| local commit | PASS | `996f315` on `tc/656b0915-…` |
+| delivery | submitted | `disposition=submitted`、`diff_digest=176767ec…` |
+
+**边界**：`prompt_ack=unknown`、`host_trusted_receipt=false`；DONE 需 human accept（M4-04）；真实 Claude 使用 oMLX 本地模型（非云端），`.claude` 协议副本与 `.agents` 字节一致（installer）。证据副本：`.teamcraft/hg-f-2026-11-28-claude/`。
+
+**M6-07 状态**：离线适配（installer/allowlist/discovery/init-path）与**真实 Claude leg 均 PASS**；非阻塞缺口：`ceo_initialization` 的 runtime skill hash 路径仍读 `.agents`（Claude-only 安装需后续按 harness 解析 `.claude`）。

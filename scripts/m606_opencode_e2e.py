@@ -2279,7 +2279,7 @@ class M606LiveRun:
         ceo = ceos[0]
         ev.post("ceo", "CEO harness kind supports the protocol discovery contract",
                 expected=True,
-                observed=str(ceo[2]) in {"codex", "opencode"},
+                observed=str(ceo[2]) in ceo_initialization.SUPPORTED_CEO_HARNESSES,
                 detail=f"observed harness kind {ceo[2]!r}")
         ev.post("ceo", "CEO binds a TeamCraft Session, terminal and Attempt",
                 expected=True,
