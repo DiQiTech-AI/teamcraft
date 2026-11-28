@@ -19,6 +19,7 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -435,6 +436,68 @@ def _operation_ttl(start_timeout_ms: int, wait_timeout_ms: int | None,
     else:
         seconds += 15
     return int(seconds)
+
+
+def _stale_core_brief_template_error() -> TeamctlError:
+    """Actionable refusal when the RESOLVED core predates brief templates."""
+
+    core_path = getattr(_adapter, "__file__", None) or "<unknown core module>"
+    return TeamctlError(
+        "this TeamCraft core does not support Task Brief templates:"
+        " prepare_attempt_brief()/render_brief_template_text() lack the"
+        f" template parameters ({core_path}); refresh the bundled core with"
+        " scripts/install.sh (or reinstall the teamcraft package) and retry —"
+        " the default launch/resume path does not need it and keeps working"
+    )
+
+
+def _prepare_templated_attempt_brief(
+    conn: Any,
+    name: str,
+    *,
+    brief_template: str,
+    brief_values: dict[str, Any] | None,
+    brief_store_dir: str | None,
+) -> Any:
+    """Call the resolved core's templated brief path, or refuse actionably.
+
+    The historical/default call never reaches here (see
+    :meth:`StateStore.prepare_prompt_brief`).  Support is proven by
+    ``inspect.signature`` first so a stale bundled core is reported as one
+    actionable :class:`TeamctlError` instead of a bare ``TypeError``; a
+    ``TypeError`` naming ``brief_template`` (e.g. a ``**kwargs`` wrapper) is
+    the fallback signal only.  Every other ``TypeError`` propagates untouched.
+
+    ``brief_store_dir`` is required as well: a core that can render a template
+    but cannot bind the project store would reintroduce the silent
+    cross-project mismatch, so it is refused like a pre-template core.
+    """
+
+    try:
+        parameters = inspect.signature(
+            _adapter.prepare_attempt_brief
+        ).parameters
+    except (TypeError, ValueError):  # un-introspectable callable: try it below
+        supported: bool | None = None
+    else:
+        supported = (
+            "brief_template" in parameters
+            and "brief_store_dir" in parameters
+        )
+    if supported is False:
+        raise _stale_core_brief_template_error()
+    kwargs: dict[str, Any] = {
+        "brief_template": brief_template,
+        "brief_values": brief_values,
+    }
+    if brief_store_dir is not None:
+        kwargs["brief_store_dir"] = brief_store_dir
+    try:
+        return _adapter.prepare_attempt_brief(conn, name, **kwargs)
+    except TypeError as exc:
+        if "brief_template" not in str(exc) and "brief_store_dir" not in str(exc):
+            raise
+        raise _stale_core_brief_template_error() from exc
 
 
 class StateStore:
@@ -861,10 +924,27 @@ class StateStore:
         finally:
             conn.close()
 
-    def prepare_prompt_brief(self, name: str) -> dict[str, Any]:
+    def prepare_prompt_brief(
+        self,
+        name: str,
+        *,
+        brief_template: str | None = None,
+        brief_values: dict[str, Any] | None = None,
+        brief_store_dir: str | None = None,
+    ) -> dict[str, Any]:
         conn = self._connect()
         try:
-            brief = _adapter.prepare_attempt_brief(conn, name)
+            if brief_template is None:
+                # Historical call, byte-identical by design: a bundled core
+                # that predates Task Brief templates must keep serving the
+                # default launch/resume path (no template kwargs are sent).
+                brief = _adapter.prepare_attempt_brief(conn, name)
+            else:
+                brief = _prepare_templated_attempt_brief(
+                    conn, name, brief_template=brief_template,
+                    brief_values=brief_values,
+                    brief_store_dir=brief_store_dir,
+                )
             view = _adapter.team_view(conn)
             member = (view or {}).get("members", {}).get(name, {})
             return {"task_id": brief.task_id, "attempt_id": brief.attempt_id,
@@ -1608,6 +1688,9 @@ def prompt_member(
     wait: bool,
     timeout_ms: int,
     lease: _leader.Lease | None = None,
+    brief_template: str | None = None,
+    brief_values: dict[str, Any] | None = None,
+    brief_store_dir: str | None = None,
 ) -> dict[str, Any]:
     name = member["name"]
     own_lease = lease is None
@@ -1620,7 +1703,20 @@ def prompt_member(
         # Prepare durable Task evidence and the one-time CEO challenge before
         # changing the member to a possibly-delivered phase.
         preparer = getattr(store, "prepare_prompt_brief", None)
-        bound_brief = preparer(name) if preparer else {}
+        if preparer is None:
+            bound_brief = {}
+        elif brief_template is not None:
+            brief_kwargs: dict[str, Any] = {
+                "brief_template": brief_template, "brief_values": brief_values,
+            }
+            if brief_store_dir is not None:
+                # Bind rendering to the resolved project store; ``--cwd`` must
+                # never fall back to whatever directory is current.
+                brief_kwargs["brief_store_dir"] = brief_store_dir
+            bound_brief = preparer(name, **brief_kwargs)
+        else:
+            # Default/resume path stays byte-identical to the historical call.
+            bound_brief = preparer(name)
         ceo_bootstrap = None
         if member.get("role") == "ceo":
             conn = store._connect()
@@ -1855,9 +1951,147 @@ def launch_agent_args(
     return args
 
 
+def parse_brief_values(assignments: Sequence[str] | None) -> dict[str, str]:
+    """Parse repeatable ``--brief-value KEY=VALUE`` pairs without guessing.
+
+    ``KEY`` must be non-empty after trimming and may not repeat; the value is
+    kept verbatim (including an empty string) and placeholder/vocabulary
+    validation stays in :mod:`teamcraft.templates`.
+    """
+
+    values: dict[str, str] = {}
+    for assignment in assignments or []:
+        key, separator, value = assignment.partition("=")
+        if not separator:
+            raise TeamctlError(
+                f"--brief-value expects KEY=VALUE, got {assignment!r}"
+            )
+        key = key.strip()
+        if not key:
+            raise TeamctlError("--brief-value KEY must not be empty")
+        if key in values:
+            raise TeamctlError(f"duplicate --brief-value KEY {key!r}")
+        values[key] = value
+    return values
+
+
+def project_brief_store_dir(project_root: Path) -> Path:
+    """The ONLY store a launch against ``project_root`` may read."""
+
+    return project_root / RUNTIME_DIRECTORY_NAME / "templates"
+
+
+def resolve_brief_store_dir(project_root: Path) -> Path:
+    """Bind an explicit template launch to its resolved project store.
+
+    The project store always wins.  When it is absent we must NOT silently
+    fall back to the ``TEAMCRAFT_PROJECT_ROOT``/cwd store: from cwd B a
+    ``launch --cwd A`` would otherwise render B's same-id template (a
+    content-level error, not a missing-store refusal).  A different existing
+    store is therefore refused with the exact import remedy; two absent
+    stores are handed to the core, which reports "no active template config"
+    without creating anything.
+    """
+
+    project_store = project_brief_store_dir(project_root)
+    try:
+        canonical_project = project_store.expanduser().resolve(strict=False)
+        if canonical_project.exists():
+            return project_store
+        from teamcraft import templates as _templates
+        resolved = _templates.resolve_store_dir().expanduser()
+        canonical_resolved = resolved.resolve(strict=False)
+    except _CoreError as exc:
+        raise TeamctlError(str(exc)) from exc
+    except OSError as exc:
+        raise TeamctlError(
+            f"cannot resolve Task Brief template store: {exc}") from exc
+    if canonical_resolved != canonical_project and canonical_resolved.exists():
+        raise TeamctlError(
+            f"template store {str(resolved)!r} was resolved from the current"
+            " directory/environment, but the --cwd project store is"
+            f" {str(project_store)!r} (absent); refusing to render another"
+            " project's template. Import the document with"
+            f" TEAMCRAFT_PROJECT_ROOT={str(project_root)!r} so it lands in the"
+            " --cwd project store, or set TEAMCRAFT_PROJECT_ROOT to that same"
+            " project before launching"
+        )
+    return project_store
+
+
+def _renderer_accepts_store_dir(renderer: Any) -> bool:
+    """True when the resolved renderer can be bound to an explicit store.
+
+    An intermediate core that renders templates but resolves the store itself
+    would silently reintroduce the tested ``--cwd`` mismatch, so it is refused
+    exactly like a pre-template core.  Un-introspectable callables are tried;
+    a resulting ``TypeError`` naming ``store_dir`` is translated by the caller.
+    """
+
+    try:
+        parameters = inspect.signature(renderer).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "store_dir"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def prepare_launch_brief_options(
+    args: argparse.Namespace,
+    *,
+    project_root: Path,
+) -> tuple[str | None, dict[str, str] | None]:
+    """Validate explicit brief template options BEFORE any launch side effect.
+
+    Rendering once here proves the active template id and values are usable
+    before ``reserve_member``/split/prompt.  Nothing is persisted, executed, or
+    allowed to influence ownership, command allowlists, approvals, or routing.
+    ``project_root`` is the resolved ``--cwd`` project, so its store is the
+    only one consulted.
+    """
+
+    template_id = getattr(args, "brief_template", None)
+    values = parse_brief_values(getattr(args, "brief_value", None))
+    if values and template_id is None:
+        raise TeamctlError("--brief-value requires --brief-template")
+    if template_id is None:
+        return None, None
+    renderer = getattr(_adapter, "render_brief_template_text", None)
+    if not callable(renderer):
+        # A pre-M6-04 bundled core has no renderer at all.  Refuse with the
+        # same actionable refresh message instead of an AttributeError, and
+        # only on the explicit template path (the default path never gets
+        # here and keeps working against such a core).
+        raise _stale_core_brief_template_error()
+    if not _renderer_accepts_store_dir(renderer):
+        raise _stale_core_brief_template_error()
+    store_dir = resolve_brief_store_dir(project_root)
+    try:
+        renderer(template_id, values, store_dir=str(store_dir))
+    except TypeError as exc:
+        if "store_dir" not in str(exc):
+            raise
+        raise _stale_core_brief_template_error() from exc
+    except _CoreError as exc:
+        raise TeamctlError(str(exc)) from exc
+    return template_id, values
+
+
 def _launch_operation(args: argparse.Namespace) -> int:
-    require_herdr()
+    # Resolve the project FIRST (read-only) so an explicit ``--cwd`` decides
+    # which template store is authoritative; validating brief options before
+    # this would silently bind the launch to the caller's current directory.
     root, task, responsibility, ownership = validate_common_launch(args)
+    brief_template, brief_values = prepare_launch_brief_options(
+        args, project_root=root)
+    brief_store_dir = (
+        str(project_brief_store_dir(root))
+        if brief_template is not None else None
+    )
+    require_herdr()
     model = getattr(args, "opencode_model", None)
     agent_args = launch_agent_args(args.role, args.kind, args.agent_arg)
     if model is not None:
@@ -1904,7 +2138,8 @@ def _launch_operation(args: argparse.Namespace) -> int:
         set_member_pane_label(member, getattr(args, "label", None))
         member = prompt_member(
             member, store, session, wait=args.wait, timeout_ms=args.timeout_ms,
-            lease=lease,
+            lease=lease, brief_template=brief_template,
+            brief_values=brief_values, brief_store_dir=brief_store_dir,
         )
         with store.locked() as state:
             assert state is not None
@@ -4858,6 +5093,16 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--start-timeout-ms", type=int, default=30_000)
     launch_parser.add_argument("--wait", action="store_true")
     launch_parser.add_argument("--timeout-ms", type=int, default=120_000)
+    launch_parser.add_argument(
+        "--brief-template", dest="brief_template", default=None,
+        metavar="ID",
+        help="explicitly render this ACTIVE Task Brief template into the brief",
+    )
+    launch_parser.add_argument(
+        "--brief-value", dest="brief_value", action="append", default=[],
+        metavar="KEY=VALUE",
+        help="placeholder value for --brief-template (repeatable)",
+    )
     launch_parser.add_argument(
         "--label",
         help="explicit full pane label (defaults to auto-derived '<role> · <task>')",

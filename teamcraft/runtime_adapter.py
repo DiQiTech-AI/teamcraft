@@ -35,10 +35,11 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from . import commands as command_core
 from . import briefs
+from . import templates
 from . import worker_reports
 from . import recovery
 from . import ceo_protocol
@@ -2047,8 +2048,114 @@ def latest_stage_command(conn: TeamCraftConnection, member: str,
     return command_core.get_command(conn, str(row[0]))
 
 
-def prepare_attempt_brief(conn: TeamCraftConnection, member: str, *, clock: Any = None) -> briefs.AttemptBrief:
-    """Create/read the full dispatch brief before a prompt Command is claimed."""
+def _active_brief_template(
+    template_id: str, store_dir: str | Path | None = None
+) -> templates.TaskBriefTemplate:
+    """Resolve one template id from the project-local ACTIVE config store.
+
+    ``store_dir`` makes the caller's project explicit (``launch --cwd`` MUST
+    not silently read another directory's store); when omitted the historical
+    ``resolve_store_dir()`` lookup is unchanged.
+
+    This is deliberately a read-only lookup: the store is never imported,
+    selected, or rolled back here.  Missing/invalid configuration fails closed
+    with :class:`RuntimeAdapterError`; brief *value* problems stay
+    :class:`ValidationError` so callers can tell "bad config" from "bad input"
+    while both are refused before any brief row is written.
+    """
+
+    if store_dir is not None:
+        directory = Path(store_dir).expanduser()
+    else:
+        directory = templates.resolve_store_dir()
+    # Read-only guarantee: probe BEFORE constructing ConfigStore, whose
+    # __init__ would otherwise create ``<store>/versions/`` under a missing
+    # store.  A failed lookup must not leave a directory behind.
+    if not directory.exists():
+        raise RuntimeAdapterError(
+            "no active template config: no template config store at"
+            f" {str(directory)!r}; import one explicitly with"
+            " `python -m teamcraft.templates import FILE`"
+        )
+    try:
+        store = templates.ConfigStore(directory)
+        document = store.active_document()
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(
+            f"cannot load Task Brief template config: {exc}"
+        ) from exc
+    if document is None:
+        raise RuntimeAdapterError(
+            "no active template config; import one explicitly with"
+            " `python -m teamcraft.templates import FILE`"
+        )
+    try:
+        parsed = templates.parse_document(document)
+    except TeamCraftError as exc:
+        raise RuntimeAdapterError(
+            f"active Task Brief template config is invalid: {exc}"
+        ) from exc
+    available = {template.id: template for template in parsed.templates}
+    if template_id not in available:
+        raise RuntimeAdapterError(
+            f"template {template_id!r} is not in the active config;"
+            f" available: {sorted(available)}"
+        )
+    return available[template_id]
+
+
+def render_brief_template_text(
+    template_id: str,
+    values: Mapping[str, Any] | None = None,
+    *,
+    store_dir: str | Path | None = None,
+) -> str:
+    """Render one active template to inert text (no commands, no writes).
+
+    Exposed for the CLI's pre-flight validation: launch can prove the template
+    id and values are usable BEFORE reserving a member or touching Herdr.
+    ``store_dir`` binds that check to the resolved project (``--cwd``) instead
+    of whatever directory happens to be current.
+    """
+
+    template = _active_brief_template(template_id, store_dir)
+    if values is not None:
+        if not isinstance(values, Mapping):
+            raise ValidationError(
+                "brief values must be a mapping of placeholder to text")
+        # Defense in depth beyond the data layer's ``{{``/``}}`` check: rendered
+        # text is inert, so no value may carry ANY brace character and look
+        # like placeholder or later-directive syntax to a reader.
+        for key, value in values.items():
+            if isinstance(value, str) and ("{" in value or "}" in value):
+                raise ValidationError(
+                    f"brief value {key!r} contains brace characters; values"
+                    " are inert text and may not carry placeholder syntax")
+    return templates.render_brief(template, values or {})
+
+
+def prepare_attempt_brief(
+    conn: TeamCraftConnection,
+    member: str,
+    *,
+    brief_template: str | None = None,
+    brief_values: Mapping[str, Any] | None = None,
+    brief_store_dir: str | Path | None = None,
+    clock: Any = None,
+) -> briefs.AttemptBrief:
+    """Create/read the full dispatch brief before a prompt Command is claimed.
+
+    ``brief_template is None`` keeps the historical content byte-for-byte: the
+    same object, the same ``json.dumps`` call, no extra keys.  An explicit
+    template id appends one inert ``brief_text`` string to that same object and
+    changes nothing else (ownership, read-only, allowed commands, task version
+    and milestone bindings remain exactly as before).  ``brief_store_dir``
+    binds rendering to the resolved project (``launch --cwd``) instead of the
+    process's current directory.  Every template error is raised here, before
+    :func:`briefs.create_attempt_brief`, so a refused template can never leave
+    a half-written brief.
+    """
+
     row = conn.execute("SELECT task_id, attempt_id, session_id, role, responsibility, ownership_json, read_only, task FROM members WHERE name=?", (member,)).fetchone()
     if row is None or row[0] is None or row[1] is None:
         raise RuntimeAdapterError("versioned prompt requires member Task and Attempt")
@@ -2056,13 +2163,13 @@ def prepare_attempt_brief(conn: TeamCraftConnection, member: str, *, clock: Any 
     acceptance = json.loads(task.acceptance_json)
     milestones = ([{"id": f"acceptance-{i + 1}"} for i, _ in enumerate(acceptance)]
                   if isinstance(acceptance, list) and acceptance else [{"id": "final"}])
-    content = json.dumps({"task": {"id": task.id, "title": task.title, "description": task.description,
+    content_object: dict[str, Any] = {"task": {"id": task.id, "title": task.title, "description": task.description,
         "acceptance": acceptance, "version": task.version}, "milestones": milestones,
         "attempt_id": str(row[1]), "session_id": row[2], "role": row[3],
         "responsibility": row[4], "ownership": json.loads(str(row[5])),
         "read_only": bool(row[6]), "assignment": row[7],
         "allowed_commands": "only project-approved commands; do not broaden ownership",
-        "budget": "usage may be unknown (NULL), never report it as zero"}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        "budget": "usage may be unknown (NULL), never report it as zero"}
     try:
         brief = briefs.get_attempt_brief(conn, str(row[1]))
         if domain.get_task(conn, brief.task_id).version != brief.task_version:
@@ -2071,6 +2178,14 @@ def prepare_attempt_brief(conn: TeamCraftConnection, member: str, *, clock: Any 
     except Exception as exc:
         from .errors import NotFoundError
         if not isinstance(exc, NotFoundError): raise
+    if brief_template is not None:
+        # Explicit opt-in only; the historical no-template path above never
+        # reaches this branch and therefore gains no keys and no I/O.
+        content_object["brief_text"] = render_brief_template_text(
+            brief_template, brief_values, store_dir=brief_store_dir,
+        )
+    content = json.dumps(content_object, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
     return briefs.create_attempt_brief(conn, str(row[1]), content=content, clock=clock)
 
 

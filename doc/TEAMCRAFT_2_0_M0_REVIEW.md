@@ -402,7 +402,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 | **M6-01 只读 DAG 可视化（功能验收通过；见 12.30）**；依赖 M3-05、M1-04 | React Flow 展示依赖、状态、角色和阻塞原因；大图筛选/定位；不开放拖拽编辑 | UI 与后端依赖一致；循环不可能由 UI 制造；阻塞路径可解释 | 大图性能；视觉状态与事件延迟 |
 | **M6-02 Diff/验证/时间线页面（实现完成，2026-11-28；证据见 §12.50）**；依赖 M4-04、M3-05 | 安全渲染 Diff、Verification、Attempt/Session/Event 时间线；截断和下载受控 | 内容转义；大日志/二进制有明确提示；Commit 与证据关联清楚 | XSS；超大工件；敏感内容 |
 | **M6-03 脱敏诊断包（本地 Python 接口；见 12.31）**；依赖 M2-07、M3-02 | 选择性导出版本、Schema、事件摘要、健康和日志；密钥/env/路径策略脱敏；生成 manifest | 默认不含凭证和原始敏感日志；用户预览导出清单；包可用于复现已覆盖故障 | 脱敏遗漏；包仍暴露源码/路径 |
-| **M6-04 模板与个人偏好（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
+| **M6-04 模板与个人偏好（实现完成，2026-11-28；证据见 §12.50；运行时接线与独立验收 PASS 见 §12.55）**；依赖 M3-05、M5-02 | Task Brief 模板、Verifier/路由显示偏好、项目覆盖；配置版本和导入校验 | 模板不能绕过 Ownership、命令白名单或审批；配置错误可回退 | 模板成为隐蔽命令注入载体 |
 | **M6-05 远程/多机独立 RFC**；依赖 M4-06、M5-06 退出验收与实际运行数据 | 基于实际瓶颈评估 SSH/VPN、授权、TLS、Worker 身份、文件/DB 一致性；不直接实现 | RFC 有威胁模型、协议、失败场景、迁移和“不做”选项；未批准不开放公网监听 | 范围失控；多机一致性和凭证面显著扩大 |
 | **M6-06 Claude 适配与跨 Harness 真实 E2E**（**路径 B 关闭，2026-11-27**；OpenCode + Codex 真实 local-only leg 通过，Codex 编辑方式 caveat 已接受；Claude 延期 M6-07（已关闭，2026-11-28）；**M6-07 已登记**，见 §12.46）；依赖 M1-08、M2-09、M3-06、M4-04、M5-03；direct-PR 场景另依赖 M4-05 | 按目标 Claude Code 版本验证 `.claude/skills/` 与规则发现，决定受管副本或验证 symlink；生成精简 `CLAUDE.md` 且不覆盖用户文件；用同一 protocol version/hash 分别跑 Codex、OpenCode、Claude 的初始化→派工→Wake→验证→交付场景；记录版本/能力矩阵和降级 | Codex/OpenCode 基础契约已在 M1/M2，不等到 M6 才实现；三 Harness 的真实测试与 Mock 分栏；Claude 不可用时保持 pending，不能宣称通过；协议无复制漂移；report/local-only E2E 绑定证据，direct-PR 若纳入则满足 M4-05 | Claude 版本/许可/安装不可得；规则冲突；跨平台 symlink；真实调用成本 |
 
@@ -1533,3 +1533,37 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
   - `prep --session-id` **不创建 session**，只附着 prep 证据到既有 session。
 
 **限制声明**：本节仅登记上述事实。`duplicate_sends=1` 按 `wake.json` 原文登记（runner 侧计数字段，本次登记不改写其口径；会话存储侧本次 Wake prompt 仅出现一次于 seq 20，漂移重放 `prompts_sent=0`，与该字段不矛盾，但其语义未由本次登记独立推导）。在 CEO ack、剩余 pending wake、云端正向派发、真实推理端到端与 CI 各项取得独立证据之前，相应边界维持 §12.52/§12.53/§9.5 所注状态。
+
+### 12.55 M6-04 运行时接线（2026-11-28）
+
+**登记口径**：本节登记 M6-04 数据层（`teamcraft/templates.py`，§12.50）接入运行时消费方的实现与独立验收结果；§12.50 历史记录（含其"尚无运行时消费者"残余风险原文）保留不删改。代码改动共 3 个文件——`teamcraft/runtime_adapter.py`、`.agents/skills/teamcraft/scripts/teamctl.py`、新增 `tests/test_brief_template_m604.py`——登记时**未提交**（由 CEO 提交），无 Schema 变更；本次登记仅改动本文档，未 commit/push，未执行 `scripts/install.sh`。文档由本地 oMLX `Qwen3.8-Flash-Next-oQ4e-mtp` 撰写。
+
+**背景**：§12.50 已登记 M6-04 数据层实现与独立复核 PASS（`tests/test_templates_m604.py` 50 OK），并在残余风险中明确指出"`teamcraft/templates.py` 尚无运行时消费者（隔离在数据层，未接入执行路径）"。本轮补齐该缺口：模板从数据层接通到 `prepare_attempt_brief` 与 `teamctl launch`，使显式请求的 Task Brief 模板能进入 Attempt brief；默认路径行为与字节输出保持不变。
+
+**实现范围**（未提交 → 由 CEO 提交）：
+
+- `teamcraft/runtime_adapter.py`：`prepare_attempt_brief(...)` 新增可选参数 `brief_template=None, brief_values=None, brief_store_dir=None`；新增只读 `render_brief_template_text(template_id, values=None, store_dir=None)` 供 CLI 预检（不写库、不建目录、不 import/select/rollback 配置）。**默认路径（`brief_template=None`）逐字节不变**——content 仍由同一 `json.dumps` 调用、同一键集合构造，显式模板分支在默认路径上不可达，测试以基线字节相等断言。显式模板仅向同一 brief 对象**新增一个 `brief_text` 字符串键**（inert 文本），ownership/read-only/allowed commands/task version/milestone 绑定一律不变；全部模板错误（store 缺失、无 active config、config 非法、未知模板 id、value 含花括号）在 `briefs.create_attempt_brief` **之前**抛出，被拒模板不留半写 brief（fail-closed，且区分 `RuntimeAdapterError`＝坏配置与 `ValidationError`＝坏输入）。模板 store 查找在构造 `ConfigStore` 前先 `directory.exists()` 探测——`ConfigStore.__init__` 本会创建 `<store>/versions/`，只读失败路径不得留下目录。
+- `.agents/skills/teamcraft/scripts/teamctl.py`：`launch` 新增 `--brief-template ID` 与可重复的 `--brief-value KEY=VALUE`（`--brief-value` 要求 `--brief-template`，KEY 非空、不得重复）；**仅 launch 接入，resume 路径不变**（不带模板 kwargs）。`_launch_operation` **先解析 `--cwd` 项目、后校验模板选项**（`validate_common_launch` → `prepare_launch_brief_options` → `require_herdr()`），校验发生在 reserve/split/prompt 之前：渲染一次即证明模板 id 与 values 可用，失败则零派工副作用。模板 store **绑定 `<project>/.teamcraft/templates`**：项目 store 存在即唯一采信；项目 store 缺失且 env/cwd 解析指向**另一个已存在的 store** → 拒绝并给出精确补救（以 `TEAMCRAFT_PROJECT_ROOT=<--cwd 项目>` 导入文档），杜绝"cwd=B 时 `launch --cwd A` 静默渲染 B 的同 id 模板"；两个 store 均缺失 → 交由 core 报 "no active template config"，任何一侧都不创建目录。**旧 bundled core 给出可操作错误**：core 缺 `render_brief_template_text`、`prepare_attempt_brief` 签名缺模板参数、或 renderer 无法绑定 `store_dir` 时，以 `inspect.signature` 预检（不可 introspect 者回退到点名 `brief_template`/`brief_store_dir` 的 `TypeError`）抛出单个 `TeamctlError`，提示重跑 `scripts/install.sh` 刷新，而非裸 `AttributeError`/`TypeError`；无租约默认 launch/resume 不发送任何模板 kwargs，对旧 core 照常工作。
+- `tests/test_brief_template_m604.py`：新增 **31 项（另含 20 subtests）**，覆盖默认路径逐字节相等、显式模板仅新增 `brief_text` 一键、fail-closed（store/config/未知 id/花括号 value 诸拒绝面）、旧 core 兼容（可操作 `TeamctlError` 非 `AttributeError`）、`--cwd` store 绑定与跨项目不一致拒绝、只读查询不建目录、注入面（渲染产物 inert、值不得携带花括号语法）。
+
+**独立验收（独立 tester，2026-11-28）**：首轮 **PASS（无阻断）**，同时列出三项非阻断缺陷：**F1**——模板 store 解析与 `--cwd` 可能不一致（env/cwd store 可被静默采信）；**F2**——旧 core 预检在某路径漏出裸 `AttributeError`；**F3**——查询失败路径仍会创建目录。三项修复后聚焦复验 **PASS**。
+
+**测试计数（本节撰写者在含上述未提交改动的工作树上复跑；仓库 `.venv`：Python 3.13.14 + pytest 9.2.0）**：
+
+- `tests/test_brief_template_m604.py`：**31 passed + 20 subtests passed**，exit 0
+- `tests/test_templates_m604.py`：**50 passed + 45 subtests passed**，exit 0
+- `tests/test_teamctl.py`：**27 passed + 2 subtests passed**，exit 0
+- 定向三文件合计：**108 passed + 67 subtests passed**，exit 0
+- 全量 `tests/`：**1674 passed，4 skipped**（530 subtests passed），exit 0
+- `.agents/skills/teamcraft/tests`：**95 passed + 53 subtests passed**，exit 0
+
+**边界 / 未声称**：
+
+- CLI 成功路径为 handler/mock 级（测试驱动 `prompt_member` 等 handler，不启动真实 Herdr pane），**本轮未用模板做真实 Herdr prompt 投递**，不声称真实 Herdr 已投递或消费过模板内容。
+- 既有 brief 不可变：同一 Attempt 已写入 brief 行时，`prepare_attempt_brief` 命中 `get_attempt_brief` 即返回旧内容，新模板参数在该路径被忽略（既有语义，非本轮新行为）。
+- 模板正文属**操作者受信配置**的提示内容面：渲染出的 `brief_text` 是 inert 文本，不改变也不绕过 Ownership、命令白名单、审批或路由绑定，任何执行环节不解释执行它；注入面由数据层 forbidden-token 扫描与渲染期花括号拒绝共同约束。
+- `scripts/core` 为 gitignored 生成物，开发 checkout 可能滞后于仓库当前代码；显式使用模板须重跑 `scripts/install.sh` 刷新 bundled core（CLI 对旧 core 现已给可操作错误而非裸异常）。本节未执行 install.sh，bundle 内容以操作者环境为准。
+- `templates.resolve_store_dir` 本身仍以 env（`TEAMCRAFT_PROJECT_ROOT`）/cwd 解析（行为不变）；`launch` 已用 `--cwd` 解析出的项目显式覆盖为 `brief_store_dir`，非 CLI 调用方（直接 import `templates` 或 `render_brief_template_text` 不传 `store_dir`）仍走 env/cwd 语义。
+- 云端正向派发、GitHub Actions、真实 oMLX 推理端到端仍未验证，维持 §12.52/§12.53/§9.5 所注 PENDING。
+
+**限制声明**：本节仅登记代码接线、独立验收与可复跑测试事实；因代码在登记时未提交，上述数字的可复跑基准是**含未提交改动的工作树**，提交落地前在干净 HEAD 上跑新 31 项面会因文件缺失而不同。在 CEO 提交该 3 文件之前，M6-04 运行时接线的持久性以提交为准；真实 Herdr 模板投递取得独立证据之前，相应边界不得宣称通过。历史 §12.50 及其前记录保留不删。
