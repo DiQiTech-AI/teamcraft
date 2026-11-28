@@ -386,8 +386,8 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 
 | ID / 依赖 | 实施步骤 | 独立验收标准 | 主要风险 |
 |---|---|---|---|
-| **M5-01 Harness/Provider 能力注册与健康检查（实现及当前版本本机核验完成，待独立验收；证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode 仅执行隔离的版本探测，oMLX 仅查询 loopback 模型目录，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。2026-11-20 当前版本本机结果：Codex/OpenCode/oMLX 有界探测 healthy，定向测试 9/9 通过，待独立 tester 验收 | 探测结果不证明推理可用；版本/模型名不稳定；文档能力与实机不同 |
-| **M5-02 确定性 Router（实现完成，待独立验收；证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
+| **M5-01 Harness/Provider 能力注册与健康检查（实现及当前版本本机核验完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode 仅执行隔离的版本探测，oMLX 仅查询 loopback 模型目录，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。2026-11-20 当前版本本机结果：Codex/OpenCode/oMLX 有界探测 healthy，定向测试 9/9 通过，待独立 tester 验收（该独立验收已于 2026-11-28 复验通过，见 §12.51） | 探测结果不证明推理可用；版本/模型名不稳定；文档能力与实机不同 |
+| **M5-02 确定性 Router（实现完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
 | **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
@@ -1401,3 +1401,40 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 **残余风险**：`teamcraft/templates.py` 尚无运行时消费者（隔离在数据层，未接入执行路径）；M6-02 为静态源码核验；真实 Herdr/GitHub Actions 未运行。**本登记仍不构成完整验收 PASS**，仅记录实现与独立复核事实。
 
 **限制声明**：本登记未声称真实 Herdr 或 GitHub Actions 已运行；无 Schema 变更。
+
+### 12.51 M5-01 / M5-02 独立验收（2026-11-28）
+
+**登记口径**：本节登记 M5-01/M5-02 首轮独立验收 FAIL（缺陷 D1–D7）、修复提交 `eab13f4` 与独立 tester 复验 PASS 的事实。该 PASS 的边界是：D1–D7 的修复复现与回归证据；**不声称真实 oMLX 服务端到端已验证，也不声称 GitHub Actions 已运行**（见下文残余风险与限制声明）。
+
+**首轮独立验收 FAIL（缺陷 D1–D7）**：
+
+| 缺陷 | 首轮问题 |
+|---|---|
+| D1 | oMLX 非法响应（非 JSON 对象、`data` 非列表、不可解码等）仍可被投影为 healthy |
+| D2 | credential-shaped 凭据文本/字段（version/source/models/discovery 中的 `Bearer`/`sk-`/`key=value`/URL userinfo 等）可在持久化前不被拒绝而入库 |
+| D3 | 仅读取 `/v1/models` 目录即声明 `inference_request=supported`，属过度声明（目录可读 ≠ 推理可用） |
+| D4 | oMLX 探测默认 transport 跟随 3xx 重定向，loopback 端点可把探测引向非 loopback origin |
+| D5 | Router 默认高风险标签过窄，credential/password/secret/token/api_key/ssh/iam 等变体不被提升，默认停留在 normal 风险 |
+| D6 | 能力事件 `event_id` 仅由快照 digest 决定、未按项目 scope，同一快照跨项目记录时产生跨项目 event_id 冲突 |
+| D7 | harness 探测退出码 0 但版本不可解析时仍报 healthy（healthy with unknown version） |
+
+**修复提交 `eab13f4`**（"fix: M5-01/M5-02 acceptance defects D1-D7"）：
+
+- providers（`teamcraft/providers.py`）：持久化前递归拒绝 credential-shaped 字段与文本，bare `key` 以边界锚定避免误伤普通词（D2）；oMLX 响应严格校验——非对象、`data` 非列表、credential-shaped 的 model/version 一律 `unhealthy/invalid_response`（D1）；`inference_request` 由目录读取降级为 `unknown`，目录可读不再推断推理可用（D3）；新增 `_RefuseRedirectHandler` 拒绝一切重定向，并保留显式空 ProxyHandler（D4）；`event_id` 改为按 `project_id` scope 的 SHA-256 确定性构造，同一快照在不同项目产生不同事件、同项目幂等（D6）；harness 退出码 0 且版本不可解析改判 `unhealthy/version_unparsable`（D7）。
+- router（`teamcraft/router.py`）：规范化高风险标签词表（D5）——标签小写、按非字母数字切分后做单复数、前缀与紧凑子串匹配，覆盖 credential/password/passwd/secret/token/api_key（含 apikey 紧凑形）/key/ssh/iam/auth（auth 仅精确匹配，避免 `author` 误伤）/deploy 变体；高风险任务在无 assured 候选时仍 fail closed。
+
+**复验 PASS（独立 tester，2026-11-28）**：
+
+- HEAD `eab13f4`、`git` 工作树 clean；`tests/test_providers_m501.py` **25 OK**、`tests/test_router_m502.py` **17 OK**、全量 `tests/` **1639 OK（4 skipped）**。
+- D1–D7 用真实手段复现通过：非法响应/重定向/凭据目录由真实 loopback HTTP 复现，事件 `event_id` 隔离与凭据不入库在真实 SQLite 存储流上核验，版本不可解析由二进制进程探针复现；非 Mock 替代。
+- docs 登记时本机复跑佐证（同 HEAD `eab13f4`，`git status` clean）：providers **25 OK**、router **17 OK**、全量 **1639 OK（skipped=4）**，与 tester 数字一致。仓库内回归以注入 getter 覆盖 oMLX 响应面，并在真实 SQLite 上核验事件持久化。
+
+**残余风险**：
+
+- D5 规范化匹配为 fail-closed 设计，存在**过度分类**：普通标签 `keyboard-layout`、`keynote`、`tokenizer`、`secretary` 会因 `key`/`token`/`secret` 前缀被误标高风险；同时存在**压缩复合词漏判**：`accesskey`、`signingkey` 等后缀式紧凑词不被命中。
+- D2 文本启发式不完备：无分隔符或过短的 secret 可避开 `[:=]` 形态与长度门限，仍存在漏检面。
+- D4 拒绝重定向绑定默认 transport（`urllib` opener）；注入的自定义 getter 需自行保证同等拒绝语义。
+- Router 决策**尚未接入主 dispatch 流程**，Attempt 能力快照也**尚未接入模型选择主流程**（当前仅提供显式绑定入口与纯决策原语）。
+- **真实 oMLX 服务端到端未验证（PENDING）**：现有 oMLX 证据止于本地 loopback 契约探针（`/v1/models` 目录与失败路径），未发起真实推理请求。
+
+**限制声明**：本节不声称真实 oMLX 服务端到端通过、不声称 GitHub Actions 已运行；§9.5 中 M5-01/M5-02 的“验收通过”仅指 D1–D7 修复后的缺陷复现与回归证据成立。历史 12.25/12.26 记录保留不删；上述接入与端到端项在后续里程碑补证。
