@@ -388,7 +388,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 |---|---|---|---|
 | **M5-01 Harness/Provider 能力注册与健康检查（实现及当前版本本机核验完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode 仅执行隔离的版本探测，oMLX 仅查询 loopback 模型目录，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。2026-11-20 当前版本本机结果：Codex/OpenCode/oMLX 有界探测 healthy，定向测试 9/9 通过，待独立 tester 验收（该独立验收已于 2026-11-28 复验通过，见 §12.51） | 探测结果不证明推理可用；版本/模型名不稳定；文档能力与实机不同 |
 | **M5-02 确定性 Router（实现完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
-| **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件（两项延期验证结果见 §12.52：仍 PENDING） |
+| **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件（两项延期验证结果见 §12.52；升级链路已闭环、真实投递已复现，见 §12.53） |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
 | **M5-06 对照实验（工具验收完成，真实实验延期；见 12.29）**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
@@ -1475,3 +1475,37 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - **实际 prompt 投递、重启恢复、身份漂移处置仍 PENDING**：这些操作会写入真实 pane，需操作者明确同意并提供 disposable CEO pane 后才能执行；本次未执行、未发送任何真实 Herdr prompt。
 
 **限制声明**：本节仅登记上述事实。三项 PENDING（升级链路 `NEEDS_HUMAN`/通知消费者、云端正向派发、真实 Herdr 投递/重启/漂移）留待后续补证；在此之前 M5-03 的两项延期验证维持 §9.5 所注“仍 PENDING”。
+
+**后续更新（2026-11-28）**：本节升级链路 PENDING 缺口已在 §12.53 闭环（同事务 `blocked` + `wake-status --state blocked` 通知消费者）；真实 Herdr 投递已在 §12.53 于 HG-F 授权下复现（runner 级记 unknown，非 submitted）；云端正向派发仍 PENDING。本节原文保留不改。
+
+### 12.53 M5-03 升级链路闭环与真实 Herdr 投递（2026-11-28）
+
+**登记口径**：本节登记 §12.52 两项 PENDING（升级链路未闭环、真实 Herdr 投递未验证）的修复与复验结果；§12.27、§12.52 历史记录保留不删改。A 节为代码修复（提交 `8739304`，测试计数由本节撰写者在 HEAD 上复跑核实）；B 节为真实 Herdr 验证（disposable 双 pane，操作者 HG-F 授权；验证后 disposable root 已清理，B 节事实以该次授权运行的 runner 记录与真实会话存储为准）。本次登记仅改动本文档，未 commit/push；文档由本地 oMLX `Qwen3.8-Flash-Next-oQ4e-mtp` 撰写。
+
+**A. 升级链路闭环（代码，提交 `8739304`）**：
+
+- `teamcraft/wake.py` 的 `record_urgent_wake_escalation`：**同一事务**内写入 `wake.urgent_escalated` 事件并把 pending Wake 迁移为 `blocked`，`detail=urgent_wake_budget_exhausted:<used>/<max>`；状态迁移是 CAS（`UPDATE wakes SET state='blocked',detail=? … WHERE id=? AND state='pending'`），rowcount≠1 抛 `StorageError`，保证事件与状态原子一致。
+- **重放幂等**：Wake 已 `blocked` 且已有 escalated 记录时返回既有事件（`inserted=False`），行与事件流均不变；同一 Wake 的重复拒绝不产生重复记录。另有 lease fencing（`require_project_lease`）与 head 校验；该函数**不消耗预算、不创建 Command、不触 transport**（预算读取失败也只降级标注 `budget_config_invalid`，不阻断人工信号）。
+- **`blocked` 复用既有词汇**：现承载两种含义——对账证明未投递、预算耗尽升级——两者都表示“人工处理前禁止自动投递”；**通知消费者** = `wake-status --state blocked`（CLI 已支持 `--state blocked`，列出 blocked Wake 及其 `detail`），§12.52 所指“事件只能从通用 `/api/v1/events` 读取、无专门消费端”的缺口就此闭环。
+- **升级粒度为 Wake 级而非 Task 级**：`wakes` 表无 `task_id` 列，升级 Wake 是跨事件合并批，无法安全绑定单一 Task，故不伪造 Task 状态；人工处理以 Wake 行 + `detail` + escalated 事件为准。
+
+**测试计数**：
+
+- 定向：`test_wake_m503.py` **32 OK**、`test_escalation_m503.py` **30 OK**。
+- 全量：`unittest discover` **Ran 1647, OK（4 skipped）**（= pytest 口径 **1643 passed + 4 skipped**）。
+
+**B. 真实 Herdr Wake 验证（disposable 双 pane，HG-F 授权）**：
+
+- worker pane：`dispatch.json` state=`submitted`、returncode=0、transport_observation=`accepted`。
+- CEO bootstrap：transport=`submitted`、state=`initialized`、receipt_source=`assumed_default`、identity_mode=`native`、ceo_acknowledged=`false`。
+- **真实投递已复现**：Wake `1ff4603d-…` 以 `--wait --until idle,done --timeout 120000` 等待返回 rc=1（CEO 仍在生成）→ runner 保守记 `transport=unresolved / outcome=unknown`；但真实 CEO OpenCode 会话存储中 `session_message seq 20` 的 289 字符 prompt 的 sha256 与 `wake.json.delivery.prompt_sha256` **逐字节一致** → 该 prompt 确实投递到了真实 CEO 会话。
+- **runner 判定边界**：120 秒等待窗口在 CEO 到达 idle/done 之前到期、未取得可判 `submitted` 的 transport receipt，故 runner 层维持 `outcome=unknown`，**未伪造** `submitted`；CEO 亦未 ack（`acknowledged_seq=0`）。sha256 匹配是会话存储级的投递佐证，不替代 runner 层的 submitted/ack 判定。
+- **身份漂移拒绝**：同一 pane/terminal 重启即为新 session；以旧 `--ceo-expect-session-id` 重放 **exit 2**，`gate_ceo_target()` 在任何 prompt 发送之前拒绝；零副作用核实——新 CEO session 消息数 0、worker session 消息数 11 不变、wakes 表不变、`acknowledged_seq=0` → 无盲重发。
+- **清理**：`--cleanup-only` exit 0，disposable root 已删除；项目仓库未被写入（项目 `.teamcraft/teamcraft.db` 的 `wakes` 表为空、`git status` 干净，与“验证使用独立 disposable 环境”一致）。
+
+**仍未达成 / 边界**：
+
+- runner 级 `outcome=submitted` **未达成**（本轮记 unknown）：需另一次授权运行并配 `--submit-timeout-ms ≥ 600000`，让 runner 等到 CEO receipt；**不得重发本次 Wake**（该 Wake 已投递并由会话存储证明，`blocked`/保守语义同样禁止自动重发）。
+- **CEO ack 未发生**（`ceo_acknowledged=false`、`acknowledged_seq=0`）：不得声称 CEO 已阅读或确认本 Wake。
+- **云端正向派发仍 PENDING**（§12.52：仓库内无出站云客户端）。
+- 真实 oMLX 推理的端到端效果（CEO 收到 wake 后是否产生实质处理）与 GitHub Actions CI 未验证。
