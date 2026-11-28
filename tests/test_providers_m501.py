@@ -299,6 +299,202 @@ class ProviderCapabilitiesM501Tests(unittest.TestCase):
         ).fetchone()[0])
         self.assertEqual(after, before, "rejected credential metadata must write no event")
 
+    def test_credential_shaped_values_are_rejected_across_untrusted_fields(self) -> None:
+        observed = self.clock.now().isoformat()
+        valid_until = (self.clock.now() + timedelta(minutes=5)).isoformat()
+
+        def snapshot(**overrides):
+            values = {
+                "entity_type": "harness", "name": "codex", "version": None,
+                "provider": None, "models": (), "discovery": {},
+                "capabilities": {}, "health": "healthy", "reason_code": "ok",
+                "source": "local_process", "observed_at": observed,
+                "valid_until": valid_until,
+            }
+            values.update(overrides)
+            return providers.CapabilitySnapshot(**values)
+
+        credential_values = (
+            "password:hunter2",
+            "passwd=hunter2",
+            "token:abc123",
+            "api_key=abc123",
+            "apikey:abc123",
+            "secret:abc123",
+            "Authorization: Basic dXNlcjpwYXNz",
+            "ssh:identity-material",
+            "ssh_key=identity-material",
+            "iam:role-material",
+            "iam_role=role-material",
+            "credential:material",
+            "credential_file=/tmp/credential",
+        )
+        for value in credential_values:
+            for field, overrides in (
+                    ("version", {"version": value}),
+                    ("source", {"source": value}),
+                    ("model", {"models": (value,)})):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValidationError, "credential-shaped"):
+                        snapshot(**overrides)
+        for source in ("http://user:pass@127.0.0.1:8000/v1/models",
+                       "https://alice:secret@example.com/v1",
+                       "//alice:secret@example.com/v1"):
+            with self.subTest(field="source", value=source):
+                with self.assertRaisesRegex(ValidationError, "credential-shaped"):
+                    snapshot(source=source)
+        for key in ("passwd", "apikey", "iam", "credential", "x-api-key"):
+            with self.subTest(field=key):
+                with self.assertRaisesRegex(ValidationError, "credential-shaped"):
+                    snapshot(discovery={key: "supported"})
+        # The boundary-anchored key rule must not reject ordinary words.
+        snapshot(discovery={"monkey": "supported"})
+
+    def test_omlx_invalid_response_shapes_are_not_healthy(self) -> None:
+        for body in (b"[]", b"null", b'"hello"', b"42", b"{}", b'{"data":{}}'):
+            with self.subTest(body=body):
+                snapshot = providers.probe_omlx(
+                    getter=lambda url, timeout, payload=body: (200, payload),
+                    clock=self.clock,
+                )
+                self.assertEqual(snapshot.health, "unhealthy")
+                self.assertEqual(snapshot.reason_code, "invalid_response")
+                self.assertEqual(snapshot.models, ())
+                self.assertIsNone(snapshot.version)
+                self.assertEqual(
+                    snapshot.capabilities["inference_request"], "unknown")
+
+    def test_omlx_credential_shaped_catalog_and_version_fail_closed(self) -> None:
+        cases = (
+            {"version": "password:hunter2", "data": [{"id": "model-a"}]},
+            {"version": "Authorization: Basic dXNlcjpwYXNz",
+             "data": [{"id": "model-a"}]},
+            {"data": [{"id": "token:abcdef1234"}]},
+        )
+        for document in cases:
+            body = json.dumps(document).encode()
+            with self.subTest(document=document):
+                snapshot = providers.probe_omlx(
+                    getter=lambda url, timeout, payload=body: (200, payload),
+                    clock=self.clock,
+                )
+                self.assertEqual(snapshot.health, "unhealthy")
+                self.assertEqual(snapshot.reason_code, "invalid_response")
+                self.assertEqual(snapshot.models, ())
+                self.assertIsNone(snapshot.version)
+
+    def test_omlx_catalog_read_is_not_inference_support(self) -> None:
+        body = json.dumps(
+            {"version": "0.9.1", "data": [{"id": "model-a"}]}
+        ).encode()
+        snapshot = providers.probe_omlx(
+            getter=lambda url, timeout: (200, body), clock=self.clock
+        )
+        self.assertEqual(snapshot.health, "healthy")
+        self.assertEqual(snapshot.discovery["model_catalog"], "supported")
+        self.assertEqual(snapshot.capabilities["inference_request"], "unknown")
+
+        empty = providers.probe_omlx(
+            getter=lambda url, timeout: (200, b'{"data":[]}'),
+            clock=self.clock,
+        )
+        self.assertEqual(empty.health, "healthy")
+        self.assertEqual(empty.models, ())
+        self.assertEqual(empty.capabilities["inference_request"], "unknown")
+
+    def test_default_omlx_transport_refuses_redirects(self) -> None:
+        request = providers.urllib.request.Request(
+            "http://127.0.0.1:8000/v1/models"
+        )
+        handler = providers._RefuseRedirectHandler()
+        with self.assertRaises(providers.urllib.error.HTTPError) as caught:
+            handler.redirect_request(
+                request, None, 302, "Found", {},
+                "http://example.com/collected",
+            )
+        self.assertEqual(caught.exception.code, 302)
+
+        opener = mock.MagicMock()
+        opener.open.side_effect = providers.urllib.error.HTTPError(
+            request.full_url, 302, "Found", {}, None
+        )
+        with mock.patch.object(
+                providers.urllib.request, "build_opener",
+                return_value=opener) as build_opener:
+            status, body = providers._default_http_get(request.full_url, 1.0)
+        self.assertEqual((status, body), (302, b""))
+        handlers = build_opener.call_args.args
+        self.assertIsInstance(
+            handlers[0], providers.urllib.request.ProxyHandler)
+        self.assertEqual(handlers[0].proxies, {})
+        self.assertTrue(any(
+            isinstance(item, providers._RefuseRedirectHandler)
+            for item in handlers
+        ))
+
+    def test_same_snapshot_in_two_projects_gets_distinct_event_ids(self) -> None:
+        other = domain.create_project(
+            self.conn, "m501-other", str(self.root / "other-repo"),
+            clock=self.clock,
+        )
+        snapshot = providers.CapabilitySnapshot(
+            "provider", "omlx", "0.9.1", "openai_compatible", ("model-a",),
+            {"model_catalog": "supported"},
+            {"inference_request": "unknown", "event_stream": "unsupported",
+             "prompt_ack": "unsupported"},
+            "healthy", "ok", "http://127.0.0.1:8000/v1/models",
+            self.clock.now().isoformat(),
+            (self.clock.now() + timedelta(minutes=5)).isoformat(),
+        )
+        first = providers.record_capability_probe(
+            self.conn, self.project.id, snapshot)
+        replay = providers.record_capability_probe(
+            self.conn, self.project.id, snapshot)
+        second = providers.record_capability_probe(
+            self.conn, other.id, snapshot)
+        self.assertEqual(first.event_id, replay.event_id)
+        self.assertNotEqual(first.event_id, second.event_id)
+        self.assertEqual(first.project_id, self.project.id)
+        self.assertEqual(second.project_id, other.id)
+        self.assertEqual(
+            providers.latest_capability_probes(
+                self.conn, self.project.id)[0].name,
+            "omlx",
+        )
+        self.assertEqual(
+            providers.latest_capability_probes(
+                self.conn, other.id)[0].name,
+            "omlx",
+        )
+
+    def test_harness_exit_zero_without_recognizable_version_is_unhealthy(self) -> None:
+        missing_version = providers.probe_harness(
+            "opencode", self.root,
+            runner=lambda argv, cwd, timeout: (0, "opencode\n"),
+            clock=self.clock,
+        )
+        self.assertIsNone(missing_version.version)
+        self.assertEqual(missing_version.health, "unhealthy")
+        self.assertEqual(missing_version.reason_code, "version_unparsable")
+
+        parsed = providers.probe_harness(
+            "opencode", self.root,
+            runner=lambda argv, cwd, timeout: (0, "opencode v2.2.6\n"),
+            clock=self.clock,
+        )
+        self.assertEqual(parsed.version, "opencode v2.2.6")
+        self.assertEqual(parsed.health, "healthy")
+        self.assertEqual(parsed.reason_code, "ok")
+
+        failed = providers.probe_harness(
+            "opencode", self.root,
+            runner=lambda argv, cwd, timeout: (1, "opencode v2.2.6\n"),
+            clock=self.clock,
+        )
+        self.assertIsNone(failed.version)
+        self.assertEqual(failed.health, "unhealthy")
+        self.assertEqual(failed.reason_code, "version_probe_failed")
+
 
 class ClaudeProbeM606P1Tests(unittest.TestCase):
     """Offline bounded Claude version/discovery reporting (M6-06 P1).

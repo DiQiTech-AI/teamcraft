@@ -20,9 +20,30 @@ from .providers import CapabilitySnapshot
 
 LOCALITIES = frozenset({"local", "cloud"})
 RISK_LEVELS = frozenset({"normal", "high", "critical"})
-DEFAULT_HIGH_RISK_TAGS = frozenset({"auth", "authentication", "credentials",
-                                    "deploy", "deployment", "keys", "secrets"})
+# Canonical risk vocabulary.  Matching is deliberately fail-closed: tags are
+# lower-cased, split on ``-``/``_``/``/``/``.``/``:``/``+`` (and any other
+# non-alphanumeric), then compared case-insensitively while accepting
+# singular/plural, prefix and compact-substring forms.  Multi-word entries
+# also match their separator-free spelling (``api_key`` -> ``apikey``).
+DEFAULT_HIGH_RISK_TAGS = frozenset({
+    "auth", "authn", "authz", "authentication", "authorization", "oauth",
+    "credential", "credentials",
+    "password", "passwords", "passwd",
+    "secret", "secrets",
+    "token", "tokens",
+    "api_key", "api-key", "apikey",
+    "key", "keys",
+    "ssh", "iam",
+    "deploy", "deployment", "deployments",
+})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,199}\Z")
+_TAG_SEPARATOR = re.compile(r"[^a-z0-9]+")
+# Short stems use prefix matching too (``sshkeys``, ``iamrole``, ``keyring``);
+# only ``auth`` is exact-only because its prefix would flag ordinary words such
+# as ``author``.  The explicit ``authn``/``authz``/``authentication``/
+# ``authorization`` entries cover the intended auth vocabulary.
+_PREFIX_EXCLUDED_MARKERS = frozenset({"auth"})
+_MIN_SUBSTRING_MATCH_LENGTH = 5
 _SECRET_TEXT = re.compile(
     r"\bBearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|"
     r"\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*\S+",
@@ -228,12 +249,78 @@ class RouteDecision:
         return hashlib.sha256(_canonical(self.payload()).encode("utf-8")).hexdigest()
 
 
+def _normalize_tag(tag: str) -> tuple[str, ...]:
+    """Split a validated tag into lower-case alphanumeric components."""
+
+    return tuple(part for part in _TAG_SEPARATOR.split(tag.lower()) if part)
+
+
+def _singular_forms(token: str) -> frozenset[str]:
+    """Return the token plus conservative singular spellings.
+
+    Only one plural marker is removed, which keeps the result deterministic and
+    avoids stemmer dictionaries.  Irregular forms used by the risk vocabulary
+    (``passwd``, ``apikey``) are listed explicitly instead.
+    """
+
+    forms = {token}
+    if token.endswith("ies") and len(token) > 3:
+        forms.add(token[:-3] + "y")
+    if token.endswith("es") and len(token) > 2:
+        forms.add(token[:-2])
+    if token.endswith("s") and not token.endswith("ss"):
+        forms.add(token[:-1])
+    return frozenset(forms)
+
+
+def _risk_markers(policy_tags: Iterable[str]) -> tuple[frozenset[str], frozenset[str]]:
+    """Normalize policy tags into single-token and compact multi-word markers."""
+
+    single: set[str] = set()
+    compact: set[str] = set()
+    for tag in policy_tags:
+        parts = _normalize_tag(tag)
+        if not parts:
+            continue
+        if len(parts) == 1:
+            single.update(_singular_forms(parts[0]))
+        else:
+            compact.update(_singular_forms("".join(parts)))
+    return frozenset(single), frozenset(compact)
+
+
+def _is_high_risk_tag(tag: str, single: frozenset[str],
+                      compact: frozenset[str]) -> bool:
+    parts = _normalize_tag(tag)
+    if not parts:
+        return False
+    joined = "".join(parts)
+    # Multi-word policy markers match both their canonical separator forms and
+    # any compact substring (``apikey`` inside ``myapikey``).
+    if any(marker in joined for marker in compact):
+        return True
+    for part in parts:
+        forms = _singular_forms(part)
+        if any(form in single for form in forms):
+            return True
+        # Prefix matching handles affixed and concatenated forms such as
+        # ``passwordless``, ``credentialed``, ``sshkeys``, and ``iamrole``.
+        if any(form.startswith(marker) for form in forms for marker in single
+               if marker not in _PREFIX_EXCLUDED_MARKERS):
+            return True
+    # Substring matching for long single-token stems covers affixed compounds
+    # such as ``mypassword`` or ``proddeploy``; short stems are prefix-only so
+    # ``miami`` does not look like ``iam``.
+    return any(len(marker) >= _MIN_SUBSTRING_MATCH_LENGTH and marker in joined
+               for marker in single)
+
+
 def _effective_risk(request: RouteRequest, policy: RouterPolicy) -> str:
     if request.risk == "critical":
         return "critical"
-    normalized_tags = frozenset(tag.lower() for tag in request.task_tags)
-    policy_tags = frozenset(tag.lower() for tag in policy.high_risk_tags)
-    if request.risk == "high" or normalized_tags.intersection(policy_tags):
+    single, compact = _risk_markers(policy.high_risk_tags)
+    if request.risk == "high" or any(
+            _is_high_risk_tag(tag, single, compact) for tag in request.task_tags):
         return "high"
     return "normal"
 

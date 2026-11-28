@@ -102,6 +102,94 @@ class DeterministicRouterM502Tests(unittest.TestCase):
                 self.assertEqual(decision.reason_code,
                                  "high_risk_assurance_unsatisfied")
 
+    def test_default_high_risk_tags_cover_credential_vocabulary(self) -> None:
+        tags = (
+            "credential", "credentials", "CREDENTIALS",
+            "password", "passwords", "PASSWD",
+            "secret", "SECRETS",
+            "token", "TOKENS",
+            "api_key", "api-key", "API_KEY", "API-KEY", "apikey",
+            "key", "keys",
+            "ssh", "SSH", "iam", "IAM",
+            "sshkeys", "iamrole", "keyring",
+            "auth", "AUTH", "authentication", "authorization", "oauth",
+            "deploy", "deployment", "deployments",
+            "auth/deployment", "aws/iam/role", "prod-deploy", "db_password",
+            "api-key-rotation", "mypassword", "proddeploy",
+        )
+        weak = self.candidate("weak-local", locality="local", assurance=1, cost=0)
+        strong = self.candidate("strong-cloud", locality="cloud", assurance=3,
+                                cost=100)
+        for tag in tags:
+            with self.subTest(tag=tag):
+                decision = router.route(
+                    router.RouteRequest(task_tags=(tag,)), (weak, strong),
+                    now=self.now,
+                )
+                self.assertEqual(decision.effective_risk, "high")
+                self.assertEqual(decision.selection, strong.selection)
+                self.assertEqual(decision.reason_code,
+                                 "selected_high_risk_assurance")
+                reversed_decision = router.route(
+                    router.RouteRequest(task_tags=(tag,)), (strong, weak),
+                    now=self.now,
+                )
+                self.assertEqual(reversed_decision.decision_digest,
+                                 decision.decision_digest)
+
+    def test_high_risk_tags_fail_closed_without_assured_candidate(self) -> None:
+        weak = self.candidate("weak", assurance=1)
+        for tag in ("credential", "PASSWORD", "api-key", "API_KEY", "ssh",
+                    "iam", "authorization"):
+            with self.subTest(tag=tag):
+                decision = router.route(
+                    router.RouteRequest(task_tags=(tag,)), (weak,), now=self.now
+                )
+                self.assertIsNone(decision.selection)
+                self.assertEqual(decision.effective_risk, "high")
+                self.assertEqual(decision.reason_code,
+                                 "high_risk_assurance_unsatisfied")
+
+    def test_custom_policy_high_risk_tags_are_normalized(self) -> None:
+        policy = router.RouterPolicy(
+            high_risk_tags=frozenset({"pci-dss", "internal_audit", "credentials"})
+        )
+        weak = self.candidate("weak", locality="local", assurance=1, cost=0)
+        strong = self.candidate("strong", locality="cloud", assurance=3, cost=100)
+        for tag in ("PCI-DSS", "pci_dss", "pci/dss", "INTERNAL-AUDIT",
+                    "internal_audit", "credential"):
+            with self.subTest(tag=tag):
+                decision = router.route(
+                    router.RouteRequest(task_tags=(tag,)), (weak, strong),
+                    policy=policy, now=self.now,
+                )
+                self.assertEqual(decision.effective_risk, "high")
+                self.assertEqual(decision.selection, strong.selection)
+                self.assertEqual(decision.reason_code,
+                                 "selected_high_risk_assurance")
+
+    def test_unrelated_tags_keep_normal_risk_and_local_first(self) -> None:
+        local = self.candidate("local", locality="local", assurance=1, cost=10)
+        cloud = self.candidate("cloud", locality="cloud", assurance=3, cost=0)
+        for tag in ("docs", "ui-polish", "tests", "performance"):
+            with self.subTest(tag=tag):
+                decision = router.route(
+                    router.RouteRequest(task_tags=(tag,)), (cloud, local),
+                    now=self.now,
+                )
+                self.assertEqual(decision.effective_risk, "normal")
+                self.assertEqual(decision.selection, local.selection)
+                self.assertEqual(decision.reason_code, "selected_local_first")
+
+    def test_default_high_risk_tags_are_exported_and_complete(self) -> None:
+        self.assertIsInstance(router.DEFAULT_HIGH_RISK_TAGS, frozenset)
+        self.assertLessEqual(
+            {"credential", "password", "passwd", "secret", "token", "api_key",
+             "apikey", "key", "ssh", "iam", "auth", "authentication",
+             "authorization", "deploy", "deployment"},
+            router.DEFAULT_HIGH_RISK_TAGS,
+        )
+
     def test_required_capabilities_must_be_explicitly_supported(self) -> None:
         candidate = self.candidate("basic", capabilities=("inference_request",))
         missing = router.route(

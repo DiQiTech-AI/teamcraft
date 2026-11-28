@@ -42,7 +42,25 @@ CLAUDE_CONTRACT_REQUIRES_SKILL = True
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,199}\Z")
 _SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,199}\Z")
 _VERSION_DIAGNOSTIC = re.compile(r"(?:warning|warn|error|platformerror)\b", re.I)
-_SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|bearer|password|secret|token)", re.I)
+#: Scan untrusted metadata for credential-shaped *fields* and *text*.  The
+#: bare ``key`` alternative is boundary-anchored so ordinary words such as
+#: "monkey" are not mistaken for credential material; ``password:hunter2``,
+#: ``api_key=...``, ``Authorization: Basic ...``, URL userinfo, Bearer tokens
+#: and ``sk-`` keys are all rejected before anything can be persisted.
+_CREDENTIAL_NAMES = (
+    r"api[_-]?key|apikey|authorization|bearer|password|passwd|secret|token|"
+    r"ssh|iam|credential"
+)
+_SECRET_KEY = re.compile(
+    rf"(?<![A-Za-z0-9])(?:{_CREDENTIAL_NAMES}|key)s?(?![A-Za-z0-9])", re.I
+)
+_CREDENTIAL_TEXT = re.compile(
+    rf"(?:\bBearer\s+\S+"
+    rf"|\bsk-[A-Za-z0-9_-]{{8,}}"
+    rf"|(?<![A-Za-z0-9])(?:{_CREDENTIAL_NAMES}|key)[A-Za-z0-9_-]{{0,32}}\s*[:=]\s*\S+"
+    rf"|(?:[A-Za-z][A-Za-z0-9+.-]*:)?//[^\s/?#]*@)",
+    re.I,
+)
 
 ProcessRunner = Callable[[Sequence[str], str, float], tuple[int, str]]
 HttpGetter = Callable[[str, float], tuple[int, bytes]]
@@ -78,6 +96,8 @@ def _digest(value: Any) -> str:
 def _safe_name(value: str | None, field: str, *, optional: bool = False) -> str | None:
     if value is None and optional:
         return None
+    if isinstance(value, str):
+        _reject_secrets(value, field)
     if not isinstance(value, str) or not _SAFE_NAME.fullmatch(value):
         raise ValidationError(f"{field} must be a bounded safe identifier")
     return value
@@ -87,6 +107,7 @@ def _safe_version(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
+    _reject_secrets(text, "version")
     if not _SAFE_VERSION.fullmatch(text):
         raise ValidationError("version must be bounded printable metadata")
     return text
@@ -101,7 +122,7 @@ def _reject_secrets(value: Any, path: str = "payload") -> None:
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             _reject_secrets(child, f"{path}[{index}]")
-    elif isinstance(value, str) and re.search(r"\bBearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}", value, re.I):
+    elif isinstance(value, str) and _CREDENTIAL_TEXT.search(value):
         raise ValidationError(f"{path} contains credential-shaped text")
 
 
@@ -288,13 +309,24 @@ def probe_harness(name: str, project_root: str | Path, *, runner: ProcessRunner 
     skill = (root / ".agents/skills/teamcraft-ceo/SKILL.md").is_file()
     rules = ((root / "AGENTS.md").is_file() if name == "codex"
              else (root / ".opencode/agents").is_dir())
-    return CapabilitySnapshot("harness", name, _bounded_version(output), None, (),
+    version = _bounded_version(output) if code == 0 else None
+    if code == 0 and version is not None:
+        health, reason = "healthy", "ok"
+    elif code == 0:
+        # Exit 0 proves the executable ran, NOT that its version is
+        # identifiable.  Match the Claude path: unparsable version is
+        # unhealthy rather than "healthy with unknown version".
+        health, reason = "unhealthy", "version_unparsable"
+    elif code == 127:
+        health, reason = "unhealthy", "executable_missing"
+    else:
+        health, reason = "unhealthy", "version_probe_failed"
+    return CapabilitySnapshot("harness", name, version, None, (),
         {"skill_rules": "supported" if skill else "unsupported",
          "project_rules": "supported" if rules else "unsupported"},
         {"event_stream": "unknown", "prompt_ack": "unknown"},
-        "healthy" if code == 0 else "unhealthy",
-        "ok" if code == 0 else ("executable_missing" if code == 127 else "version_probe_failed"),
-        "local_process", _iso(observed), _iso(observed + timedelta(seconds=ttl_seconds)))
+        health, reason, "local_process", _iso(observed),
+        _iso(observed + timedelta(seconds=ttl_seconds)))
 
 
 def _loopback_models_url(base_url: str) -> str:
@@ -321,13 +353,32 @@ def _loopback_models_url(base_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, model_path, "", ""))
 
 
+class _RefuseRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject every redirect so a loopback probe cannot be steered off-host.
+
+    urllib follows 3xx responses by default, which would let a loopback
+    endpoint hand the probe to an arbitrary external URL.  Refusing at the
+    redirect hook keeps every request on the already-validated loopback
+    origin; the resulting ``HTTPError`` is reported as a plain probe failure
+    by :func:`_default_http_get`.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "oMLX probe refuses HTTP redirects", headers, fp
+        )
+
+
 def _default_http_get(url: str, timeout: float) -> tuple[int, bytes]:
     request = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
     # A provider health probe must not inherit HTTP(S)_PROXY/NO_PROXY or any
     # authentication behavior from the host environment.  The endpoint is
     # already constrained to loopback; this explicit empty ProxyHandler keeps
     # urllib from consulting ambient proxy configuration on the request path.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # The redirect handler is deliberately restrictive: a loopback service
+    # must never be able to redirect the probe to a non-loopback origin.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _RefuseRedirectHandler())
     try:
         with opener.open(request, timeout=timeout) as response:
             return int(response.status), response.read(262145)
@@ -351,16 +402,35 @@ def probe_omlx(base_url: str = "http://127.0.0.1:8000/v1", *, getter: HttpGetter
     if status == 200 and len(body) <= 262144:
         try:
             document = json.loads(body.decode("utf-8"))
-            raw_models = document.get("data", [])
-            models = tuple(sorted({str(item["id"]) for item in raw_models
-                                   if isinstance(item, dict) and _SAFE_NAME.fullmatch(str(item.get("id", ""))) }))
-            version = _safe_version(document.get("version"))
+            if not isinstance(document, dict):
+                raise TypeError("oMLX response must be a JSON object")
+            raw_models = document.get("data")
+            if not isinstance(raw_models, list):
+                raise TypeError("oMLX response data must be a list")
+            safe_models: set[str] = set()
+            for item in raw_models:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("id")
+                if not isinstance(model_id, str) or not _SAFE_NAME.fullmatch(model_id):
+                    continue
+                _reject_secrets(model_id, "omlx.models")
+                safe_models.add(model_id)
+            candidate_version = _safe_version(document.get("version"))
+            _reject_secrets(candidate_version, "omlx.version")
+            models = tuple(sorted(safe_models))
+            version = candidate_version
             health, reason = "healthy", "ok"
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValidationError):
-            reason = "invalid_response"
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError,
+                TypeError, ValueError, ValidationError):
+            models, version = (), None
+            health, reason = "unhealthy", "invalid_response"
+    # A read-only /v1/models fetch establishes catalog readability only.  It
+    # cannot prove that the service accepts an inference request, so that
+    # capability stays "unknown" rather than being inferred from a GET.
     return CapabilitySnapshot("provider", "omlx", version, "openai_compatible", models,
         {"model_catalog": "supported" if health == "healthy" else "unknown"},
-        {"inference_request": "supported", "event_stream": "unsupported", "prompt_ack": "unsupported"},
+        {"inference_request": "unknown", "event_stream": "unsupported", "prompt_ack": "unsupported"},
         health, reason, url, _iso(observed), _iso(observed + timedelta(seconds=ttl_seconds)))
 
 
@@ -371,7 +441,13 @@ def record_capability_probe(conn: storage.TeamCraftConnection, project_id: str,
     payload = {"schema_version": 1, "snapshot": snapshot.payload(),
                "snapshot_digest": snapshot.snapshot_digest}
     _reject_secrets(payload)
-    event_id = "evt-cap-" + snapshot.snapshot_digest[:40]
+    # Snapshot digests are project-independent, so scope the deterministic
+    # event ID by project: the SAME snapshot recorded in two projects must
+    # produce two distinct events instead of conflicting on one global ID.
+    scoped = hashlib.sha256(
+        f"{project_id}\0{snapshot.snapshot_digest}".encode("utf-8")
+    ).hexdigest()
+    event_id = "evt-cap-" + scoped[:40]
     event, _ = events.append_event_idempotent(conn, CAPABILITY_PROBE_EVENT,
         project_id=project_id, payload_json=_canonical(payload), event_id=event_id)
     return event
