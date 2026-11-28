@@ -388,7 +388,7 @@ M2-07 的 GitHub 失租窗口只使用可控 Fake 外部调用验证 Leader/Reco
 |---|---|---|---|
 | **M5-01 Harness/Provider 能力注册与健康检查（实现及当前版本本机核验完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.25）**；依赖 M2-01、M1-08 | 记录 Harness/Provider/Model 版本、Skill/规则发现、事件/ack 能力、来源和探测时间；Codex/OpenCode 仅执行隔离的版本探测，oMLX 仅查询 loopback 模型目录，Claude 标为待适配；不读取/存储明文密钥 | 本地服务断开被识别；过期/未知健康不视为 healthy；不支持的发现/ack 安全降级；实际选择与能力快照记录到 Attempt。2026-11-20 当前版本本机结果：Codex/OpenCode/oMLX 有界探测 healthy，定向测试 9/9 通过，待独立 tester 验收（该独立验收已于 2026-11-28 复验通过，见 §12.51） | 探测结果不证明推理可用；版本/模型名不稳定；文档能力与实机不同 |
 | **M5-02 确定性 Router（实现完成，验收通过（2026-11-28；证据见 §12.51）；原证据见 12.26）**；依赖 M5-01、M2-02 | 纯决策层配置 local-first、任务风险、能力要求、人工覆盖；消费 M5-01 快照并输出选择、稳定 reason code 与决策 digest；高风险规则优先 | 相同输入/配置得到相同结果；认证/密钥/部署任务不会仅因便宜走弱模型；unknown/unhealthy/stale、能力不足和无效覆盖 fail closed；用户覆盖有显式审计 | 风险分类错误；策略过度复杂 |
-| **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件 |
+| **M5-03 有界失败升级、CEO Wake 与预算（任务完成，两项验证延期；见 12.27）**；依赖 M5-02、M2-05、M2-09 | 复用 max Attempts/超时/失败分类，增加云端 Token/Wake 预算和升级 Approval；local unavailable 时 BLOCKED/NEEDS_HUMAN 或获批升级；未知 Token 以 NULL 和保守策略处理 | 不无限重试；UNKNOWN 不计作可自动重试失败；合并 Wake 遵守预算且紧急项可升级；未知用量不当作 0、免费或完整预算；预算不足不调用云端 | Provider 用量不可比；未知导致保守阻塞；Wake 预算延误事件（两项延期验证结果见 §12.52：仍 PENDING） |
 | **M5-04 Usage 数据与价格来源（用户验收通过；见 12.28）**；依赖 M1-03、M5-01 | 分别记录 CEO、Worker、Verifier 的 Harness/model、source、exact/estimated、input/output/cache tokens、响应/Wake 次数、时长、币种、价格版本；未知保持 NULL | 缺失显示 unavailable；估算与实数可区分；本地/云端和 CEO/Worker 可筛分；价格可追溯 | Harness 不暴露用量；订阅额度无法折算 |
 | **M5-05 用量/成本 UI（实现完成，2026-11-28；证据见 §12.50）**；依赖 M3-05、M5-04 | 任务级及 CEO/Wake 明细、趋势和筛选；本地模型/云端标记；精度标签；失败尝试也计入；不默认宣称节省率 | 任一数字可追到 Attempt/Wake/来源；NULL 不错误求和；权限和脱敏一致 | 图表虚假精确；大量明细查询慢 |
 | **M5-06 对照实验（工具验收完成，真实实验延期；见 12.29）**；依赖 M5-03、M5-04 | 固定版本、同一任务集和验收；运行纯云端与混合策略；记录成功率、耗时、人工介入、恢复和用量 | 实验可复现；失败任务保留；结果标注样本和限制；“50%”只作为目标而非承诺 | 样本偏差；模型更新导致结果漂移；真实费用 |
@@ -1438,3 +1438,40 @@ Owner 决定：本机 `claude` 不可得（PG-1），Claude 适配与真实 leg 
 - **真实 oMLX 服务端到端未验证（PENDING）**：现有 oMLX 证据止于本地 loopback 契约探针（`/v1/models` 目录与失败路径），未发起真实推理请求。
 
 **限制声明**：本节不声称真实 oMLX 服务端到端通过、不声称 GitHub Actions 已运行；§9.5 中 M5-01/M5-02 的“验收通过”仅指 D1–D7 修复后的缺陷复现与回归证据成立。历史 12.25/12.26 记录保留不删；上述接入与端到端项在后续里程碑补证。
+
+
+### 12.52 M5-03 延期验证结果（2026-11-28）
+
+**登记口径**：本节登记只读 tester 对 M5-03 两项延期验证（§12.27：云端正向派发、紧急 Wake 超预算的端到端升级）的复验结果。12.27 历史记录保留不删。本节**不声称任何一项延期验证通过**：紧急超预算的预算拒绝与升级事件已在临时 DB 上端到端复现，但其 Task/Wake `NEEDS_HUMAN` 转义与人工通知消费链路仍 **PENDING**；云端正向派发仍 **PENDING**；真实 Herdr 的实际 prompt 投递、重启恢复与身份漂移仍 **PENDING**。本次登记未改动任何代码/Schema/tests，未发送任何真实 Herdr prompt；文档由本地 oMLX `Qwen3.8-Flash-Next-oQ4e-mtp` 撰写。
+
+**测试计数**：
+
+- 定向：`test_wake_m503.py` **25 OK**、`test_escalation_m503.py` **29 OK**。
+- 全量：`tests/` **1639 OK（4 skipped）**。
+
+**紧急 Wake 超预算端到端（临时 DB，`max=1` / allow-urgent）**：
+
+- urgent Wake 超出预算时被拒绝，拒绝码 `urgent_wake_budget_exhausted:1/1`；**未发送任何 prompt、未写入 `ceo.wake`**。
+- 被拒后 wake 保持 **pending** 状态。
+- 每次拒绝写入一条幂等的 `wake.urgent_escalated` 事件（`escalation="needs_human"`）；重复派发不产生重复事件（幂等）。
+- `max=0` 配置下同样触发 escalated。
+- 非 urgent Wake 超预算时仅普通 defer，不产生 escalated 事件。
+
+**PENDING 缺口（升级链路未闭环）**：
+
+- 无 Task/Wake **`NEEDS_HUMAN`** 状态转义：`wake.urgent_escalated` 仅是持久化事件，不驱动 Task/Wake 进入 `NEEDS_HUMAN`。
+- 无通知消费者：该事件目前只能从通用 `/api/v1/events` 读取，没有专门的通知/人工介入消费端。
+- 因此 §12.27 延期项“事件转 `NEEDS_HUMAN` 或人工通知的端到端验证”仍 **PENDING**，本项不得视为通过。
+
+**云端正向派发（仍 PENDING）**：
+
+- scheduler 在派发时拒绝并报 `cloud_transport_unavailable`；仓库内**没有出站云客户端**，无法发起真实云端派发。
+- 未知 bearer token 的回调/请求返回 **401**（认证按预期 fail closed）。
+- 因此 §12.27 延期项“云端正向派发”仍 **PENDING**。
+
+**真实 Herdr 0.9.3（部分核验）**：
+
+- 只读身份门禁 **PASS**：对 CEO pane `w3:p35` 的身份核验通过，并正确拒绝 terminal/session/name/moved-pane 四类漂移。
+- **实际 prompt 投递、重启恢复、身份漂移处置仍 PENDING**：这些操作会写入真实 pane，需操作者明确同意并提供 disposable CEO pane 后才能执行；本次未执行、未发送任何真实 Herdr prompt。
+
+**限制声明**：本节仅登记上述事实。三项 PENDING（升级链路 `NEEDS_HUMAN`/通知消费者、云端正向派发、真实 Herdr 投递/重启/漂移）留待后续补证；在此之前 M5-03 的两项延期验证维持 §9.5 所注“仍 PENDING”。
